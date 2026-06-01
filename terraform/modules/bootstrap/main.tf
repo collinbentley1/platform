@@ -138,7 +138,7 @@ resource "google_service_account" "terraform" {
   project      = var.project_id
   account_id   = "gha-terraform"
   display_name = "GitHub Actions Terraform"
-  description  = "Runs production Terraform from GitHub Actions on main."
+  description  = var.terraform_service_account_description
 
   depends_on = [google_project_service.required]
 }
@@ -147,7 +147,7 @@ resource "google_service_account" "prod_deploy" {
   project      = var.project_id
   account_id   = "gha-prod-deploy"
   display_name = "GitHub Actions Production Deploy"
-  description  = "Builds and deploys the production Cloud Run service from main."
+  description  = var.prod_deploy_service_account_description
 
   depends_on = [google_project_service.required]
 }
@@ -156,7 +156,7 @@ resource "google_service_account" "preview_deploy" {
   project      = var.project_id
   account_id   = "gha-preview-deploy"
   display_name = "GitHub Actions Preview Deploy"
-  description  = "Builds, deploys, and deletes pull request Cloud Run previews."
+  description  = var.preview_deploy_service_account_description
 
   depends_on = [google_project_service.required]
 }

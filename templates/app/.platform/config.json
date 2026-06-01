@@ -4,5 +4,5 @@
   "region": "us-east4",
   "serviceName": "example",
   "artifactRegistryRepository": "site",
-  "platformVersion": "v0.1.0"
+  "platformVersion": "v0.1.1"
 }

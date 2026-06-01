@@ -89,6 +89,24 @@ variable "runtime_display_name" {
   default     = "Cloud Run Runtime"
 }
 
+variable "terraform_service_account_description" {
+  description = "Description for the Terraform service account."
+  type        = string
+  default     = "Runs production Terraform from GitHub Actions on main."
+}
+
+variable "prod_deploy_service_account_description" {
+  description = "Description for the production deploy service account."
+  type        = string
+  default     = "Builds and deploys the production Cloud Run service from main."
+}
+
+variable "preview_deploy_service_account_description" {
+  description = "Description for the preview deploy service account."
+  type        = string
+  default     = "Builds, deploys, and deletes pull request Cloud Run previews."
+}
+
 variable "runtime_description" {
   description = "Description for the Cloud Run runtime service account."
   type        = string

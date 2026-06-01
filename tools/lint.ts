@@ -20,7 +20,7 @@ for (const workflow of reusableWorkflows) {
 }
 
 const readme = await read("README.md");
-requireContains("README.md", readme, "v0.1.0", "README should document the current release pin.");
+requireContains("README.md", readme, "v0.1.1", "README should document the current release pin.");
 
 const moduleMain = await read("terraform/modules/cloud-run-service/main.tf");
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");

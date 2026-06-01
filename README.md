@@ -34,7 +34,7 @@ Pin app repositories to a tagged platform release.
 jobs:
   verify:
     name: Bun verify
-    uses: collinbentley1/platform/.github/workflows/application.yml@v0.1.0
+    uses: collinbentley1/platform/.github/workflows/application.yml@v0.1.1
     with:
       bun-version: canary
       verify-command: bun run verify
@@ -79,6 +79,6 @@ contains the expected Bun, Docker, and Terraform contract files.
 Create a tag for app repositories to pin:
 
 ```sh
-git tag v0.1.0
-git push origin main v0.1.0
+git tag v0.1.1
+git push origin main v0.1.1
 ```
