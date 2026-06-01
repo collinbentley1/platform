@@ -1,0 +1,7 @@
+.git
+.github
+.terraform
+dist
+node_modules
+coverage
+README.md

@@ -1,0 +1,7 @@
+[install]
+exact = true
+
+[install.security]
+scanner = "@socketsecurity/bun-security-scanner"
+
+[install.scopes]

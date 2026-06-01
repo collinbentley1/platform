@@ -1,0 +1,22 @@
+name: Deploy production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  deploy:
+    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@v0.1.0
+    with:
+      project-id: __PROJECT_ID__
+      region: us-east4
+      artifact-registry-repository: site
+      service-name: __APP_NAME__
+      runtime-service-account: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      deploy-service-account: ${{ vars.GCP_PROD_DEPLOY_SERVICE_ACCOUNT }}
+    secrets: inherit

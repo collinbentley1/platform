@@ -1,0 +1,66 @@
+name: Cleanup preview
+
+on:
+  workflow_call:
+    inputs:
+      project-id:
+        description: Google Cloud project ID.
+        required: true
+        type: string
+      region:
+        description: Google Cloud region.
+        required: true
+        type: string
+      service-name:
+        description: Base Cloud Run service name.
+        required: true
+        type: string
+      workload-identity-provider:
+        description: GitHub Workload Identity Provider resource name.
+        required: true
+        type: string
+      deploy-service-account:
+        description: Preview deploy service account email.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  cleanup:
+    name: Cleanup preview
+    runs-on: ubuntu-24.04
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ inputs.project-id }}
+      REGION: ${{ inputs.region }}
+      SERVICE_NAME: ${{ inputs.service-name }}
+      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ inputs.workload-identity-provider }}
+          service_account: ${{ inputs.deploy-service-account }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Delete preview service
+        run: |
+          set -euo pipefail
+          preview_service="${SERVICE_NAME}-pr-${{ github.event.pull_request.number }}"
+
+          if gcloud run services describe "$preview_service" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            gcloud run services delete "$preview_service" --region="$REGION" --project="$PROJECT_ID" --quiet
+          else
+            echo "Preview service $preview_service does not exist; nothing to delete."
+          fi

@@ -1,0 +1,124 @@
+name: Infrastructure
+
+on:
+  workflow_call:
+    inputs:
+      project-id:
+        description: Google Cloud project ID.
+        required: true
+        type: string
+      workload-identity-provider:
+        description: GitHub Workload Identity Provider resource name.
+        required: true
+        type: string
+      terraform-service-account:
+        description: Service account used for Terraform apply.
+        required: true
+        type: string
+      terraform-version:
+        description: Terraform version.
+        required: false
+        type: string
+        default: 1.14.5
+      terraform-dirs:
+        description: Space-separated Terraform roots to validate.
+        required: false
+        type: string
+        default: infra/terraform/bootstrap infra/terraform/prod
+      prod-dir:
+        description: Terraform root applied on main pushes.
+        required: false
+        type: string
+        default: infra/terraform/prod
+      production-environment:
+        description: GitHub environment used for production applies.
+        required: false
+        type: string
+        default: production
+
+permissions: {}
+
+concurrency:
+  group: infrastructure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  terraform-validate:
+    name: Terraform validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive infra/terraform
+
+      - name: Validate Terraform roots
+        env:
+          TERRAFORM_DIRS: ${{ inputs.terraform-dirs }}
+        run: |
+          set -euo pipefail
+          for dir in ${TERRAFORM_DIRS}; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+  checkov:
+    name: Checkov
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898 # v12.3102.0
+        with:
+          directory: .
+          config_file: .checkov.yml
+
+  terraform-apply:
+    name: Terraform apply
+    runs-on: ubuntu-24.04
+    needs:
+      - terraform-validate
+      - checkov
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: ${{ inputs.production-environment }}
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ inputs.project-id }}
+          workload_identity_provider: ${{ inputs.workload-identity-provider }}
+          service_account: ${{ inputs.terraform-service-account }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - name: Apply production Terraform
+        env:
+          PROD_DIR: ${{ inputs.prod-dir }}
+        run: |
+          set -euo pipefail
+          terraform -chdir="$PROD_DIR" init -input=false
+          terraform -chdir="$PROD_DIR" apply -auto-approve -input=false

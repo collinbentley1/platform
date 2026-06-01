@@ -1,0 +1,24 @@
+name: Deploy preview
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions: {}
+
+jobs:
+  deploy:
+    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@v0.1.0
+    with:
+      project-id: __PROJECT_ID__
+      region: us-east4
+      artifact-registry-repository: site
+      service-name: __APP_NAME__
+      runtime-service-account: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      deploy-service-account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}
+    secrets: inherit

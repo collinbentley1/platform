@@ -1,0 +1,5 @@
+framework:
+  - terraform
+skip-check:
+  - CKV_DOCKER_2
+quiet: true

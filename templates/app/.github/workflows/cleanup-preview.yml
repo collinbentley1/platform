@@ -1,0 +1,18 @@
+name: Cleanup preview
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions: {}
+
+jobs:
+  cleanup:
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@v0.1.0
+    with:
+      project-id: __PROJECT_ID__
+      region: us-east4
+      service-name: __APP_NAME__
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      deploy-service-account: ${{ vars.GCP_PREVIEW_DEPLOY_SERVICE_ACCOUNT }}

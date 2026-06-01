@@ -1,0 +1,187 @@
+name: Deploy preview
+
+on:
+  workflow_call:
+    inputs:
+      project-id:
+        description: Google Cloud project ID.
+        required: true
+        type: string
+      region:
+        description: Google Cloud region.
+        required: true
+        type: string
+      artifact-registry-repository:
+        description: Artifact Registry Docker repository ID.
+        required: true
+        type: string
+      service-name:
+        description: Base Cloud Run service name.
+        required: true
+        type: string
+      runtime-service-account:
+        description: Runtime service account email.
+        required: true
+        type: string
+      workload-identity-provider:
+        description: GitHub Workload Identity Provider resource name.
+        required: true
+        type: string
+      deploy-service-account:
+        description: Preview deploy service account email.
+        required: true
+        type: string
+      runtime-config-script:
+        description: Optional script that writes Cloud Run deploy flags to GITHUB_OUTPUT.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DHI_USERNAME:
+        required: true
+      DHI_ACCESS_TOKEN:
+        required: true
+      MAPBOX_ACCESS_TOKEN:
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy preview
+    runs-on: ubuntu-24.04
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      PROJECT_ID: ${{ inputs.project-id }}
+      REGION: ${{ inputs.region }}
+      ARTIFACT_REGISTRY_REPOSITORY: ${{ inputs.artifact-registry-repository }}
+      SERVICE_NAME: ${{ inputs.service-name }}
+      RUNTIME_SERVICE_ACCOUNT: ${{ inputs.runtime-service-account }}
+      PLATFORM_DEPLOY_ENVIRONMENT: preview
+      PLATFORM_PREVIEW_NUMBER: ${{ github.event.pull_request.number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Detect deployable app
+        id: app
+        run: |
+          set -euo pipefail
+          if [ -f Dockerfile ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+            echo "image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPOSITORY}/${SERVICE_NAME}:pr-${{ github.event.pull_request.number }}-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "preview_service=${SERVICE_NAME}-pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployable=false" >> "$GITHUB_OUTPUT"
+            echo "No root-level Dockerfile exists yet; preview deployment skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: steps.app.outputs.deployable == 'true'
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ inputs.workload-identity-provider }}
+          service_account: ${{ inputs.deploy-service-account }}
+          token_format: access_token
+
+      - name: Setup Docker Buildx
+        if: steps.app.outputs.deployable == 'true'
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to Artifact Registry
+        if: steps.app.outputs.deployable == 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Setup gcloud
+        if: steps.app.outputs.deployable == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Resolve runtime configuration
+        if: steps.app.outputs.deployable == 'true'
+        id: runtime
+        env:
+          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
+          RUNTIME_CONFIG_SCRIPT: ${{ inputs.runtime-config-script }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RUNTIME_CONFIG_SCRIPT" ] && [ -f "$RUNTIME_CONFIG_SCRIPT" ]; then
+            chmod +x "$RUNTIME_CONFIG_SCRIPT"
+            "$RUNTIME_CONFIG_SCRIPT"
+          else
+            echo "flags=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect existing image
+        if: steps.app.outputs.deployable == 'true'
+        id: image
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${{ steps.app.outputs.image }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing existing immutable image: ${{ steps.app.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to Docker Hardened Images
+        if: steps.app.outputs.deployable == 'true' && steps.image.outputs.exists != 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME }}
+          password: ${{ secrets.DHI_ACCESS_TOKEN }}
+
+      - name: Build and push image
+        if: steps.app.outputs.deployable == 'true' && steps.image.outputs.exists != 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.app.outputs.image }}
+
+      - name: Deploy preview to Cloud Run
+        if: steps.app.outputs.deployable == 'true'
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3
+        with:
+          service: ${{ steps.app.outputs.preview_service }}
+          image: ${{ steps.app.outputs.image }}
+          region: ${{ env.REGION }}
+          skip_default_labels: true
+          flags: >-
+            --no-invoker-iam-check
+            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
+            --ingress=all
+            --min-instances=0
+            --max-instances=2
+            --memory=512Mi
+            --cpu=1
+            --concurrency=80
+            --timeout=300s
+            ${{ steps.runtime.outputs.flags }}
+            --labels=managed-by=github-actions,environment=preview,pr=${{ github.event.pull_request.number }}
+
+      - name: Comment preview URL
+        if: steps.app.outputs.deployable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          gh pr comment "${{ github.event.pull_request.number }}" --body "Preview deployed: ${PREVIEW_URL}"
