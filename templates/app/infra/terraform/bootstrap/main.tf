@@ -1,5 +1,5 @@
 module "bootstrap" {
-  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=v0.1.1"
+  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=v0.1.2"
 
   app                   = "__APP_NAME__"
   project_id            = var.project_id

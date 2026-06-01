@@ -5,11 +5,13 @@ on:
     types:
       - closed
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   cleanup:
-    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@v0.1.1
+    uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@v0.1.2
     with:
       project-id: __PROJECT_ID__
       region: us-east4

@@ -6,11 +6,13 @@ on:
       - main
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   deploy:
-    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@v0.1.1
+    uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@v0.1.2
     with:
       project-id: __PROJECT_ID__
       region: us-east4

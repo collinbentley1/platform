@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: bun run verify
+      install-command:
+        description: Command that installs dependencies before verification.
+        required: false
+        type: string
+        default: bun install --frozen-lockfile
 
 permissions: {}
 
@@ -31,6 +36,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: ${{ inputs.bun-version }}
+
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
 
       - name: Verify app
         run: ${{ inputs.verify-command }}

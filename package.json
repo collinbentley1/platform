@@ -1,6 +1,6 @@
 {
   "name": "@collinbentley/platform",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Reusable Bun, GitOps, and Google Cloud Run platform for Collin Bentley projects.",
   "type": "module",
   "license": "MIT",

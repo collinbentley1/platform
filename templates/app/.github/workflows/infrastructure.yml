@@ -7,11 +7,13 @@ on:
       - main
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   infrastructure:
-    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.1.1
+    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@v0.1.2
     with:
       project-id: __PROJECT_ID__
       workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
