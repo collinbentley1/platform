@@ -12,6 +12,13 @@ locals {
   github_prod_principal     = "principal://iam.googleapis.com/${local.workload_identity_pool}/subject/${local.github_prod_subject}"
   github_repo_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.repository_id/${var.github_repository_id}"
 
+  # Rename-proof production binding. The pool's attribute_condition already restricts entry to this
+  # one repository by immutable numeric id, so keying on attribute.environment/production means
+  # exactly "this repository's production environment" without embedding the repository name (which
+  # a rename would break, as the medlock->healthmcp rename did). GitHub environment protection rules
+  # still gate which jobs may assume the production environment.
+  github_prod_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.environment/production"
+
   labels = {
     app        = var.app
     managed-by = "terraform"
@@ -124,7 +131,11 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.ref"                 = "assertion.ref"
     "attribute.repository_id"       = "assertion.repository_id"
     "attribute.repository_owner_id" = "assertion.repository_owner_id"
-    "google.subject"                = "assertion.sub"
+    # environment is an optional OIDC claim (absent on pull_request / preview / validate tokens);
+    # the has() guard keeps CEL evaluation from failing for those exchanges, which would break
+    # preview auth. Present only on jobs running in a GitHub environment (e.g. production).
+    "attribute.environment" = "has(assertion.environment) ? assertion.environment : ''"
+    "google.subject"        = "assertion.sub"
   }
 
   attribute_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}'"
@@ -250,6 +261,33 @@ resource "google_service_account_iam_member" "prod_deploy_wif_main_token_creator
   service_account_id = google_service_account.prod_deploy.name
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = local.github_prod_principal
+}
+
+# Rename-proof production bindings, added alongside the subject-based *_wif_main bindings above so
+# there is no window where production cannot authenticate (IAM members are OR'd). Once every app is
+# confirmed authenticating through these, the subject-based bindings and their locals can be removed.
+resource "google_service_account_iam_member" "terraform_wif_prod_env" {
+  service_account_id = google_service_account.terraform.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = local.github_prod_principal_set
+}
+
+resource "google_service_account_iam_member" "terraform_wif_prod_env_token_creator" {
+  service_account_id = google_service_account.terraform.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = local.github_prod_principal_set
+}
+
+resource "google_service_account_iam_member" "prod_deploy_wif_prod_env" {
+  service_account_id = google_service_account.prod_deploy.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = local.github_prod_principal_set
+}
+
+resource "google_service_account_iam_member" "prod_deploy_wif_prod_env_token_creator" {
+  service_account_id = google_service_account.prod_deploy.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = local.github_prod_principal_set
 }
 
 resource "google_service_account_iam_member" "preview_deploy_wif_repo" {
