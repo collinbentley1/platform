@@ -7,7 +7,7 @@ on:
         description: Bun version passed to oven-sh/setup-bun.
         required: false
         type: string
-        default: canary
+        default: 1.4.0
       verify-command:
         description: Command that verifies the application.
         required: false

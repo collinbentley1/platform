@@ -3,9 +3,9 @@
 Reusable Bun, GitOps, and Google Cloud Run platform for Collin Bentley projects.
 
 This repository is the source of truth for the operational pattern shared by the
-`critical-history`, `medlock`, `cdbentley`, and `runsetta` applications:
+`critical-history`, `healthmcp`, `cdbentley`, and `runsetta` applications:
 
-- Pure Bun application verification.
+- Pure Bun application verification, Bun 1.4 native (stable pins, no canary fallbacks).
 - Socket Firewall dependency checks.
 - Checkov and Terraform validation.
 - GitHub Actions Workload Identity Federation into Google Cloud.
@@ -34,9 +34,9 @@ Pin app repositories to a tagged platform release.
 jobs:
   verify:
     name: Bun verify
-    uses: collinbentley1/platform/.github/workflows/application.yml@v0.1.2
+    uses: collinbentley1/platform/.github/workflows/application.yml@v0.2.0
     with:
-      bun-version: canary
+      bun-version: 1.4.0
       verify-command: bun run verify
 ```
 
@@ -67,7 +67,7 @@ The workflow exposes these environment variables to the script:
 ## CLI
 
 ```sh
-bun run platform doctor ../critical-history ../medlock
+bun run platform doctor ../critical-history ../healthmcp
 bun run platform scaffold my-new-app ../my-new-app
 ```
 
@@ -79,6 +79,6 @@ contains the expected Bun, Docker, and Terraform contract files.
 Create a tag for app repositories to pin:
 
 ```sh
-git tag v0.1.2
-git push origin main v0.1.2
+git tag v0.2.0
+git push origin main v0.2.0
 ```
