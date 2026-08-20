@@ -5,7 +5,7 @@ Bun.serve({
   fetch(request) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/healthz") {
+    if (url.pathname === "/livez") {
       return Response.json({ ok: true });
     }
 
