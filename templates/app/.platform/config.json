@@ -3,6 +3,5 @@
   "projectId": "example",
   "region": "us-east4",
   "serviceName": "example",
-  "artifactRegistryRepository": "site",
-  "platformVersion": "v0.4.0"
+  "artifactRegistryRepository": "site"
 }

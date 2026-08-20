@@ -9,7 +9,6 @@ type PlatformConfig = {
   readonly region?: string;
   readonly serviceName?: string;
   readonly artifactRegistryRepository?: string;
-  readonly platformVersion?: string;
   readonly runtimeConfigScript?: string;
 };
 
@@ -70,12 +69,17 @@ async function doctor(repoArgs: string[]): Promise<void> {
     if (!config) {
       messages.push("missing .platform/config.json");
     } else {
-      for (const key of ["projectId", "region", "serviceName", "platformVersion"] as const) {
+      for (const key of ["projectId", "region", "serviceName"] as const) {
         if (!config[key]) {
           messages.push(`.platform/config.json missing ${key}`);
         }
       }
     }
+
+    // The pinned platform version is derived from the workflow and Terraform
+    // references that actually consume the platform — the single source of truth —
+    // rather than a hand-maintained field that can silently drift.
+    const platformRefs = new Set<string>();
 
     for (const workflow of workflowFiles) {
       const workflowPath = join(repoPath, ".github/workflows", workflow);
@@ -85,9 +89,35 @@ async function doctor(repoArgs: string[]): Promise<void> {
         continue;
       }
 
-      if (!workflowText.includes("collinbentley1/platform/.github/workflows/")) {
-        messages.push(`.github/workflows/${workflow} does not call platform reusable workflow`);
+      const call = workflowText.match(
+        /collinbentley1\/platform\/\.github\/workflows\/[^@\s]+@(v\d+\.\d+\.\d+)/,
+      );
+      if (!call) {
+        messages.push(`.github/workflows/${workflow} does not call a version-pinned platform reusable workflow`);
+        continue;
       }
+      platformRefs.add(call[1]!);
+    }
+
+    for (const terraformRoot of ["infra/terraform/bootstrap/main.tf", "infra/terraform/prod/main.tf"]) {
+      const terraformText = await readText(join(repoPath, terraformRoot));
+      if (!terraformText) {
+        continue;
+      }
+      for (const match of terraformText.matchAll(
+        /github\.com\/collinbentley1\/platform\/\/[^"?]+\?ref=(v\d+\.\d+\.\d+)/g,
+      )) {
+        platformRefs.add(match[1]!);
+      }
+    }
+
+    let platformVersion = "unknown";
+    if (platformRefs.size === 1) {
+      platformVersion = [...platformRefs][0]!;
+    } else if (platformRefs.size > 1) {
+      messages.push(
+        `platform version drift: workflow and Terraform pins disagree (${[...platformRefs].sort().join(", ")})`,
+      );
     }
 
     if (messages.length > 0) {
@@ -97,7 +127,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
         console.error(`- ${message}`);
       }
     } else {
-      console.log(`${repoName}: ok`);
+      console.log(`${repoName}: ok (platform ${platformVersion})`);
     }
   }
 
