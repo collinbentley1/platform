@@ -4,12 +4,8 @@ data "google_project" "current" {
 
 locals {
   github_repo_full_name  = "${var.github_owner}/${var.github_repo}"
-  github_main_subject    = "repo:${local.github_repo_full_name}:ref:refs/heads/main"
-  github_prod_subject    = "repo:${local.github_repo_full_name}:environment:production"
   workload_identity_pool = "projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
 
-  github_main_principal     = "principal://iam.googleapis.com/${local.workload_identity_pool}/subject/${local.github_main_subject}"
-  github_prod_principal     = "principal://iam.googleapis.com/${local.workload_identity_pool}/subject/${local.github_prod_subject}"
   github_repo_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.repository_id/${var.github_repository_id}"
 
   # Rename-proof production binding. The pool's attribute_condition already restricts entry to this
@@ -239,33 +235,9 @@ resource "google_service_account_iam_member" "preview_deploy_self_token_creator"
   member             = "serviceAccount:${google_service_account.preview_deploy.email}"
 }
 
-resource "google_service_account_iam_member" "terraform_wif_main" {
-  service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_prod_principal
-}
-
-resource "google_service_account_iam_member" "terraform_wif_main_token_creator" {
-  service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = local.github_prod_principal
-}
-
-resource "google_service_account_iam_member" "prod_deploy_wif_main" {
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_prod_principal
-}
-
-resource "google_service_account_iam_member" "prod_deploy_wif_main_token_creator" {
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = local.github_prod_principal
-}
-
-# Rename-proof production bindings, added alongside the subject-based *_wif_main bindings above so
-# there is no window where production cannot authenticate (IAM members are OR'd). Once every app is
-# confirmed authenticating through these, the subject-based bindings and their locals can be removed.
+# Rename-proof production bindings. Keyed on attribute.environment/production rather than the OIDC
+# subject (which embeds the repo name and broke on the medlock->healthmcp rename). The pool
+# attribute_condition already restricts entry to one repository by immutable numeric id.
 resource "google_service_account_iam_member" "terraform_wif_prod_env" {
   service_account_id = google_service_account.terraform.name
   role               = "roles/iam.workloadIdentityUser"
