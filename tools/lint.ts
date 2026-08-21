@@ -1124,6 +1124,51 @@ for (const publisherVariable of [
 }
 
 const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
+const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
+requireContains(
+  "terraform/modules/bootstrap/variables.tf",
+  bootstrapVariables,
+  'variable "manage_automatic_default_service_account_grants_policy"',
+  "Organization-policy management must be an explicit protected bootstrap decision.",
+);
+const organizationPolicyVariableBlock = sectionBetween(
+  bootstrapVariables,
+  'variable "manage_automatic_default_service_account_grants_policy"',
+  "\n}\n",
+);
+if (/^\s*default\s*=/m.test(organizationPolicyVariableBlock)) {
+  failures.push(
+    "terraform/modules/bootstrap/variables.tf: Organization-policy management must be an explicit decision at every protected module call.",
+  );
+}
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  sectionBetween(
+    bootstrapMain,
+    'resource "google_org_policy_policy" "disable_automatic_default_service_account_grants"',
+    "\n}\n",
+  ),
+  "count = var.manage_automatic_default_service_account_grants_policy ? 1 : 0",
+  "The organization policy must not be planned for a standalone project.",
+);
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  bootstrapMain,
+  "effective_required_services = setunion(",
+  "The Org Policy API must follow the explicit organization-policy management decision.",
+);
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  bootstrapMain,
+  "from = google_org_policy_policy.disable_automatic_default_service_account_grants",
+  "Existing organization-backed state must migrate to the counted policy address without replacement.",
+);
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  bootstrapMain,
+  "to   = google_org_policy_policy.disable_automatic_default_service_account_grants[0]",
+  "Existing organization-backed state must migrate to the counted policy address without replacement.",
+);
 requireContains(
   "terraform/modules/bootstrap/main.tf",
   bootstrapMain,
@@ -1256,6 +1301,36 @@ for (const forbidden of [
   );
 }
 const bootstrapDeployment = await read("terraform/deployments/bootstrap/main.tf");
+requireContains(
+  "terraform/deployments/bootstrap/main.tf",
+  bootstrapDeployment,
+  "manage_automatic_default_service_account_grants_policy = false",
+  "The four registered standalone projects must not request organization-only authority.",
+);
+const templateBootstrapMain = await read("templates/app/infra/terraform/bootstrap/main.tf");
+const templateBootstrapVariables = await read("templates/app/infra/terraform/bootstrap/variables.tf");
+requireContains(
+  "templates/app/infra/terraform/bootstrap/main.tf",
+  templateBootstrapMain,
+  "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
+  "Generic scaffolds must require an explicit organization-policy capability decision.",
+);
+requireContains(
+  "templates/app/infra/terraform/bootstrap/variables.tf",
+  templateBootstrapVariables,
+  'variable "manage_automatic_default_service_account_grants_policy"',
+  "Generic scaffolds must expose the explicit organization-policy capability decision.",
+);
+const templateOrganizationPolicyVariableBlock = sectionBetween(
+  templateBootstrapVariables,
+  'variable "manage_automatic_default_service_account_grants_policy"',
+  "\n}\n",
+);
+if (/^\s*default\s*=/m.test(templateOrganizationPolicyVariableBlock)) {
+  failures.push(
+    "templates/app/infra/terraform/bootstrap/variables.tf: A generic scaffold must not silently choose a standalone or organization-backed policy mode.",
+  );
+}
 const forbiddenPreMigrationWorkflowShas = [
   "734d0cd02187f88c6e91263f127dc3f4c0709feb",
   "1378a3e81a5e74c71f2adfd5548b430bb008490e",

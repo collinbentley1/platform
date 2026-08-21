@@ -14,6 +14,7 @@ module "bootstrap" {
   trusted_platform_workflow_shas = [
     "__PLATFORM_SHA__",
   ]
-  legacy_compatibility_mode = false
-  runtime_description       = "Runtime identity for the __APP_NAME__ Cloud Run services."
+  legacy_compatibility_mode                              = false
+  manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy
+  runtime_description                                    = "Runtime identity for the __APP_NAME__ Cloud Run services."
 }

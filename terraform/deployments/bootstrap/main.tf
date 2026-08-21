@@ -87,7 +87,6 @@ locals {
         "cloudresourcemanager.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
-        "orgpolicy.googleapis.com",
         "run.googleapis.com",
         "serviceusage.googleapis.com",
         "storage.googleapis.com",
@@ -110,7 +109,6 @@ locals {
         "cloudresourcemanager.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
-        "orgpolicy.googleapis.com",
         "run.googleapis.com",
         "secretmanager.googleapis.com",
         "serviceusage.googleapis.com",
@@ -135,7 +133,6 @@ locals {
         "firestore.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
-        "orgpolicy.googleapis.com",
         "run.googleapis.com",
         "serviceusage.googleapis.com",
         "storage.googleapis.com",
@@ -160,7 +157,6 @@ locals {
         "cloudresourcemanager.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
-        "orgpolicy.googleapis.com",
         "run.googleapis.com",
         "serviceusage.googleapis.com",
         "storage.googleapis.com",
@@ -194,7 +190,13 @@ module "bootstrap" {
   github_repository_id           = local.deployment.github_repository_id
   trusted_platform_workflow_shas = local.trusted_workflow_shas
   legacy_compatibility_mode      = var.legacy_compatibility_mode
-  required_services              = local.deployment.required_services
-  runtime_project_roles          = local.deployment.runtime_project_roles
-  runtime_description            = local.deployment.runtime_description
+  # These four personal projects have no organization parent. Google permits
+  # Organization Policy Administrator only at organization scope and marks the
+  # write permissions unsupported in project custom roles. The authoritative
+  # empty Editor binding remains mandatory; enable this policy only after a
+  # separately reviewed move into an organization.
+  manage_automatic_default_service_account_grants_policy = false
+  required_services                                      = local.deployment.required_services
+  runtime_project_roles                                  = local.deployment.runtime_project_roles
+  runtime_description                                    = local.deployment.runtime_description
 }
