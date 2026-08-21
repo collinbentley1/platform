@@ -128,9 +128,18 @@ the recovery object and stop; never rerun from empty state.
    `preview-operations` without secrets/reviewers for automatic teardown and
    `supply-chain` without secrets. Create secretless `production-publish` with
    the same protected-main restriction and owner review as `production`. For
-   Critical History only, store the rotated public Mapbox `pk.*` token as the
-   `MAPBOX_PUBLIC_TOKEN` environment secret in `preview-cloud` and `production`;
-   all other deploy environments remain free of runtime values.
+   Critical History only, store the rotated public Mapbox `pk.*` values in the
+   `MAPBOX_PUBLIC_TOKEN` environment-secret slots in `preview-cloud` and
+   `production`. These values are browser-visible public configuration; the
+   secret slots provide approval gating and log masking, not confidentiality.
+   The simplest setup reuses one least-scope value restricted to
+   `https://ycriticalhistory.org`, which Mapbox also permits on every subdomain.
+   If separate values are desired, restrict the preview value to
+   `https://preview.ycriticalhistory.org`; that narrows preview-to-production use
+   but the production parent still includes preview subdomains. Mapbox URL
+   restrictions are best-effort abuse controls, not authorization. Do not enter
+   unsupported wildcard syntax. All other deploy environments remain free of
+   runtime values.
    Do this before any caller references the new workflow.
    GitHub never releases environment secrets to external-fork or Dependabot
    pull-request jobs. Those two cases therefore run the pinned Socket scanner in
@@ -145,13 +154,14 @@ the recovery object and stop; never rerun from empty state.
    mirror to the reviewed full platform SHA, remove caller-controlled commands
    and cloud inputs, remove production `workflow_dispatch`, remove
    `secrets: inherit`, and adopt the canonical Docker/Bun contract.
-   For Critical History, rotate the old repository-scoped Mapbox value to a
-   dedicated public `pk.*` client token with only the required read scopes and
-   exact preview/production URL restrictions. Store it only as the protected
-   environment secret `MAPBOX_PUBLIC_TOKEN` described above, verify Mapbox usage
-   and browser referrer behavior, then delete the old repository secret. The
-   workflow maps it to the runtime `MAPBOX_PUBLIC_TOKEN` only after format validation. Never
-   put an `sk.*` token in Cloud Run service metadata.
+   For Critical History, rotate the old repository-scoped Mapbox value to
+   a public `pk.*` client value with only the required read scopes and the parent
+   URL restriction above. Reuse it in both protected environment
+   `MAPBOX_PUBLIC_TOKEN` slots, or use the optional narrower preview value, then
+   verify Mapbox usage and browser referrer behavior and delete the old
+   repository secret. The
+   workflow maps a value to the runtime `MAPBOX_PUBLIC_TOKEN` only after format
+   validation. Never put an `sk.*` token in Cloud Run service metadata.
 3. Complete the default-service-account workload inventory above. Wait for all
    old workflow runs to finish. Through the privileged pipeline, authoritatively
    inventory and delete every legacy `${SERVICE}-pr-*` service, including open
@@ -170,6 +180,17 @@ the recovery object and stop; never rerun from empty state.
    production deploy, preview deploy, and preview traffic operations, so tokens
    admitted on one path cannot impersonate another identity. Old workflows stop
    authenticating at this point.
+   The current stable-preview follow-on starts after that Phase-A migration:
+   `95ad7531492cba2891ec6d02fa2d821955cd36bc` is already active and every
+   prepared consumer head pins it. For a new stable-preview workflow SHA `S`, do
+   not repeat the empty-transition form above. Before repinning any consumer,
+   apply all four protected bootstrap roots with `active_workflow_sha = S`,
+   `transition_workflow_sha =
+   "95ad7531492cba2891ec6d02fa2d821955cd36bc"`, and
+   `legacy_compatibility_mode = true`. Retain both exact SHA bindings until all
+   new-SHA canaries and operations pass. The final Phase-B apply is
+   `active_workflow_sha = S`, an empty transition, and
+   `legacy_compatibility_mode = false`.
 4. Confirm the first bootstrap plan removes the four direct default Compute
    `Editor` grants and all state-bucket convenience principals before it creates
    the protected bucket. For the current standalone projects, confirm the plan
@@ -206,22 +227,53 @@ the recovery object and stop; never rerun from empty state.
    deploy identity. No upload/delete-capable registry grant may remain on a
    deploy identity, and the preview operator must have no registry or runtime
    `actAs` grant. Require the subsequent exposure plan to remain empty. For a
-   fresh app, apply production first and exposure second.
-9. Keep consumer Actions disabled until the no-data preview runtime, shared
+   fresh app, apply production first and exposure second. The current Critical
+   History service already completed this baseline migration with public preview
+   ingress. For its follow-on stable namespace, do not apply the new production
+   root that restricts ingress until step 9 has activated and verified the
+   frontend.
+9. For Critical History, use the protected bootstrap root to enable the Compute
+   and Certificate Manager APIs, then apply the protected exposure root to
+   create the dedicated global external HTTPS load balancer, fixed-service
+   serverless NEG, TLS policy, global address, Certificate Manager DNS
+   authorization, wildcard certificate, and certificate map. Add exactly the
+   emitted DNS-authorization CNAME and wildcard A record
+   `*.preview.ycriticalhistory.org` to the authoritative zone, both DNS-only and
+   unproxied. Wait until the
+   certificate and certificate-map entry are active. The NEG must fix
+   `critical-history-preview` and parse only the tag with
+   `<tag>.preview.ycriticalhistory.org`; no caller or pull request may mutate DNS
+   or load-balancer resources. While the existing preview service still has
+   public ingress, confirm a nonexistent tag returns 404 through the stable
+   frontend. Do not apply the new Critical production root yet: a 404 proves the
+   frontend can reject a missing tag, but does not prove that it can reach a live
+   tagged revision after ingress is restricted. Never apply an older exposure
+   root that omits this module: review every saved exposure plan for zero destroy
+   operations even though both Terraform and provider deletion prevention are
+   present.
+10. Keep consumer Actions disabled until the no-data preview runtime, shared
    preview service, service-scoped IAM, and exact-WIF bindings are independently
-   verified from the protected pipeline. Then enable one consumer at a time and
-   run fresh production, Terraform, preview build/publish/deploy, cleanup, and
-   reconciliation jobs at the new SHA. Require every unconditional canary and
-   operation to succeed. Disable that consumer again and stop on any unexpected
-   claim or permission; no broad project role remains during this proof.
-10. Reconciliation must continue to report zero legacy `${SERVICE}-pr-*`
+   verified from the protected pipeline. After the required Critical History
+   environment values are present, activate Critical History first. Its first
+   reviewed new-SHA preview deploy sets the shared preview service ingress to
+   `internal-and-cloud-load-balancing` and must nonce-verify a live tagged
+   revision through `https://pr-N.preview.ycriticalhistory.org`. Only after that
+   proof, apply the reviewed Critical production root to converge the declarative
+   ingress setting; require the stable tagged URL to remain healthy and the
+   generated `run.app` URL to be denied. Then enable each remaining consumer one
+   at a time and run fresh production, Terraform, preview build/publish/deploy,
+   cleanup, and reconciliation jobs at the new SHA. Require every unconditional
+   canary and operation to succeed. Disable that consumer again and stop on any
+   unexpected claim or permission; no broad project role remains during this
+   proof.
+11. Reconciliation must continue to report zero legacy `${SERVICE}-pr-*`
     services. Re-deploy any needed preview onto the shared service only after
     phase B.
-11. Use Policy Analyzer across the canary service account, project, parent
+12. Use Policy Analyzer across the canary service account, project, parent
     folder, and organization. Rule out project roles and every alternate
     external-principal, public, group, domain, inherited, or custom grant that
     could mint its tokens.
-12. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
+13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
     `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish` and require the expected
     identity-specific `attribute.*_workflow_sha/<new-sha>` Workload Identity User
     binding on each. Prove both publisher accounts have only one exact
@@ -230,6 +282,24 @@ the recovery object and stop; never rerun from empty state.
     Run and runtime `actAs` grants, and the preview operator has zero Artifact
     Registry and runtime `actAs` grants. The canary alone cannot prove each
     operational binding.
+
+### Stable-preview rollback boundary
+
+- If bootstrap, exposure, DNS, certificate, or frontend verification fails
+  before the first new-SHA Critical preview changes ingress, stop with consumer
+  Actions disabled and preview ingress still `all`. Leave the protected edge
+  resources dormant for diagnosis; do not destroy or partially unwind them.
+- If the first live-tag proof fails after ingress becomes restricted, retain
+  both the new and `95ad7531492cba2891ec6d02fa2d821955cd36bc` workflow-SHA WIF
+  bindings. Restore the Critical preview service to public ingress with the
+  exact reviewed `95ad7531492cba2891ec6d02fa2d821955cd36bc` production root, or
+  use a separately reviewed hotfix, and prove the generated raw URL healthy
+  before any repin or retry.
+- Never apply the `95ad7531492cba2891ec6d02fa2d821955cd36bc` exposure root after
+  the stable frontend exists, and never remove DNS as the first recovery step;
+  that older exposure root does not own the new protected edge resources.
+- Remove the old workflow-SHA WIF trust only after the new-SHA production,
+  Terraform, stable preview, cleanup, and reconciliation operations all pass.
 
 Artifact Registry does not provide a predefined upload-only Docker role. The
 repository-scoped Writer role is the smallest Google-documented role for a
@@ -263,8 +333,11 @@ deployments.
    consumer must separately remove any consumer-owned preview IAM grant.
 3. Confirm each service-account policy contains only the expected
    `attribute.*_workflow_sha/<approved-sha>` principal sets.
-4. Run a new production deploy; create a preview tag; close the PR; confirm
-   cleanup removes it; and run reconciliation.
+4. Run a new production deploy; create two preview tags; close one PR; confirm
+   cleanup removes only its tag and its stable URL converges to an exact 404
+   without redirects while the other stable preview remains healthy. Run
+   reconciliation and repeat the 404 proof for an invalidated tag. Confirm the
+   direct generated `run.app` URL remains denied throughout.
    These post-cutover operations prove the custom revision-deployer role.
    Cloud-mutation jobs key on immutable repository ID and use `queue: max`,
    serializing up to 100 pending runs FIFO across deploy/apply or

@@ -31,6 +31,7 @@ locals {
       bootstrap_runtime_service_account = "cloud-run-bootstrap@cdbentley.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@cdbentley.iam.gserviceaccount.com"
       preview_runtime_service_account   = "cloud-run-preview@cdbentley.iam.gserviceaccount.com"
+      preview_ingress                   = "INGRESS_TRAFFIC_ALL"
       prod_deploy_service_account       = "gha-prod-deploy@cdbentley.iam.gserviceaccount.com"
       prod_publisher_service_account    = "gha-prod-publish@cdbentley.iam.gserviceaccount.com"
       preview_deploy_service_account    = "gha-preview-deploy@cdbentley.iam.gserviceaccount.com"
@@ -63,6 +64,7 @@ locals {
       bootstrap_runtime_service_account = "cloud-run-bootstrap@runsetta.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@runsetta.iam.gserviceaccount.com"
       preview_runtime_service_account   = "cloud-run-preview@runsetta.iam.gserviceaccount.com"
+      preview_ingress                   = "INGRESS_TRAFFIC_ALL"
       prod_deploy_service_account       = "gha-prod-deploy@runsetta.iam.gserviceaccount.com"
       prod_publisher_service_account    = "gha-prod-publish@runsetta.iam.gserviceaccount.com"
       preview_deploy_service_account    = "gha-preview-deploy@runsetta.iam.gserviceaccount.com"
@@ -95,6 +97,7 @@ locals {
       bootstrap_runtime_service_account = "cloud-run-bootstrap@medlock-1025243085.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@medlock-1025243085.iam.gserviceaccount.com"
       preview_runtime_service_account   = "cloud-run-preview@medlock-1025243085.iam.gserviceaccount.com"
+      preview_ingress                   = "INGRESS_TRAFFIC_ALL"
       prod_deploy_service_account       = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
       prod_publisher_service_account    = "gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
       preview_deploy_service_account    = "gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
@@ -115,6 +118,7 @@ locals {
       bootstrap_runtime_service_account = "cloud-run-bootstrap@critical-history-16823277.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@critical-history-16823277.iam.gserviceaccount.com"
       preview_runtime_service_account   = "cloud-run-preview@critical-history-16823277.iam.gserviceaccount.com"
+      preview_ingress                   = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
       prod_deploy_service_account       = "gha-prod-deploy@critical-history-16823277.iam.gserviceaccount.com"
       prod_publisher_service_account    = "gha-prod-publish@critical-history-16823277.iam.gserviceaccount.com"
       preview_deploy_service_account    = "gha-preview-deploy@critical-history-16823277.iam.gserviceaccount.com"
@@ -159,6 +163,7 @@ module "site" {
   bootstrap_runtime_service_account_email = local.deployment.bootstrap_runtime_service_account
   runtime_service_account_email           = local.deployment.runtime_service_account
   preview_runtime_service_account_email   = local.deployment.preview_runtime_service_account
+  preview_ingress                         = local.deployment.preview_ingress
   prod_deploy_service_account_email       = local.deployment.prod_deploy_service_account
   prod_publisher_service_account_email    = local.deployment.prod_publisher_service_account
   preview_deploy_service_account_email    = local.deployment.preview_deploy_service_account

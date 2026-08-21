@@ -6,7 +6,8 @@ Bun.serve({
     const url = new URL(request.url);
 
     if (url.pathname === "/livez") {
-      return Response.json({ ok: true });
+      const deployment = Bun.env.PLATFORM_DEPLOY_NONCE;
+      return Response.json(deployment ? { ok: true, deployment } : { ok: true });
     }
 
     return new Response("__APP_NAME__", {

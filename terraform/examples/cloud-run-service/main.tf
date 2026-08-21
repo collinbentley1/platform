@@ -39,6 +39,7 @@ module "site" {
   bootstrap_runtime_service_account_email = "cloud-run-bootstrap@example.iam.gserviceaccount.com"
   runtime_service_account_email           = "cloud-run-runtime@example.iam.gserviceaccount.com"
   preview_runtime_service_account_email   = "cloud-run-preview@example.iam.gserviceaccount.com"
+  preview_ingress                         = "INGRESS_TRAFFIC_ALL"
   prod_deploy_service_account_email       = "gha-prod-deploy@example.iam.gserviceaccount.com"
   prod_publisher_service_account_email    = "gha-prod-publish@example.iam.gserviceaccount.com"
   preview_deploy_service_account_email    = "gha-preview-deploy@example.iam.gserviceaccount.com"

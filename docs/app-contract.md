@@ -101,12 +101,42 @@ defaults to empty and must be a subset of the retained containers. Runsetta stay
 offline with no runtime accessor grants until reviewed versions are encoded.
 
 The sole client-token exception is Critical History's `MAPBOX_PUBLIC_TOKEN`.
-Because every browser receives it, the owner-approved `preview-cloud` and
-`production` environments may expose only a dedicated `MAPBOX_PUBLIC_TOKEN`
-secret in Mapbox's public `pk.*` format; use a least-scope token with exact URL
-restrictions, never an `sk.*` token. Every cloud flow unconditionally proves its
-exact workflow-SHA binding through the no-role canary before authenticating its
-operational identity.
+Because every browser receives it, this is public configuration rather than a
+confidential credential. The owner-approved `preview-cloud` and `production`
+environments nevertheless carry it in their `MAPBOX_PUBLIC_TOKEN` secret slots
+so release approval and log masking stay fail closed. Use public `pk.*` tokens
+with only the needed read scopes, never an `sk.*` token. One value restricted to
+`https://ycriticalhistory.org` may be reused in both slots because Mapbox also
+permits it on every subdomain. If separate values are desired, restrict the
+preview value to `https://preview.ycriticalhistory.org`, which covers every
+`https://pr-N.preview.ycriticalhistory.org` origin without a wildcard character.
+This does not isolate the production value from preview subdomains, and Mapbox
+URL restrictions are a best-effort abuse control rather than authorization.
+Every cloud flow unconditionally proves its exact workflow-SHA binding through
+the no-role canary before authenticating its operational identity.
+
+Critical History is the only app with a stable preview namespace. A dedicated
+global external HTTPS load balancer terminates the wildcard certificate and a
+serverless NEG fixes the Cloud Run service to `critical-history-preview` while
+extracting only `<tag>` from `<tag>.preview.ycriticalhistory.org`. The workflow
+maps numeric pull request `N` to tag `pr-N`; callers cannot supply the host,
+service, or tag. Its preview service ingress is
+`internal-and-cloud-load-balancing`, which blocks direct public `run.app`
+bypass. Preview deployments add a random non-confidential
+`PLATFORM_DEPLOY_NONCE`; `/livez` must echo it as `deployment` only when the
+variable is present. The workflow bounds the response and verifies that exact
+nonce through the stable URL, so a stale prior revision cannot satisfy readiness.
+Any post-mutation failure compare-and-removes the tag only if it still targets
+that run's exact revision. Removing the tag during invalidation, cleanup, or
+reconciliation makes the hostname unroutable without per-pull-request DNS
+changes.
+
+These preview hosts are same-site with production under `ycriticalhistory.org`.
+That is safe only while Critical History has no authentication or cookies. If
+either is introduced, use host-only `__Host-` cookies plus explicit Origin and
+CSRF validation, and reject every parent-domain cookie; otherwise move previews
+to a separate registrable domain before shipping the feature. `SameSite` alone
+does not isolate arbitrary pull-request code on a sibling subdomain.
 
 The consumer `infra/terraform` roots are reviewed mirrors for validation. Any
 job holding Google credentials executes only the app configuration mapped by

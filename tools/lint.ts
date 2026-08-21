@@ -99,6 +99,63 @@ for (const needle of [
     `Preview identity/lifecycle policy is missing: ${needle}`,
   );
 }
+const previewDeployJob = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
+for (const needle of [
+  'stable_preview_domain="preview.ycriticalhistory.org"',
+  'preview_ingress="internal-and-cloud-load-balancing"',
+  'echo "project_number=$project_number"',
+  '--ingress="$PREVIEW_INGRESS"',
+  'deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"',
+  '[a-z0-9.-]+\\.run\\.app',
+  'public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"',
+  "PLATFORM_DEPLOY_NONCE: $deploy_nonce",
+  'preview_nonce="$(openssl rand -hex 32)"',
+  '"${public_preview_url}/livez"',
+  "--max-filesize 1024",
+  'if health_status="$(curl --silent --show-error',
+  'jq -e -s --arg nonce "$preview_nonce"',
+  'length == 1 and .[0] == {deployment: $nonce, ok: true}',
+  "rollback_tag=true",
+  'if [ "$current_revision" = "$expected_revision" ]',
+  '--remove-tags="$tag"',
+  "rollback_tag=false",
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    previewDeployJob,
+    needle,
+    `Stable Critical History preview routing is missing: ${needle}`,
+  );
+}
+requireBefore(
+  ".github/workflows/deploy-preview.yml",
+  previewDeployJob,
+  "rollback_tag=true",
+  'gcloud run deploy "$PREVIEW_SERVICE"',
+  "Preview rollback must arm before Cloud Run can mutate the shared service.",
+);
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  sectionBetween(
+    previewDeployJob,
+    'jq -e -s --arg nonce "$preview_nonce"',
+    'echo "url=$public_preview_url"',
+  ),
+  "rollback_tag=false",
+  "Preview rollback must remain armed until the stable health response is validated.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewDeployJob,
+  "--ingress=all",
+  "Preview ingress must come only from the immutable numeric-repository-ID map.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewDeployJob,
+  "*.preview.ycriticalhistory.org",
+  "Mapbox and workflow URL policy must use the stable parent origin, not unsupported wildcard syntax.",
+);
 
 const grypeConfig = await read("tools/ci/grype.yaml");
 requireContains("tools/ci/grype.yaml", grypeConfig, "auto-update: false", "Grype must not trust a mutable database listing.");
@@ -353,12 +410,37 @@ rejectContains(
   "gha-preview-deploy@",
   "Stale-preview invalidation must not authenticate the preview deployer.",
 );
+for (const needle of [
+  "verify_stable_preview_absent",
+  'preview.ycriticalhistory.org"',
+  '[ "$status" = "404" ]',
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    previewInvalidation,
+    needle,
+    `Stale-preview invalidation must verify stable data-plane teardown: ${needle}`,
+  );
+}
 for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
   const path = `.github/workflows/${workflowName}`;
   const workflow = await read(path);
   requireContains(path, workflow, "gha-preview-operator@", "Preview traffic operations must use the dedicated operator.");
   rejectContains(path, workflow, "gha-preview-deploy@", "Preview traffic operations must not authenticate the deploy identity.");
   rejectContains(path, workflow, "gha-preview-publish@", "Preview traffic operations must not authenticate the publisher identity.");
+  requireContains(
+    path,
+    workflow,
+    "verify_stable_preview_absent",
+    "Preview traffic operations must verify the stable Critical History URL is unroutable.",
+  );
+  requireContains(path, workflow, '[ "$status" = "404" ]', "Stable preview cleanup must require an exact 404 without redirects.");
+  rejectContains(
+    path,
+    sectionFrom(workflow, "verify_stable_preview_absent()"),
+    "--location",
+    "Stable preview teardown probes must not follow redirects.",
+  );
 }
 requireBefore(
   ".github/workflows/deploy-preview.yml",
@@ -979,6 +1061,13 @@ checkDockerPins("templates/app/Dockerfile", dockerfile);
 
 const readme = await read("README.md");
 requireContains("README.md", readme, "0.5.0", "README should document the current release.");
+const templateServer = await read("templates/app/src/server.ts");
+requireContains(
+  "templates/app/src/server.ts",
+  templateServer,
+  "Bun.env.PLATFORM_DEPLOY_NONCE",
+  "The standard preview health response must bind the data plane to this deployment.",
+);
 
 const moduleMain = await read("terraform/modules/cloud-run-service/main.tf");
 const moduleVariables = await read("terraform/modules/cloud-run-service/variables.tf");
@@ -1026,6 +1115,84 @@ requireContains(
   "Runtime accessor IDs must be validated as a subset of retained secret containers.",
 );
 const productionDeployment = await read("terraform/deployments/prod/main.tf");
+const exposureDeployment = await read("terraform/deployments/exposure/main.tf");
+const exposureOutputs = await read("terraform/deployments/exposure/outputs.tf");
+const previewDomainMain = await read("terraform/modules/cloud-run-preview-domain/main.tf");
+const previewDomainOutputs = await read("terraform/modules/cloud-run-preview-domain/outputs.tf");
+const previewDomainVariables = await read("terraform/modules/cloud-run-preview-domain/variables.tf");
+for (const needle of [
+  'network_endpoint_type = "SERVERLESS"',
+  "service  = var.preview_service_name",
+  'url_mask = "<tag>.${var.preview_domain}"',
+  'load_balancing_scheme = "EXTERNAL_MANAGED"',
+  'min_tls_version = "TLS_1_2"',
+  'profile         = "MODERN"',
+  'type            = "PER_PROJECT_RECORD"',
+  "domains            = [local.wildcard_domain]",
+  'port_range            = "443"',
+]) {
+  requireContains(
+    "terraform/modules/cloud-run-preview-domain/main.tf",
+    previewDomainMain,
+    needle,
+    `Stable preview-domain module is missing security boundary: ${needle}`,
+  );
+}
+for (const forbidden of ["allUsers", "allAuthenticatedUsers", "google_cloud_run_v2_service", "http_forwarding_rule"] ) {
+  rejectContains(
+    "terraform/modules/cloud-run-preview-domain/main.tf",
+    previewDomainMain,
+    forbidden,
+    `Preview routing must not create or publicly bind a Cloud Run service: ${forbidden}`,
+  );
+}
+if ([...previewDomainMain.matchAll(/deletion_policy\s*=\s*"PREVENT"/g)].length !== 11) {
+  failures.push(
+    "terraform/modules/cloud-run-preview-domain/main.tf: every preview frontend resource must retain provider-level deletion prevention.",
+  );
+}
+rejectContains(
+  "terraform/modules/cloud-run-preview-domain/variables.tf",
+  previewDomainVariables,
+  "url_mask",
+  "The serverless NEG URL mask must remain fixed in trusted module code.",
+);
+for (const needle of [
+  'var.repository_id == "280932482"',
+  'toset(["preview.ycriticalhistory.org"])',
+  'preview_service_name = "${local.deployment.service_name}-preview"',
+]) {
+  requireContains(
+    "terraform/deployments/exposure/main.tf",
+    exposureDeployment,
+    needle,
+    `Protected exposure root is missing the Critical-only preview boundary: ${needle}`,
+  );
+}
+requireContains(
+  "terraform/modules/cloud-run-preview-domain/outputs.tf",
+  previewDomainOutputs,
+  'value       = "https://pr-N.${var.preview_domain}"',
+  "The operator-facing preview URL pattern must stay tied to workflow-created pr-N tags.",
+);
+requireContains(
+  "terraform/deployments/exposure/outputs.tf",
+  exposureOutputs,
+  'module.preview_domain["preview.ycriticalhistory.org"].dns_records',
+  "The protected exposure plan must emit the exact DNS changes for owner review.",
+);
+rejectContains(
+  "terraform/deployments/exposure/outputs.tf",
+  exposureOutputs,
+  "try(",
+  "Critical preview output evaluation errors must fail the protected plan instead of becoming null.",
+);
+requireContains(
+  "terraform/deployments/prod/main.tf",
+  productionDeployment,
+  'preview_ingress                   = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
+  "Critical History previews must reject direct public run.app ingress after the frontend exists.",
+);
 for (const needle of [
   'alias                           = "no_attribution"',
   "google.no_attribution = google.no_attribution",
@@ -1420,6 +1587,12 @@ requireContains(
   platformWorkflow,
   "terraform -chdir=terraform/deployments/bootstrap test -no-color",
   "Platform CI must execute protected bootstrap variable-validation regressions.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "terraform -chdir=terraform/deployments/exposure test -no-color",
+  "Platform CI must execute stable preview-domain selection regressions.",
 );
 requireContains(
   ".github/workflows/platform.yml",

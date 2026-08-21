@@ -60,12 +60,20 @@ map; repository variables and deploy callers cannot add or redirect them.
 Runsetta is deliberately offline, its old secret containers are retained for
 recovery, and its runtime service account has no accessor grant. Critical
 History's `MAPBOX_PUBLIC_TOKEN` is the narrow exception because the app returns
-it to every browser: the owner-approved `preview-cloud` and `production`
-environments provide a dedicated `MAPBOX_PUBLIC_TOKEN` secret containing only a
-public `pk.*` token with the required read scopes and URL restrictions. The
-workflow validates its public format before mapping it to the app's runtime
-name; Mapbox `sk.*` tokens are rejected. Do not use `secrets: inherit` or add
-secret parameters to deploy callers.
+it to every browser. It is a Mapbox public `pk.*` token, not a confidential
+credential; the owner-approved `preview-cloud` and `production` environments use
+their `MAPBOX_PUBLIC_TOKEN` secret slots only as approval-gated configuration
+channels. Give each value only the required public read scopes. The simplest
+configuration reuses one value restricted to `https://ycriticalhistory.org`,
+which Mapbox also permits on all subdomains, including every stable
+`https://pr-N.preview.ycriticalhistory.org` origin. A separate preview value may
+instead be restricted to `https://preview.ycriticalhistory.org`, but that is
+one-way narrowing: the production parent still includes all of its subdomains.
+Mapbox documents URL restrictions as best-effort abuse controls, not an
+authorization boundary; never grant a browser token confidential scopes. Do not
+enter wildcard syntax. The workflow validates the public format before mapping
+it to the app's runtime name; Mapbox `sk.*` tokens are rejected. Do not use
+`secrets: inherit` or add secret parameters to deploy callers.
 The Socket token must be admin-visible only, grant only `packages:list`, and be
 rotated and usage-audited on the same schedule as other CI credentials.
 
@@ -105,6 +113,26 @@ workflow; callers cannot redirect a deployment by changing workflow inputs.
 Authenticated Terraform jobs likewise check out only the exact platform commit
 and never execute consumer HCL, providers, lockfiles, caches, functions, or
 outputs.
+
+Critical History previews use one stable wildcard DNS namespace backed by a
+dedicated global external HTTPS load balancer. The serverless NEG fixes the
+backend service to `critical-history-preview` and derives only the Cloud Run
+traffic tag from `<tag>.preview.ycriticalhistory.org`; the workflow is the sole
+creator of `pr-N` tags. The preview service accepts external traffic only from
+Cloud Load Balancing, so its generated `run.app` URLs cannot bypass the stable
+origin. Each deployment receives a random non-confidential nonce, and `/livez`
+must echo that exact value through the stable origin before the workflow reports
+success; a failed or stale validation removes the tag only when it still targets
+that run's exact revision. Closing or invalidating a pull request removes its tag
+and makes the corresponding stable hostname stop routing without changing DNS
+or load-balancer state.
+
+The preview namespace is same-site with production. Critical History currently
+has no authentication or cookies; that remains a security invariant. Before
+adding either, use host-only `__Host-` cookies with explicit Origin/CSRF checks
+and reject parent-domain cookies, or move previews to a separate registrable
+domain. `SameSite` by itself does not isolate pull-request code on a sibling
+subdomain.
 
 ## CLI
 

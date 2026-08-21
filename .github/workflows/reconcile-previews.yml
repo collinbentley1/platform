@@ -111,14 +111,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROJECT_ID: ${{ steps.app.outputs.project_id }}
           REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
           SERVICE_NAME: ${{ steps.app.outputs.service_name }}
           CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
         run: |
           set -euo pipefail
+          if [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]]; then
+            echo "Refusing invalid preview reconciliation identity." >&2
+            exit 1
+          fi
           service="${SERVICE_NAME}-preview"
           service_json="$(mktemp)"
           describe_error="$(mktemp)"
           trap 'rm -f "$service_json" "$describe_error"' EXIT
+
+          verify_stable_preview_absent() {
+            local pr_number="$1"
+            local preview_tag="$2"
+            if [ "$REPOSITORY_ID" != "280932482" ]; then
+              return 0
+            fi
+            stable_url="https://pr-${pr_number}.preview.ycriticalhistory.org"
+            for attempt in $(seq 1 30); do
+              if status="$(curl --silent --show-error \
+                --output /dev/null \
+                --write-out '%{http_code}' \
+                --max-time 10 \
+                --proto '=https' \
+                "$stable_url")" && [ "$status" = "404" ]; then
+                return 0
+              fi
+              if [ "$attempt" -lt 30 ]; then
+                sleep 5
+              fi
+            done
+            echo "Stable preview URL remained routable after removing $preview_tag." >&2
+            return 1
+          }
 
           if gcloud run services describe "$service" \
             --project="$PROJECT_ID" \
@@ -156,6 +185,7 @@ jobs:
                 --region="$REGION" \
                 --remove-tags="$preview_tag" \
                 --quiet
+              verify_stable_preview_absent "$pr_number" "$preview_tag"
             done < <(jq -r '.status.traffic[]? | select(.tag != null) | [.tag, (.revisionName // "")] | @tsv' "$service_json")
           else
             if rg -qi 'not[ _-]?found|could not be found|404' "$describe_error"; then

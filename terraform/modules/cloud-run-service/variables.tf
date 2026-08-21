@@ -53,6 +53,20 @@ variable "preview_runtime_service_account_email" {
   type        = string
 }
 
+variable "preview_ingress" {
+  description = "Ingress policy for the shared preview Cloud Run service. Use load-balancer-only ingress only when a protected preview frontend exists."
+  type        = string
+  default     = "INGRESS_TRAFFIC_ALL"
+
+  validation {
+    condition = contains([
+      "INGRESS_TRAFFIC_ALL",
+      "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    ], var.preview_ingress)
+    error_message = "preview_ingress must allow all traffic or only internal and Cloud Load Balancing traffic."
+  }
+}
+
 variable "prod_deploy_service_account_email" {
   description = "Production deploy service account email; receives service update, exact runtime actAs, and exact-repository Artifact Registry Reader only."
   type        = string

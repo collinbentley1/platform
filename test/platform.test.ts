@@ -655,6 +655,8 @@ describe("platform scaffold and doctor", () => {
     expect(cleanup).toContain("github.event.action == 'converted_to_draft'");
     expect(cleanup).toContain("gha-preview-operator@");
     expect(cleanup).not.toContain("gha-preview-deploy@");
+    expect(cleanup).toContain("verify_stable_preview_absent");
+    expect(cleanup).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain('--revision-suffix="$revision_suffix"');
     expect(deploy).toContain("EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}");
     const publishCanary = deploy.slice(
@@ -669,6 +671,8 @@ describe("platform scaffold and doctor", () => {
     expect(deploy).toContain("  invalidate:\n");
     const invalidation = deploy.slice(deploy.indexOf("  invalidate:\n"));
     expect(invalidation).toContain("gha-preview-operator@");
+    expect(invalidation).toContain("verify_stable_preview_absent");
+    expect(invalidation).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain("deployed-revision: ${{ steps.deploy.outputs.revision }}");
     expect(invalidation).toContain("EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}");
     expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
@@ -676,6 +680,108 @@ describe("platform scaffold and doctor", () => {
     expect(reconcile).toContain("head_sha:0:12");
     expect(reconcile).toContain("gha-preview-operator@");
     expect(reconcile).not.toContain("gha-preview-deploy@");
+    expect(reconcile).toContain("verify_stable_preview_absent");
+    expect(reconcile).toContain('[ "$status" = "404" ]');
+  });
+
+  test("Critical History previews use one stable origin without a run.app bypass", async () => {
+    const preview = await readFile(
+      join(repoRoot, ".github/workflows/deploy-preview.yml"),
+      "utf8",
+    );
+    const deploy = preview.slice(
+      preview.indexOf("  deploy:\n"),
+      preview.indexOf("\n  invalidate:\n"),
+    );
+
+    expect(deploy).toContain('stable_preview_domain="preview.ycriticalhistory.org"');
+    expect(deploy).toContain('preview_ingress="internal-and-cloud-load-balancing"');
+    expect(deploy).toContain('--ingress="$PREVIEW_INGRESS"');
+    expect(deploy).not.toContain("--ingress=all");
+    expect(deploy).toContain(
+      'deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"',
+    );
+    expect(deploy).toContain('[a-z0-9.-]+\\.run\\.app');
+    expect(deploy).toContain(
+      'public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"',
+    );
+    expect(deploy).toContain("PLATFORM_DEPLOY_NONCE: $deploy_nonce");
+    expect(deploy).toContain('preview_nonce="$(openssl rand -hex 32)"');
+    expect(deploy).toContain('"${public_preview_url}/livez"');
+    expect(deploy).toContain("--max-filesize 1024");
+    expect(deploy).toContain('if health_status="$(curl --silent --show-error');
+    expect(deploy).not.toContain('"${public_preview_url}/livez" || true');
+    expect(deploy).toContain('jq -e -s --arg nonce "$preview_nonce"');
+    expect(deploy).toContain('length == 1 and .[0] == {deployment: $nonce, ok: true}');
+    expect(deploy).not.toContain("*.preview.ycriticalhistory.org");
+    expect(deploy).toContain("rollback_tag=true");
+    expect(deploy).toContain('if [ "$current_revision" = "$expected_revision" ]');
+    expect(deploy).toContain('--remove-tags="$tag"');
+    expect(deploy.indexOf("rollback_tag=true")).toBeLessThan(
+      deploy.indexOf('gcloud run deploy "$PREVIEW_SERVICE"'),
+    );
+    expect(deploy.indexOf('jq -e -s --arg nonce "$preview_nonce"')).toBeLessThan(
+      deploy.lastIndexOf("rollback_tag=false"),
+    );
+
+    const templateServer = await readFile(
+      join(repoRoot, "templates/app/src/server.ts"),
+      "utf8",
+    );
+    expect(templateServer).toContain("Bun.env.PLATFORM_DEPLOY_NONCE");
+
+    const router = await readFile(
+      join(repoRoot, "terraform/modules/cloud-run-preview-domain/main.tf"),
+      "utf8",
+    );
+    const exposure = await readFile(
+      join(repoRoot, "terraform/deployments/exposure/main.tf"),
+      "utf8",
+    );
+    const production = await readFile(
+      join(repoRoot, "terraform/deployments/prod/main.tf"),
+      "utf8",
+    );
+    expect(router).toContain('network_endpoint_type = "SERVERLESS"');
+    expect(router).toContain("service  = var.preview_service_name");
+    expect(router).toContain('url_mask = "<tag>.${var.preview_domain}"');
+    expect(router).toContain('load_balancing_scheme = "EXTERNAL_MANAGED"');
+    expect(router).toContain('min_tls_version = "TLS_1_2"');
+    expect(router).toContain('port_range            = "443"');
+    expect(router.match(/deletion_policy\s*=\s*"PREVENT"/g)?.length).toBe(11);
+    expect(router).not.toContain("allUsers");
+    expect(exposure).toContain('var.repository_id == "280932482"');
+    expect(exposure).toContain('toset(["preview.ycriticalhistory.org"])');
+    const exposureOutputs = await readFile(
+      join(repoRoot, "terraform/deployments/exposure/outputs.tf"),
+      "utf8",
+    );
+    expect(exposureOutputs).not.toContain("try(");
+    expect(production).toContain(
+      'preview_ingress                   = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
+    );
+
+    const nonce = "a".repeat(64);
+    const healthRoot = await mkdtemp(join(tmpdir(), "platform-health-test-"));
+    temporaryRoots.push(healthRoot);
+    const validHealth = join(healthRoot, "valid.json");
+    const concatenatedHealth = join(healthRoot, "concatenated.json");
+    await writeFile(validHealth, `{"deployment":"${nonce}","ok":true}\n`);
+    await writeFile(
+      concatenatedHealth,
+      `{"deployment":"wrong","ok":false}\n{"deployment":"${nonce}","ok":true}\n`,
+    );
+    const predicate = 'length == 1 and .[0] == {deployment: $nonce, ok: true}';
+    const validJq = Bun.spawn(
+      ["jq", "-e", "-s", "--arg", "nonce", nonce, predicate, validHealth],
+      { stdout: "ignore", stderr: "pipe" },
+    );
+    const concatenatedJq = Bun.spawn(
+      ["jq", "-e", "-s", "--arg", "nonce", nonce, predicate, concatenatedHealth],
+      { stdout: "ignore", stderr: "pipe" },
+    );
+    expect(await validJq.exited).toBe(0);
+    expect(await concatenatedJq.exited).not.toBe(0);
   });
 
   test("Artifact Registry publishers, deployers, and preview traffic operators remain disjoint", async () => {

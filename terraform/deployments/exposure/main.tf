@@ -66,3 +66,14 @@ module "domains" {
   service_name = local.deployment.service_name
   domains      = local.deployment.domains
 }
+
+module "preview_domain" {
+  for_each = var.repository_id == "280932482" ? toset(["preview.ycriticalhistory.org"]) : toset([])
+  source   = "../../modules/cloud-run-preview-domain"
+
+  project_id           = local.deployment.project_id
+  region               = local.deployment.region
+  preview_service_name = "${local.deployment.service_name}-preview"
+  preview_domain       = each.value
+  resource_name_prefix = "${local.deployment.service_name}-preview"
+}
