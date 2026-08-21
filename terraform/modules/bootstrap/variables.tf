@@ -82,6 +82,11 @@ variable "legacy_compatibility_mode" {
   default     = false
 }
 
+variable "manage_automatic_default_service_account_grants_policy" {
+  description = "Explicitly manage iam.automaticIamGrantsForDefaultServiceAccounts only when the project has an organization parent and the protected bootstrap identity has organization-level policy authority. Standalone projects must set false while the authoritative empty Editor binding still removes every direct Editor member."
+  type        = bool
+}
+
 variable "required_services" {
   description = "Google APIs required by the application project."
   type        = set(string)
@@ -90,7 +95,6 @@ variable "required_services" {
     "cloudresourcemanager.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
-    "orgpolicy.googleapis.com",
     "run.googleapis.com",
     "serviceusage.googleapis.com",
     "storage.googleapis.com",

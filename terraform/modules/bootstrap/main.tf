@@ -65,10 +65,18 @@ locals {
     managed-by = "terraform"
   }
 
+  # Organization Policy Service is useful only when this module manages the
+  # preventive policy. Remove a caller-supplied/default entry for standalone
+  # projects, and add it authoritatively for an organization-backed project.
+  effective_required_services = setunion(
+    setsubtract(var.required_services, toset(["orgpolicy.googleapis.com"])),
+    var.manage_automatic_default_service_account_grants_policy ? toset(["orgpolicy.googleapis.com"]) : toset([]),
+  )
+
 }
 
 resource "google_project_service" "required" {
-  for_each = var.required_services
+  for_each = local.effective_required_services
 
   project            = var.project_id
   service            = each.value
@@ -427,9 +435,11 @@ resource "google_project_iam_member" "runtime_project_roles" {
   member  = "serviceAccount:${google_service_account.runtime.email}"
 }
 
-# This authoritative empty binding removes the direct project Editor grant from
-# the default Compute Engine service account in the first protected apply and
-# prevents it from silently returning. Inventory all workloads before phase A.
+# This authoritative empty binding removes every direct project Editor grant at
+# each protected convergence. Organization-backed deployments separately enable
+# the preventive automatic-grant policy below. A standalone deployment cannot
+# prevent an out-of-band regrant between applies, so it must inventory workloads
+# and assert a live zero-Editor policy after every protected service/API change.
 resource "google_project_iam_binding" "editor_absent" {
   #checkov:skip=CKV_GCP_49:An authoritative empty binding removes impersonation-capable basic-role members; it grants no principal access.
   #checkov:skip=CKV_GCP_117:An authoritative empty Editor binding removes the basic role and prevents drift; it grants no principal access.
@@ -441,6 +451,8 @@ resource "google_project_iam_binding" "editor_absent" {
 }
 
 resource "google_org_policy_policy" "disable_automatic_default_service_account_grants" {
+  count = var.manage_automatic_default_service_account_grants_policy ? 1 : 0
+
   name   = "projects/${data.google_project.current.number}/policies/iam.automaticIamGrantsForDefaultServiceAccounts"
   parent = "projects/${data.google_project.current.number}"
 
@@ -452,6 +464,11 @@ resource "google_org_policy_policy" "disable_automatic_default_service_account_g
 
   deletion_policy = "PREVENT"
   depends_on      = [google_project_service.required]
+}
+
+moved {
+  from = google_org_policy_policy.disable_automatic_default_service_account_grants
+  to   = google_org_policy_policy.disable_automatic_default_service_account_grants[0]
 }
 
 resource "google_storage_bucket_iam_member" "terraform_state_reader" {

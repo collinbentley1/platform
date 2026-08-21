@@ -31,13 +31,29 @@ consumer Actions disabled so no cloud workflow can start against incomplete IAM.
 Before its first apply, inventory every Compute Engine default service account,
 instance, job, trigger, and attached workload and prove nothing depends on the
 default account. The exact bootstrap root then authoritatively removes all
-direct project `roles/editor` members, enforces
-`iam.automaticIamGrantsForDefaultServiceAccounts`, and strips the legacy
-project-owner/editor/viewer convenience bindings from the routine state,
-bootstrap state, and access-log buckets. The state buckets explicitly depend on
-that Editor removal, so the new protected bucket is never created while the
-default Compute identity can inherit state access. Stop if the reviewed plan
-contains any other Editor member or workload fallback.
+direct project `roles/editor` members and strips the legacy project-owner/editor/
+viewer convenience bindings from the routine state, bootstrap state, and
+access-log buckets. The state buckets explicitly depend on that Editor removal,
+so the new protected bucket is never created while the default Compute identity
+can inherit state access. Stop if the reviewed plan contains any other Editor
+member or workload fallback.
+
+The four registered personal projects currently have no organization parent.
+Google permits Organization Policy Administrator only at organization scope and
+marks the policy write permissions unsupported in project custom roles, so these
+deployments must keep
+`manage_automatic_default_service_account_grants_policy = false`. The protected
+root still converges the authoritative empty Editor binding, but that is not
+real-time prevention: a future out-of-band service/default-account creation
+could regrant Editor between protected applies. Keep Compute disabled, require
+every future service/API change to use the protected bootstrap lane, and fail
+the post-apply live assertion unless the Editor binding is still empty. If a
+project is later moved into an organization, enable
+`iam.automaticIamGrantsForDefaultServiceAccounts` only in a separate reviewed
+rollout using an organization-scoped bootstrap identity; do not grant a service-
+agent role to a user or introduce a static key to approximate that authority.
+The module enables Organization Policy Service only in that organization-backed
+mode; the current standalone plans must not enable an otherwise unused API.
 
 Existing apps currently keep bootstrap and routine production state in one
 bucket. While the exact platform bootstrap root still uses the old backend, the
@@ -156,9 +172,13 @@ the recovery object and stop; never rerun from empty state.
    authenticating at this point.
 4. Confirm the first bootstrap plan removes the four direct default Compute
    `Editor` grants and all state-bucket convenience principals before it creates
-   the protected bucket. Apply it, then complete the bootstrap-state-bucket
-   migration above. Prove both the default Compute and routine `gha-terraform`
-   identities cannot read bootstrap state and neither can write it.
+   the protected bucket. For the current standalone projects, confirm the plan
+   contains no Organization Policy resource and the immutable deployment root
+   explicitly disables it for the documented reason above. Apply the plan, then
+   complete the bootstrap-state-bucket migration above. Prove both the default
+   Compute and routine `gha-terraform` identities cannot read bootstrap state
+   and neither can write it. Read the live project IAM policy again and require
+   exactly zero direct `roles/editor` members before continuing.
 5. Merge the prepared consumer PRs. The normal production Terraform job now
    executes only `terraform/deployments/prod` from the exact platform SHA;
    checked-out consumer Terraform is validation/documentation and is never

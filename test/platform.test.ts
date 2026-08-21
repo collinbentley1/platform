@@ -28,6 +28,12 @@ describe("platform scaffold and doctor", () => {
       projectId: "secure-app",
       serviceName: "secure-app",
     });
+    expect(await readFile(join(app, "infra/terraform/bootstrap/main.tf"), "utf8")).toContain(
+      "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
+    );
+    expect(await readFile(join(app, "infra/terraform/bootstrap/variables.tf"), "utf8")).toContain(
+      'variable "manage_automatic_default_service_account_grants_policy"',
+    );
     expect((await run(["doctor", app])).exitCode).toBe(0);
   });
 
