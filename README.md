@@ -113,8 +113,13 @@ bun run platform doctor ../critical-history ../healthmcp
 bun run platform scaffold my-new-app 0123456789abcdef0123456789abcdef01234567 123456789 ../my-new-app
 ```
 
-`doctor` checks whether a repository is wired to the platform workflows and
-contains the expected Bun, Docker, and Terraform contract files.
+`doctor` checks whether a repository is wired to the platform workflows,
+whether its developer-facing verification commands have drifted, and whether it
+contains the expected Bun, Docker, and Terraform contract files. Privileged CI
+and Docker verification use the byte-matched platform runner with the
+checksum-pinned Bun executable, not dependency-shadowable package-script
+orchestration. Doctor also rejects committed Terraform state, saved plans,
+variable/override files, CLI config, and crash logs.
 
 ## Release
 

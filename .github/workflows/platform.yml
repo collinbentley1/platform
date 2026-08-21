@@ -43,7 +43,25 @@ jobs:
           mkdir -p "$destination"
           unzip -q "$archive" -d "$destination"
           echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          echo "PLATFORM_BUN=$destination/bun-linux-x64/bun" >> "$GITHUB_ENV"
           "$destination/bun-linux-x64/bun" -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
+      - name: Reject dependency patching before any Socket credential exists
+        env:
+          LOCK_PATH: ${{ github.workspace }}/bun.lock
+          PACKAGE_PATH: ${{ github.workspace }}/package.json
+        run: |
+          set -euo pipefail
+          (
+            cd "$RUNNER_TEMP"
+            "$PLATFORM_BUN" --no-env-file --no-orphans -e '
+              const packageJson = JSON.parse(await Bun.file(Bun.env.PACKAGE_PATH).text());
+              const lock = Bun.JSONC.parse(await Bun.file(Bun.env.LOCK_PATH).text());
+              if (Object.hasOwn(packageJson, "patchedDependencies") || Object.hasOwn(lock, "patchedDependencies")) {
+                throw new Error("Bun patchedDependencies are forbidden for trusted CI dependencies.");
+              }
+            '
+          )
 
       - name: Install dependencies
         env:
@@ -71,7 +89,9 @@ jobs:
           fi
 
       - name: Verify platform
-        run: bun run verify
+        run: |
+          set -euo pipefail
+          "$PLATFORM_BUN" --no-env-file --no-orphans tools/ci/verify-platform.ts "$GITHUB_WORKSPACE"
 
       - name: Install checksum-pinned actionlint 1.7.12
         env:

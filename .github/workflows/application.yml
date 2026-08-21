@@ -61,6 +61,7 @@ jobs:
           mkdir -p "$destination"
           unzip -q "$archive" -d "$destination"
           echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          echo "PLATFORM_BUN=$destination/bun-linux-x64/bun" >> "$GITHUB_ENV"
           (
             cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
             "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
@@ -74,7 +75,8 @@ jobs:
             cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
             bun --no-env-file --no-orphans ./enforce-app-contract.ts \
               "$GITHUB_WORKSPACE" \
-              "$GITHUB_WORKSPACE/_platform_policy/templates/app"
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ github.event.repository.id }}"
           )
 
       - name: Install dependencies
@@ -101,4 +103,11 @@ jobs:
           fi
 
       - name: Verify app
-        run: bun --no-env-file --no-orphans run verify:ci
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$PLATFORM_BUN" --no-env-file --no-orphans \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app/tools/platform-verify.ts" \
+              "$GITHUB_WORKSPACE"
+          )

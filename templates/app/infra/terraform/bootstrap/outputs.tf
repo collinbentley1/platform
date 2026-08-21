@@ -14,7 +14,7 @@ output "workload_identity_provider" {
 }
 
 output "terraform_service_account_email" {
-  description = "Service account used by Terraform apply workflow."
+  description = "Metadata-only service account used by the immutable Terraform convergence workflow."
   value       = module.bootstrap.terraform_service_account_email
 }
 

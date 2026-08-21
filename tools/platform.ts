@@ -1,8 +1,13 @@
 #!/usr/bin/env bun
 
 import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { basename, join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
+import {
+  isForbiddenTerraformArtifact,
+  validateAppScripts,
+  validateTerraformGitignore,
+  validateTypeScriptLock,
+} from "./ci/app-contract";
 
 type PlatformConfig = {
   readonly name?: string;
@@ -20,7 +25,13 @@ const requiredFiles = [
   "bunfig.toml",
   "bun.lock",
   "package.json",
+  ".gitignore",
   ".dockerignore",
+  "tsconfig.json",
+  "tools/build.ts",
+  "tools/format.ts",
+  "tools/lint.ts",
+  "tools/platform-verify.ts",
   "infra/terraform/bootstrap/main.tf",
   "infra/terraform/prod/main.tf",
 ];
@@ -42,12 +53,17 @@ const expectedReusableCalls: Readonly<Record<string, readonly string[]>> = {
   "cleanup-preview.yml": ["cleanup-preview.yml"],
   "reconcile-previews.yml": ["reconcile-previews.yml"],
 };
-const canonicalAppFiles = ["Dockerfile", ".dockerignore", "bunfig.toml"];
+const canonicalAppFiles = [
+  "Dockerfile",
+  ".dockerignore",
+  "bunfig.toml",
+  "tools/platform-verify.ts",
+];
 const approvedAdditionalWorkflows: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   // Runsetta's credential-free macOS Swift package check is centralized here so
   // a consumer PR cannot add or alter an executable workflow without a platform review.
   "711292980": {
-    "apple.yml": "3af8f8085983a15a1703c1f44aba20d30edbfef915c53f2f678e5769d956513d",
+    "apple.yml": "templates/additional-workflows/runsetta/apple.yml",
   },
 };
 const forbiddenPreMigrationWorkflowShas = new Set([
@@ -135,10 +151,20 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const lockText = await readText(join(repoPath, "bun.lock"));
     if (lockText) {
       try {
-        const lock = Bun.JSONC.parse(lockText) as { packages?: Record<string, unknown> };
+        const lock = Bun.JSONC.parse(lockText) as {
+          packages?: Record<string, unknown>;
+          patchedDependencies?: unknown;
+        };
+        const reviewedLock = Bun.JSONC.parse(
+          (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
+        ) as { packages?: Record<string, unknown> };
         if (JSON.stringify(lock.packages?.[scanner]) !== JSON.stringify(expectedScannerLock)) {
           messages.push("bun.lock does not resolve the reviewed Socket scanner integrity");
         }
+        if (Object.hasOwn(lock, "patchedDependencies")) {
+          messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
+        }
+        messages.push(...validateTypeScriptLock(lock.packages, reviewedLock.packages));
       } catch {
         messages.push("bun.lock is not valid JSONC");
       }
@@ -188,6 +214,45 @@ async function doctor(repoArgs: string[]): Promise<void> {
       }
     }
 
+    const packageText = await readText(join(repoPath, "package.json"));
+    if (packageText) {
+      try {
+        const packageJson = JSON.parse(packageText) as {
+          packageManager?: unknown;
+          scripts?: Record<string, unknown>;
+          devDependencies?: Record<string, unknown>;
+          patchedDependencies?: unknown;
+        };
+        if (packageJson.packageManager !== "bun@1.4.0") {
+          messages.push("package.json packageManager must be bun@1.4.0");
+        }
+        if (packageJson.devDependencies?.typescript !== "7.0.2") {
+          messages.push("package.json must pin the reviewed TypeScript version");
+        }
+        if (Object.hasOwn(packageJson, "patchedDependencies")) {
+          messages.push(
+            "package.json patchedDependencies are forbidden for trusted CI dependencies",
+          );
+        }
+        messages.push(
+          ...validateAppScripts(packageJson.scripts, config?.githubRepositoryId ?? ""),
+        );
+      } catch {
+        messages.push("package.json is not valid JSON");
+      }
+    }
+
+    const gitignoreText = await readText(join(repoPath, ".gitignore"));
+    if (gitignoreText !== undefined) {
+      messages.push(...validateTerraformGitignore(gitignoreText));
+    }
+
+    for (const path of await trackedFiles(repoPath)) {
+      if (isForbiddenTerraformArtifact(path)) {
+        messages.push(`forbidden committed Terraform state/config artifact ${path}`);
+      }
+    }
+
     const workflowDirectory = join(repoPath, ".github/workflows");
     const workflowEntries = await readdir(workflowDirectory, { withFileTypes: true }).catch(() => []);
     const additionalWorkflows = approvedAdditionalWorkflows[config?.githubRepositoryId ?? ""] ?? {};
@@ -203,11 +268,13 @@ async function doctor(repoArgs: string[]): Promise<void> {
         messages.push(`unreviewed additional workflow .github/workflows/${entry.name}`);
         continue;
       }
-      const expectedDigest = additionalWorkflows[entry.name];
-      if (expectedDigest) {
-        const workflowText = await readFile(join(workflowDirectory, entry.name));
-        const digest = createHash("sha256").update(workflowText).digest("hex");
-        if (digest !== expectedDigest) {
+      const expectedTemplate = additionalWorkflows[entry.name];
+      if (expectedTemplate) {
+        const [workflowText, expectedText] = await Promise.all([
+          readFile(join(workflowDirectory, entry.name)),
+          readFile(join(root, expectedTemplate)),
+        ]);
+        if (!workflowText.equals(expectedText)) {
           messages.push(`approved additional workflow .github/workflows/${entry.name} has drifted`);
         }
       }
@@ -402,7 +469,19 @@ async function scaffold(args: string[]): Promise<void> {
   }
 
   await mkdir(target, { recursive: true });
-  await cp(join(root, "templates/app"), target, { recursive: true });
+  const templateRoot = join(root, "templates/app");
+  await cp(templateRoot, target, {
+    recursive: true,
+    filter: (source) => {
+      const templateRelativePath = relative(templateRoot, source).replaceAll("\\", "/");
+      const name = basename(source);
+      return (
+        templateRelativePath.length === 0 ||
+        (!isForbiddenTerraformArtifact(templateRelativePath) &&
+          !["node_modules", "coverage", "dist", ".DS_Store"].includes(name))
+      );
+    },
+  });
   await replaceTokens(target, {
     __APP_NAME__: name,
     __PROJECT_ID__: name,
@@ -487,4 +566,24 @@ function isFullCommitSha(value: string): boolean {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function trackedFiles(directory: string): Promise<string[]> {
+  const child = Bun.spawn(["git", "-C", directory, "ls-files", "-z"], {
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const [exitCode, output] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+  ]);
+  if (exitCode === 0) {
+    return output.split("\0").filter(Boolean);
+  }
+
+  const paths: string[] = [];
+  for await (const path of walk(directory)) {
+    paths.push(path.slice(directory.length + 1).replaceAll("\\", "/"));
+  }
+  return paths;
 }

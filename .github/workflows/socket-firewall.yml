@@ -73,7 +73,8 @@ jobs:
             cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
             bun --no-env-file --no-orphans ./enforce-app-contract.ts \
               "$GITHUB_WORKSPACE" \
-              "$GITHUB_WORKSPACE/_platform_policy/templates/app"
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ github.event.repository.id }}"
           )
 
       - name: Run Bun install with Socket scanner

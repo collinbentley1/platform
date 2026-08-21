@@ -17,6 +17,7 @@ the repeated delivery mechanics.
 - `bunfig.toml`
 - `bun.lock`
 - `package.json`
+- `.gitignore`
 - `infra/terraform/bootstrap`
 - `infra/terraform/prod`
 
@@ -37,6 +38,24 @@ required and these required checks:
   published package versions for seven days before they may be resolved
 
 Apps can add project-specific checks such as `Swift package check`.
+
+The platform binds the application policy to the immutable numeric repository
+ID from the GitHub event. For the four managed apps it requires exact
+platform-reviewed `format:check`, `lint`, `typecheck`, `test`, and `build`
+commands and this developer-facing composition:
+
+```text
+verify = bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci
+verify:ci = bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build
+```
+
+Implicit `pre*` and `post*` hooks for those commands are forbidden. A pull
+request cannot replace a required check with `true` while retaining the expected
+job name. CI and the canonical Dockerfile do not execute those package scripts:
+the checksum-pinned Bun binary runs each reviewed entrypoint sequentially through
+the trusted platform runner, rejects dependency-installed `bun` shims, and calls
+the pinned TypeScript entrypoint by its exact installed path. The package scripts
+are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
 commit SHA. Deploy callers pass no secrets and must never use `secrets: inherit`.
@@ -93,3 +112,7 @@ The consumer `infra/terraform` roots are reviewed mirrors for validation. Any
 job holding Google credentials executes only the app configuration mapped by
 immutable repository ID under `platform/terraform/deployments`; it never runs
 consumer Terraform code.
+
+Terraform working directories, state, saved plans, variable files, CLI config,
+crash logs, and override files are forbidden in app commits and covered by the
+required `.gitignore`. Provider lockfiles remain committed and reviewed.

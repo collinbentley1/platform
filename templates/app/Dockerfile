@@ -21,7 +21,8 @@ COPY public ./public
 COPY src ./src
 COPY test ./test
 COPY tools ./tools
-RUN bun --no-env-file run verify:ci
+RUN /usr/local/bin/bun --no-env-file --no-orphans \
+  /app/tools/platform-verify.ts /app
 
 FROM dhi.io/bun:1@sha256:7d31a1b2907df08fe257212331bd0f8e661595870c60285860fcc60abd394473 AS runtime
 WORKDIR /app

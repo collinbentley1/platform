@@ -177,6 +177,56 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("does not resolve the reviewed Socket scanner integrity");
   });
 
+  test("doctor and immutable contract pin the native TypeScript compiler package", async () => {
+    const app = await scaffold("typescript-native-substitution");
+    const path = join(app, "bun.lock");
+    const original = await readFile(path, "utf8");
+    await writeFile(
+      path,
+      original.replace(
+        "sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==",
+        "sha512-invalid-native-compiler-integrity",
+      ),
+    );
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(
+      "bun.lock does not resolve the reviewed TypeScript integrity for @typescript/typescript-linux-x64",
+    );
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "bun.lock does not resolve the reviewed TypeScript integrity for @typescript/typescript-linux-x64",
+    );
+  });
+
+  test("doctor and immutable contract reject Bun dependency patches", async () => {
+    const app = await scaffold("dependency-patches");
+    const packagePath = join(app, "package.json");
+    const lockPath = join(app, "bun.lock");
+    const originalPackage = await readFile(packagePath, "utf8");
+    const packageJson = JSON.parse(originalPackage) as Record<string, unknown>;
+    packageJson.patchedDependencies = { "typescript@7.0.2": "patches/typescript.patch" };
+    await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("package.json patchedDependencies are forbidden");
+    }
+
+    await writeFile(packagePath, originalPackage);
+    const lock = Bun.JSONC.parse(await readFile(lockPath, "utf8")) as Record<string, unknown>;
+    lock.patchedDependencies = { "typescript@7.0.2": "sha512-attacker-controlled" };
+    await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("bun.lock patchedDependencies are forbidden");
+    }
+  });
+
   test("doctor rejects an effective Bun registry override", async () => {
     const app = await scaffold("registry-override");
     const path = join(app, "bunfig.toml");
@@ -192,6 +242,113 @@ describe("platform scaffold and doctor", () => {
     const result = await run(["doctor", app]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("does not exactly match the immutable platform template");
+  });
+
+  test("doctor and immutable contract reject delegated verification bypasses", async () => {
+    const app = await scaffold("verification-bypass");
+    const path = join(app, "package.json");
+    const original = JSON.parse(await readFile(path, "utf8")) as {
+      scripts: Record<string, string>;
+    };
+    for (const script of ["verify", "verify:ci", "test"]) {
+      const packageJson = structuredClone(original);
+      packageJson.scripts[script] = "true";
+      await writeFile(path, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+      const doctor = await run(["doctor", app]);
+      expect(doctor.exitCode).not.toBe(0);
+      expect(doctor.stderr).toContain(
+        `package.json script ${script} must exactly match the immutable platform command`,
+      );
+
+      const contract = await runContract(app);
+      expect(contract.exitCode).not.toBe(0);
+      expect(contract.stderr).toContain(
+        `package.json script ${script} must exactly match the immutable platform command`,
+      );
+    }
+
+    const packageJson = structuredClone(original);
+    packageJson.scripts.pretest = "true";
+    await writeFile(path, `${JSON.stringify(packageJson, null, 2)}\n`);
+    expect((await run(["doctor", app])).stderr).toContain(
+      "package.json must not define the implicit pretest hook",
+    );
+    expect((await runContract(app)).stderr).toContain(
+      "package.json must not define the implicit pretest hook",
+    );
+  });
+
+  test("immutable contract binds app policy to the event repository ID", async () => {
+    const app = await scaffold("repository-id-drift");
+    const result = await runContract(app, "987654321");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("must match the immutable GitHub event repository ID");
+  });
+
+  test("doctor and immutable contract reject Terraform state and saved plans", async () => {
+    const app = await scaffold("terraform-artifacts");
+    await writeFile(join(app, "infra/terraform/prod/review.tfplan"), "sensitive plan\n");
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(
+      "forbidden committed Terraform state/config artifact infra/terraform/prod/review.tfplan",
+    );
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "Forbidden Terraform state/config artifact: infra/terraform/prod/review.tfplan",
+    );
+  });
+
+  test("immutable contract rejects backup copies of Terraform variables and plans", async () => {
+    const app = await scaffold("terraform-artifact-backups");
+    await writeFile(join(app, "infra/terraform/prod/terraform.tfvars.bak"), "token = \"bad\"\n");
+    await writeFile(join(app, "infra/terraform/prod/release.tfplan.backup"), "sensitive plan\n");
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain("Forbidden Terraform state/config artifact");
+  });
+
+  test("immutable contract scans nested directories named like the trusted policy checkout", async () => {
+    const app = await scaffold("nested-policy-decoy");
+    await mkdir(join(app, "infra/_platform_policy"), { recursive: true });
+    await writeFile(join(app, "infra/_platform_policy/leak.tfstate"), "sensitive state\n");
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "Forbidden Terraform state/config artifact: infra/_platform_policy/leak.tfstate",
+    );
+  });
+
+  test("doctor and immutable contract require Terraform leak-prevention ignores", async () => {
+    const app = await scaffold("terraform-ignore-drift");
+    const path = join(app, ".gitignore");
+    await writeFile(path, (await readFile(path, "utf8")).replace("*.tfstate.*\n", ""));
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(".gitignore must include *.tfstate.*");
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(".gitignore must include *.tfstate.*");
+  });
+
+  test("immutable contract rejects a later gitignore negation of Terraform safety rules", async () => {
+    const app = await scaffold("terraform-ignore-negation");
+    const path = join(app, ".gitignore");
+    await writeFile(path, `${await readFile(path, "utf8")}!infra/leak.tfstate\n`);
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      ".gitignore must end with the exact platform-managed Terraform safety block",
+    );
   });
 
   test("immutable contract accepts inert env examples and rejects Bun-loaded env files", async () => {
@@ -213,6 +370,24 @@ describe("platform scaffold and doctor", () => {
     const result = await runContract(app);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("Dockerfile must exactly match the immutable platform template");
+  });
+
+  test("doctor and immutable contract reject trusted verification runner drift", async () => {
+    const app = await scaffold("verification-runner-drift");
+    const path = join(app, "tools/platform-verify.ts");
+    await writeFile(path, `${await readFile(path, "utf8")}\nprocess.exit(0);\n`);
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(
+      "tools/platform-verify.ts does not exactly match the immutable platform template",
+    );
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "tools/platform-verify.ts must exactly match the immutable platform template",
+    );
   });
 
   test("trusted checker does not execute a consumer Bun preload", async () => {
@@ -241,6 +416,42 @@ describe("platform scaffold and doctor", () => {
     const result = await runContract(app);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("Committed node_modules content is forbidden");
+  });
+
+  test("trusted verification runner rejects a dependency-installed Bun executable shadow", async () => {
+    const app = await scaffold("dependency-bun-shadow");
+    await mkdir(join(app, "node_modules/.bin"), { recursive: true });
+    await mkdir(join(app, "node_modules/typescript/bin"), { recursive: true });
+    await writeFile(join(app, "node_modules/.bin/bun"), "#!/bin/sh\nexit 0\n");
+    await writeFile(join(app, "node_modules/typescript/bin/tsc"), "process.exit(0);\n");
+
+    const result = await runVerification(app);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain(
+      process.platform === "linux"
+        ? "node_modules/.bin/bun executable shadow"
+        : "Privileged application verification requires Linux /proc executable pinning",
+    );
+  });
+
+  test("trusted verification runner re-executes the loaded Bun inode", async () => {
+    const runner = await readFile(
+      join(repoRoot, "templates/app/tools/platform-verify.ts"),
+      "utf8",
+    );
+    expect(runner).toContain('process.platform !== "linux"');
+    expect(runner).toContain("`/proc/${process.pid}/exe`");
+    expect(runner.indexOf('"typecheck"')).toBeLessThan(runner.indexOf('"format check"'));
+    expect(runner).not.toContain(
+      '[bunExecutable, "--no-env-file", "--no-orphans", join(appRoot, "tools/',
+    );
+
+    const platformRunner = await readFile(join(repoRoot, "tools/ci/verify-platform.ts"), "utf8");
+    expect(platformRunner).toContain('process.platform !== "linux"');
+    expect(platformRunner).toContain("`/proc/${process.pid}/exe`");
+    expect(platformRunner.indexOf('"typecheck"')).toBeLessThan(
+      platformRunner.indexOf('"format check"'),
+    );
   });
 
   test("trusted checker rejects caller-controlled Syft configuration", async () => {
@@ -687,11 +898,42 @@ async function scaffold(name: string): Promise<string> {
   return target;
 }
 
-async function runContract(app: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function runContract(
+  app: string,
+  repositoryId = "123456789",
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const contract = join(repoRoot, "tools/ci/enforce-app-contract.ts");
   const template = join(repoRoot, "templates/app");
   const child = Bun.spawn(
-    [process.execPath, "--no-env-file", "--no-orphans", contract, app, template],
+    [
+      process.execPath,
+      "--no-env-file",
+      "--no-orphans",
+      contract,
+      app,
+      template,
+      repositoryId,
+    ],
+    {
+      cwd: join(repoRoot, "tools/ci"),
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+async function runVerification(
+  app: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const runner = join(repoRoot, "templates/app/tools/platform-verify.ts");
+  const child = Bun.spawn(
+    [process.execPath, "--no-env-file", "--no-orphans", runner, app],
     {
       cwd: join(repoRoot, "tools/ci"),
       stdout: "pipe",

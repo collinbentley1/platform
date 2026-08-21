@@ -6,14 +6,14 @@
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "start": "bun dist/server.js",
-    "build": "bun build src/server.ts --target=bun --outdir=dist",
+    "build": "bun run tools/build.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "bun run typecheck",
+    "lint": "bun run tools/lint.ts",
     "format": "bun run tools/format.ts --write",
     "format:check": "bun run tools/format.ts --check",
     "verify": "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci",
-    "verify:ci": "bun run --parallel format:check lint test build"
+    "verify:ci": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "devDependencies": {
     "@socketsecurity/bun-security-scanner": "1.1.2",

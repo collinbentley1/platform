@@ -1,5 +1,11 @@
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
+import {
+  isForbiddenTerraformArtifact,
+  validateAppScripts,
+  validateTerraformGitignore,
+  validateTypeScriptLock,
+} from "./app-contract";
 
 const scanner = "@socketsecurity/bun-security-scanner";
 const expectedScannerLock = [
@@ -8,15 +14,24 @@ const expectedScannerLock = [
   {},
   "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA==",
 ];
-const canonicalFiles = ["Dockerfile", ".dockerignore", "bunfig.toml"];
-const requiredFiles = [...canonicalFiles, "package.json", "bun.lock"];
-const ignoredWalkDirectories = new Set([
-  ".git",
-  ".terraform",
-  "coverage",
-  "dist",
-  "_platform_policy",
-]);
+const canonicalFiles = [
+  "Dockerfile",
+  ".dockerignore",
+  "bunfig.toml",
+  "tools/platform-verify.ts",
+];
+const requiredFiles = [
+  ...canonicalFiles,
+  ".gitignore",
+  ".platform/config.json",
+  "package.json",
+  "bun.lock",
+  "tsconfig.json",
+  "tools/build.ts",
+  "tools/format.ts",
+  "tools/lint.ts",
+];
+const ignoredWalkPaths = new Set([".git", "_platform_policy"]);
 const forbiddenSyftConfigs = new Set([
   ".syft",
   ".syft.yaml",
@@ -25,9 +40,11 @@ const forbiddenSyftConfigs = new Set([
   ".syft/config.yml",
 ]);
 
-const [appArg, templateArg] = Bun.argv.slice(2);
-if (!appArg || !templateArg) {
-  throw new Error("Usage: enforce-app-contract.ts <application-root> <platform-template-root>");
+const [appArg, templateArg, trustedRepositoryId] = Bun.argv.slice(2);
+if (!appArg || !templateArg || !trustedRepositoryId || !/^[1-9][0-9]*$/.test(trustedRepositoryId)) {
+  throw new Error(
+    "Usage: enforce-app-contract.ts <application-root> <platform-template-root> <trusted-repository-id>",
+  );
 }
 
 const appRoot = await realpath(resolve(appArg));
@@ -51,30 +68,64 @@ const packageJson = JSON.parse(await readFile(join(appRoot, "package.json"), "ut
   packageManager?: unknown;
   scripts?: Record<string, unknown>;
   devDependencies?: Record<string, unknown>;
+  patchedDependencies?: unknown;
 };
+const platformConfig = JSON.parse(
+  await readFile(join(appRoot, ".platform/config.json"), "utf8"),
+) as { githubRepositoryId?: unknown };
+if (platformConfig.githubRepositoryId !== trustedRepositoryId) {
+  throw new Error(
+    ".platform/config.json githubRepositoryId must match the immutable GitHub event repository ID.",
+  );
+}
 if (packageJson.packageManager !== "bun@1.4.0") {
   throw new Error("package.json packageManager must be bun@1.4.0.");
 }
 if (packageJson.devDependencies?.[scanner] !== "1.1.2") {
   throw new Error("package.json must pin the reviewed Socket scanner version.");
 }
-if (
-  typeof packageJson.scripts?.["verify:ci"] !== "string" ||
-  packageJson.scripts["verify:ci"].length === 0
-) {
-  throw new Error("package.json must define a non-empty verify:ci script.");
+if (packageJson.devDependencies?.typescript !== "7.0.2") {
+  throw new Error("package.json must pin the reviewed TypeScript version.");
+}
+if (Object.hasOwn(packageJson, "patchedDependencies")) {
+  throw new Error("package.json patchedDependencies are forbidden for trusted CI dependencies.");
+}
+const scriptFailures = validateAppScripts(packageJson.scripts, trustedRepositoryId);
+if (scriptFailures.length > 0) {
+  throw new Error(scriptFailures.join("\n"));
+}
+
+const gitignoreFailures = validateTerraformGitignore(
+  await readFile(join(appRoot, ".gitignore"), "utf8"),
+);
+if (gitignoreFailures.length > 0) {
+  throw new Error(gitignoreFailures.join("\n"));
 }
 
 const lock = Bun.JSONC.parse(await readFile(join(appRoot, "bun.lock"), "utf8")) as {
   packages?: Record<string, unknown>;
+  patchedDependencies?: unknown;
 };
+const reviewedLock = Bun.JSONC.parse(
+  await readFile(join(templateRoot, "bun.lock"), "utf8"),
+) as { packages?: Record<string, unknown> };
 if (JSON.stringify(lock.packages?.[scanner]) !== JSON.stringify(expectedScannerLock)) {
   throw new Error("bun.lock does not resolve the reviewed Socket scanner integrity.");
+}
+if (Object.hasOwn(lock, "patchedDependencies")) {
+  throw new Error("bun.lock patchedDependencies are forbidden for trusted CI dependencies.");
+}
+const typeScriptLockFailures = validateTypeScriptLock(lock.packages, reviewedLock.packages);
+if (typeScriptLockFailures.length > 0) {
+  throw new Error(typeScriptLockFailures.join("\n"));
 }
 
 for await (const file of walk(appRoot)) {
   const name = file.split("/").at(-1) ?? "";
   const relativeFile = relative(appRoot, file).replaceAll("\\", "/");
+  if (isForbiddenTerraformArtifact(relativeFile)) {
+    throw new Error(`Forbidden Terraform state/config artifact: ${relativeFile}`);
+  }
   if (
     name === ".npmrc" ||
     name === "npmrc" ||
@@ -98,11 +149,14 @@ async function requireRegularFile(path: string, label: string): Promise<void> {
 async function* walk(directory: string): AsyncGenerator<string> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
+    const relativePath = relative(appRoot, path).replaceAll("\\", "/");
     if (entry.name === "node_modules") {
       throw new Error(`Committed node_modules content is forbidden: ${relative(appRoot, path)}`);
     }
+    if (isForbiddenTerraformArtifact(relativePath)) {
+      throw new Error(`Forbidden Terraform state/config artifact: ${relativePath}`);
+    }
     if (entry.isSymbolicLink()) {
-      const relativePath = relative(appRoot, path).replaceAll("\\", "/");
       if (
         entry.name === ".npmrc" ||
         entry.name === "npmrc" ||
@@ -117,7 +171,7 @@ async function* walk(directory: string): AsyncGenerator<string> {
       continue;
     }
     if (entry.isDirectory()) {
-      if (!ignoredWalkDirectories.has(entry.name)) {
+      if (!ignoredWalkPaths.has(relativePath)) {
         yield* walk(path);
       }
     } else if (entry.isFile()) {

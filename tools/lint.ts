@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { validateTypeScriptLock } from "./ci/app-contract";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -440,6 +441,43 @@ rejectContains(
   "workflow_dispatch:",
   "Platform dependency credentials must never be reachable from an off-main manual dispatch.",
 );
+for (const boundary of [
+  "PLATFORM_BUN=",
+  "Reject dependency patching before any Socket credential exists",
+  'Object.hasOwn(packageJson, "patchedDependencies")',
+  'Object.hasOwn(lock, "patchedDependencies")',
+  'tools/ci/verify-platform.ts "$GITHUB_WORKSPACE"',
+]) {
+  requireContains(
+    ".github/workflows/platform.yml",
+    platformDependencyWorkflow,
+    boundary,
+    `Platform verification must bypass dependency-installed executable shims: ${boundary}`,
+  );
+}
+const trustedPlatformRunner = await read("tools/ci/verify-platform.ts");
+for (const boundary of [
+  'process.platform !== "linux"',
+  "`/proc/${process.pid}/exe`",
+  "node_modules/.bin/bun",
+  '"typecheck"',
+  "tools/format.ts",
+  "tools/lint.ts",
+  '"test"',
+]) {
+  requireContains(
+    "tools/ci/verify-platform.ts",
+    trustedPlatformRunner,
+    boundary,
+    `Platform verification runner is missing immutable execution boundary: ${boundary}`,
+  );
+}
+rejectContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "run: bun run verify",
+  "Platform CI must not execute dependency-shadowable package-script orchestration.",
+);
 for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-preview.yml", "deploy-prod.yml"]) {
   const path = `.github/workflows/${workflow}`;
   const text = await read(path);
@@ -447,6 +485,12 @@ for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-previe
   requireContains(path, text, "ref: ${{ job.workflow_sha }}", "Policy source must use the exact resolved reusable workflow SHA.");
   requireContains(path, text, "path: _platform_policy", "Policy source must be isolated from the caller checkout.");
   requireContains(path, text, "enforce-app-contract.ts", "Workflow must run the immutable platform contract checker.");
+  requireContains(
+    path,
+    text,
+    '"${{ github.event.repository.id }}"',
+    "Immutable app policy must bind to the caller repository's numeric GitHub ID.",
+  );
   requireContains(
     path,
     text,
@@ -463,6 +507,14 @@ for (const boundary of [
   "bun.lock does not resolve the reviewed Socket scanner integrity",
   "must exactly match the immutable platform template",
   'name !== ".env.example"',
+  "validateAppScripts",
+  "validateTerraformGitignore",
+  "isForbiddenTerraformArtifact",
+  "trusted-repository-id",
+  "validateTypeScriptLock",
+  "package.json patchedDependencies are forbidden",
+  "bun.lock patchedDependencies are forbidden",
+  "tools/platform-verify.ts",
 ]) {
   requireContains(
     "tools/ci/enforce-app-contract.ts",
@@ -471,6 +523,133 @@ for (const boundary of [
     `Immutable app policy is missing boundary: ${boundary}`,
   );
 }
+const sharedAppContract = await read("tools/ci/app-contract.ts");
+for (const boundary of [
+  "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci",
+  "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
+  "package.json script ${name} must exactly match the immutable platform command",
+  "**/.terraform/",
+  "*.tfstate.*",
+  "*.tfplan",
+  "*.tfvars.json",
+  ".terraformrc",
+  "terraformGitignoreSafetyBlock",
+  "# BEGIN platform-managed Terraform safety rules",
+  "@typescript/typescript-",
+  "bun.lock does not resolve the reviewed TypeScript integrity for ${name}",
+]) {
+  requireContains(
+    "tools/ci/app-contract.ts",
+    sharedAppContract,
+    boundary,
+    `Shared app contract is missing required boundary: ${boundary}`,
+  );
+}
+const trustedVerificationRunner = await read("templates/app/tools/platform-verify.ts");
+for (const boundary of [
+  "process.execPath",
+  'process.platform !== "linux"',
+  "`/proc/${process.pid}/exe`",
+  "node_modules/.bin/bun",
+  "node_modules/typescript/bin/tsc",
+  'verificationEnvironment.PATH = [dirname(bunExecutable), "/usr/local/bin", "/usr/bin", "/bin"]',
+  '"typecheck"',
+  "tools/format.ts",
+  "tools/lint.ts",
+  "tools/build.ts",
+]) {
+  requireContains(
+    "templates/app/tools/platform-verify.ts",
+    trustedVerificationRunner,
+    boundary,
+    `Trusted application verification runner is missing boundary: ${boundary}`,
+  );
+}
+const applicationWorkflow = await read(".github/workflows/application.yml");
+for (const boundary of ["PLATFORM_BUN=", "templates/app/tools/platform-verify.ts"]) {
+  requireContains(
+    ".github/workflows/application.yml",
+    applicationWorkflow,
+    boundary,
+    `Application verification must use the checksum-pinned absolute Bun runner: ${boundary}`,
+  );
+}
+rejectContains(
+  ".github/workflows/application.yml",
+  applicationWorkflow,
+  "run verify:ci",
+  "Application CI must not execute dependency-shadowable package-script orchestration.",
+);
+const templateDockerfile = await read("templates/app/Dockerfile");
+for (const boundary of [
+  "COPY tools ./tools",
+  "/usr/local/bin/bun --no-env-file --no-orphans",
+  "/app/tools/platform-verify.ts /app",
+]) {
+  requireContains(
+    "templates/app/Dockerfile",
+    templateDockerfile,
+    boundary,
+    `Container verification must bypass dependency-installed executable shims: ${boundary}`,
+  );
+}
+rejectContains(
+  "templates/app/Dockerfile",
+  templateDockerfile,
+  "run verify:ci",
+  "The container build must not execute dependency-shadowable package-script orchestration.",
+);
+const templateGitignore = await read("templates/app/.gitignore");
+for (const boundary of [
+  "**/.terraform/",
+  "*.tfstate",
+  "*.tfstate.*",
+  "*.tfplan",
+  "*.plan",
+  "*.tflock",
+  "*.tfvars",
+  "*.auto.tfvars",
+  ".terraformrc",
+  "terraform.rc",
+]) {
+  requireContains(
+    "templates/app/.gitignore",
+    templateGitignore,
+    boundary,
+    `Scaffold must ignore Terraform state/config artifact: ${boundary}`,
+  );
+}
+const templateBootstrapOutputs = await read("templates/app/infra/terraform/bootstrap/outputs.tf");
+rejectContains(
+  "templates/app/infra/terraform/bootstrap/outputs.tf",
+  templateBootstrapOutputs,
+  "Terraform apply workflow",
+  "The routine Terraform identity is metadata-only and must never be described as an apply identity.",
+);
+const runsettaAppleWorkflow = await read("templates/additional-workflows/runsetta/apple.yml");
+checkActionPins(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  false,
+);
+requireContains(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "persist-credentials: false",
+  "Runsetta's untrusted Swift build must not receive the checkout credential.",
+);
+rejectContains(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "secrets.",
+  "Runsetta's additional pull-request workflow must remain credential-free.",
+);
+requireContains(
+  "templates/app/infra/terraform/bootstrap/outputs.tf",
+  templateBootstrapOutputs,
+  "Metadata-only service account used by the immutable Terraform convergence workflow.",
+  "The scaffold must document the routine Terraform identity's metadata-only boundary.",
+);
 const trustedCiBunfig = await read("tools/ci/bunfig.toml");
 requireContains(
   "tools/ci/bunfig.toml",
@@ -704,6 +883,25 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
 const dockerfile = await read("templates/app/Dockerfile");
 const bunfig = await read("templates/app/bunfig.toml");
 const templateLock = await read("templates/app/bun.lock");
+const platformLock = await read("bun.lock");
+const platformPackage = JSON.parse(await read("package.json")) as Record<string, unknown>;
+const parsedTemplateLock = Bun.JSONC.parse(templateLock) as { packages?: Record<string, unknown> };
+const parsedPlatformLock = Bun.JSONC.parse(platformLock) as {
+  packages?: Record<string, unknown>;
+  patchedDependencies?: unknown;
+};
+if (Object.hasOwn(platformPackage, "patchedDependencies")) {
+  failures.push("package.json: patchedDependencies are forbidden for trusted CI dependencies.");
+}
+if (Object.hasOwn(parsedPlatformLock, "patchedDependencies")) {
+  failures.push("bun.lock: patchedDependencies are forbidden for trusted CI dependencies.");
+}
+for (const failure of validateTypeScriptLock(
+  parsedPlatformLock.packages,
+  parsedTemplateLock.packages,
+)) {
+  failures.push(`bun.lock: ${failure}`);
+}
 rejectContains(
   "templates/app/bunfig.toml",
   bunfig,
@@ -723,6 +921,12 @@ requireContains(
   templateLock,
   '"@socketsecurity/bun-security-scanner@1.1.2", "", {}, "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA=="',
   "The scaffold lockfile must retain the reviewed Socket scanner integrity.",
+);
+requireContains(
+  "templates/app/bun.lock",
+  templateLock,
+  '"@typescript/typescript-linux-x64@7.0.2", "", { "os": "linux", "cpu": "x64" }, "sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A=="',
+  "The scaffold lockfile must retain the reviewed Linux TypeScript compiler integrity.",
 );
 rejectContains("templates/app/Dockerfile", dockerfile, "curl -fsSL https://bun.com/install", "Bun installers must not execute curl-piped shell code.");
 requireContains(
