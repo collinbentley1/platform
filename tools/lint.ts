@@ -185,10 +185,10 @@ try {
     !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.url !== "string" ||
     manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-08-20T00:15:42Z_1787206628.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "39324b8b1e4ec165a873541afb91a9c1f06b090354d5461f2e7da15569dbd0fd" ||
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-08-20T16:14:23Z_1787293044.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "dca26dd65bd0c4ba626af404a2e60d983d9302863eabdd8a7e7d42008fb4da3c" ||
     manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-08-20T06:17:08Z"
+    manifest.built !== "2026-08-21T06:17:24Z"
   ) {
     failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
   }
