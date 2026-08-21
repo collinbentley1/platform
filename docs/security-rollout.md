@@ -72,7 +72,11 @@ order through the protected pipeline:
    block. Confirm the new production-state serial no longer contains any domain
    mapping and the protected exposure state contains all of them. Stop and restore
    the reviewed recovery generations if either state is incomplete; never allow a
-   destroy/recreate migration.
+   destroy/recreate migration. The production root temporarily retains the inert
+   `google.no_attribution` provider alias because the historical state instances
+   are bound to that address; no configured production resource uses the alias.
+   Remove it in a later reviewed platform release only after all four production
+   states prove that every domain-mapping address is gone.
 
 For a fresh app, the protected pipeline applies the production root first to
 create the service, then applies the exposure root in its protected prefix. No

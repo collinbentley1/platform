@@ -14,8 +14,20 @@ provider "google" {
   region  = "us-east4"
 }
 
+provider "google" {
+  alias                           = "no_attribution"
+  project                         = "example"
+  region                          = "us-east4"
+  add_terraform_attribution_label = false
+}
+
 module "site" {
   source = "../../modules/cloud-run-service"
+
+  providers = {
+    google                = google
+    google.no_attribution = google.no_attribution
+  }
 
   app                                     = "example"
   project_id                              = "example"

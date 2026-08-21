@@ -603,6 +603,27 @@ describe("platform scaffold and doctor", () => {
     expect(deployment).toContain("runtime_secret_accessor_ids       = []");
     expect(deployment).toContain('RUNSETTA_OFFLINE   = "1"');
   });
+
+  test("production state can relinquish legacy domain mappings without provider loss", async () => {
+    const moduleMain = await readFile(
+      join(repoRoot, "terraform/modules/cloud-run-service/main.tf"),
+      "utf8",
+    );
+    const moduleVersions = await readFile(
+      join(repoRoot, "terraform/modules/cloud-run-service/versions.tf"),
+      "utf8",
+    );
+    const deployment = await readFile(
+      join(repoRoot, "terraform/deployments/prod/main.tf"),
+      "utf8",
+    );
+
+    expect(moduleVersions).toContain("configuration_aliases = [google.no_attribution]");
+    expect(moduleMain).toContain("from = google_cloud_run_domain_mapping.site");
+    expect(moduleMain).not.toContain("provider = google.no_attribution");
+    expect(deployment).toContain('alias                           = "no_attribution"');
+    expect(deployment).toContain("google.no_attribution = google.no_attribution");
+  });
 });
 
 async function scaffold(name: string): Promise<string> {

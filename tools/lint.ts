@@ -733,11 +733,17 @@ requireContains("README.md", readme, "0.5.0", "README should document the curren
 const moduleMain = await read("terraform/modules/cloud-run-service/main.tf");
 const moduleVariables = await read("terraform/modules/cloud-run-service/variables.tf");
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
-rejectContains(
+requireContains(
   "terraform/modules/cloud-run-service/versions.tf",
   moduleVersions,
-  "google.no_attribution",
-  "Routine production Terraform must not retain the protected domain-mapping provider alias.",
+  "configuration_aliases = [google.no_attribution]",
+  "The no-destroy domain migration must retain its historical provider address until state is relinquished.",
+);
+rejectContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  moduleMain,
+  "provider = google.no_attribution",
+  "Routine production resources must not use the protected domain-mapping provider alias.",
 );
 requireContains(
   "terraform/modules/cloud-run-service/main.tf",
@@ -770,6 +776,17 @@ requireContains(
   "Runtime accessor IDs must be validated as a subset of retained secret containers.",
 );
 const productionDeployment = await read("terraform/deployments/prod/main.tf");
+for (const needle of [
+  'alias                           = "no_attribution"',
+  "google.no_attribution = google.no_attribution",
+]) {
+  requireContains(
+    "terraform/deployments/prod/main.tf",
+    productionDeployment,
+    needle,
+    "The trusted production root must preserve the historical domain-mapping provider address during migration.",
+  );
+}
 for (const needle of [
   "runtime_secret_accessor_ids       = []",
   'RUNSETTA_OFFLINE   = "1"',

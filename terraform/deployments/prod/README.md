@@ -11,4 +11,7 @@ The workflow supplies the corresponding fixed GCS backend bucket and prefix. Cha
 an app's cloud resources therefore require review and release in `platform` before any
 consumer pipeline can redirect them. Cloud Run domain mappings are deliberately
 owned by the separately protected `terraform/deployments/exposure` root because
-their legacy API has no no-data IAM viewer permission.
+their legacy API has no no-data IAM viewer permission. The otherwise-unused
+`google.no_attribution` alias remains only so Terraform can recognize and
+relinquish historical state instances through the no-destroy `removed` block;
+no configured resource in this root uses that provider alias.

@@ -131,8 +131,23 @@ provider "google" {
   region  = local.deployment.region
 }
 
+provider "google" {
+  alias                           = "no_attribution"
+  project                         = local.deployment.project_id
+  region                          = local.deployment.region
+  add_terraform_attribution_label = false
+}
+
 module "site" {
   source = "../../modules/cloud-run-service"
+
+  # Existing domain mappings were created with this provider address. Keep the
+  # inert alias available until the no-destroy removed block has relinquished
+  # every legacy state instance to the protected exposure root.
+  providers = {
+    google                = google
+    google.no_attribution = google.no_attribution
+  }
 
   app                                     = local.deployment.app
   project_id                              = local.deployment.project_id

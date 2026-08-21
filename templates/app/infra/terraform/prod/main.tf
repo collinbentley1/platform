@@ -1,6 +1,11 @@
 module "site" {
   source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=__PLATFORM_SHA__"
 
+  providers = {
+    google                = google
+    google.no_attribution = google.no_attribution
+  }
+
   app                                     = "__APP_NAME__"
   project_id                              = var.project_id
   region                                  = var.region
