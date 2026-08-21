@@ -2,186 +2,919 @@ name: Deploy preview
 
 on:
   workflow_call:
-    inputs:
-      project-id:
-        description: Google Cloud project ID.
-        required: true
-        type: string
-      region:
-        description: Google Cloud region.
-        required: true
-        type: string
-      artifact-registry-repository:
-        description: Artifact Registry Docker repository ID.
-        required: true
-        type: string
-      service-name:
-        description: Base Cloud Run service name.
-        required: true
-        type: string
-      runtime-service-account:
-        description: Runtime service account email.
-        required: true
-        type: string
-      workload-identity-provider:
-        description: GitHub Workload Identity Provider resource name.
-        required: true
-        type: string
-      deploy-service-account:
-        description: Preview deploy service account email.
-        required: true
-        type: string
-      runtime-config-script:
-        description: Optional script that writes Cloud Run deploy flags to GITHUB_OUTPUT.
-        required: false
-        type: string
-        default: ""
-    secrets:
-      DHI_USERNAME:
-        required: true
-      DHI_ACCESS_TOKEN:
-        required: true
-      MAPBOX_ACCESS_TOKEN:
-        required: false
 
 permissions: {}
 
-concurrency:
-  group: preview-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
-  deploy:
-    name: Deploy preview
+  build:
+    name: Build untrusted preview
     runs-on: ubuntu-24.04
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    # DHI credentials live only in this owner-approved environment. This job
+    # intentionally cannot request an OIDC token or reach Google Cloud.
+    environment: preview-build
     permissions:
       contents: read
-      id-token: write
-      pull-requests: write
-    env:
-      PROJECT_ID: ${{ inputs.project-id }}
-      REGION: ${{ inputs.region }}
-      ARTIFACT_REGISTRY_REPOSITORY: ${{ inputs.artifact-registry-repository }}
-      SERVICE_NAME: ${{ inputs.service-name }}
-      RUNTIME_SERVICE_ACCOUNT: ${{ inputs.runtime-service-account }}
-      PLATFORM_DEPLOY_ENVIRONMENT: preview
-      PLATFORM_PREVIEW_NUMBER: ${{ github.event.pull_request.number }}
+      packages: write # Publish only the digest-addressed isolated GHCR staging image.
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      sbom-artifact-id: ${{ steps.upload_sbom.outputs.artifact-id }}
+      sbom-content-digest: ${{ steps.sbom_digest.outputs.digest }}
 
     steps:
-      - name: Checkout
+      - name: Resolve fixed build metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          repository="${GITHUB_REPOSITORY#*/}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] || [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "Unexpected repository identity." >&2
+            exit 1
+          fi
+          {
+            echo "local_image=platform-preview:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "staging_image=ghcr.io/${owner}/platform-${repository}-preview-staging:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pull request
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Detect deployable app
-        id: app
-        run: |
-          set -euo pipefail
-          if [ -f Dockerfile ]; then
-            echo "deployable=true" >> "$GITHUB_OUTPUT"
-            echo "image=${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY_REPOSITORY}/${SERVICE_NAME}:pr-${{ github.event.pull_request.number }}-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-            echo "preview_service=${SERVICE_NAME}-pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "deployable=false" >> "$GITHUB_OUTPUT"
-            echo "No root-level Dockerfile exists yet; preview deployment skipped." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Authenticate to Google Cloud
-        if: steps.app.outputs.deployable == 'true'
-        id: auth
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
-          project_id: ${{ env.PROJECT_ID }}
-          workload_identity_provider: ${{ inputs.workload-identity-provider }}
-          service_account: ${{ inputs.deploy-service-account }}
-          token_format: access_token
+          persist-credentials: false
 
-      - name: Setup Docker Buildx
-        if: steps.app.outputs.deployable == 'true'
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Login to Artifact Registry
-        if: steps.app.outputs.deployable == 'true'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ${{ env.REGION }}-docker.pkg.dev
-          username: oauth2accesstoken
-          password: ${{ steps.auth.outputs.access_token }}
-
-      - name: Setup gcloud
-        if: steps.app.outputs.deployable == 'true'
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      - name: Resolve runtime configuration
-        if: steps.app.outputs.deployable == 'true'
-        id: runtime
+      - name: Resolve the exact reusable-workflow source
         env:
-          MAPBOX_ACCESS_TOKEN: ${{ secrets.MAPBOX_ACCESS_TOKEN }}
-          RUNTIME_CONFIG_SCRIPT: ${{ inputs.runtime-config-script }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          if [ -n "$RUNTIME_CONFIG_SCRIPT" ] && [ -f "$RUNTIME_CONFIG_SCRIPT" ]; then
-            chmod +x "$RUNTIME_CONFIG_SCRIPT"
-            "$RUNTIME_CONFIG_SCRIPT"
-          else
-            echo "flags=" >> "$GITHUB_OUTPUT"
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
+            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+            exit 1
           fi
 
-      - name: Detect existing image
-        if: steps.app.outputs.deployable == 'true'
-        id: image
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "${{ steps.app.outputs.image }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing existing immutable image: ${{ steps.app.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0 for structural policy checks
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+              -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+          )
+
+      - name: Enforce the trusted application and container contract
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans ./enforce-app-contract.ts \
+              "$GITHUB_WORKSPACE" \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app"
+          )
+
+      - name: Install checksum-pinned Docker Buildx and create pinned BuildKit
+        id: buildx
+        env:
+          BUILDX_SHA256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+        run: |
+          set -euo pipefail
+          docker_config="$RUNNER_TEMP/platform-docker"
+          plugin="$docker_config/cli-plugins/docker-buildx"
+          builder="platform-builder"
+          mkdir -p "$(dirname "$plugin")"
+          curl --fail --show-error --silent --location \
+            --output "$plugin" \
+            https://github.com/docker/buildx/releases/download/v0.36.1/buildx-v0.36.1.linux-amd64
+          echo "${BUILDX_SHA256}  ${plugin}" | sha256sum --check --strict
+          chmod 0755 "$plugin"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+          DOCKER_CONFIG="$docker_config" docker buildx version | grep -F 'v0.36.1'
+          DOCKER_CONFIG="$docker_config" docker buildx create \
+            --name "$builder" \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 \
+            --use
+          DOCKER_CONFIG="$docker_config" docker buildx inspect "$builder" --bootstrap
+          echo "name=$builder" >> "$GITHUB_OUTPUT"
 
       - name: Login to Docker Hardened Images
-        if: steps.app.outputs.deployable == 'true' && steps.image.outputs.exists != 'true'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: dhi.io
           username: ${{ secrets.DHI_USERNAME }}
           password: ${{ secrets.DHI_ACCESS_TOKEN }}
 
-      - name: Build and push image
-        if: steps.app.outputs.deployable == 'true' && steps.image.outputs.exists != 'true'
+      - name: Build untrusted preview image without cloud credentials
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: Dockerfile
-          push: true
-          tags: ${{ steps.app.outputs.image }}
+          load: true
+          push: false
+          tags: ${{ steps.metadata.outputs.local_image }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          secrets: |
+            socket_api_token=${{ secrets.SOCKET_API_TOKEN }}
 
-      - name: Deploy preview to Cloud Run
-        if: steps.app.outputs.deployable == 'true'
-        id: deploy
-        uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3
-        with:
-          service: ${{ steps.app.outputs.preview_service }}
-          image: ${{ steps.app.outputs.image }}
-          region: ${{ env.REGION }}
-          skip_default_labels: true
-          flags: >-
-            --no-invoker-iam-check
-            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
-            --ingress=all
-            --min-instances=0
-            --max-instances=2
-            --memory=512Mi
-            --cpu=1
-            --concurrency=80
-            --timeout=300s
-            ${{ steps.runtime.outputs.flags }}
-            --labels=managed-by=github-actions,environment=preview,pr=${{ github.event.pull_request.number }}
+      - name: Remove Docker Hardened Images credentials
+        run: docker logout dhi.io
 
-      - name: Comment preview URL
-        if: steps.app.outputs.deployable == 'true'
+      - name: Destroy BuildKit before any publish credential exists
         env:
-          GH_TOKEN: ${{ github.token }}
-          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          BUILDER_NAME: ${{ steps.buildx.outputs.name }}
         run: |
           set -euo pipefail
-          gh pr comment "${{ github.event.pull_request.number }}" --body "Preview deployed: ${PREVIEW_URL}"
+          test -n "$BUILDER_NAME"
+          docker buildx rm "$BUILDER_NAME"
+          if docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
+            echo "BuildKit builder still exists after removal." >&2
+            exit 1
+          fi
+
+      - name: Install checksum-pinned Syft and Grype
+        env:
+          GRYPE_SHA256: 38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26
+          SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
+        run: |
+          set -euo pipefail
+          grype_archive="$RUNNER_TEMP/grype.tgz"
+          syft_archive="$RUNNER_TEMP/syft.tgz"
+          tools="$RUNNER_TEMP/platform-tools"
+          mkdir -p "$tools" platform-build
+          curl --fail --show-error --silent --location \
+            --output "$syft_archive" \
+            https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
+          echo "${SYFT_SHA256}  ${syft_archive}" | sha256sum --check --strict
+          tar -xzf "$syft_archive" -C "$tools" syft
+          curl --fail --show-error --silent --location \
+            --output "$grype_archive" \
+            https://github.com/anchore/grype/releases/download/v0.117.0/grype_0.117.0_linux_amd64.tar.gz
+          echo "${GRYPE_SHA256}  ${grype_archive}" | sha256sum --check --strict
+          tar -xzf "$grype_archive" -C "$tools" grype
+          "$tools/syft" version
+          "$tools/grype" version -o json | jq -e \
+            '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"'
+
+      - name: Generate the preview SBOM before registry login
+        env:
+          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
+        run: |
+          set -euo pipefail
+          config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/syft.yaml"
+          export DOCKER_CONFIG="$RUNNER_TEMP/syft-empty-docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          unset SYFT_CONFIG SYFT_REGISTRY_AUTH_USERNAME SYFT_REGISTRY_AUTH_PASSWORD SYFT_REGISTRY_AUTH_TOKEN
+          "$RUNNER_TEMP/platform-tools/syft" --config "$config" "docker:${LOCAL_IMAGE}" \
+            --output spdx-json=platform-build/sbom.spdx.json
+          test -s platform-build/sbom.spdx.json
+
+      - name: Gate the final runtime image against the reviewed vulnerability database
+        env:
+          DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}
+          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
+        run: |
+          set -euo pipefail
+          config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/grype.yaml"
+          grype="$RUNNER_TEMP/platform-tools/grype"
+          report="platform-build/grype.json"
+          export DOCKER_CONFIG="$RUNNER_TEMP/grype-empty-docker-config"
+          export GRYPE_DB_CACHE_DIR="$RUNNER_TEMP/platform-grype-db"
+          mkdir -p "$DOCKER_CONFIG" "$GRYPE_DB_CACHE_DIR"
+          unset GRYPE_CONFIG GRYPE_REGISTRY_AUTH_USERNAME GRYPE_REGISTRY_AUTH_PASSWORD GRYPE_REGISTRY_AUTH_TOKEN
+          db_url="$(jq -er '
+            select((keys | sort) == ["built", "schemaVersion", "sha256", "url"])
+            |
+            .url as $url
+            | .sha256 as $sha
+            | select($sha | test("^[0-9a-f]{64}$"))
+            | select($url | test(("^https://grype\\.anchore\\.io/databases/v6/vulnerability-db_v6\\.[0-9]+\\.[0-9]+_[0-9TZ:-]+_[0-9]+\\.tar\\.zst\\?checksum=sha256%3A" + $sha + "$")))
+            | $url
+          ' <<< "$DB_MANIFEST_JSON")"
+          expected_schema="$(jq -er '.schemaVersion | select(test("^v6\\.[0-9]+\\.[0-9]+$"))' <<< "$DB_MANIFEST_JSON")"
+          expected_built="$(jq -er '.built | fromdateiso8601 | todateiso8601' <<< "$DB_MANIFEST_JSON")"
+          "$grype" --config "$config" db import "$db_url"
+          "$grype" --config "$config" db status -o json | jq -e \
+            --arg from "$db_url" \
+            --arg schema "$expected_schema" \
+            --arg built "$expected_built" '
+            .valid == true and
+            .schemaVersion == $schema and
+            .built == $built and
+            .from == $from and
+            ((now - (.built | fromdateiso8601)) >= -3600) and
+            ((now - (.built | fromdateiso8601)) <= 172800)
+          '
+          "$grype" --config "$config" "docker:${LOCAL_IMAGE}" \
+            --scope squashed \
+            --output json > "$report"
+          test -s "$report"
+          blocking="$RUNNER_TEMP/grype-blocking.json"
+          jq -f "$GITHUB_WORKSPACE/_platform_policy/tools/ci/grype-blocking.jq" \
+            "$report" > "$blocking"
+          total_findings="$(jq -er '.matches | length' "$report")"
+          jq -c --argjson total "$total_findings" '
+            {
+              policy: "all Critical and High findings are blocked",
+              blockingCount: length,
+              blocking: .,
+              totalFindings: $total
+            }
+          ' "$blocking"
+          jq -e 'length == 0' "$blocking"
+
+      - name: Login to the isolated GitHub staging registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish the already-built staging image
+        id: publish
+        env:
+          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
+          STAGING_IMAGE: ${{ steps.metadata.outputs.staging_image }}
+        run: |
+          set -euo pipefail
+          docker image tag "$LOCAL_IMAGE" "$STAGING_IMAGE"
+          docker image push "$STAGING_IMAGE"
+          reference="$(docker image inspect --format='{{index .RepoDigests 0}}' "$STAGING_IMAGE")"
+          digest="${reference##*@}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Registry returned an invalid image digest." >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Remove GitHub staging credentials
+        run: docker logout ghcr.io
+
+      - name: Record the exact SBOM content digest
+        id: sbom_digest
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum platform-build/sbom.spdx.json | cut -d ' ' -f 1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the SBOM only
+        id: upload_sbom
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: preview-sbom-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: platform-build/sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  canary:
+    name: Prove exact preview WIF trust
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    environment: preview-cloud
+    permissions:
+      id-token: write # Exchange only for the no-role exact-WIF canary identity.
+
+    steps:
+      - name: Resolve trusted canary configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY_ID" in
+            1255553151) project_id="cdbentley"; project_number="882468538648" ;;
+            711292980) project_id="runsetta"; project_number="601124730704" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513" ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview deployment." >&2; exit 1 ;;
+          esac
+          {
+            echo "project_id=$project_id"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange a token through the no-role canary
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+  publish-canary:
+    name: Prove exact preview publisher WIF trust
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    environment: preview-publish
+    permissions:
+      id-token: write # Exchange only for the no-role exact-WIF canary identity.
+
+    steps:
+      - name: Resolve trusted publisher-canary configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY_ID" in
+            1255553151) project_id="cdbentley"; project_number="882468538648" ;;
+            711292980) project_id="runsetta"; project_number="601124730704" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513" ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview publication." >&2; exit 1 ;;
+          esac
+          {
+            echo "project_id=$project_id"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange a preview-publish token through the no-role canary
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+  publish:
+    name: Copy preview image into Artifact Registry
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - canary
+      - publish-canary
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      needs.canary.result == 'success' &&
+      needs.publish-canary.result == 'success'
+    environment: preview-publish
+    permissions:
+      contents: read
+      id-token: write # Exchange only for the exact-SHA preview image-copy identity.
+      packages: write # Read and delete the isolated GHCR staging image.
+    outputs:
+      image-digest: ${{ steps.copy.outputs.digest }}
+      image-name: ${{ steps.app.outputs.image_name }}
+
+    steps:
+      - name: Resolve trusted application configuration
+        id: app
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          case "$REPOSITORY_ID" in
+            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site-preview" ;;
+            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api-preview" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site-preview" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site-preview" ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview deployment." >&2; exit 1 ;;
+          esac
+          image_name="us-east4-docker.pkg.dev/${project_id}/${repository}/${service_name}"
+          source_repository="${GITHUB_REPOSITORY#*/}"
+          source_owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [[ ! "$source_repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] || [[ ! "$source_owner" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+            echo "Unexpected repository identity." >&2
+            exit 1
+          fi
+          {
+            echo "project_id=$project_id"
+            echo "image_name=$image_name"
+            echo "remote_image=${image_name}:pr-${PR_NUMBER}-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "staging_image=ghcr.io/${source_owner}/platform-${source_repository}-preview-staging:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "publisher_service_account=gha-preview-publish@${project_id}.iam.gserviceaccount.com"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned crane
+        env:
+          CRANE_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/crane.tgz"
+          tools="$RUNNER_TEMP/platform-tools"
+          mkdir -p "$tools"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz
+          echo "${CRANE_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$tools" crane
+          "$tools/crane" version
+
+      - name: Prove exact preview publisher workflow-SHA WIF trust
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate preview publisher
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.publisher_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Copy the opaque image by digest
+        id: copy
+        env:
+          AR_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GH_TOKEN: ${{ github.token }}
+          REMOTE_IMAGE: ${{ steps.app.outputs.remote_image }}
+          STAGING_DIGEST: ${{ needs.build.outputs.digest }}
+          STAGING_IMAGE: ${{ steps.app.outputs.staging_image }}
+        run: |
+          set -euo pipefail
+          crane="$RUNNER_TEMP/platform-tools/crane"
+          if [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid staging digest." >&2
+            exit 1
+          fi
+          printf '%s' "$GH_TOKEN" | "$crane" auth login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$AR_ACCESS_TOKEN" | "$crane" auth login us-east4-docker.pkg.dev --username oauth2accesstoken --password-stdin
+          "$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"
+          remote_digest="$("$crane" digest "$REMOTE_IMAGE")"
+          if [ "$remote_digest" != "$STAGING_DIGEST" ]; then
+            echo "Artifact Registry changed the image digest during copy." >&2
+            exit 1
+          fi
+          echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"
+          "$crane" delete "${STAGING_IMAGE}@${STAGING_DIGEST}"
+
+  attest:
+    name: Attest preview image and SBOM
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - publish
+    if: needs.publish.result == 'success'
+    environment: supply-chain
+    permissions:
+      actions: read # Download the SBOM artifact from this workflow run.
+      attestations: write # Publish provenance and SBOM attestations for the copied digest.
+      contents: read
+      id-token: write # Obtain the GitHub artifact-attestation signing identity.
+
+    steps:
+      - name: Download the generated SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.sbom-artifact-id }}
+          path: platform-build
+          digest-mismatch: error
+
+      - name: Verify the exact SBOM content digest
+        env:
+          EXPECTED_SBOM_DIGEST: ${{ needs.build.outputs.sbom-content-digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SBOM_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Uploader returned an invalid SBOM digest." >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$EXPECTED_SBOM_DIGEST" platform-build/sbom.spdx.json \
+            | sha256sum --check --strict
+
+      - name: Require a valid JSON SBOM
+        run: jq -e '(.spdxVersion | startswith("SPDX-")) and (.packages | type == "array")' platform-build/sbom.spdx.json >/dev/null
+
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ needs.publish.outputs.image-name }}
+          subject-digest: ${{ needs.publish.outputs.image-digest }}
+
+      - name: Attest the SPDX SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ needs.publish.outputs.image-name }}
+          subject-digest: ${{ needs.publish.outputs.image-digest }}
+          sbom-path: platform-build/sbom.spdx.json
+
+  deploy:
+    name: Deploy isolated preview
+    runs-on: ubuntu-24.04
+    needs:
+      - attest
+      - publish
+    if: >-
+      needs.attest.result == 'success' &&
+      needs.publish.result == 'success'
+    environment: preview-cloud
+    permissions:
+      contents: read
+      id-token: write # Exchange only for the service-scoped preview deploy identity.
+      pull-requests: write # Post the validated tagged preview URL on its pull request.
+    outputs:
+      deployed-revision: ${{ steps.deploy.outputs.revision }}
+      lifecycle-keep: ${{ steps.lifecycle.outputs.keep }}
+    concurrency:
+      group: preview-cloud-${{ github.event.repository.id }}
+      queue: max
+      cancel-in-progress: false
+
+    steps:
+      - name: Resolve trusted application configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY_ID" in
+            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley" ;;
+            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history" ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview deployment." >&2; exit 1 ;;
+          esac
+          {
+            echo "project_id=$project_id"
+            echo "region=us-east4"
+            echo "service_name=$service_name"
+            echo "preview_service=${service_name}-preview"
+            echo "runtime_service_account=cloud-run-preview@${project_id}.iam.gserviceaccount.com"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned Google Cloud CLI
+        env:
+          GCLOUD_SHA256: deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/google-cloud-cli-581.0.0-linux-x86_64.tar.gz"
+          sdk_root="$RUNNER_TEMP/google-cloud-cli"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            'https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-581.0.0-linux-x86_64.tar.gz?generation=1787059661116797'
+          echo "${GCLOUD_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$sdk_root"
+          tar -xzf "$archive" -C "$sdk_root" --strip-components=1
+          export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
+          export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+          export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
+          "$sdk_root/bin/gcloud" version --format=json \
+            | jq -e '.["Google Cloud SDK"] == "581.0.0"' >/dev/null
+          echo "$sdk_root/bin" >> "$GITHUB_PATH"
+          {
+            echo "CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true"
+            echo "CLOUDSDK_CORE_DISABLE_PROMPTS=1"
+            echo "CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Authenticate preview deployer
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.deploy_service_account }}
+
+      - name: Confirm the pull request is still deployable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r .state <<< "$pr_json")"
+          draft="$(jq -r .draft <<< "$pr_json")"
+          head_sha="$(jq -r .head.sha <<< "$pr_json")"
+          if [ "$state" != "open" ] || [ "$draft" != "false" ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "Refusing stale preview deploy: state=$state draft=$draft head=$head_sha" >&2
+            exit 1
+          fi
+
+      - name: Deploy preview to Cloud Run
+        id: deploy
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
+          IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
+          MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ steps.app.outputs.runtime_service_account }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
+             [[ ! "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+             [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] ||
+             [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pull request, commit, workflow-run, or image identity." >&2
+            exit 1
+          fi
+
+          run_tail="${GITHUB_RUN_ID: -6}"
+          revision_suffix="p${PR_NUMBER}-${EXPECTED_HEAD_SHA:0:12}-r${run_tail}a${GITHUB_RUN_ATTEMPT}"
+          expected_revision="${PREVIEW_SERVICE}-${revision_suffix}"
+          if [[ ! "$expected_revision" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || [ "${#expected_revision}" -gt 63 ]; then
+            echo "Derived Cloud Run revision identity is invalid: $expected_revision" >&2
+            exit 1
+          fi
+
+          umask 077
+          env_file="$RUNNER_TEMP/preview-env.json"
+          response="$RUNNER_TEMP/cloud-run-preview-deploy.json"
+          trap 'rm -f "$env_file" "${env_file}.next" "$response"' EXIT
+          jq -n --arg preview_number "$PR_NUMBER" \
+            '{PLATFORM_DEPLOY_ENVIRONMENT: "preview", PLATFORM_PREVIEW_NUMBER: $preview_number}' > "$env_file"
+          case "$REPOSITORY_ID" in
+            1255553151)
+              # cdbentley has no product-specific preview configuration.
+              ;;
+            711292980)
+              # Runsetta is intentionally offline. Preview code must never gain
+              # live OpenAI or Spotify configuration.
+              jq '. + {
+                RUNSETTA_OFFLINE: "1",
+                RUNSETTA_TTS_MODEL: "gpt-4o-mini-tts",
+                RUNSETTA_TTS_VOICE: "marin"
+              }' "$env_file" > "${env_file}.next"
+              mv "${env_file}.next" "$env_file"
+              ;;
+            1025243085)
+              # Medlock previews use an in-memory waitlist and have no data-plane
+              # identity or Firestore coordinates.
+              jq '. + {
+                ALLOWED_HOSTS: "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app",
+                ALLOWED_ORIGINS: "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app",
+                CANONICAL_HOST: "medlock.ai",
+                LEGACY_HOSTS: "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app",
+                MEDLOCK_VERSION: "0.2.0",
+                WAITLIST_BACKEND: "memory"
+              }' "$env_file" > "${env_file}.next"
+              mv "${env_file}.next" "$env_file"
+              ;;
+            280932482)
+              if [[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+                echo "Critical History requires a protected MAPBOX_PUBLIC_TOKEN in public pk format." >&2
+                exit 1
+              fi
+              jq --arg token "$MAPBOX_PUBLIC_TOKEN" \
+                '. + {MAPBOX_ACCESS_TOKEN: $token}' "$env_file" > "${env_file}.next"
+              mv "${env_file}.next" "$env_file"
+              ;;
+            *)
+              echo "Repository id $REPOSITORY_ID has no trusted preview runtime configuration." >&2
+              exit 1
+              ;;
+          esac
+
+          tag="pr-${PR_NUMBER}"
+          gcloud run deploy "$PREVIEW_SERVICE" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --revision-suffix="$revision_suffix" \
+            --tag="$tag" \
+            --no-traffic \
+            --env-vars-file="$env_file" \
+            --clear-secrets \
+            --service-account="$RUNTIME_SERVICE_ACCOUNT" \
+            --ingress=all \
+            --min-instances=0 \
+            --max-instances=2 \
+            --memory=512Mi \
+            --cpu=1 \
+            --concurrency=80 \
+            --timeout=300s \
+            --labels=managed-by=github-actions,environment=preview \
+            --quiet \
+            --format=json > "$response"
+          preview_record="$(jq -cer --arg tag "$tag" \
+            '[.status.traffic[]? | select(.tag == $tag) | {url, revisionName}] | if length == 1 then .[0] else error("expected exactly one tagged preview record") end' \
+            "$response")"
+          preview_url="$(jq -er '.url | select(type == "string" and startswith("https://"))' <<< "$preview_record")"
+          preview_revision="$(jq -er '.revisionName | select(type == "string")' <<< "$preview_record")"
+          if [ "$preview_revision" != "$expected_revision" ]; then
+            echo "Cloud Run tagged an unexpected revision: $preview_revision" >&2
+            exit 1
+          fi
+          echo "url=$preview_url" >> "$GITHUB_OUTPUT"
+          echo "revision=$preview_revision" >> "$GITHUB_OUTPUT"
+
+      - name: Recheck pull request state after deployment
+        id: lifecycle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          state="$(jq -r .state <<< "$pr_json")"
+          draft="$(jq -r .draft <<< "$pr_json")"
+          head_sha="$(jq -r .head.sha <<< "$pr_json")"
+          if [ "$state" = "open" ] && [ "$draft" = "false" ] && [ "$head_sha" = "$EXPECTED_HEAD_SHA" ]; then
+            echo "keep=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "keep=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment preview URL
+        if: steps.lifecycle.outputs.keep == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PREVIEW_REVISION: ${{ steps.deploy.outputs.revision }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --body "Preview for commit ${EXPECTED_HEAD_SHA} deployed at ${PREVIEW_URL} (revision ${PREVIEW_REVISION})."
+
+  invalidate:
+    name: Invalidate stale preview
+    runs-on: ubuntu-24.04
+    needs: deploy
+    if: >-
+      needs.deploy.result == 'success' &&
+      needs.deploy.outputs.lifecycle-keep != 'true'
+    environment: preview-operations
+    permissions:
+      id-token: write # Exchange only for the service-scoped preview traffic operator.
+    concurrency:
+      group: preview-cloud-${{ github.event.repository.id }}
+      queue: max
+      cancel-in-progress: false
+
+    steps:
+      - name: Resolve trusted application configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY_ID" in
+            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley" ;;
+            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history" ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview invalidation." >&2; exit 1 ;;
+          esac
+          {
+            echo "project_id=$project_id"
+            echo "region=us-east4"
+            echo "preview_service=${service_name}-preview"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "operator_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned Google Cloud CLI
+        env:
+          GCLOUD_SHA256: deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/google-cloud-cli-581.0.0-linux-x86_64.tar.gz"
+          sdk_root="$RUNNER_TEMP/google-cloud-cli"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            'https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-581.0.0-linux-x86_64.tar.gz?generation=1787059661116797'
+          echo "${GCLOUD_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$sdk_root"
+          tar -xzf "$archive" -C "$sdk_root" --strip-components=1
+          export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
+          export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+          export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
+          "$sdk_root/bin/gcloud" version --format=json \
+            | jq -e '.["Google Cloud SDK"] == "581.0.0"' >/dev/null
+          echo "$sdk_root/bin" >> "$GITHUB_PATH"
+          {
+            echo "CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true"
+            echo "CLOUDSDK_CORE_DISABLE_PROMPTS=1"
+            echo "CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Prove exact preview operator workflow-SHA WIF trust
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate preview traffic operator
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.operator_service_account }}
+
+      - name: Remove a tag deployed after its pull request changed
+        env:
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}
+          CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
+             [[ ! "$EXPECTED_REVISION" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+            echo "Refusing invalid preview tag or revision identity." >&2
+            exit 1
+          fi
+
+          tag="pr-${PR_NUMBER}"
+          service_json="$(mktemp)"
+          describe_error="$(mktemp)"
+          trap 'rm -f "$service_json" "$describe_error"' EXIT
+          if ! gcloud run services describe "$PREVIEW_SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format=json > "$service_json" 2> "$describe_error"; then
+            cat "$describe_error" >&2
+            exit 1
+          fi
+
+          current_revision="$(jq -er --arg tag "$tag" \
+            '[.status.traffic[]? | select(.tag == $tag) | .revisionName] | if length == 0 then "__absent__" elif length == 1 then .[0] else error("duplicate preview traffic tag") end' \
+            "$service_json")"
+          if [ "$current_revision" = "__absent__" ]; then
+            echo "Preview tag $tag is already absent; nothing to invalidate."
+            exit 0
+          fi
+          if [[ ! "$current_revision" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+            echo "Cloud Run returned an invalid current revision identity; preserving $tag." >&2
+            exit 1
+          fi
+          if [ "$current_revision" != "$EXPECTED_REVISION" ]; then
+            echo "Preserving $tag at $current_revision because this run deployed $EXPECTED_REVISION."
+            exit 0
+          fi
+
+          gcloud run services update-traffic "$PREVIEW_SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --remove-tags="$tag" \
+            --quiet

@@ -10,31 +10,1101 @@ const reusableWorkflows = [
   "deploy-prod.yml",
   "deploy-preview.yml",
   "cleanup-preview.yml",
+  "reconcile-previews.yml",
 ];
+const platformWorkflows = [...reusableWorkflows, "platform.yml"];
 
 for (const workflow of reusableWorkflows) {
   const path = `.github/workflows/${workflow}`;
   const text = await read(path);
   requireContains(path, text, "workflow_call:", "Reusable workflow must expose workflow_call.");
-  rejectContains(path, text, "@v", "Actions must be pinned to immutable SHAs, not mutable version tags.");
 }
 
+for (const workflow of platformWorkflows) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  checkActionPins(path, text, false);
+  rejectContains(
+    path,
+    text,
+    "${{ vars.",
+    "Security-sensitive workflow policy must never be controlled by a repository or environment variable.",
+  );
+}
+
+const deployProd = await read(".github/workflows/deploy-prod.yml");
+requireContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProd,
+  "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+  "Production deploys must fail closed outside a main-branch push.",
+);
+requireContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProd,
+  "deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6",
+  "Production deploys must verify the reviewed Cloud SDK archive.",
+);
+
+const deployPreview = await read(".github/workflows/deploy-preview.yml");
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  deployPreview,
+  "runtime-config-script",
+  "Preview workflows must not execute caller-controlled runtime scripts.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  sectionBetween(deployPreview, "  build:\n", "\n  canary:\n"),
+  "id-token: write",
+  "The untrusted preview build job must not receive an OIDC token.",
+);
+for (const needle of [
+  "Enforce the trusted application and container contract",
+  "environment: preview-build",
+  "environment: preview-cloud",
+  "environment: preview-publish",
+  "environment: supply-chain",
+  "48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778",
+  "image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8",
+  "builder: ${{ steps.buildx.outputs.name }}",
+  "needs.canary.result == 'success'",
+  "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
+  "preview-env.json",
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    needle,
+    `Preview workflow is missing required boundary: ${needle}`,
+  );
+}
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  deployPreview,
+  "deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6",
+  "Preview deploys must verify the reviewed Cloud SDK archive.",
+);
+for (const needle of [
+  "github.event.pull_request.user.type == 'User'",
+  "github.actor != 'dependabot[bot]'",
+  '--revision-suffix="$revision_suffix"',
+  "EXPECTED_HEAD_SHA",
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    needle,
+    `Preview identity/lifecycle policy is missing: ${needle}`,
+  );
+}
+
+const grypeConfig = await read("tools/ci/grype.yaml");
+requireContains("tools/ci/grype.yaml", grypeConfig, "auto-update: false", "Grype must not trust a mutable database listing.");
+requireContains("tools/ci/grype.yaml", grypeConfig, "max-allowed-built-age: 48h", "The reviewed vulnerability DB must expire closed.");
+const grypeBlockingPolicy = await read("tools/ci/grype-blocking.jq");
+requireContains(
+  "tools/ci/grype-blocking.jq",
+  grypeBlockingPolicy,
+  '.vulnerability.severity == "High"',
+  "Every High vulnerability must block publication even when no upstream fix exists.",
+);
+rejectContains(
+  "tools/ci/grype-blocking.jq",
+  grypeBlockingPolicy,
+  ".vulnerability.fix.state ==",
+  "Vulnerability blocking must not depend on upstream fix availability.",
+);
+try {
+  const manifest = JSON.parse(await read("tools/ci/grype-db.json")) as {
+    built?: unknown;
+    schemaVersion?: unknown;
+    sha256?: unknown;
+    url?: unknown;
+  };
+  if (
+    typeof manifest.sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
+    typeof manifest.url !== "string" ||
+    manifest.url !==
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-08-20T00:15:42Z_1787206628.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "39324b8b1e4ec165a873541afb91a9c1f06b090354d5461f2e7da15569dbd0fd" ||
+    manifest.schemaVersion !== "v6.1.9" ||
+    manifest.built !== "2026-08-20T06:17:08Z"
+  ) {
+    failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
+  }
+  const builtAt = typeof manifest.built === "string" ? Date.parse(manifest.built) : Number.NaN;
+  const databaseAgeMs = Date.now() - builtAt;
+  if (!Number.isFinite(builtAt) || databaseAgeMs < -60 * 60 * 1000 || databaseAgeMs > 48 * 60 * 60 * 1000) {
+    failures.push("tools/ci/grype-db.json: reviewed vulnerability DB must be between zero and 48 hours old.");
+  }
+} catch {
+  failures.push("tools/ci/grype-db.json: vulnerability DB manifest must be valid JSON.");
+}
+
+for (const [path, workflow] of [
+  [".github/workflows/deploy-prod.yml", deployProd],
+  [".github/workflows/deploy-preview.yml", deployPreview],
+] as const) {
+  requireContains(
+    path,
+    workflow,
+    "DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+    "Image scanning must use the owner-controlled build-environment vulnerability DB manifest secret.",
+  );
+  requireContains(path, workflow, '<<< "$DB_MANIFEST_JSON"', "The vulnerability DB manifest must be parsed as inert JSON.");
+  requireContains(path, workflow, 'db import "$db_url"', "Image scanning must import the exact checksum-qualified DB archive.");
+  rejectContains(path, workflow, "db update", "Image scanning must not trust mutable database metadata.");
+  requireContains(
+    path,
+    workflow,
+    "tools/ci/grype-blocking.jq",
+    "Image publication must use the reviewed High-and-Critical blocking policy.",
+  );
+  requireContains(path, workflow, "jq -e 'length == 0'", "Image publication must fail when the blocking policy finds a vulnerability.");
+  requireContains(
+    path,
+    workflow,
+    '--config "$config" "docker:${LOCAL_IMAGE}"',
+    "SBOM generation must use the trusted platform-owned Syft configuration.",
+  );
+  requireContains(
+    path,
+    workflow,
+    "syft-empty-docker-config",
+    "SBOM generation must not inherit registry credentials from the build.",
+  );
+  requireContains(
+    path,
+    workflow,
+    "socket_api_token=${{ secrets.SOCKET_API_TOKEN }}",
+    "Container dependency installs must receive only the owner-approved Socket policy credential as a BuildKit secret.",
+  );
+}
+const syftConfig = await read("tools/ci/syft.yaml");
+if (syftConfig.trim() !== "{}") {
+  failures.push("tools/ci/syft.yaml: trusted Syft policy must retain complete default cataloging without caller exclusions.");
+}
+
+const deployProduction = await read(".github/workflows/deploy-prod.yml");
+rejectContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "--set-secrets",
+  "Production workflows must not accept generic Secret Manager mappings.",
+);
+requireContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "--clear-secrets",
+  "The current immutable runtime map must authoritatively clear undeclared secret mappings.",
+);
+rejectContains(
+  ".github/workflows/deploy-prod.yml",
+  sectionBetween(deployProduction, "  build:\n", "\n  canary:\n"),
+  "id-token: write",
+  "The production image build job must not receive an OIDC token.",
+);
+for (const needle of [
+  "Enforce the trusted application and container contract",
+  "environment: production-build",
+  "environment: production",
+  "environment: production-publish",
+  "environment: supply-chain",
+  "48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778",
+  "image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8",
+  "builder: ${{ steps.buildx.outputs.name }}",
+  "needs.canary.result == 'success'",
+  "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
+  "production-env.json",
+]) {
+  requireContains(
+    ".github/workflows/deploy-prod.yml",
+    deployProduction,
+    needle,
+    `Production workflow is missing required boundary: ${needle}`,
+  );
+}
+for (const needle of [
+  "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
+  ". + {MAPBOX_ACCESS_TOKEN: $token}",
+  'RUNSETTA_OFFLINE: "1"',
+  'WAITLIST_BACKEND: "firestore"',
+  'FIRESTORE_PROJECT_ID: "medlock-1025243085"',
+]) {
+  requireContains(
+    ".github/workflows/deploy-prod.yml",
+    deployProduction,
+    needle,
+    `Immutable production runtime configuration is missing: ${needle}`,
+  );
+}
+for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP_PROD_SECRETS"]) {
+  rejectContains(
+    ".github/workflows/deploy-prod.yml",
+    deployProduction,
+    needle,
+    `Production runtime configuration must not accept generic caller-controlled ${needle}.`,
+  );
+}
+for (const needle of [
+  "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
+  ". + {MAPBOX_ACCESS_TOKEN: $token}",
+  'RUNSETTA_OFFLINE: "1"',
+  'WAITLIST_BACKEND: "memory"',
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    needle,
+    `Immutable preview runtime configuration is missing: ${needle}`,
+  );
+}
+for (const needle of ["EXTRA_ENV_VARS", "GCP_PREVIEW_ENV_VARS", "GCP_CLOUD_PREVIEW_ENABLED"]) {
+  rejectContains(
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    needle,
+    `Preview runtime/deployment policy must not accept repository-controlled ${needle}.`,
+  );
+}
+
+for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount, publisherCanary] of [
+  [
+    ".github/workflows/deploy-prod.yml",
+    deployProduction,
+    "environment: production-publish",
+    "gha-prod-publish@",
+    "gha-prod-deploy@",
+    "Prove exact production publisher workflow-SHA WIF trust",
+  ],
+  [
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    "environment: preview-publish",
+    "gha-preview-publish@",
+    "gha-preview-deploy@",
+    "Prove exact preview publisher workflow-SHA WIF trust",
+  ],
+] as const) {
+  const publish = sectionBetween(workflow, "  publish:\n", "\n  attest:\n");
+  const deploy =
+    path === ".github/workflows/deploy-preview.yml"
+      ? sectionBetween(workflow, "  deploy:\n", "\n  invalidate:\n")
+      : sectionFrom(workflow, "  deploy:\n");
+  requireContains(path, publish, publishEnvironment, "Image publication must use its distinct protected environment claim.");
+  requireContains(path, publish, publisherAccount, "Image publication must use the dedicated publisher service account.");
+  requireContains(path, publish, publisherCanary, "Each publisher claim must have an independent no-role canary exchange.");
+  rejectContains(path, publish, deployAccount, "An image publisher job must not authenticate the Cloud Run operator.");
+  requireContains(path, deploy, deployAccount, "Cloud Run mutation must use the dedicated deploy/operator service account.");
+  rejectContains(path, deploy, publisherAccount, "A Cloud Run deploy job must not authenticate the Artifact Registry publisher.");
+}
+const previewInvalidation = sectionFrom(deployPreview, "  invalidate:\n");
+const previewPublishCanary = sectionBetween(deployPreview, "  publish-canary:\n", "\n  publish:\n");
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  previewPublishCanary,
+  "environment: preview-publish",
+  "Preview publisher trust must have an independent publish-environment canary.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewPublishCanary,
+  "GCP_EXACT_WIF_CANARY_ENABLED",
+  "The preview publisher canary must not have a repository-variable bypass.",
+);
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  sectionBetween(deployPreview, "  publish:\n", "\n  attest:\n"),
+  "needs.publish-canary.result == 'success'",
+  "Preview publication must fail closed unless the independent publisher canary succeeds.",
+);
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  previewInvalidation,
+  "environment: preview-operations",
+  "Stale-preview invalidation must use the traffic-only environment claim.",
+);
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  previewInvalidation,
+  "gha-preview-operator@",
+  "Stale-preview invalidation must authenticate the traffic-only operator.",
+);
+for (const boundary of [
+  "deployed-revision: ${{ steps.deploy.outputs.revision }}",
+  "EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}",
+  'if [ "$current_revision" != "$EXPECTED_REVISION" ]',
+]) {
+  requireContains(
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    boundary,
+    `Stale-preview invalidation must preserve a newer queued deployment: ${boundary}`,
+  );
+}
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewInvalidation,
+  "gha-preview-deploy@",
+  "Stale-preview invalidation must not authenticate the preview deployer.",
+);
+for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
+  const path = `.github/workflows/${workflowName}`;
+  const workflow = await read(path);
+  requireContains(path, workflow, "gha-preview-operator@", "Preview traffic operations must use the dedicated operator.");
+  rejectContains(path, workflow, "gha-preview-deploy@", "Preview traffic operations must not authenticate the deploy identity.");
+  rejectContains(path, workflow, "gha-preview-publish@", "Preview traffic operations must not authenticate the publisher identity.");
+}
+requireBefore(
+  ".github/workflows/deploy-preview.yml",
+  deployPreview,
+  "Enforce the trusted application and container contract",
+  "Login to Docker Hardened Images",
+  "Preview Docker policy must run before registry credentials are exposed.",
+);
+requireBefore(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "Enforce the trusted application and container contract",
+  "Login to Docker Hardened Images",
+  "Production Docker policy must run before registry credentials are exposed.",
+);
+
+for (const workflow of ["application.yml", "socket-firewall.yml", "platform.yml"]) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  rejectContains(path, text, "oven-sh/setup-bun@", "Bun must be installed from a checksum-pinned archive.");
+  requireContains(
+    path,
+    text,
+    "2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452",
+    "Bun 1.4.0 archive checksum must be pinned.",
+  );
+}
+
+const application = await read(".github/workflows/application.yml");
+for (const forbidden of ["install-command", "verify-command", "inputs.bun-version"]) {
+  rejectContains(
+    ".github/workflows/application.yml",
+    application,
+    forbidden,
+    `Application verification must not accept caller-controlled ${forbidden}.`,
+  );
+}
+for (const [path, workflow] of [
+  [".github/workflows/application.yml", application],
+  [".github/workflows/socket-firewall.yml", await read(".github/workflows/socket-firewall.yml")],
+] as const) {
+  requireContains(path, workflow, "environment: dependency-scan", "Socket organization policy must come from the protected dependency-scan environment.");
+  requireContains(path, workflow, "SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}", "Scanner 1.1.2 must receive the protected organization token through its supported process variable.");
+  requireContains(path, workflow, "Socket Security Scanner free mode", "Socket installs must fail closed if organization policy is unavailable.");
+  requireContains(
+    path,
+    workflow,
+    "github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]'",
+    "Only external-fork and Dependabot pull requests may use Socket's secretless public policy.",
+  );
+}
+const platformDependencyWorkflow = await read(".github/workflows/platform.yml");
+requireContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "environment: ${{ github.event_name == 'push' && 'dependency-scan' || 'platform-pull-request' }}",
+  "Platform pull requests must use a secretless environment distinct from trusted main.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "ALLOW_SOCKET_FREE_MODE: ${{ github.event_name != 'push' }}",
+  "Platform pull requests must use Socket's secretless policy.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "SOCKET_API_KEY: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
+  "The Socket organization token must be unavailable to platform pull requests.",
+);
+rejectContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}",
+  "Platform pull requests must never receive the Socket token through an unconditional mapping.",
+);
+rejectContains(
+  ".github/workflows/platform.yml",
+  platformDependencyWorkflow,
+  "workflow_dispatch:",
+  "Platform dependency credentials must never be reachable from an off-main manual dispatch.",
+);
+for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-preview.yml", "deploy-prod.yml"]) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  requireContains(path, text, "repository: ${{ job.workflow_repository }}", "Policy source must be the reusable workflow repository.");
+  requireContains(path, text, "ref: ${{ job.workflow_sha }}", "Policy source must use the exact resolved reusable workflow SHA.");
+  requireContains(path, text, "path: _platform_policy", "Policy source must be isolated from the caller checkout.");
+  requireContains(path, text, "enforce-app-contract.ts", "Workflow must run the immutable platform contract checker.");
+  requireContains(
+    path,
+    text,
+    "--no-env-file --no-orphans",
+    "Trusted Bun commands must disable env files and kill descendants.",
+  );
+  rejectContains(path, text, "declare -A stages", "Untrusted Docker tokens must never enter Bash associative arrays.");
+}
+
+const appPolicy = await read("tools/ci/enforce-app-contract.ts");
+for (const boundary of [
+  "canonicalFiles",
+  "Bun.JSONC.parse",
+  "bun.lock does not resolve the reviewed Socket scanner integrity",
+  "must exactly match the immutable platform template",
+  'name !== ".env.example"',
+]) {
+  requireContains(
+    "tools/ci/enforce-app-contract.ts",
+    appPolicy,
+    boundary,
+    `Immutable app policy is missing boundary: ${boundary}`,
+  );
+}
+const trustedCiBunfig = await read("tools/ci/bunfig.toml");
+requireContains(
+  "tools/ci/bunfig.toml",
+  trustedCiBunfig,
+  'registry = "https://registry.npmjs.org"',
+  "Trusted Bun execution must pin the official registry.",
+);
+const platformBunfig = await read("bunfig.toml");
+for (const boundary of [
+  "env = false",
+  "telemetry = false",
+  "minimumReleaseAge = 604800",
+  'registry = "https://registry.npmjs.org"',
+  'scanner = "@socketsecurity/bun-security-scanner"',
+]) {
+  requireContains("bunfig.toml", platformBunfig, boundary, `The platform Bun policy is missing boundary: ${boundary}`);
+}
+requireContains(
+  "tools/ci/bunfig.toml",
+  trustedCiBunfig,
+  'scanner = "@socketsecurity/bun-security-scanner"',
+  "Trusted Bun execution must pin the Socket scanner.",
+);
+
+const socketFirewall = await read(".github/workflows/socket-firewall.yml");
+rejectContains(
+  ".github/workflows/socket-firewall.yml",
+  socketFirewall,
+  "socket-config-command",
+  "Socket verification must not accept a caller-controlled command.",
+);
+rejectContains(
+  ".github/workflows/socket-firewall.yml",
+  socketFirewall,
+  "socketdev/action@",
+  "The Bun-only platform must not download the mutable Socket Firewall wrapper.",
+);
+
+const infrastructure = await read(".github/workflows/infrastructure.yml");
+requireContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280",
+  "Terraform must be installed from the reviewed checksum-pinned archive.",
+);
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "hashicorp/setup-terraform@",
+  "Terraform tool-cache downloads do not verify the release archive checksum.",
+);
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "config_file: .checkov.yml",
+  "Checkov policy must not come from the caller checkout.",
+);
+requireContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+  "Checkov container must be digest pinned.",
+);
+for (const configName of [".checkov.yml", ".checkov.yaml", "checkov.yml", "checkov.yaml"]) {
+  requireContains(
+    ".github/workflows/infrastructure.yml",
+    infrastructure,
+    configName,
+    `Infrastructure verification must reject caller-controlled ${configName}.`,
+  );
+}
+requireContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "--config-file .platform-checkov.yml",
+  "Checkov must use a trusted fail-closed configuration written by the reusable workflow.",
+);
+requireContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "printf '%s\\n' 'soft-fail: false'",
+  "The trusted Checkov configuration must fail closed.",
+);
+for (const boundary of [
+  "validate_root infra/terraform/bootstrap bootstrap terraform/modules/bootstrap",
+  "validate_root infra/terraform/prod site terraform/modules/cloud-run-service",
+  "Consumer roots may configure only the reviewed platform modules",
+  "platform.ts\" doctor",
+  "Committed Terraform caches and substituted modules/providers are forbidden",
+  "Checkout only the exact trusted platform source",
+  "platform-source/terraform/deployments/prod",
+]) {
+  requireContains(
+    ".github/workflows/infrastructure.yml",
+    infrastructure,
+    boundary,
+    `Infrastructure workflow is missing trusted module boundary: ${boundary}`,
+  );
+}
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  sectionFrom(infrastructure, "  terraform-convergence:\n"),
+  "terraform -chdir=infra/terraform/prod",
+  "Authenticated Terraform convergence must never execute the consumer root.",
+);
+
+for (const workflow of [
+  "deploy-prod.yml",
+  "deploy-preview.yml",
+  "cleanup-preview.yml",
+  "reconcile-previews.yml",
+  "infrastructure.yml",
+]) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  requireContains(path, text, "queue: max", "Cloud mutations must retain a FIFO pending queue.");
+  requireContains(
+    path,
+    text,
+    "github.event.repository.id",
+    "Cloud mutation locks must survive repository renames via numeric ID.",
+  );
+}
+
+for (const workflow of ["deploy-prod.yml", "deploy-preview.yml", "cleanup-preview.yml", "reconcile-previews.yml"]) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  requireContains(
+    path,
+    text,
+    "https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-581.0.0-linux-x86_64.tar.gz?generation=1787059661116797",
+    "Cloud operations must use the reviewed Cloud SDK archive.",
+  );
+  requireContains(
+    path,
+    text,
+    "deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6",
+    "Cloud operations must verify the reviewed Cloud SDK archive checksum.",
+  );
+  requireContains(path, text, '.["Google Cloud SDK"] == "581.0.0"', "Cloud operations must verify the extracted SDK version.");
+  requireContains(
+    path,
+    text,
+    "export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true",
+    "The Cloud SDK update check must be disabled before its first execution.",
+  );
+  requireContains(
+    path,
+    text,
+    "export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true",
+    "Cloud SDK usage reporting must be disabled before its first execution.",
+  );
+  rejectContains(path, text, "google-github-actions/setup-gcloud@", "Cloud SDK tool-cache downloads are not independently verified.");
+  rejectContains(path, text, "google-github-actions/deploy-cloudrun@", "Cloud Run deploys must use the checksum-verified SDK.");
+  rejectContains(path, text, "install.sh", "The Cloud SDK installer script must not execute in privileged jobs.");
+}
+
+requireBefore(
+  ".github/workflows/cleanup-preview.yml",
+  await read(".github/workflows/cleanup-preview.yml"),
+  "Install checksum-pinned Google Cloud CLI",
+  "Prove exact workflow-SHA WIF trust",
+  "Preview cleanup must verify gcloud before any OIDC exchange.",
+);
+requireBefore(
+  ".github/workflows/reconcile-previews.yml",
+  await read(".github/workflows/reconcile-previews.yml"),
+  "Install checksum-pinned Google Cloud CLI",
+  "Prove exact workflow-SHA WIF trust",
+  "Preview reconciliation must verify gcloud before any OIDC exchange.",
+);
+requireBefore(
+  ".github/workflows/deploy-preview.yml",
+  sectionFrom(deployPreview, "  deploy:\n"),
+  "Install checksum-pinned Google Cloud CLI",
+  "Authenticate preview deployer",
+  "Preview deploys must verify gcloud before OIDC authentication.",
+);
+requireBefore(
+  ".github/workflows/deploy-prod.yml",
+  sectionFrom(deployProduction, "  deploy:\n"),
+  "Install checksum-pinned Google Cloud CLI",
+  "Authenticate production deployer",
+  "Production deploys must verify gcloud before OIDC authentication.",
+);
+
+for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewall.yml"]) {
+  const path = `templates/app/.github/workflows/${workflow}`;
+  const text = await read(path);
+  requireContains(path, text, "@__PLATFORM_SHA__", "Template workflows must use the scaffolded platform SHA.");
+  rejectContains(path, text, "secrets: inherit", "Template workflows must pass only named secrets.");
+  checkActionPins(path, text, true);
+}
+
+const dockerfile = await read("templates/app/Dockerfile");
+const bunfig = await read("templates/app/bunfig.toml");
+const templateLock = await read("templates/app/bun.lock");
+rejectContains(
+  "templates/app/bunfig.toml",
+  bunfig,
+  "[install.scopes]",
+  "The scaffold must not contain a package scope override section.",
+);
+for (const boundary of ["env = false", "telemetry = false", "minimumReleaseAge = 604800"]) {
+  requireContains(
+    "templates/app/bunfig.toml",
+    bunfig,
+    boundary,
+    `The scaffold Bun policy is missing boundary: ${boundary}`,
+  );
+}
+requireContains(
+  "templates/app/bun.lock",
+  templateLock,
+  '"@socketsecurity/bun-security-scanner@1.1.2", "", {}, "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA=="',
+  "The scaffold lockfile must retain the reviewed Socket scanner integrity.",
+);
+rejectContains("templates/app/Dockerfile", dockerfile, "curl -fsSL https://bun.com/install", "Bun installers must not execute curl-piped shell code.");
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6",
+  "The exact Bun binary source image must be digest pinned.",
+);
+rejectContains("templates/app/Dockerfile", dockerfile, "apt-get", "Container builds must not execute mutable package-manager downloads.");
+rejectContains("templates/app/Dockerfile", dockerfile, "curl ", "Container builds must not download executable build inputs over the network.");
+requireContains("templates/app/Dockerfile", dockerfile, "--ignore-scripts", "Docker dependency installs must disable lifecycle scripts.");
+requireContains("templates/app/Dockerfile", dockerfile, "--no-env-file", "Docker dependency installs must disable environment-file loading.");
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "--mount=type=secret,id=socket_api_token,required=true",
+  "Docker dependency installs must receive the Socket organization key as an ephemeral required secret mount.",
+);
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "Socket Security Scanner free mode",
+  "Docker dependency installs must fail closed if Socket falls back to free mode.",
+);
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "--registry=https://registry.npmjs.org",
+  "Docker dependency installs must pin the official registry.",
+);
+requireContains("templates/app/Dockerfile", dockerfile, "dhi.io/bun:1-dev@sha256:", "Build base images must be digest pinned.");
+requireContains("templates/app/Dockerfile", dockerfile, "dhi.io/bun:1@sha256:", "Runtime base images must be digest pinned.");
+rejectContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "# syntax=",
+  "Dockerfile syntax frontends must not be fetched through mutable directives.",
+);
+checkDockerPins("templates/app/Dockerfile", dockerfile);
+
 const readme = await read("README.md");
-requireContains("README.md", readme, "v0.4.1", "README should document the current release pin.");
+requireContains("README.md", readme, "0.5.0", "README should document the current release.");
 
 const moduleMain = await read("terraform/modules/cloud-run-service/main.tf");
+const moduleVariables = await read("terraform/modules/cloud-run-service/variables.tf");
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
-requireContains(
+rejectContains(
   "terraform/modules/cloud-run-service/versions.tf",
   moduleVersions,
   "google.no_attribution",
-  "Domain mappings must support the no-attribution provider alias.",
+  "Routine production Terraform must not retain the protected domain-mapping provider alias.",
+);
+requireContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  moduleMain,
+  "from = google_cloud_run_domain_mapping.site",
+  "Routine production state must relinquish legacy domain mappings without destroying them.",
 );
 requireContains(
   "terraform/modules/cloud-run-service/main.tf",
   moduleMain,
   "template[0].containers[0].env",
   "Cloud Run service must ignore deploy-owned runtime environment drift.",
+);
+requireContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  moduleMain,
+  "for_each = var.runtime_secret_accessor_ids",
+  "Secret containers must not implicitly grant runtime payload access.",
+);
+requireContains(
+  "terraform/modules/cloud-run-service/variables.tf",
+  sectionFrom(moduleVariables, 'variable "runtime_secret_accessor_ids"'),
+  "default     = []",
+  "Runtime secret payload access must default to empty.",
+);
+requireContains(
+  "terraform/modules/cloud-run-service/variables.tf",
+  sectionFrom(moduleVariables, 'variable "runtime_secret_accessor_ids"'),
+  "setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)",
+  "Runtime accessor IDs must be validated as a subset of retained secret containers.",
+);
+const productionDeployment = await read("terraform/deployments/prod/main.tf");
+for (const needle of [
+  "runtime_secret_accessor_ids       = []",
+  'RUNSETTA_OFFLINE   = "1"',
+  'RUNSETTA_TTS_MODEL = "gpt-4o-mini-tts"',
+  'RUNSETTA_TTS_VOICE = "marin"',
+]) {
+  requireContains(
+    "terraform/deployments/prod/main.tf",
+    productionDeployment,
+    needle,
+    `The immutable Runsetta offline boundary is missing: ${needle}`,
+  );
+}
+for (const [publisherResource, publisherVariable, formerDeployResource] of [
+  ["prod_publisher_writer", "prod_publisher_service_account_email", "prod_deploy_writer"],
+  ["preview_publisher_writer", "preview_publisher_service_account_email", "preview_deploy_writer"],
+] as const) {
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    moduleMain,
+    `resource "google_artifact_registry_repository_iam_member" "${publisherResource}"`,
+    "Artifact Registry Writer must be repository-scoped to a dedicated publisher resource.",
+  );
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    moduleMain,
+    `member     = "serviceAccount:${"${var."}${publisherVariable}}"`,
+    "Artifact Registry Writer must belong only to the publisher identity.",
+  );
+  rejectContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    moduleMain,
+    `resource "google_artifact_registry_repository_iam_member" "${formerDeployResource}" {`,
+    "Deploy/operator identities must not retain Artifact Registry Writer resources.",
+  );
+}
+for (const [readerResource, deployVariable] of [
+  ["prod_deploy_reader", "prod_deploy_service_account_email"],
+  ["preview_deploy_reader", "preview_deploy_service_account_email"],
+] as const) {
+  const reader = sectionBetween(
+    moduleMain,
+    `resource "google_artifact_registry_repository_iam_member" "${readerResource}"`,
+    "\n}\n",
+  );
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    reader,
+    'role       = "roles/artifactregistry.reader"',
+    "Cloud Run deployers need only the documented repository-scoped Artifact Registry Reader role.",
+  );
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    reader,
+    `member     = "serviceAccount:${"${var."}${deployVariable}}"`,
+    "Artifact Registry Reader must belong only to the matching deploy identity.",
+  );
+  rejectContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    reader,
+    'roles/artifactregistry.writer',
+    "Deploy identities must not receive Artifact Registry upload or delete permissions.",
+  );
+}
+rejectContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  sectionBetween(
+    moduleMain,
+    'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
+    'resource "google_secret_manager_secret" "runtime"',
+  ),
+  "preview_operator_service_account_email",
+  "Preview traffic operators must have zero Artifact Registry access.",
+);
+for (const publisherVariable of [
+  "prod_publisher_service_account_email",
+  "preview_publisher_service_account_email",
+]) {
+  rejectContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    sectionFrom(moduleMain, 'resource "google_cloud_run_v2_service_iam_member" "prod_deploy"'),
+    publisherVariable,
+    "Artifact Registry publishers must have zero Cloud Run role grants.",
+  );
+}
+
+const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  bootstrapMain,
+  '"(${local.trusted_workflow_sha_condition})",',
+  "The WIF provider itself must reject unapproved workflow SHAs.",
+);
+for (const boundary of [
+  'account_id   = "gha-prod-publish"',
+  'account_id   = "gha-preview-publish"',
+  'account_id   = "gha-preview-operator"',
+  '"attribute.preview_deploy_workflow_sha"',
+  '"attribute.preview_operator_workflow_sha"',
+  '"attribute.prod_publish_workflow_sha"',
+  '"attribute.preview_publish_workflow_sha"',
+  '"attribute.legacy_preview_deploy"',
+  '"attribute.legacy_preview_operator"',
+  '"attribute.legacy_prod_deploy"',
+  '"attribute.legacy_terraform"',
+  'resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha"',
+  'resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha"',
+  'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
+  'resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha"',
+  'resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha"',
+  'resource "google_service_account_iam_member" "canary_wif_prod_publish_workflow_sha"',
+  'resource "google_service_account_iam_member" "canary_wif_preview_publish_workflow_sha"',
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    boundary,
+    `Publisher/deployer WIF isolation is missing boundary: ${boundary}`,
+  );
+}
+for (const forbiddenMapping of ['"attribute.environment"', '"attribute.repository_id"']) {
+  rejectContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    forbiddenMapping,
+    `Compatibility WIF must not expose aggregate cross-identity mapping ${forbiddenMapping}.`,
+  );
+}
+for (const [binding, serviceAccount, attribute] of [
+  ["prod_deploy_wif_workflow_sha", "prod_deploy", "prod_workflow_sha"],
+  ["prod_publisher_wif_workflow_sha", "prod_publisher", "prod_publish_workflow_sha"],
+  ["preview_deploy_wif_workflow_sha", "preview_deploy", "preview_deploy_workflow_sha"],
+  ["preview_operator_wif_workflow_sha", "preview_operator", "preview_operator_workflow_sha"],
+  ["preview_publisher_wif_workflow_sha", "preview_publisher", "preview_publish_workflow_sha"],
+  ["terraform_wif_workflow_sha", "terraform", "terraform_workflow_sha"],
+] as const) {
+  const block = sectionBetween(
+    bootstrapMain,
+    `resource "google_service_account_iam_member" "${binding}"`,
+    "\n}\n",
+  );
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    block,
+    `service_account_id = google_service_account.${serviceAccount}.name`,
+    `Exact WIF binding ${binding} must target only ${serviceAccount}.`,
+  );
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    block,
+    `/attribute.${attribute}/`,
+    `Exact WIF binding ${binding} must use only ${attribute}.`,
+  );
+}
+for (const [binding, serviceAccount, principal] of [
+  ["prod_deploy_wif_prod_env", "prod_deploy", "legacy_prod_deploy_principal_set"],
+  ["preview_deploy_wif_repo", "preview_deploy", "legacy_preview_deploy_principal_set"],
+  ["preview_operator_wif_repo", "preview_operator", "legacy_preview_operator_principal_set"],
+  ["terraform_wif_prod_env", "terraform", "legacy_terraform_principal_set"],
+] as const) {
+  const block = sectionBetween(
+    bootstrapMain,
+    `resource "google_service_account_iam_member" "${binding}"`,
+    "\n}\n",
+  );
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    block,
+    `service_account_id = google_service_account.${serviceAccount}.name`,
+    `Legacy WIF binding ${binding} must target only ${serviceAccount}.`,
+  );
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    block,
+    `member             = local.${principal}`,
+    `Legacy WIF binding ${binding} must use only ${principal}.`,
+  );
+}
+for (const forbiddenPublisherFallback of ["legacy_prod_publish", "legacy_preview_publish"]) {
+  rejectContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    forbiddenPublisherFallback,
+    "Publisher identities must never receive a generic compatibility WIF attribute.",
+  );
+}
+for (const publisher of ["prod_publisher", "preview_publisher"]) {
+  rejectContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    `member             = "serviceAccount:${"${google_service_account."}${publisher}.email}"`,
+    "Publisher identities must not receive project roles or runtime service-account actAs.",
+  );
+}
+rejectContains(
+  "terraform/modules/bootstrap/main.tf",
+  bootstrapMain,
+  'member             = "serviceAccount:${google_service_account.preview_operator.email}"',
+  "The preview traffic operator must not receive project roles or runtime service-account actAs.",
+);
+for (const forbidden of [
+  "roles/artifactregistry.admin",
+  "roles/run.admin",
+  "roles/secretmanager.admin",
+  "roles/datastore.owner",
+  "roles/iam.serviceAccountTokenCreator",
+  '"terraform_uses_runtime"',
+  '"terraform_uses_preview_runtime"',
+  '"terraform_uses_bootstrap_runtime"',
+  '"preview_deploy_uses_runtime"',
+]) {
+  rejectContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    forbidden,
+    `The first protected bootstrap apply must remove legacy privilege: ${forbidden}`,
+  );
+}
+const bootstrapDeployment = await read("terraform/deployments/bootstrap/main.tf");
+const forbiddenPreMigrationWorkflowShas = [
+  "734d0cd02187f88c6e91263f127dc3f4c0709feb",
+  "1378a3e81a5e74c71f2adfd5548b430bb008490e",
+  "37bd4b1beea8802ec85c38d69ea08d5992c75a50",
+  "42435a3c4c5c063a342765ef7c85047224217fe2",
+  "7f01d9f008a7757df12f13ac8fa0f261600cf21a",
+  "4f032955477c26b942fdd4f1b01f5272380390ea",
+  "92c73184bc527388b5e10ccb5e4f0222a84e68b5",
+  "33ab9b9a5f3d8a0553372980c22540cad001f776",
+];
+const platformTool = await read("tools/platform.ts");
+for (const sha of forbiddenPreMigrationWorkflowShas) {
+  if (bootstrapDeployment.split(sha).length - 1 !== 2) {
+    failures.push(
+      `terraform/deployments/bootstrap/main.tf: pre-migration SHA ${sha} must be denied for both active and transition trust.`,
+    );
+  }
+  requireContains(
+    "tools/platform.ts",
+    platformTool,
+    sha,
+    `Doctor must reject pre-migration workflow SHA ${sha}.`,
+  );
+}
+for (const forbidden of [
+  "roles/artifactregistry.admin",
+  "roles/run.admin",
+  "roles/secretmanager.admin",
+  "roles/datastore.owner",
+  "terraform_project_roles",
+]) {
+  rejectContains(
+    "terraform/deployments/bootstrap/main.tf",
+    bootstrapDeployment,
+    forbidden,
+    `The trusted bootstrap map must never restore a legacy routine/deployer privilege: ${forbidden}`,
+  );
+}
+
+for (const rootPath of [
+  "terraform/deployments/bootstrap/main.tf",
+  "terraform/deployments/exposure/main.tf",
+  "terraform/deployments/prod/main.tf",
+]) {
+  const deployment = await read(rootPath);
+  requireContains(rootPath, deployment, 'source = "../../modules/', "Trusted deployment roots must use local platform modules.");
+  rejectContains(rootPath, deployment, "github.com/", "Trusted deployment roots must not download caller-selected modules.");
+}
+const platformWorkflow = await read(".github/workflows/platform.yml");
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "Committed node_modules content is forbidden before the Socket credential is released.",
+  "Platform CI must reject checkout-controlled node_modules before releasing the Socket token.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "terraform/deployments/*",
+  "Platform CI must validate every privileged deployment root.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "terraform -chdir=terraform/deployments/bootstrap test -no-color",
+  "Platform CI must execute protected bootstrap variable-validation regressions.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+  "Platform Terraform must be scanned by the reviewed digest-pinned Checkov image.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "--directory terraform",
+  "Platform Checkov must scan the trusted modules and deployment roots.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "--config-file tools/ci/checkov-platform.yml",
+  "Platform Checkov must ignore ambient user configuration and use the reviewed fail-closed policy.",
+);
+const platformCheckov = await read("tools/ci/checkov-platform.yml");
+requireContains("tools/ci/checkov-platform.yml", platformCheckov, "soft-fail: false", "Platform Checkov must fail on findings.");
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+  "Platform CI must checksum-pin actionlint.",
+);
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml",
+  "Platform CI must lint reusable and caller workflow syntax.",
+);
+const actionlintConfig = await read(".github/actionlint.yaml");
+for (const knownSchemaLag of [
+  'property "workflow_(repository|sha)" is not defined in object type',
+  'unexpected key "queue" for "concurrency" section',
+]) {
+  requireContains(
+    ".github/actionlint.yaml",
+    actionlintConfig,
+    knownSchemaLag,
+    `actionlint may ignore only the documented schema lag: ${knownSchemaLag}`,
+  );
+}
+rejectContains(
+  ".github/actionlint.yaml",
+  actionlintConfig,
+  "- '.*'",
+  "actionlint configuration must not suppress all findings.",
 );
 
 if (failures.length > 0) {
@@ -55,5 +1125,78 @@ function requireContains(path: string, text: string, needle: string, message: st
 function rejectContains(path: string, text: string, needle: string, message: string): void {
   if (text.includes(needle)) {
     failures.push(`${path}: ${message}`);
+  }
+}
+
+function sectionBetween(text: string, start: string, end: string): string {
+  const startIndex = text.indexOf(start);
+  const endIndex = text.indexOf(end, startIndex + start.length);
+  if (startIndex === -1 || endIndex === -1) {
+    return text;
+  }
+  return text.slice(startIndex, endIndex);
+}
+
+function sectionFrom(text: string, start: string): string {
+  const startIndex = text.indexOf(start);
+  return startIndex === -1 ? text : text.slice(startIndex);
+}
+
+function requireBefore(
+  path: string,
+  text: string,
+  first: string,
+  second: string,
+  message: string,
+): void {
+  const firstIndex = text.indexOf(first);
+  const secondIndex = text.indexOf(second);
+  if (firstIndex === -1 || secondIndex === -1 || firstIndex >= secondIndex) {
+    failures.push(`${path}: ${message}`);
+  }
+}
+
+function checkActionPins(path: string, text: string, allowPlatformPlaceholder: boolean): void {
+  for (const match of text.matchAll(
+    /^\s*uses:\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))(?:\s+#.*)?$/gm,
+  )) {
+    const spec = match[1] ?? match[2] ?? match[3]!;
+    if (spec.startsWith("./")) {
+      failures.push(`${path}: local action ${spec} is not allowed in platform workflows.`);
+      continue;
+    }
+    if (spec.startsWith("docker://")) {
+      if (!/^docker:\/\/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$/.test(spec)) {
+        failures.push(`${path}: container action ${spec} must use a full sha256 image digest.`);
+      }
+      continue;
+    }
+
+    const separator = spec.lastIndexOf("@");
+    const action = separator === -1 ? spec : spec.slice(0, separator);
+    const ref = separator === -1 ? "" : spec.slice(separator + 1);
+    const allowedPlaceholder =
+      allowPlatformPlaceholder &&
+      action.startsWith("collinbentley1/platform/.github/workflows/") &&
+      ref === "__PLATFORM_SHA__";
+
+    if (!allowedPlaceholder && !/^[0-9a-f]{40}$/.test(ref)) {
+      failures.push(`${path}: action ${spec} must use a full lowercase 40-character commit SHA.`);
+    }
+  }
+}
+
+function checkDockerPins(path: string, text: string): void {
+  const stages = new Set<string>();
+
+  for (const match of text.matchAll(/^FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$/gim)) {
+    const image = match[1]!;
+    const alias = match[2]?.toLowerCase();
+    if (!stages.has(image.toLowerCase()) && !/@sha256:[0-9a-f]{64}$/.test(image)) {
+      failures.push(`${path}: external base image ${image} must be pinned to a sha256 digest.`);
+    }
+    if (alias) {
+      stages.add(alias);
+    }
   }
 }

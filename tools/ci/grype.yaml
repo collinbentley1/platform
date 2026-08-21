@@ -1,0 +1,10 @@
+check-for-app-update: false
+
+db:
+  auto-update: false
+  validate-age: true
+  max-allowed-built-age: 48h
+  validate-by-hash-on-start: true
+
+registry:
+  auth: []

@@ -2,45 +2,8 @@ name: Infrastructure
 
 on:
   workflow_call:
-    inputs:
-      project-id:
-        description: Google Cloud project ID.
-        required: true
-        type: string
-      workload-identity-provider:
-        description: GitHub Workload Identity Provider resource name.
-        required: true
-        type: string
-      terraform-service-account:
-        description: Service account used for Terraform apply.
-        required: true
-        type: string
-      terraform-version:
-        description: Terraform version.
-        required: false
-        type: string
-        default: 1.14.5
-      terraform-dirs:
-        description: Space-separated Terraform roots to validate.
-        required: false
-        type: string
-        default: infra/terraform/bootstrap infra/terraform/prod
-      prod-dir:
-        description: Terraform root applied on main pushes.
-        required: false
-        type: string
-        default: infra/terraform/prod
-      production-environment:
-        description: GitHub environment used for production applies.
-        required: false
-        type: string
-        default: production
 
 permissions: {}
-
-concurrency:
-  group: infrastructure-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   terraform-validate:
@@ -52,22 +15,156 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: ${{ inputs.terraform-version }}
+          persist-credentials: false
+
+      - name: Resolve the exact reusable-workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
+            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+            exit 1
+          fi
+
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Enforce exact platform modules and declarative roots
+        run: |
+          set -euo pipefail
+          if find infra/terraform -type l -print -quit | grep -q .; then
+            echo "Terraform roots must not contain symbolic links." >&2
+            exit 1
+          fi
+          if find infra/terraform -type d -name .terraform -print -quit | grep -q .; then
+            echo "Committed Terraform caches and substituted modules/providers are forbidden." >&2
+            exit 1
+          fi
+          if find infra/terraform -type f -name '*.tf.json' -print -quit | grep -q .; then
+            echo "JSON Terraform roots are outside the reviewed platform contract." >&2
+            exit 1
+          fi
+          if rg -n '^\s*(resource|data)\s+"|\bprovisioner\s+"(local-exec|remote-exec)"|\bexternal\b' infra/terraform; then
+            echo "Consumer roots may configure only the reviewed platform modules; direct resources and executable provisioners are forbidden." >&2
+            exit 1
+          fi
+
+          validate_root() {
+            local root="$1"
+            local module_name="$2"
+            local module_path="$3"
+            local expected_sha="${4:-}"
+            local main="$root/main.tf"
+            local declarations
+            local declaration_count
+            local sources
+            local source_count
+
+            declarations="$(rg -n --glob '*.tf' '^\s*module\s+"' "$root" || true)"
+            declaration_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "$declarations")"
+            if [ "$declaration_count" -ne 1 ] || ! rg -n "^\\s*module\\s+\"${module_name}\"\\s*\\{" "$main" >/dev/null; then
+              echo "$root must contain exactly the reviewed ${module_name} module." >&2
+              exit 1
+            fi
+
+            sources="$(sed -nE 's/^[[:space:]]*source[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' "$main")"
+            source_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "$sources")"
+            if [ "$source_count" -ne 1 ] || [[ ! "$sources" =~ ^github\.com/collinbentley1/platform//${module_path}\?ref=([0-9a-f]{40})$ ]]; then
+              echo "$root must use the canonical ${module_path} source at a full commit SHA." >&2
+              exit 1
+            fi
+
+            resolved_sha="${BASH_REMATCH[1]}"
+            if [ -n "$expected_sha" ] && [ "$resolved_sha" != "$expected_sha" ]; then
+              echo "Bootstrap and production modules must use the same reviewed platform SHA." >&2
+              exit 1
+            fi
+            printf '%s' "$resolved_sha"
+          }
+
+          platform_sha="$(validate_root infra/terraform/bootstrap bootstrap terraform/modules/bootstrap)"
+          validate_root infra/terraform/prod site terraform/modules/cloud-run-service "$platform_sha" >/dev/null
+
+          platform_refs="$(rg -n 'collinbentley1/platform|github\.com/[^"[:space:]]+/platform' infra/terraform || true)"
+          platform_ref_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "$platform_refs")"
+          if [ "$platform_ref_count" -ne 2 ]; then
+            echo "Unexpected or missing platform source reference." >&2
+            printf '%s\n' "$platform_refs" >&2
+            exit 1
+          fi
+
+      - name: Install checksum-pinned Bun 1.4.0 for the trusted platform doctor
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+              -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+          )
+
+      - name: Prove all consumer pins match this exact reusable workflow
+        env:
+          PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans \
+              "$GITHUB_WORKSPACE/_platform_policy/tools/platform.ts" doctor "$GITHUB_WORKSPACE"
+          )
+
+      - name: Install checksum-pinned Terraform 1.14.5
+        env:
+          TERRAFORM_SHA256: ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/terraform.zip"
+          destination="$RUNNER_TEMP/terraform-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip
+          echo "${TERRAFORM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          test "$("$destination/terraform" version -json | jq -r .terraform_version)" = "1.14.5"
+          echo "$destination" >> "$GITHUB_PATH"
 
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive infra/terraform
 
       - name: Validate Terraform roots
-        env:
-          TERRAFORM_DIRS: ${{ inputs.terraform-dirs }}
         run: |
           set -euo pipefail
-          for dir in ${TERRAFORM_DIRS}; do
-            terraform -chdir="$dir" init -backend=false -input=false
+          for dir in infra/terraform/bootstrap infra/terraform/prod; do
+            terraform -chdir="$dir" init -backend=false -input=false -lockfile=readonly
             terraform -chdir="$dir" validate
           done
 
@@ -80,45 +177,217 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@4048c972aae68d0b983a48bb3479aab2d877b898 # v12.3102.0
         with:
-          directory: .
-          config_file: .checkov.yml
+          persist-credentials: false
 
-  terraform-apply:
-    name: Terraform apply
+      - name: Reject caller-controlled Checkov suppressions
+        run: |
+          set -euo pipefail
+          if find . \( -name .checkov.yml -o -name .checkov.yaml -o -name checkov.yml -o -name checkov.yaml \) \
+            -not -path './.git/*' -print -quit | grep -q .; then
+            echo "Caller-controlled Checkov configuration is forbidden." >&2
+            exit 1
+          fi
+          if rg --hidden -n '#\s*checkov:skip' . --glob '!.git/**'; then
+            echo "Inline Checkov suppressions are not accepted in any scanned caller file." >&2
+            exit 1
+          fi
+          rm -f -- "$GITHUB_WORKSPACE/.platform-checkov.yml"
+          printf '%s\n' 'soft-fail: false' > "$GITHUB_WORKSPACE/.platform-checkov.yml"
+
+      - name: Run digest-pinned Checkov with platform policy
+        uses: docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a # 3.2.527
+        with:
+          args: >-
+            --directory .
+            --config-file .platform-checkov.yml
+            --framework terraform github_actions
+            --compact
+            --quiet
+            --download-external-modules false
+            --skip-path .terraform
+            --skip-path outputs
+            --skip-path work
+
+  terraform-convergence:
+    name: Terraform convergence
     runs-on: ubuntu-24.04
     needs:
       - terraform-validate
       - checkov
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment: ${{ inputs.production-environment }}
+    environment: production
+    concurrency:
+      group: production-${{ github.event.repository.id }}
+      queue: max
+      cancel-in-progress: false
     permissions:
       contents: read
-      id-token: write
+      id-token: write # Prove exact-SHA WIF and read cloud metadata for convergence only.
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
-        with:
-          project_id: ${{ inputs.project-id }}
-          workload_identity_provider: ${{ inputs.workload-identity-provider }}
-          service_account: ${{ inputs.terraform-service-account }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        with:
-          terraform_version: ${{ inputs.terraform-version }}
-
-      - name: Apply production Terraform
+      - name: Reject a stale main-branch run after acquiring the production lock
         env:
-          PROD_DIR: ${{ inputs.prod-dir }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          terraform -chdir="$PROD_DIR" init -input=false
-          terraform -chdir="$PROD_DIR" apply -auto-approve -input=false
+          response="$RUNNER_TEMP/main-ref.json"
+          curl --fail-with-body --show-error --silent --location \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "$response" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/ref/heads/main"
+          head_sha="$(jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' "$response")"
+          if [ "$head_sha" != "$GITHUB_SHA" ]; then
+            echo "Refusing stale Terraform convergence plan for ${GITHUB_SHA}; main is ${head_sha}." >&2
+            exit 1
+          fi
+
+      - name: Resolve trusted application configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          case "$REPOSITORY_ID" in
+            1255553151)
+              project_id="cdbentley"
+              project_number="882468538648"
+              state_bucket="cdbentley-tfstate-882468538648"
+              state_prefix="cdbentley/prod"
+              ;;
+            711292980)
+              project_id="runsetta"
+              project_number="601124730704"
+              state_bucket="runsetta-tfstate-601124730704"
+              state_prefix="runsetta/prod"
+              ;;
+            1025243085)
+              project_id="medlock-1025243085"
+              project_number="229383559510"
+              state_bucket="medlock-tfstate-1025243085"
+              state_prefix="medlock/prod"
+              ;;
+            280932482)
+              project_id="critical-history-16823277"
+              project_number="422714632513"
+              state_bucket="critical-history-tfstate-422714632513"
+              state_prefix="critical-history/prod"
+              ;;
+            *)
+              echo "Repository id $REPOSITORY_ID is not registered for infrastructure deployment." >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "project_id=$project_id"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "terraform_service_account=gha-terraform@${project_id}.iam.gserviceaccount.com"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+            echo "state_bucket=$state_bucket"
+            echo "state_prefix=$state_prefix"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the exact reusable-workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ -e "$GITHUB_WORKSPACE/platform-source" ] || [ -L "$GITHUB_WORKSPACE/platform-source" ]; then
+            echo "The reserved platform-source checkout path must be empty." >&2
+            exit 1
+          fi
+
+      - name: Checkout only the exact trusted platform source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: platform-source
+          persist-credentials: false
+
+      - name: Verify the checked-out trusted platform commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/platform-source" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Terraform 1.14.5
+        env:
+          TERRAFORM_SHA256: ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/terraform.zip"
+          destination="$RUNNER_TEMP/terraform-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip
+          echo "${TERRAFORM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          test "$("$destination/terraform" version -json | jq -r .terraform_version)" = "1.14.5"
+          echo "$destination" >> "$GITHUB_PATH"
+
+      - name: Validate the immutable production root before cloud authentication
+        env:
+          TF_VAR_repository_id: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          unset TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply
+          terraform -chdir=platform-source/terraform/deployments/prod \
+            init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=platform-source/terraform/deployments/prod validate
+
+      - name: Prove exact workflow-SHA WIF trust
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate the metadata-only Terraform convergence reader
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.terraform_service_account }}
+
+      - name: Require production infrastructure to be converged
+        env:
+          STATE_BUCKET: ${{ steps.app.outputs.state_bucket }}
+          STATE_PREFIX: ${{ steps.app.outputs.state_prefix }}
+          TF_VAR_repository_id: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          unset TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply
+          terraform -chdir=platform-source/terraform/deployments/prod init \
+            -reconfigure \
+            -input=false \
+            -lockfile=readonly \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="prefix=${STATE_PREFIX}"
+          set +e
+          terraform -chdir=platform-source/terraform/deployments/prod plan \
+            -detailed-exitcode \
+            -input=false \
+            -lock=false
+          plan_status=$?
+          set -e
+          case "$plan_status" in
+            0) ;;
+            2)
+              echo "Production infrastructure drift or a requested change exists." >&2
+              echo "Apply the reviewed exact platform root through the protected bootstrap pipeline; routine GitHub Terraform is intentionally read-only." >&2
+              exit 1
+              ;;
+            *) exit "$plan_status" ;;
+          esac

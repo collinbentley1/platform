@@ -5,7 +5,6 @@ const mode = Bun.argv.includes("--write") ? "write" : "check";
 const root = join(import.meta.dir, "..");
 const formattedRoots = new Set([".github", ".platform", "infra", "src", "test", "tools"]);
 const formattedFiles = new Set([
-  ".checkov.yml",
   ".dockerignore",
   "bunfig.toml",
   "Dockerfile",

@@ -2,17 +2,6 @@ name: Socket Firewall
 
 on:
   workflow_call:
-    inputs:
-      bun-version:
-        description: Bun version passed to oven-sh/setup-bun.
-        required: false
-        type: string
-        default: 1.4.0
-      socket-config-command:
-        description: Command that validates Bun Socket scanner configuration.
-        required: false
-        type: string
-        default: bun run tools/verify-socket-config.ts
 
 permissions:
   contents: read
@@ -21,65 +10,91 @@ jobs:
   firewall:
     name: Socket Firewall
     runs-on: ubuntu-24.04
+    environment: dependency-scan
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Socket Firewall
-        if: ${{ hashFiles('package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock') != '' && hashFiles('bun.lock', 'bunfig.toml') == '' }}
-        uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
-          mode: firewall
+          persist-credentials: false
 
-      - name: Detect dependency manager
-        id: dependency-manager
+      - name: Resolve the exact reusable-workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-
-          if [ -f bun.lock ] || [ -f bunfig.toml ] || { [ -f package.json ] && grep -q '"packageManager"[[:space:]]*:[[:space:]]*"bun@' package.json; }; then
-            echo "name=bun" >> "$GITHUB_OUTPUT"
-          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-            echo "name=npm" >> "$GITHUB_OUTPUT"
-          elif [ -f pnpm-lock.yaml ]; then
-            echo "name=pnpm" >> "$GITHUB_OUTPUT"
-          elif [ -f yarn.lock ]; then
-            echo "name=yarn" >> "$GITHUB_OUTPUT"
-          elif [ -f package.json ]; then
-            echo "name=npm-package-lock" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=none" >> "$GITHUB_OUTPUT"
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
+            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+            exit 1
           fi
 
-      - name: Setup Bun
-        if: steps.dependency-manager.outputs.name == 'bun'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          bun-version: ${{ inputs.bun-version }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+              -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+          )
+
+      - name: Enforce trusted Bun scanner configuration
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans ./enforce-app-contract.ts \
+              "$GITHUB_WORKSPACE" \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app"
+          )
 
       - name: Run Bun install with Socket scanner
-        if: steps.dependency-manager.outputs.name == 'bun'
+        env:
+          ALLOW_SOCKET_FREE_MODE: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') }}
+          # Scanner 1.1.2 still consumes the legacy process variable. The
+          # protected GitHub secret keeps Socket's current token naming.
+          SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}
         run: |
           set -euo pipefail
-
-          ${{ inputs.socket-config-command }}
-          bun install --frozen-lockfile --ignore-scripts
-
-      - name: Run install through Socket Firewall
-        if: steps.dependency-manager.outputs.name != 'bun'
-        run: |
-          set -euo pipefail
-
-          if [ "${{ steps.dependency-manager.outputs.name }}" = "npm" ]; then
-            sfw npm ci --ignore-scripts
-          elif [ "${{ steps.dependency-manager.outputs.name }}" = "pnpm" ]; then
-            corepack enable
-            sfw pnpm install --frozen-lockfile --ignore-scripts
-          elif [ "${{ steps.dependency-manager.outputs.name }}" = "yarn" ]; then
-            corepack enable
-            sfw yarn install --immutable --ignore-scripts || sfw yarn install --frozen-lockfile --ignore-scripts
-          elif [ "${{ steps.dependency-manager.outputs.name }}" = "npm-package-lock" ]; then
-            sfw npm install --package-lock-only --ignore-scripts
-          else
-            echo "No supported package manifest or lockfile found; skipping Socket Firewall install check."
+          if [[ -z "$SOCKET_API_KEY" && "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "The Socket organization token is required outside an external-fork or Dependabot pull request." >&2
+            exit 1
+          fi
+          unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
+          if ! install_output="$(bun --no-env-file --no-orphans install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org 2>&1)"; then
+            printf '%s\n' "$install_output"
+            exit 1
+          fi
+          printf '%s\n' "$install_output"
+          if grep -Fq 'Socket Security Scanner free mode' <<< "$install_output" && [[ "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "Socket must enforce the owner-approved organization policy." >&2
+            exit 1
           fi

@@ -2,7 +2,7 @@ terraform {
   required_version = "~> 1.14.0"
 
   backend "gcs" {
-    bucket = "__STATE_BUCKET__"
+    bucket = "__STATE_BUCKET__-bootstrap"
     prefix = "__APP_NAME__/bootstrap"
   }
 

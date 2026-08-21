@@ -12,7 +12,7 @@
     "lint": "bun run typecheck",
     "format": "bun run tools/format.ts --write",
     "format:check": "bun run tools/format.ts --check",
-    "verify": "bun ci && bun run verify:ci",
+    "verify": "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci",
     "verify:ci": "bun run --parallel format:check lint test build"
   },
   "devDependencies": {

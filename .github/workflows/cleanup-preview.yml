@@ -2,27 +2,6 @@ name: Cleanup preview
 
 on:
   workflow_call:
-    inputs:
-      project-id:
-        description: Google Cloud project ID.
-        required: true
-        type: string
-      region:
-        description: Google Cloud region.
-        required: true
-        type: string
-      service-name:
-        description: Base Cloud Run service name.
-        required: true
-        type: string
-      workload-identity-provider:
-        description: GitHub Workload Identity Provider resource name.
-        required: true
-        type: string
-      deploy-service-account:
-        description: Preview deploy service account email.
-        required: true
-        type: string
 
 permissions: {}
 
@@ -30,37 +9,139 @@ jobs:
   cleanup:
     name: Cleanup preview
     runs-on: ubuntu-24.04
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'closed' ||
+       github.event.action == 'synchronize' ||
+       github.event.action == 'converted_to_draft') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    environment: preview-operations
     permissions:
-      contents: read
-      id-token: write
-    env:
-      PROJECT_ID: ${{ inputs.project-id }}
-      REGION: ${{ inputs.region }}
-      SERVICE_NAME: ${{ inputs.service-name }}
-      CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+      id-token: write # Exchange only for the exact-SHA preview cleanup identity.
+    concurrency:
+      group: preview-cloud-${{ github.event.repository.id }}
+      queue: max
+      cancel-in-progress: false
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-          workload_identity_provider: ${{ inputs.workload-identity-provider }}
-          service_account: ${{ inputs.deploy-service-account }}
-
-      - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      - name: Delete preview service
+      - name: Resolve trusted application configuration
+        id: app
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
-          preview_service="${SERVICE_NAME}-pr-${{ github.event.pull_request.number }}"
+          case "$REPOSITORY_ID" in
+            1255553151)
+              project_id="cdbentley"
+              project_number="882468538648"
+              service_name="cdbentley"
+              ;;
+            711292980)
+              project_id="runsetta"
+              project_number="601124730704"
+              service_name="runsetta"
+              ;;
+            1025243085)
+              project_id="medlock-1025243085"
+              project_number="229383559510"
+              service_name="medlock"
+              ;;
+            280932482)
+              project_id="critical-history-16823277"
+              project_number="422714632513"
+              service_name="critical-history"
+              ;;
+            *)
+              echo "Repository id $REPOSITORY_ID is not registered for preview cleanup." >&2
+              exit 1
+              ;;
+          esac
 
-          if gcloud run services describe "$preview_service" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
-            gcloud run services delete "$preview_service" --region="$REGION" --project="$PROJECT_ID" --quiet
-          else
-            echo "Preview service $preview_service does not exist; nothing to delete."
+          {
+            echo "project_id=$project_id"
+            echo "region=us-east4"
+            echo "service_name=$service_name"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
+            echo "operator_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
+            echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install checksum-pinned Google Cloud CLI
+        env:
+          GCLOUD_SHA256: deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/google-cloud-cli-581.0.0-linux-x86_64.tar.gz"
+          sdk_root="$RUNNER_TEMP/google-cloud-cli"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            'https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-581.0.0-linux-x86_64.tar.gz?generation=1787059661116797'
+          echo "${GCLOUD_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$sdk_root"
+          tar -xzf "$archive" -C "$sdk_root" --strip-components=1
+          export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
+          export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+          export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
+          "$sdk_root/bin/gcloud" version --format=json \
+            | jq -e '.["Google Cloud SDK"] == "581.0.0"' >/dev/null
+          echo "$sdk_root/bin" >> "$GITHUB_PATH"
+          {
+            echo "CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true"
+            echo "CLOUDSDK_CORE_DISABLE_PROMPTS=1"
+            echo "CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Prove exact workflow-SHA WIF trust
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.canary_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Authenticate preview cleanup
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.operator_service_account }}
+
+      - name: Remove the invalidated pull request traffic tag
+        env:
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
+        run: |
+          set -euo pipefail
+          preview_service="${SERVICE_NAME}-preview"
+          preview_tag="pr-${PR_NUMBER}"
+          service_json="$(mktemp)"
+          describe_error="$(mktemp)"
+          trap 'rm -f "$service_json" "$describe_error"' EXIT
+
+          if ! gcloud run services describe "$preview_service" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format=json > "$service_json" 2> "$describe_error"; then
+            if rg -qi 'not[ _-]?found|could not be found|404' "$describe_error"; then
+              echo "Preview service $preview_service does not exist; nothing to invalidate."
+              exit 0
+            fi
+            cat "$describe_error" >&2
+            exit 1
           fi
+
+          if ! jq -e --arg tag "$preview_tag" '.status.traffic[]? | select(.tag == $tag)' "$service_json" >/dev/null; then
+            echo "Preview tag $preview_tag is already absent; nothing to invalidate."
+            exit 0
+          fi
+
+          gcloud run services update-traffic "$preview_service" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --remove-tags="$preview_tag" \
+            --quiet

@@ -1,0 +1,12 @@
+self-hosted-runner:
+  labels: []
+
+config-variables: null
+
+paths:
+  .github/workflows/*.yml:
+    ignore:
+      # actionlint 1.7.12 predates these documented GitHub.com fields. The
+      # platform regression suite independently requires their exact use.
+      - 'property "workflow_(repository|sha)" is not defined in object type'
+      - 'unexpected key "queue" for "concurrency" section'

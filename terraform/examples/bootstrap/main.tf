@@ -17,13 +17,18 @@ provider "google" {
 module "bootstrap" {
   source = "../../modules/bootstrap"
 
-  app                   = "example"
-  project_id            = "example"
-  region                = "us-east4"
-  state_bucket_name     = "example-tfstate"
-  state_bucket_location = "US-EAST4"
-  github_owner          = "collinbentley1"
-  github_repo           = "example"
-  github_owner_id       = "16823277"
-  github_repository_id  = "123456789"
+  app                         = "example"
+  project_id                  = "example"
+  region                      = "us-east4"
+  state_bucket_name           = "example-tfstate"
+  bootstrap_state_bucket_name = "example-bootstrap-tfstate"
+  state_bucket_location       = "US-EAST4"
+  github_owner                = "collinbentley1"
+  github_repo                 = "example"
+  github_owner_id             = "16823277"
+  github_repository_id        = "123456789"
+  trusted_platform_workflow_shas = [
+    "0123456789abcdef0123456789abcdef01234567",
+  ]
+  legacy_compatibility_mode = false
 }

@@ -1,0 +1,9 @@
+env = false
+telemetry = false
+
+[install]
+exact = true
+registry = "https://registry.npmjs.org"
+
+[install.security]
+scanner = "@socketsecurity/bun-security-scanner"

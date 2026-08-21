@@ -29,9 +29,18 @@ variable "artifact_registry_description" {
 }
 
 variable "bootstrap_image" {
-  description = "Initial public image used before the application container exists."
+  description = "Digest-pinned initial public image used before the application container exists."
   type        = string
-  default     = "us-docker.pkg.dev/cloudrun/container/hello"
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.bootstrap_image))
+    error_message = "bootstrap_image must end in an immutable sha256 digest."
+  }
+}
+
+variable "bootstrap_runtime_service_account_email" {
+  description = "No-role service account used only while the digest-pinned bootstrap image is active."
+  type        = string
 }
 
 variable "runtime_service_account_email" {
@@ -39,20 +48,34 @@ variable "runtime_service_account_email" {
   type        = string
 }
 
+variable "preview_runtime_service_account_email" {
+  description = "No-data Cloud Run runtime service account email for pull request previews."
+  type        = string
+}
+
 variable "prod_deploy_service_account_email" {
-  description = "Production deploy service account email."
+  description = "Production deploy service account email; receives service update, exact runtime actAs, and exact-repository Artifact Registry Reader only."
+  type        = string
+}
+
+variable "prod_publisher_service_account_email" {
+  description = "Artifact Registry-only production publisher service account email."
   type        = string
 }
 
 variable "preview_deploy_service_account_email" {
-  description = "Preview deploy service account email."
+  description = "Preview deploy service account email; receives service update, exact runtime actAs, and exact-repository Artifact Registry Reader only."
   type        = string
 }
 
-variable "custom_domains" {
-  description = "Cloud Run custom domains mapped to the production service."
-  type        = set(string)
-  default     = []
+variable "preview_operator_service_account_email" {
+  description = "Preview traffic operator service account email; receives service update only, with no Artifact Registry or runtime actAs grant."
+  type        = string
+}
+
+variable "preview_publisher_service_account_email" {
+  description = "Artifact Registry-only preview publisher service account email."
+  type        = string
 }
 
 variable "container_env" {
@@ -62,9 +85,20 @@ variable "container_env" {
 }
 
 variable "runtime_secret_ids" {
-  description = "Secret Manager secret IDs created for the runtime service account."
+  description = "Secret Manager secret containers managed by the platform. Declaring a container does not grant the runtime access."
   type        = set(string)
   default     = []
+}
+
+variable "runtime_secret_accessor_ids" {
+  description = "Declared runtime secret IDs whose payloads the production runtime may read. Secure default is no access."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)) == 0
+    error_message = "runtime_secret_accessor_ids must be a subset of runtime_secret_ids."
+  }
 }
 
 variable "firestore_database" {
