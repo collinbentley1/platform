@@ -46,6 +46,20 @@ variable "preview_runtime_service_account_email" {
   default     = "cloud-run-preview@__PROJECT_ID__.iam.gserviceaccount.com"
 }
 
+variable "preview_ingress" {
+  description = "Ingress policy for the shared preview Cloud Run service."
+  type        = string
+  default     = "INGRESS_TRAFFIC_ALL"
+
+  validation {
+    condition = contains([
+      "INGRESS_TRAFFIC_ALL",
+      "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    ], var.preview_ingress)
+    error_message = "preview_ingress must allow all traffic or only internal and Cloud Load Balancing traffic."
+  }
+}
+
 variable "prod_deploy_service_account_email" {
   description = "Production deploy service account email with exact-repository read access."
   type        = string

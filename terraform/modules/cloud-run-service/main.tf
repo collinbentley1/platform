@@ -272,7 +272,7 @@ resource "google_cloud_run_v2_service" "preview" {
   location             = var.region
   client               = "terraform"
   deletion_protection  = true
-  ingress              = "INGRESS_TRAFFIC_ALL"
+  ingress              = var.preview_ingress
   invoker_iam_disabled = true
   labels               = merge(local.labels, { environment = "preview" })
 

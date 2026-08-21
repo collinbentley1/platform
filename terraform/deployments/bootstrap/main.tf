@@ -154,7 +154,9 @@ locals {
       github_repository_id        = "280932482"
       required_services = [
         "artifactregistry.googleapis.com",
+        "certificatemanager.googleapis.com",
         "cloudresourcemanager.googleapis.com",
+        "compute.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
         "run.googleapis.com",

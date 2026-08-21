@@ -114,14 +114,42 @@ jobs:
           REGION: ${{ steps.app.outputs.region }}
           SERVICE_NAME: ${{ steps.app.outputs.service_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
           CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
         run: |
           set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
+             [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]]; then
+            echo "Refusing invalid preview cleanup identity." >&2
+            exit 1
+          fi
           preview_service="${SERVICE_NAME}-preview"
           preview_tag="pr-${PR_NUMBER}"
           service_json="$(mktemp)"
           describe_error="$(mktemp)"
           trap 'rm -f "$service_json" "$describe_error"' EXIT
+
+          verify_stable_preview_absent() {
+            if [ "$REPOSITORY_ID" != "280932482" ]; then
+              return 0
+            fi
+            stable_url="https://pr-${PR_NUMBER}.preview.ycriticalhistory.org"
+            for attempt in $(seq 1 30); do
+              if status="$(curl --silent --show-error \
+                --output /dev/null \
+                --write-out '%{http_code}' \
+                --max-time 10 \
+                --proto '=https' \
+                "$stable_url")" && [ "$status" = "404" ]; then
+                return 0
+              fi
+              if [ "$attempt" -lt 30 ]; then
+                sleep 5
+              fi
+            done
+            echo "Stable preview URL remained routable after removing $preview_tag." >&2
+            return 1
+          }
 
           if ! gcloud run services describe "$preview_service" \
             --region="$REGION" \
@@ -129,6 +157,7 @@ jobs:
             --format=json > "$service_json" 2> "$describe_error"; then
             if rg -qi 'not[ _-]?found|could not be found|404' "$describe_error"; then
               echo "Preview service $preview_service does not exist; nothing to invalidate."
+              verify_stable_preview_absent
               exit 0
             fi
             cat "$describe_error" >&2
@@ -137,6 +166,7 @@ jobs:
 
           if ! jq -e --arg tag "$preview_tag" '.status.traffic[]? | select(.tag == $tag)' "$service_json" >/dev/null; then
             echo "Preview tag $preview_tag is already absent; nothing to invalidate."
+            verify_stable_preview_absent
             exit 0
           fi
 
@@ -145,3 +175,4 @@ jobs:
             --project="$PROJECT_ID" \
             --remove-tags="$preview_tag" \
             --quiet
+          verify_stable_preview_absent

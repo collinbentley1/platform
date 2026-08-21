@@ -16,6 +16,7 @@ module "site" {
   bootstrap_runtime_service_account_email = var.bootstrap_runtime_service_account_email
   runtime_service_account_email           = var.runtime_service_account_email
   preview_runtime_service_account_email   = var.preview_runtime_service_account_email
+  preview_ingress                         = var.preview_ingress
   prod_deploy_service_account_email       = var.prod_deploy_service_account_email
   prod_publisher_service_account_email    = var.prod_publisher_service_account_email
   preview_deploy_service_account_email    = var.preview_deploy_service_account_email

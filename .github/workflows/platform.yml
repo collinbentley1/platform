@@ -201,6 +201,9 @@ jobs:
       - name: Test protected bootstrap input validation
         run: terraform -chdir=terraform/deployments/bootstrap test -no-color
 
+      - name: Test stable preview-domain selection
+        run: terraform -chdir=terraform/deployments/exposure test -no-color
+
       - name: Run digest-pinned Checkov against the trusted platform Terraform
         env:
           CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a # 3.2.527
