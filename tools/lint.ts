@@ -1054,6 +1054,29 @@ for (const rootPath of [
   requireContains(rootPath, deployment, 'source = "../../modules/', "Trusted deployment roots must use local platform modules.");
   rejectContains(rootPath, deployment, "github.com/", "Trusted deployment roots must not download caller-selected modules.");
 }
+const expectedTerraformPlatformHashes = [
+  '"h1:5bwzwKa/bvJmUkVMkrF18v9AfFeJ/wjR230oY+4LHrc="',
+  '"h1:EYsKCMfXi6gtv3fE6XgNpsKrt7qFNrGFwenhlTkrrRM="',
+  '"h1:FGFsRBzfeyq56BUAcb/WT676NieMX3NRfR4DBj2eEqk="',
+  '"h1:snI9jfT+CtL8dH099NZCe79ciOSTuL74nPB7KaCf9pM="',
+].sort();
+for (const lockPath of [
+  "terraform/deployments/bootstrap/.terraform.lock.hcl",
+  "terraform/deployments/exposure/.terraform.lock.hcl",
+  "terraform/deployments/prod/.terraform.lock.hcl",
+  "terraform/examples/bootstrap/.terraform.lock.hcl",
+  "terraform/examples/cloud-run-service/.terraform.lock.hcl",
+  "templates/app/infra/terraform/bootstrap/.terraform.lock.hcl",
+  "templates/app/infra/terraform/prod/.terraform.lock.hcl",
+]) {
+  const lock = await read(lockPath);
+  const actualPlatformHashes = [...lock.matchAll(/"h1:[^"]+"/g)].map(([hash]) => hash).sort();
+  if (JSON.stringify(actualPlatformHashes) !== JSON.stringify(expectedTerraformPlatformHashes)) {
+    failures.push(
+      `${lockPath}: Google provider lockfile must include the reviewed Darwin/Linux amd64+arm64 package hashes.`,
+    );
+  }
+}
 const platformWorkflow = await read(".github/workflows/platform.yml");
 requireContains(
   ".github/workflows/platform.yml",
