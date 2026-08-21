@@ -192,22 +192,55 @@ jobs:
             echo "Inline Checkov suppressions are not accepted in any scanned caller file." >&2
             exit 1
           fi
-          rm -f -- "$GITHUB_WORKSPACE/.platform-checkov.yml"
-          printf '%s\n' 'soft-fail: false' > "$GITHUB_WORKSPACE/.platform-checkov.yml"
+          policy_file="$RUNNER_TEMP/platform-checkov.yml"
+          rm -f -- "$policy_file"
+          umask 077
+          printf '%s\n' 'soft-fail: false' > "$policy_file"
+          chmod 0444 "$policy_file"
 
       - name: Run digest-pinned Checkov with platform policy
-        uses: docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a # 3.2.527
-        with:
-          args: >-
-            --directory .
-            --config-file .platform-checkov.yml
-            --framework terraform github_actions
-            --compact
-            --quiet
-            --download-external-modules false
-            --skip-path .terraform
-            --skip-path outputs
-            --skip-path work
+        env:
+          CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a # 3.2.527
+        run: |
+          set -euo pipefail
+          scan_root="$GITHUB_WORKSPACE"
+          policy_file="$RUNNER_TEMP/platform-checkov.yml"
+          if [ ! -d "$scan_root" ] || [ -L "$scan_root" ] || [ "$(realpath -e -- "$scan_root")" != "$scan_root" ]; then
+            echo "The caller scan root must be a canonical directory." >&2
+            exit 1
+          fi
+          if [ ! -f "$policy_file" ] || [ -L "$policy_file" ] || [ "$(realpath -e -- "$policy_file")" != "$policy_file" ]; then
+            echo "The generated Checkov policy must be a canonical regular file." >&2
+            exit 1
+          fi
+          docker pull "$CHECKOV_IMAGE"
+          docker run --rm --pull=never \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges=true \
+            --user 65532:65532 \
+            --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=1777 \
+            --env HOME=/tmp \
+            --env CKV_SKIP_PACKAGE_UPDATE_CHECK=true \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env XDG_CACHE_HOME=/tmp \
+            --workdir /tmp \
+            --mount "type=bind,src=${scan_root},dst=/scan,readonly" \
+            --mount "type=bind,src=${policy_file},dst=/policy.yml,readonly" \
+            --entrypoint /usr/local/bin/checkov \
+            "$CHECKOV_IMAGE" \
+            --directory /scan \
+            --config-file /policy.yml \
+            --framework terraform github_actions \
+            --compact \
+            --quiet \
+            --skip-download \
+            --download-external-modules false \
+            --skip-path '(^|/)\.terraform(/|$)' \
+            --skip-path '(^|/)outputs(/|$)' \
+            --skip-path '(^|/)work(/|$)'
 
   terraform-convergence:
     name: Terraform convergence

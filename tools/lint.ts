@@ -531,7 +531,7 @@ rejectContains(
 requireContains(
   ".github/workflows/infrastructure.yml",
   infrastructure,
-  "docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+  "CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
   "Checkov container must be digest pinned.",
 );
 for (const configName of [".checkov.yml", ".checkov.yaml", "checkov.yml", "checkov.yaml"]) {
@@ -545,14 +545,50 @@ for (const configName of [".checkov.yml", ".checkov.yaml", "checkov.yml", "check
 requireContains(
   ".github/workflows/infrastructure.yml",
   infrastructure,
-  "--config-file .platform-checkov.yml",
+  "--config-file /policy.yml",
   "Checkov must use a trusted fail-closed configuration written by the reusable workflow.",
 );
 requireContains(
   ".github/workflows/infrastructure.yml",
   infrastructure,
-  "printf '%s\\n' 'soft-fail: false'",
+  "printf '%s\\n' 'soft-fail: false' > \"$policy_file\"",
   "The trusted Checkov configuration must fail closed.",
+);
+requireContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  'chmod 0444 "$policy_file"',
+  "The non-root Checkov container must be able to read the generated non-secret policy.",
+);
+for (const boundary of [
+  'policy_file="$RUNNER_TEMP/platform-checkov.yml"',
+  "docker run --rm --pull=never",
+  "--network=none",
+  "--read-only",
+  "--cap-drop=ALL",
+  "--security-opt no-new-privileges=true",
+  "--user 65532:65532",
+  "--workdir /tmp",
+  '--mount "type=bind,src=${scan_root},dst=/scan,readonly"',
+  '--mount "type=bind,src=${policy_file},dst=/policy.yml,readonly"',
+  "--entrypoint /usr/local/bin/checkov",
+  "--skip-download",
+  "--skip-path '(^|/)\\.terraform(/|$)'",
+  "--skip-path '(^|/)outputs(/|$)'",
+  "--skip-path '(^|/)work(/|$)'",
+]) {
+  requireContains(
+    ".github/workflows/infrastructure.yml",
+    infrastructure,
+    boundary,
+    `Infrastructure Checkov isolation is missing ${boundary}.`,
+  );
+}
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  "uses: docker://ghcr.io/bridgecrewio/checkov@",
+  "The Checkov GitHub Action entrypoint ignores raw args and must not wrap the trusted scan.",
 );
 for (const boundary of [
   "validate_root infra/terraform/bootstrap bootstrap terraform/modules/bootstrap",
@@ -1099,23 +1135,66 @@ requireContains(
 requireContains(
   ".github/workflows/platform.yml",
   platformWorkflow,
-  "docker://ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+  "CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
   "Platform Terraform must be scanned by the reviewed digest-pinned Checkov image.",
 );
 requireContains(
   ".github/workflows/platform.yml",
   platformWorkflow,
-  "--directory terraform",
+  'docker pull "$CHECKOV_IMAGE"',
+  "Platform CI must explicitly pull the reviewed Checkov digest before disabling network access.",
+);
+for (const boundary of [
+  "docker run --rm --pull=never",
+  "--network=none",
+  "--read-only",
+  "--cap-drop=ALL",
+  "--security-opt no-new-privileges=true",
+  "--user 65532:65532",
+  "--workdir /tmp",
+  '--mount "type=bind,src=${terraform_root},dst=/scan,readonly"',
+  '--mount "type=bind,src=${policy_file},dst=/policy.yml,readonly"',
+  "--entrypoint /usr/local/bin/checkov",
+  "--skip-download",
+  "--skip-path '(^|/)\\.terraform(/|$)'",
+]) {
+  requireContains(
+    ".github/workflows/platform.yml",
+    platformWorkflow,
+    boundary,
+    `Platform Checkov isolation is missing ${boundary}.`,
+  );
+}
+rejectContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  '--mount "type=bind,src=${GITHUB_WORKSPACE},dst=/scan,readonly"',
+  "Platform Checkov must never receive the caller-controlled repository root.",
+);
+for (const configName of [".checkov.yml", ".checkov.yaml", "checkov.yml", "checkov.yaml"]) {
+  requireContains(
+    ".github/workflows/platform.yml",
+    platformWorkflow,
+    configName,
+    `Platform Terraform verification must reject ambient ${configName}.`,
+  );
+}
+requireContains(
+  ".github/workflows/platform.yml",
+  platformWorkflow,
+  "--directory /scan",
   "Platform Checkov must scan the trusted modules and deployment roots.",
 );
 requireContains(
   ".github/workflows/platform.yml",
   platformWorkflow,
-  "--config-file tools/ci/checkov-platform.yml",
+  "--config-file /policy.yml",
   "Platform Checkov must ignore ambient user configuration and use the reviewed fail-closed policy.",
 );
 const platformCheckov = await read("tools/ci/checkov-platform.yml");
-requireContains("tools/ci/checkov-platform.yml", platformCheckov, "soft-fail: false", "Platform Checkov must fail on findings.");
+if (platformCheckov !== "soft-fail: false\n") {
+  failures.push("tools/ci/checkov-platform.yml: Platform Checkov policy must contain only soft-fail: false.");
+}
 requireContains(
   ".github/workflows/platform.yml",
   platformWorkflow,

@@ -326,6 +326,58 @@ describe("platform scaffold and doctor", () => {
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
+  test("Checkov bypasses the action wrapper and accepts only trusted policy mounts", async () => {
+    const workflow = await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8");
+    expect(workflow).toContain(
+      "CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+    );
+    for (const boundary of [
+      "docker run --rm --pull=never",
+      "--network=none",
+      "--read-only",
+      "--cap-drop=ALL",
+      "--security-opt no-new-privileges=true",
+      "--user 65532:65532",
+      "--workdir /tmp",
+      '--mount "type=bind,src=${terraform_root},dst=/scan,readonly"',
+      '--mount "type=bind,src=${policy_file},dst=/policy.yml,readonly"',
+      "--directory /scan",
+      "--config-file /policy.yml",
+      "--skip-download",
+      "--skip-path '(^|/)\\.terraform(/|$)'",
+    ]) {
+      expect(workflow).toContain(boundary);
+    }
+    for (const configName of [".checkov.yml", ".checkov.yaml", "checkov.yml", "checkov.yaml"]) {
+      expect(workflow).toContain(configName);
+    }
+    expect(await readFile(join(repoRoot, "tools/ci/checkov-platform.yml"), "utf8")).toBe(
+      "soft-fail: false\n",
+    );
+    expect(workflow).toContain("The platform Checkov policy must contain only the fail-closed setting.");
+    expect(workflow).not.toContain('uses: docker://ghcr.io/bridgecrewio/checkov@');
+
+    const infrastructure = await readFile(
+      join(repoRoot, ".github/workflows/infrastructure.yml"),
+      "utf8",
+    );
+    expect(infrastructure).toContain(
+      "CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a",
+    );
+    expect(infrastructure).toContain('policy_file="$RUNNER_TEMP/platform-checkov.yml"');
+    expect(infrastructure).toContain('chmod 0444 "$policy_file"');
+    expect(infrastructure).toContain(
+      '--mount "type=bind,src=${scan_root},dst=/scan,readonly"',
+    );
+    expect(infrastructure).toContain(
+      '--mount "type=bind,src=${policy_file},dst=/policy.yml,readonly"',
+    );
+    expect(infrastructure).toContain("--entrypoint /usr/local/bin/checkov");
+    expect(infrastructure).toContain("--skip-path '(^|/)work(/|$)'");
+    expect(infrastructure).not.toContain("--skip-path work");
+    expect(infrastructure).not.toContain('uses: docker://ghcr.io/bridgecrewio/checkov@');
+  });
+
   test("SBOM attest jobs consume the exact uploaded artifact and verify its content", async () => {
     for (const workflowName of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const workflow = await readFile(
