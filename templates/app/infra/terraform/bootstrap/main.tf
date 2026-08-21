@@ -1,14 +1,19 @@
 module "bootstrap" {
-  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=v0.4.1"
+  source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=__PLATFORM_SHA__"
 
-  app                   = "__APP_NAME__"
-  project_id            = var.project_id
-  region                = var.region
-  state_bucket_name     = var.state_bucket_name
-  state_bucket_location = var.state_bucket_location
-  github_owner          = var.github_owner
-  github_repo           = var.github_repo
-  github_owner_id       = var.github_owner_id
-  github_repository_id  = var.github_repository_id
-  runtime_description   = "Runtime identity for the __APP_NAME__ Cloud Run services."
+  app                         = "__APP_NAME__"
+  project_id                  = var.project_id
+  region                      = var.region
+  state_bucket_name           = var.state_bucket_name
+  bootstrap_state_bucket_name = var.bootstrap_state_bucket_name
+  state_bucket_location       = var.state_bucket_location
+  github_owner                = var.github_owner
+  github_repo                 = var.github_repo
+  github_owner_id             = var.github_owner_id
+  github_repository_id        = var.github_repository_id
+  trusted_platform_workflow_shas = [
+    "__PLATFORM_SHA__",
+  ]
+  legacy_compatibility_mode = false
+  runtime_description       = "Runtime identity for the __APP_NAME__ Cloud Run services."
 }

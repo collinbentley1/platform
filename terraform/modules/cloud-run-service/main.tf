@@ -17,6 +17,10 @@ locals {
       (var.firestore_database.runtime_collection_env_name) = var.firestore_database.runtime_collection_env_value
     },
   )
+
+  preview_repository_id            = "${var.artifact_registry_repository_id}-preview"
+  preview_service_name             = "${var.service_name}-preview"
+  cloud_run_revision_deployer_role = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
 }
 
 resource "google_artifact_registry_repository" "site" {
@@ -56,28 +60,85 @@ resource "google_artifact_registry_repository" "site" {
   labels = local.labels
 }
 
-resource "google_artifact_registry_repository_iam_member" "prod_deploy_writer" {
+# Artifact Registry has no predefined upload-only Docker role. Writer is bound
+# to this one repository (never the project); it can upload/read, create or
+# update tags, and delete attachments, but cannot delete repository images,
+# tags, or versions. Do not replace it with a guessed custom role until crane
+# copy + digest is exercised through the protected pipeline against every
+# required OCI request.
+resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer" {
   project    = var.project_id
   location   = google_artifact_registry_repository.site.location
   repository = google_artifact_registry_repository.site.repository_id
   role       = "roles/artifactregistry.writer"
-  member     = "serviceAccount:${var.prod_deploy_service_account_email}"
+  member     = "serviceAccount:${var.prod_publisher_service_account_email}"
 }
 
-resource "google_artifact_registry_repository_iam_member" "preview_deploy_writer" {
+resource "google_artifact_registry_repository_iam_member" "preview_publisher_writer" {
   project    = var.project_id
-  location   = google_artifact_registry_repository.site.location
-  repository = google_artifact_registry_repository.site.repository_id
+  location   = google_artifact_registry_repository.preview.location
+  repository = google_artifact_registry_repository.preview.repository_id
   role       = "roles/artifactregistry.writer"
-  member     = "serviceAccount:${var.preview_deploy_service_account_email}"
+  member     = "serviceAccount:${var.preview_publisher_service_account_email}"
 }
 
-resource "google_artifact_registry_repository_iam_member" "runtime_reader" {
+# Cloud Run requires the deployer itself to have downloadArtifacts on the image
+# repository. The predefined Reader role is the documented deployment contract;
+# repository scope contains its metadata and download breadth and grants no
+# upload or delete permission.
+resource "google_artifact_registry_repository_iam_member" "prod_deploy_reader" {
   project    = var.project_id
   location   = google_artifact_registry_repository.site.location
   repository = google_artifact_registry_repository.site.repository_id
   role       = "roles/artifactregistry.reader"
-  member     = "serviceAccount:${var.runtime_service_account_email}"
+  member     = "serviceAccount:${var.prod_deploy_service_account_email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.preview.location
+  repository = google_artifact_registry_repository.preview.repository_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${var.preview_deploy_service_account_email}"
+}
+
+moved {
+  from = google_artifact_registry_repository_iam_member.prod_deploy_writer
+  to   = google_artifact_registry_repository_iam_member.prod_publisher_writer
+}
+
+moved {
+  from = google_artifact_registry_repository_iam_member.preview_deploy_writer
+  to   = google_artifact_registry_repository_iam_member.preview_publisher_writer
+}
+
+resource "google_artifact_registry_repository" "preview" {
+  #checkov:skip=CKV_GCP_84:Google-managed encryption is sufficient for public application preview images.
+  project       = var.project_id
+  location      = var.region
+  repository_id = local.preview_repository_id
+  description   = "Ephemeral pull request images for ${var.app}."
+  format        = "DOCKER"
+
+  docker_config {
+    # Preview tags contain PR, commit, run, and attempt. Keeping them mutable lets
+    # Artifact Registry's delete policy actually reclaim tagged preview images.
+    immutable_tags = false
+  }
+
+  cleanup_policy_dry_run = false
+
+  cleanup_policies {
+    id     = "delete-preview-images-after-30-days"
+    action = "DELETE"
+
+    condition {
+      older_than = "2592000s"
+      tag_state  = "ANY"
+    }
+  }
+
+  labels = merge(local.labels, { environment = "preview" })
 }
 
 resource "google_secret_manager_secret" "runtime" {
@@ -95,10 +156,10 @@ resource "google_secret_manager_secret" "runtime" {
 }
 
 resource "google_secret_manager_secret_iam_member" "runtime_accessor" {
-  for_each = google_secret_manager_secret.runtime
+  for_each = var.runtime_secret_accessor_ids
 
   project   = var.project_id
-  secret_id = each.value.secret_id
+  secret_id = google_secret_manager_secret.runtime[each.value].secret_id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${var.runtime_service_account_email}"
 }
@@ -116,12 +177,12 @@ resource "google_firestore_database" "firestore" {
   delete_protection_state           = "DELETE_PROTECTION_ENABLED"
 }
 
-resource "google_project_iam_member" "runtime_firestore_user" {
-  count = var.firestore_database == null ? 0 : 1
+removed {
+  from = google_project_iam_member.runtime_firestore_user
 
-  project = var.project_id
-  role    = "roles/datastore.user"
-  member  = "serviceAccount:${var.runtime_service_account_email}"
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "google_cloud_run_v2_service" "site" {
@@ -135,7 +196,7 @@ resource "google_cloud_run_v2_service" "site" {
   labels               = local.labels
 
   template {
-    service_account                  = var.runtime_service_account_email
+    service_account                  = var.bootstrap_runtime_service_account_email
     timeout                          = "300s"
     max_instance_request_concurrency = 80
 
@@ -185,6 +246,7 @@ resource "google_cloud_run_v2_service" "site" {
       client_version,
       labels,
       template[0].labels,
+      template[0].service_account,
       template[0].containers[0].env,
       template[0].containers[0].image,
     ]
@@ -192,35 +254,106 @@ resource "google_cloud_run_v2_service" "site" {
 
   depends_on = [
     google_artifact_registry_repository.site,
-    google_artifact_registry_repository_iam_member.runtime_reader,
-    google_project_iam_member.runtime_firestore_user,
     google_secret_manager_secret_iam_member.runtime_accessor,
   ]
 }
 
-resource "google_cloud_run_domain_mapping" "site" {
-  for_each = var.custom_domains
-  provider = google.no_attribution
-
+resource "google_cloud_run_v2_service_iam_member" "prod_deploy" {
   project  = var.project_id
-  location = var.region
-  name     = each.value
+  location = google_cloud_run_v2_service.site.location
+  name     = google_cloud_run_v2_service.site.name
+  role     = local.cloud_run_revision_deployer_role
+  member   = "serviceAccount:${var.prod_deploy_service_account_email}"
+}
 
-  metadata {
-    namespace = var.project_id
+resource "google_cloud_run_v2_service" "preview" {
+  project              = var.project_id
+  name                 = local.preview_service_name
+  location             = var.region
+  client               = "terraform"
+  deletion_protection  = true
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  labels               = merge(local.labels, { environment = "preview" })
+
+  template {
+    service_account                  = var.preview_runtime_service_account_email
+    timeout                          = "300s"
+    max_instance_request_concurrency = 80
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 2
+    }
+
+    containers {
+      name  = "site"
+      image = var.bootstrap_image
+
+      ports {
+        name           = "http1"
+        container_port = 8080
+      }
+
+      env {
+        name  = "PLATFORM_DEPLOY_ENVIRONMENT"
+        value = "preview"
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+
+        cpu_idle          = true
+        startup_cpu_boost = true
+      }
+    }
   }
 
-  spec {
-    route_name = google_cloud_run_v2_service.site.name
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
   }
 
   lifecycle {
-    prevent_destroy = true
     ignore_changes = [
-      metadata[0].annotations,
-      metadata[0].labels,
-      spec[0].certificate_mode,
-      spec[0].force_override,
+      client,
+      client_version,
+      labels,
+      template[0].labels,
+      template[0].containers[0].env,
+      template[0].containers[0].image,
+      traffic,
     ]
+  }
+
+  depends_on = [
+    google_artifact_registry_repository.preview,
+  ]
+}
+
+resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.preview.location
+  name     = google_cloud_run_v2_service.preview.name
+  role     = local.cloud_run_revision_deployer_role
+  member   = "serviceAccount:${var.preview_deploy_service_account_email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "preview_operator" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.preview.location
+  name     = google_cloud_run_v2_service.preview.name
+  role     = local.cloud_run_revision_deployer_role
+  member   = "serviceAccount:${var.preview_operator_service_account_email}"
+}
+
+removed {
+  from = google_cloud_run_domain_mapping.site
+
+  lifecycle {
+    destroy = false
   }
 }

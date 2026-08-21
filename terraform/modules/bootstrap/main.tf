@@ -6,24 +6,65 @@ locals {
   github_repo_full_name  = "${var.github_owner}/${var.github_repo}"
   workload_identity_pool = "projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
 
-  github_repo_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.repository_id/${var.github_repository_id}"
+  legacy_preview_deploy_principal_set   = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_preview_deploy/${var.github_repository_id}"
+  legacy_preview_operator_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_preview_operator/${var.github_repository_id}"
+  legacy_prod_deploy_principal_set      = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_prod_deploy/${var.github_repository_id}"
+  legacy_terraform_principal_set        = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_terraform/${var.github_repository_id}"
 
-  # Rename-proof production binding. The pool's attribute_condition already restricts entry to this
-  # one repository by immutable numeric id, so keying on attribute.environment/production means
-  # exactly "this repository's production environment" without embedding the repository name (which
-  # a rename would break, as the medlock->healthmcp rename did). GitHub environment protection rules
-  # still gate which jobs may assume the production environment.
-  github_prod_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.environment/production"
+  preview_deploy_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-cloud'"
+  preview_operator_workflow_condition = join(" || ", [
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/cleanup-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/reconcile-previews.yml@' + assertion.job_workflow_sha && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+  ])
+  preview_publish_workflow_condition    = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-publish'"
+  production_workflow_condition         = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  production_publish_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production-publish'"
+  terraform_workflow_condition          = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/infrastructure.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+
+  # Compatibility accepts an immediately previous reviewed workflow ref for
+  # each old operational identity, but maps a distinct attribute per path. A
+  # token accepted for one legacy workflow therefore cannot impersonate a
+  # different service account through an aggregate repository/environment key.
+  legacy_preview_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && (!has(assertion.environment) || assertion.environment == 'preview-cloud')"
+  legacy_preview_operator_workflow_condition = join(" || ", [
+    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/cleanup-preview.yml@') && assertion.event_name == 'pull_request' && (!has(assertion.environment) || assertion.environment == 'preview-operations')",
+    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/reconcile-previews.yml@') && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+  ])
+  legacy_prod_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  legacy_terraform_workflow_condition   = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  legacy_workflow_condition = join(" || ", [
+    "(${local.legacy_preview_deploy_workflow_condition})",
+    "(${local.legacy_preview_operator_workflow_condition})",
+    "(${local.legacy_prod_deploy_workflow_condition})",
+    "(${local.legacy_terraform_workflow_condition})",
+    # Publisher identities never receive a generic compatibility binding. Even
+    # in phase A, only a full-SHA caller can mint their exact mapped attribute.
+    "(${local.preview_publish_workflow_condition})",
+    "(${local.production_publish_workflow_condition})",
+  ])
+  trusted_workflow_sha_condition = join(" || ", [
+    for sha in sort(tolist(var.trusted_platform_workflow_shas)) : "assertion.job_workflow_sha == '${sha}'"
+  ])
+
+  exact_workflow_provider_condition = join(" && ", [
+    "assertion.repository_owner_id == '${var.github_owner_id}'",
+    "assertion.repository_id == '${var.github_repository_id}'",
+    "has(assertion.job_workflow_ref)",
+    "has(assertion.job_workflow_sha)",
+    "assertion.runner_environment == 'github-hosted'",
+    "(${local.trusted_workflow_sha_condition})",
+    "((${local.preview_deploy_workflow_condition}) || (${local.preview_operator_workflow_condition}) || (${local.preview_publish_workflow_condition}) || (${local.production_workflow_condition}) || (${local.production_publish_workflow_condition}) || (${local.terraform_workflow_condition}))",
+  ])
+  legacy_provider_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && assertion.runner_environment == 'github-hosted' && (${local.trusted_workflow_sha_condition}) && (${local.legacy_workflow_condition})"
+  provider_condition        = var.legacy_compatibility_mode ? local.legacy_provider_condition : local.exact_workflow_provider_condition
 
   labels = {
     app        = var.app
     managed-by = "terraform"
   }
 
-  service_accounts = {
-    prod    = google_service_account.prod_deploy.email
-    preview = google_service_account.preview_deploy.email
-  }
 }
 
 resource "google_project_service" "required" {
@@ -68,6 +109,46 @@ resource "google_storage_bucket" "terraform_state" {
 
   depends_on = [
     google_project_service.required,
+    google_project_iam_binding.editor_absent,
+    google_storage_bucket_iam_member.terraform_state_access_logs_writer,
+  ]
+}
+
+resource "google_storage_bucket" "bootstrap_state" {
+  name                        = var.bootstrap_state_bucket_name
+  project                     = var.project_id
+  location                    = var.state_bucket_location
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  logging {
+    log_bucket        = google_storage_bucket.terraform_state_access_logs.name
+    log_object_prefix = "bootstrap-state/"
+  }
+
+  versioning {
+    enabled = true
+  }
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+
+    condition {
+      age                   = 365
+      matches_storage_class = ["STANDARD"]
+      num_newer_versions    = 50
+      with_state            = "ARCHIVED"
+    }
+  }
+
+  labels = merge(local.labels, { purpose = "privileged-bootstrap-state" })
+
+  depends_on = [
+    google_project_service.required,
+    google_project_iam_binding.editor_absent,
     google_storage_bucket_iam_member.terraform_state_access_logs_writer,
   ]
 }
@@ -98,7 +179,43 @@ resource "google_storage_bucket" "terraform_state_access_logs" {
 
   labels = merge(local.labels, { purpose = "terraform-state-access-logs" })
 
-  depends_on = [google_project_service.required]
+  depends_on = [
+    google_project_service.required,
+    google_project_iam_binding.editor_absent,
+  ]
+}
+
+locals {
+  legacy_storage_roles = toset([
+    "roles/storage.legacyBucketOwner",
+    "roles/storage.legacyBucketReader",
+    "roles/storage.legacyObjectOwner",
+    "roles/storage.legacyObjectReader",
+  ])
+}
+
+resource "google_storage_bucket_iam_binding" "terraform_state_no_legacy_access" {
+  for_each = local.legacy_storage_roles
+
+  bucket  = google_storage_bucket.terraform_state.name
+  role    = each.value
+  members = []
+}
+
+resource "google_storage_bucket_iam_binding" "bootstrap_state_no_legacy_access" {
+  for_each = local.legacy_storage_roles
+
+  bucket  = google_storage_bucket.bootstrap_state.name
+  role    = each.value
+  members = []
+}
+
+resource "google_storage_bucket_iam_binding" "terraform_state_logs_no_legacy_access" {
+  for_each = local.legacy_storage_roles
+
+  bucket  = google_storage_bucket.terraform_state_access_logs.name
+  role    = each.value
+  members = []
 }
 
 resource "google_storage_bucket_iam_member" "terraform_state_access_logs_writer" {
@@ -124,17 +241,21 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   description                        = "OIDC provider restricted to ${local.github_repo_full_name}."
 
   attribute_mapping = {
-    "attribute.ref"                 = "assertion.ref"
-    "attribute.repository_id"       = "assertion.repository_id"
-    "attribute.repository_owner_id" = "assertion.repository_owner_id"
-    # environment is an optional OIDC claim (absent on pull_request / preview / validate tokens);
-    # the has() guard keeps CEL evaluation from failing for those exchanges, which would break
-    # preview auth. Present only on jobs running in a GitHub environment (e.g. production).
-    "attribute.environment" = "has(assertion.environment) ? assertion.environment : ''"
-    "google.subject"        = "assertion.sub"
+    "attribute.preview_deploy_workflow_sha"   = "(${local.preview_deploy_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.preview_operator_workflow_sha" = "(${local.preview_operator_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.preview_publish_workflow_sha"  = "(${local.preview_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.prod_workflow_sha"             = "(${local.production_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.prod_publish_workflow_sha"     = "(${local.production_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.terraform_workflow_sha"        = "(${local.terraform_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.legacy_preview_deploy"         = "(${local.legacy_preview_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_prod_deploy"            = "(${local.legacy_prod_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_terraform"              = "(${local.legacy_terraform_workflow_condition}) ? assertion.repository_id : 'denied'"
+    # Numeric IDs survive renames. run_id makes the subject non-reusable across runs.
+    "google.subject" = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
   }
 
-  attribute_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}'"
+  attribute_condition = local.provider_condition
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com/"
@@ -159,11 +280,108 @@ resource "google_service_account" "prod_deploy" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_service_account" "prod_publisher" {
+  project      = var.project_id
+  account_id   = "gha-prod-publish"
+  display_name = "GitHub Actions Production Publisher"
+  description  = var.prod_publisher_service_account_description
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_service_account" "preview_deploy" {
   project      = var.project_id
   account_id   = "gha-preview-deploy"
   display_name = "GitHub Actions Preview Deploy"
   description  = var.preview_deploy_service_account_description
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "preview_operator" {
+  project      = var.project_id
+  account_id   = "gha-preview-operator"
+  display_name = "GitHub Actions Preview Operator"
+  description  = var.preview_operator_service_account_description
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "preview_publisher" {
+  project      = var.project_id
+  account_id   = "gha-preview-publish"
+  display_name = "GitHub Actions Preview Publisher"
+  description  = var.preview_publisher_service_account_description
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "exact_wif_canary" {
+  project      = var.project_id
+  account_id   = "gha-wif-canary"
+  display_name = "GitHub Actions Exact WIF Canary"
+  description  = "No-role identity that proves exact reusable-workflow SHA trust before legacy WIF bindings are removed."
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
+  project     = var.project_id
+  role_id     = "cloudRunRevisionDeployer"
+  title       = "Cloud Run Revision Deployer"
+  description = "Updates and observes pre-created Cloud Run services without create, delete, or IAM policy permissions."
+  permissions = [
+    "run.operations.get",
+    "run.services.get",
+    "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "terraform_convergence_reader" {
+  project     = var.project_id
+  role_id     = "terraformConvergenceReader"
+  title       = "Terraform Convergence Reader"
+  description = "Reads only infrastructure metadata for the immutable production convergence plan; cannot mutate services or read application data."
+  permissions = concat(
+    [
+      "artifactregistry.locations.get",
+      "artifactregistry.locations.list",
+      "artifactregistry.repositories.get",
+      "artifactregistry.repositories.getIamPolicy",
+      "artifactregistry.repositories.list",
+      "artifactregistry.repositories.listEffectiveTags",
+      "artifactregistry.repositories.listTagBindings",
+      "resourcemanager.projects.get",
+      "resourcemanager.projects.getIamPolicy",
+      "run.locations.list",
+      "run.operations.get",
+      "run.operations.list",
+      "run.services.get",
+      "run.services.getIamPolicy",
+      "run.services.list",
+      "run.services.listEffectiveTags",
+      "run.services.listTagBindings",
+      "serviceusage.services.get",
+      "serviceusage.services.list",
+      "serviceusage.services.use",
+    ],
+    contains(var.required_services, "firestore.googleapis.com") ? [
+      "datastore.databases.get",
+      "datastore.databases.getMetadata",
+      "datastore.databases.list",
+    ] : [],
+    contains(var.required_services, "secretmanager.googleapis.com") ? [
+      "secretmanager.locations.get",
+      "secretmanager.locations.list",
+      "secretmanager.secrets.get",
+      "secretmanager.secrets.getIamPolicy",
+      "secretmanager.secrets.list",
+      "secretmanager.secrets.listEffectiveTags",
+      "secretmanager.secrets.listTagBindings",
+    ] : [],
+  )
 
   depends_on = [google_project_service.required]
 }
@@ -177,32 +395,74 @@ resource "google_service_account" "runtime" {
   depends_on = [google_project_service.required]
 }
 
-resource "google_project_iam_member" "terraform_project_roles" {
-  for_each = var.terraform_project_roles
+resource "google_service_account" "preview_runtime" {
+  project      = var.project_id
+  account_id   = "cloud-run-preview"
+  display_name = var.preview_runtime_display_name
+  description  = var.preview_runtime_description
 
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "bootstrap_runtime" {
+  project      = var.project_id
+  account_id   = "cloud-run-bootstrap"
+  display_name = "Cloud Run Bootstrap Runtime"
+  description  = "No-role identity used only by the digest-pinned bootstrap image before the first application deploy."
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "terraform_convergence_reader" {
   project = var.project_id
-  role    = each.value
+  role    = google_project_iam_custom_role.terraform_convergence_reader.name
   member  = "serviceAccount:${google_service_account.terraform.email}"
 }
 
-resource "google_project_iam_member" "deploy_project_roles" {
-  for_each = var.deploy_project_roles
+resource "google_project_iam_member" "runtime_project_roles" {
+  for_each = var.runtime_project_roles
 
   project = var.project_id
-  role    = each.value.role
-  member  = "serviceAccount:${local.service_accounts[each.value.target]}"
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.runtime.email}"
 }
 
-resource "google_storage_bucket_iam_member" "terraform_state_admin" {
+# This authoritative empty binding removes the direct project Editor grant from
+# the default Compute Engine service account in the first protected apply and
+# prevents it from silently returning. Inventory all workloads before phase A.
+resource "google_project_iam_binding" "editor_absent" {
+  #checkov:skip=CKV_GCP_49:An authoritative empty binding removes impersonation-capable basic-role members; it grants no principal access.
+  #checkov:skip=CKV_GCP_117:An authoritative empty Editor binding removes the basic role and prevents drift; it grants no principal access.
+  project = var.project_id
+  role    = "roles/editor"
+  members = []
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_org_policy_policy" "disable_automatic_default_service_account_grants" {
+  name   = "projects/${data.google_project.current.number}/policies/iam.automaticIamGrantsForDefaultServiceAccounts"
+  parent = "projects/${data.google_project.current.number}"
+
+  spec {
+    rules {
+      enforce = "TRUE"
+    }
+  }
+
+  deletion_policy = "PREVENT"
+  depends_on      = [google_project_service.required]
+}
+
+resource "google_storage_bucket_iam_member" "terraform_state_reader" {
   bucket = google_storage_bucket.terraform_state.name
-  role   = "roles/storage.admin"
+  role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.terraform.email}"
 }
 
-resource "google_service_account_iam_member" "terraform_uses_runtime" {
-  service_account_id = google_service_account.runtime.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.terraform.email}"
+moved {
+  from = google_storage_bucket_iam_member.terraform_state_admin
+  to   = google_storage_bucket_iam_member.terraform_state_reader
 }
 
 resource "google_service_account_iam_member" "prod_deploy_uses_runtime" {
@@ -211,65 +471,157 @@ resource "google_service_account_iam_member" "prod_deploy_uses_runtime" {
   member             = "serviceAccount:${google_service_account.prod_deploy.email}"
 }
 
-resource "google_service_account_iam_member" "preview_deploy_uses_runtime" {
-  service_account_id = google_service_account.runtime.name
+resource "google_service_account_iam_member" "preview_deploy_uses_preview_runtime" {
+  service_account_id = google_service_account.preview_runtime.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.preview_deploy.email}"
 }
 
-resource "google_service_account_iam_member" "terraform_self_token_creator" {
-  service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.terraform.email}"
+# Preserve only the addresses of the constrained legacy Workload Identity User
+# bindings while compatibility mode transitions them to count-based resources.
+moved {
+  from = google_service_account_iam_member.terraform_wif_prod_env
+  to   = google_service_account_iam_member.terraform_wif_prod_env[0]
 }
 
-resource "google_service_account_iam_member" "prod_deploy_self_token_creator" {
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.prod_deploy.email}"
+moved {
+  from = google_service_account_iam_member.prod_deploy_wif_prod_env
+  to   = google_service_account_iam_member.prod_deploy_wif_prod_env[0]
 }
 
-resource "google_service_account_iam_member" "preview_deploy_self_token_creator" {
-  service_account_id = google_service_account.preview_deploy.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = "serviceAccount:${google_service_account.preview_deploy.email}"
+moved {
+  from = google_service_account_iam_member.preview_deploy_wif_repo
+  to   = google_service_account_iam_member.preview_deploy_wif_repo[0]
 }
 
-# Rename-proof production bindings. Keyed on attribute.environment/production rather than the OIDC
-# subject (which embeds the repo name and broke on the medlock->healthmcp rename). The pool
-# attribute_condition already restricts entry to one repository by immutable numeric id.
-resource "google_service_account_iam_member" "terraform_wif_prod_env" {
+# Each service account trusts only its reviewed reusable workflow, exact platform
+# commit, immutable caller repository IDs, and expected event/ref/environment.
+resource "google_service_account_iam_member" "terraform_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
   service_account_id = google_service_account.terraform.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_prod_principal_set
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.terraform_workflow_sha/${each.value}"
 }
 
-resource "google_service_account_iam_member" "terraform_wif_prod_env_token_creator" {
+resource "google_service_account_iam_member" "prod_deploy_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.prod_deploy.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.prod_publisher.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_publish_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_deploy_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.preview_deploy.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.preview_operator.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.preview_publisher.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_publish_workflow_sha/${each.value}"
+}
+
+# The canary has no project permissions and no legacy WIF binding. A successful
+# access-token exchange against it proves the exact workflow attribute path.
+resource "google_service_account_iam_member" "canary_wif_terraform_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.terraform_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "canary_wif_prod_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "canary_wif_prod_publish_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_publish_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "canary_wif_preview_publish_workflow_sha" {
+  for_each = var.trusted_platform_workflow_shas
+
+  service_account_id = google_service_account.exact_wif_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_publish_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "terraform_wif_prod_env" {
+  count = var.legacy_compatibility_mode ? 1 : 0
+
   service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = local.github_prod_principal_set
+  role               = "roles/iam.workloadIdentityUser"
+  member             = local.legacy_terraform_principal_set
 }
 
 resource "google_service_account_iam_member" "prod_deploy_wif_prod_env" {
+  count = var.legacy_compatibility_mode ? 1 : 0
+
   service_account_id = google_service_account.prod_deploy.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_prod_principal_set
-}
-
-resource "google_service_account_iam_member" "prod_deploy_wif_prod_env_token_creator" {
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = local.github_prod_principal_set
+  member             = local.legacy_prod_deploy_principal_set
 }
 
 resource "google_service_account_iam_member" "preview_deploy_wif_repo" {
+  count = var.legacy_compatibility_mode ? 1 : 0
+
   service_account_id = google_service_account.preview_deploy.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = local.github_repo_principal_set
+  member             = local.legacy_preview_deploy_principal_set
 }
 
-resource "google_service_account_iam_member" "preview_deploy_wif_repo_token_creator" {
-  service_account_id = google_service_account.preview_deploy.name
-  role               = "roles/iam.serviceAccountTokenCreator"
-  member             = local.github_repo_principal_set
+resource "google_service_account_iam_member" "preview_operator_wif_repo" {
+  count = var.legacy_compatibility_mode ? 1 : 0
+
+  service_account_id = google_service_account.preview_operator.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = local.legacy_preview_operator_principal_set
 }

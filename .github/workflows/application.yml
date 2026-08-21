@@ -2,22 +2,6 @@ name: Application
 
 on:
   workflow_call:
-    inputs:
-      bun-version:
-        description: Bun version passed to oven-sh/setup-bun.
-        required: false
-        type: string
-        default: 1.4.0
-      verify-command:
-        description: Command that verifies the application.
-        required: false
-        type: string
-        default: bun run verify
-      install-command:
-        description: Command that installs dependencies before verification.
-        required: false
-        type: string
-        default: bun install --frozen-lockfile
 
 permissions: {}
 
@@ -25,20 +9,105 @@ jobs:
   verify:
     name: Bun verify
     runs-on: ubuntu-24.04
+    environment: dependency-scan
     permissions:
       contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ${{ inputs.bun-version }}
+          persist-credentials: false
+
+      - name: Resolve the exact reusable-workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
+            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+            exit 1
+          fi
+
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          echo "PLATFORM_BUN=$destination/bun-linux-x64/bun" >> "$GITHUB_ENV"
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+              -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+          )
+
+      - name: Enforce the platform dependency and container contract
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans ./enforce-app-contract.ts \
+              "$GITHUB_WORKSPACE" \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ github.event.repository.id }}"
+          )
 
       - name: Install dependencies
-        run: ${{ inputs.install-command }}
+        env:
+          ALLOW_SOCKET_FREE_MODE: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') }}
+          # Scanner 1.1.2 still consumes the legacy process variable. The
+          # protected GitHub secret keeps Socket's current token naming.
+          SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SOCKET_API_KEY" && "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "The Socket organization token is required outside an external-fork or Dependabot pull request." >&2
+            exit 1
+          fi
+          unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
+          if ! install_output="$(bun --no-env-file --no-orphans install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org 2>&1)"; then
+            printf '%s\n' "$install_output"
+            exit 1
+          fi
+          printf '%s\n' "$install_output"
+          if grep -Fq 'Socket Security Scanner free mode' <<< "$install_output" && [[ "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "Socket must enforce the owner-approved organization policy." >&2
+            exit 1
+          fi
 
       - name: Verify app
-        run: ${{ inputs.verify-command }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            "$PLATFORM_BUN" --no-env-file --no-orphans \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app/tools/platform-verify.ts" \
+              "$GITHUB_WORKSPACE"
+          )

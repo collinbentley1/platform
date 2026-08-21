@@ -5,31 +5,158 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions: {}
+
+concurrency:
+  group: platform-${{ github.event.repository.id }}-${{ github.ref }}
+  queue: max
+  cancel-in-progress: false
 
 jobs:
   verify:
     name: Platform verify
     runs-on: ubuntu-24.04
+    # A platform PR controls this workflow and its package-manager inputs, so it
+    # must never receive the organization Socket token before merge.
+    environment: ${{ github.event_name == 'push' && 'dependency-scan' || 'platform-pull-request' }}
     permissions:
       contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Bun 1.4
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: 1.4.0
+          persist-credentials: false
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          echo "PLATFORM_BUN=$destination/bun-linux-x64/bun" >> "$GITHUB_ENV"
+          "$destination/bun-linux-x64/bun" -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
+      - name: Reject dependency patching before any Socket credential exists
+        env:
+          LOCK_PATH: ${{ github.workspace }}/bun.lock
+          PACKAGE_PATH: ${{ github.workspace }}/package.json
+        run: |
+          set -euo pipefail
+          (
+            cd "$RUNNER_TEMP"
+            "$PLATFORM_BUN" --no-env-file --no-orphans -e '
+              const packageJson = JSON.parse(await Bun.file(Bun.env.PACKAGE_PATH).text());
+              const lock = Bun.JSONC.parse(await Bun.file(Bun.env.LOCK_PATH).text());
+              if (Object.hasOwn(packageJson, "patchedDependencies") || Object.hasOwn(lock, "patchedDependencies")) {
+                throw new Error("Bun patchedDependencies are forbidden for trusted CI dependencies.");
+              }
+            '
+          )
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        env:
+          ALLOW_SOCKET_FREE_MODE: ${{ github.event_name != 'push' }}
+          SOCKET_API_KEY: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}
+        run: |
+          set -euo pipefail
+          if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
+            echo "Committed node_modules content is forbidden before the Socket credential is released." >&2
+            exit 1
+          fi
+          if [[ -z "$SOCKET_API_KEY" && "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "The Socket organization token is required outside an external-fork or Dependabot pull request." >&2
+            exit 1
+          fi
+          unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
+          if ! install_output="$(bun --no-env-file --no-orphans install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org 2>&1)"; then
+            printf '%s\n' "$install_output"
+            exit 1
+          fi
+          printf '%s\n' "$install_output"
+          if grep -Fq 'Socket Security Scanner free mode' <<< "$install_output" && [[ "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
+            echo "Socket must enforce the owner-approved organization policy." >&2
+            exit 1
+          fi
 
       - name: Verify platform
-        run: bun run verify
+        run: |
+          set -euo pipefail
+          "$PLATFORM_BUN" --no-env-file --no-orphans tools/ci/verify-platform.ts "$GITHUB_WORKSPACE"
+
+      - name: Install checksum-pinned actionlint 1.7.12
+        env:
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tgz"
+          tools="$RUNNER_TEMP/platform-tools"
+          mkdir -p "$tools"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$tools" actionlint
+          echo "$tools" >> "$GITHUB_PATH"
+
+      - name: Validate GitHub Actions syntax
+        run: actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml
+
+      - name: Install checksum-pinned Grype 0.117.0
+        env:
+          GRYPE_SHA256: 38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/grype.tgz"
+          tools="$RUNNER_TEMP/platform-tools"
+          mkdir -p "$tools"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/anchore/grype/releases/download/v0.117.0/grype_0.117.0_linux_amd64.tar.gz
+          echo "${GRYPE_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$tools" grype
+          "$tools/grype" version -o json | jq -e \
+            '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"'
+
+      - name: Validate the reviewed vulnerability database snapshot
+        run: |
+          set -euo pipefail
+          manifest="$GITHUB_WORKSPACE/tools/ci/grype-db.json"
+          grype="$RUNNER_TEMP/platform-tools/grype"
+          export GRYPE_DB_CACHE_DIR="$RUNNER_TEMP/platform-grype-db"
+          mkdir -p "$GRYPE_DB_CACHE_DIR"
+          db_url="$(jq -er '
+            select((keys | sort) == ["built", "schemaVersion", "sha256", "url"])
+            |
+            .url as $url
+            | .sha256 as $sha
+            | select($sha | test("^[0-9a-f]{64}$"))
+            | select($url | test(("^https://grype\\.anchore\\.io/databases/v6/vulnerability-db_v6\\.[0-9]+\\.[0-9]+_[0-9TZ:-]+_[0-9]+\\.tar\\.zst\\?checksum=sha256%3A" + $sha + "$")))
+            | $url
+          ' "$manifest")"
+          expected_schema="$(jq -er '.schemaVersion | select(test("^v6\\.[0-9]+\\.[0-9]+$"))' "$manifest")"
+          expected_built="$(jq -er '.built | fromdateiso8601 | todateiso8601' "$manifest")"
+          "$grype" --config tools/ci/grype.yaml db import "$db_url"
+          "$grype" --config tools/ci/grype.yaml db status -o json | jq -e \
+            --arg from "$db_url" \
+            --arg schema "$expected_schema" \
+            --arg built "$expected_built" '
+              .valid == true and
+              .schemaVersion == $schema and
+              .built == $built and
+              .from == $from and
+              ((now - (.built | fromdateiso8601)) >= -3600) and
+              ((now - (.built | fromdateiso8601)) <= 172800)
+            '
 
   terraform:
     name: Terraform modules
@@ -40,11 +167,24 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: 1.14.5
+          persist-credentials: false
+
+      - name: Install checksum-pinned Terraform 1.14.5
+        env:
+          TERRAFORM_SHA256: ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/terraform.zip"
+          destination="$RUNNER_TEMP/terraform-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip
+          echo "${TERRAFORM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          test "$("$destination/terraform" version -json | jq -r .terraform_version)" = "1.14.5"
+          echo "$destination" >> "$GITHUB_PATH"
 
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive terraform
@@ -52,8 +192,63 @@ jobs:
       - name: Validate module fixtures
         run: |
           set -euo pipefail
-          for dir in terraform/examples/*; do
+          for dir in terraform/examples/* terraform/deployments/*; do
             [ -d "$dir" ] || continue
-            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" init -backend=false -input=false -lockfile=readonly
             terraform -chdir="$dir" validate
           done
+
+      - name: Test protected bootstrap input validation
+        run: terraform -chdir=terraform/deployments/bootstrap test -no-color
+
+      - name: Run digest-pinned Checkov against the trusted platform Terraform
+        env:
+          CHECKOV_IMAGE: ghcr.io/bridgecrewio/checkov@sha256:f4c7c5bde21df03432ca8d9d1305ffe21b7205ea752c3d4e65559abae67ead4a # 3.2.527
+        run: |
+          set -euo pipefail
+          terraform_root="$GITHUB_WORKSPACE/terraform"
+          policy_file="$GITHUB_WORKSPACE/tools/ci/checkov-platform.yml"
+          if [ ! -d "$terraform_root" ] || [ -L "$terraform_root" ] || [ "$(realpath -e -- "$terraform_root")" != "$terraform_root" ]; then
+            echo "The platform Terraform scan root must be a canonical directory." >&2
+            exit 1
+          fi
+          if [ ! -f "$policy_file" ] || [ -L "$policy_file" ] || [ "$(realpath -e -- "$policy_file")" != "$policy_file" ]; then
+            echo "The platform Checkov policy must be a canonical regular file." >&2
+            exit 1
+          fi
+          if [ "$(cat "$policy_file")" != "soft-fail: false" ] || [ "$(wc -l < "$policy_file" | tr -d ' ')" != "1" ]; then
+            echo "The platform Checkov policy must contain only the fail-closed setting." >&2
+            exit 1
+          fi
+          if find "$terraform_root" \
+            \( -name .checkov.yml -o -name .checkov.yaml -o -name checkov.yml -o -name checkov.yaml \) \
+            -print -quit | grep -q .; then
+            echo "Ambient Checkov configuration is forbidden in platform Terraform." >&2
+            exit 1
+          fi
+          docker pull "$CHECKOV_IMAGE"
+          docker run --rm --pull=never \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges=true \
+            --user 65532:65532 \
+            --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=1777 \
+            --env HOME=/tmp \
+            --env CKV_SKIP_PACKAGE_UPDATE_CHECK=true \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --env XDG_CACHE_HOME=/tmp \
+            --workdir /tmp \
+            --mount "type=bind,src=${terraform_root},dst=/scan,readonly" \
+            --mount "type=bind,src=${policy_file},dst=/policy.yml,readonly" \
+            --entrypoint /usr/local/bin/checkov \
+            "$CHECKOV_IMAGE" \
+            --directory /scan \
+            --config-file /policy.yml \
+            --framework terraform \
+            --compact \
+            --quiet \
+            --skip-download \
+            --download-external-modules false \
+            --skip-path '(^|/)\.terraform(/|$)'

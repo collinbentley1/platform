@@ -2,4 +2,7 @@
 node_modules
 *.tsbuildinfo
 .terraform
-.terraform.lock.hcl
+gha-creds-*.json
+.env
+.env.*
+!.env.example

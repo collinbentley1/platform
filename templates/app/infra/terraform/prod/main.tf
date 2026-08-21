@@ -1,20 +1,26 @@
 module "site" {
-  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=v0.4.1"
+  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=__PLATFORM_SHA__"
 
   providers = {
     google                = google
     google.no_attribution = google.no_attribution
   }
 
-  app                                  = "__APP_NAME__"
-  project_id                           = var.project_id
-  region                               = var.region
-  service_name                         = var.service_name
-  artifact_registry_repository_id      = var.artifact_registry_repository_id
-  artifact_registry_description        = "Container images for __APP_NAME__."
-  bootstrap_image                      = var.bootstrap_image
-  runtime_service_account_email        = var.runtime_service_account_email
-  prod_deploy_service_account_email    = var.prod_deploy_service_account_email
-  preview_deploy_service_account_email = var.preview_deploy_service_account_email
-  custom_domains                       = []
+  app                                     = "__APP_NAME__"
+  project_id                              = var.project_id
+  region                                  = var.region
+  service_name                            = var.service_name
+  artifact_registry_repository_id         = var.artifact_registry_repository_id
+  artifact_registry_description           = "Container images for __APP_NAME__."
+  bootstrap_image                         = var.bootstrap_image
+  bootstrap_runtime_service_account_email = var.bootstrap_runtime_service_account_email
+  runtime_service_account_email           = var.runtime_service_account_email
+  preview_runtime_service_account_email   = var.preview_runtime_service_account_email
+  prod_deploy_service_account_email       = var.prod_deploy_service_account_email
+  prod_publisher_service_account_email    = var.prod_publisher_service_account_email
+  preview_deploy_service_account_email    = var.preview_deploy_service_account_email
+  preview_operator_service_account_email  = var.preview_operator_service_account_email
+  preview_publisher_service_account_email = var.preview_publisher_service_account_email
+  runtime_secret_ids                      = var.runtime_secret_ids
+  runtime_secret_accessor_ids             = var.runtime_secret_accessor_ids
 }
