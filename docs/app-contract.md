@@ -81,7 +81,7 @@ container does not grant its payload to a runtime: `runtime_secret_accessor_ids`
 defaults to empty and must be a subset of the retained containers. Runsetta stays
 offline with no runtime accessor grants until reviewed versions are encoded.
 
-The sole client-token exception is Critical History's `MAPBOX_ACCESS_TOKEN`.
+The sole client-token exception is Critical History's `MAPBOX_PUBLIC_TOKEN`.
 Because every browser receives it, the owner-approved `preview-cloud` and
 `production` environments may expose only a dedicated `MAPBOX_PUBLIC_TOKEN`
 secret in Mapbox's public `pk.*` format; use a least-scope token with exact URL

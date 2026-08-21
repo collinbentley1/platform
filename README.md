@@ -59,7 +59,7 @@ Manager versions encoded in this repository's immutable numeric-repository-ID
 map; repository variables and deploy callers cannot add or redirect them.
 Runsetta is deliberately offline, its old secret containers are retained for
 recovery, and its runtime service account has no accessor grant. Critical
-History's `MAPBOX_ACCESS_TOKEN` is the narrow exception because the app returns
+History's `MAPBOX_PUBLIC_TOKEN` is the narrow exception because the app returns
 it to every browser: the owner-approved `preview-cloud` and `production`
 environments provide a dedicated `MAPBOX_PUBLIC_TOKEN` secret containing only a
 public `pk.*` token with the required read scopes and URL restrictions. The

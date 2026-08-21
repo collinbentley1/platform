@@ -229,7 +229,7 @@ for (const needle of [
 for (const needle of [
   "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
   '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
-  ". + {MAPBOX_ACCESS_TOKEN: $token}",
+  ". + {MAPBOX_PUBLIC_TOKEN: $token}",
   'RUNSETTA_OFFLINE: "1"',
   'WAITLIST_BACKEND: "firestore"',
   'FIRESTORE_PROJECT_ID: "medlock-1025243085"',
@@ -252,7 +252,7 @@ for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP
 for (const needle of [
   "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
   '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
-  ". + {MAPBOX_ACCESS_TOKEN: $token}",
+  ". + {MAPBOX_PUBLIC_TOKEN: $token}",
   'RUNSETTA_OFFLINE: "1"',
   'WAITLIST_BACKEND: "memory"',
 ]) {
@@ -753,8 +753,18 @@ requireContains(
   "--registry=https://registry.npmjs.org",
   "Docker dependency installs must pin the official registry.",
 );
-requireContains("templates/app/Dockerfile", dockerfile, "dhi.io/bun:1-dev@sha256:", "Build base images must be digest pinned.");
-requireContains("templates/app/Dockerfile", dockerfile, "dhi.io/bun:1@sha256:", "Runtime base images must be digest pinned.");
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "dhi.io/bun:1-dev@sha256:8a1c66b0e289dd86f9ebfb24abd273f653bde4cfd18c8284d9bebba81ebeeaac",
+  "The reviewed zero-High/Critical build base image must stay digest pinned.",
+);
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "dhi.io/bun:1@sha256:7d31a1b2907df08fe257212331bd0f8e661595870c60285860fcc60abd394473",
+  "The reviewed zero-vulnerability runtime base image must stay digest pinned.",
+);
 rejectContains(
   "templates/app/Dockerfile",
   dockerfile,

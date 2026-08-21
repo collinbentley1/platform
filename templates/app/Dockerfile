@@ -1,6 +1,6 @@
 FROM oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6 AS bun-release
 
-FROM dhi.io/bun:1-dev@sha256:67209598b7e7db266ae5630f9b27662d3a80b0915615bbcb9f703f562c5b5a52 AS deps
+FROM dhi.io/bun:1-dev@sha256:8a1c66b0e289dd86f9ebfb24abd273f653bde4cfd18c8284d9bebba81ebeeaac AS deps
 WORKDIR /app
 
 COPY --from=bun-release /usr/local/bin/bun /usr/local/bin/bun
@@ -23,7 +23,7 @@ COPY test ./test
 COPY tools ./tools
 RUN bun --no-env-file run verify:ci
 
-FROM dhi.io/bun:1@sha256:3f3bcd8aeebefe5a4477ad5cd3a1a0154213c028f63a4d6ea84eeafe5dc69a38 AS runtime
+FROM dhi.io/bun:1@sha256:7d31a1b2907df08fe257212331bd0f8e661595870c60285860fcc60abd394473 AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

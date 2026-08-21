@@ -134,7 +134,7 @@ the recovery object and stop; never rerun from empty state.
    exact preview/production URL restrictions. Store it only as the protected
    environment secret `MAPBOX_PUBLIC_TOKEN` described above, verify Mapbox usage
    and browser referrer behavior, then delete the old repository secret. The
-   workflow maps it to `MAPBOX_ACCESS_TOKEN` only after format validation. Never
+   workflow maps it to the runtime `MAPBOX_PUBLIC_TOKEN` only after format validation. Never
    put an `sk.*` token in Cloud Run service metadata.
 3. Complete the default-service-account workload inventory above. Wait for all
    old workflow runs to finish. Through the privileged pipeline, authoritatively

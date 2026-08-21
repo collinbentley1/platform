@@ -627,7 +627,7 @@ describe("platform scaffold and doctor", () => {
       expect(workflow).toContain("DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}");
       expect(workflow).toContain("MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}");
       expect(workflow).toContain('[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]');
-      expect(workflow).toContain('. + {MAPBOX_ACCESS_TOKEN: $token}');
+      expect(workflow).toContain('. + {MAPBOX_PUBLIC_TOKEN: $token}');
       expect(workflow).toContain('RUNSETTA_OFFLINE: "1"');
     }
     expect(preview).toContain('WAITLIST_BACKEND: "memory"');

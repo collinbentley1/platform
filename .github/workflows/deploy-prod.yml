@@ -660,7 +660,7 @@ jobs:
                 exit 1
               fi
               jq --arg token "$MAPBOX_PUBLIC_TOKEN" \
-                '. + {MAPBOX_ACCESS_TOKEN: $token}' "$env_file" > "${env_file}.next"
+                '. + {MAPBOX_PUBLIC_TOKEN: $token}' "$env_file" > "${env_file}.next"
               mv "${env_file}.next" "$env_file"
               ;;
             *)
