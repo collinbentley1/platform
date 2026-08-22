@@ -333,6 +333,9 @@ resource "google_cloud_run_v2_service" "preview" {
       client_version,
       labels,
       template[0].labels,
+      # deploy-preview owns deterministic revision names. Land preview template
+      # changes through that workflow first to avoid immutable-name conflicts.
+      template[0].revision,
       template[0].containers[0].env,
       template[0].containers[0].image,
       traffic,

@@ -1327,8 +1327,39 @@ describe("platform scaffold and doctor", () => {
     const serviceModule = serviceModuleFiles[0]!;
     const allServiceModuleTerraform = serviceModuleFiles.join("\n");
     expect(createHash("sha256").update(serviceModule).digest("hex")).toBe(
-      "df1530df67f74814fd8444459ff776fa4dc30d9688162900e6abe37287e0e2e8",
+      "79f919267d1f29cfdee8bcc93a254ec089c890b65f860a029aad15cae3f2e4b8",
     );
+    const productionServiceStart = serviceModule.indexOf(
+      'resource "google_cloud_run_v2_service" "site"',
+    );
+    const productionService = serviceModule.slice(
+      productionServiceStart,
+      serviceModule.indexOf(
+        'resource "google_cloud_run_v2_service_iam_member" "prod_deploy"',
+        productionServiceStart,
+      ),
+    );
+    const previewServiceStart = serviceModule.indexOf(
+      'resource "google_cloud_run_v2_service" "preview"',
+    );
+    const previewService = serviceModule.slice(
+      previewServiceStart,
+      serviceModule.indexOf(
+        'resource "google_cloud_run_v2_service_iam_member" "preview_deploy"',
+        previewServiceStart,
+      ),
+    );
+    const previewLifecycle = previewService.slice(
+      previewService.indexOf("  lifecycle {\n"),
+      previewService.indexOf("\n  depends_on"),
+    );
+    expect(productionService).not.toContain("template[0].revision");
+    expect(previewLifecycle).toContain(
+      "# deploy-preview owns deterministic revision names. Land preview template\n" +
+        "      # changes through that workflow first to avoid immutable-name conflicts.",
+    );
+    expect(previewService.split("template[0].revision")).toHaveLength(2);
+    expect(previewLifecycle.split("      template[0].revision,\n")).toHaveLength(2);
     expect(serviceModule).not.toMatch(/^\s*module\s+"/m);
     expect(serviceModule).not.toMatch(/<<|\/\*|^\s*\/\//m);
     expect(serviceModule).toContain(

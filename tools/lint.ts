@@ -1593,10 +1593,48 @@ const moduleVariables = await read("terraform/modules/cloud-run-service/variable
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
 if (
   createHash("sha256").update(moduleMain).digest("hex") !==
-  "df1530df67f74814fd8444459ff776fa4dc30d9688162900e6abe37287e0e2e8"
+  "79f919267d1f29cfdee8bcc93a254ec089c890b65f860a029aad15cae3f2e4b8"
 ) {
   failures.push(
     "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
+  );
+}
+const productionServiceBlock = sectionBetween(
+  moduleMain,
+  'resource "google_cloud_run_v2_service" "site"',
+  'resource "google_cloud_run_v2_service_iam_member" "prod_deploy"',
+);
+const previewServiceBlock = sectionBetween(
+  moduleMain,
+  'resource "google_cloud_run_v2_service" "preview"',
+  'resource "google_cloud_run_v2_service_iam_member" "preview_deploy"',
+);
+const previewLifecycleBlock = sectionBetween(
+  previewServiceBlock,
+  "  lifecycle {\n",
+  "\n  depends_on",
+);
+if (productionServiceBlock.includes("template[0].revision")) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: Production must not ignore revision names it does not own.",
+  );
+}
+if (
+  !previewLifecycleBlock.includes(
+    "# deploy-preview owns deterministic revision names. Land preview template\n" +
+      "      # changes through that workflow first to avoid immutable-name conflicts.",
+  )
+) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: Document the workflow-owned preview revision-name invariant.",
+  );
+}
+if (
+  previewServiceBlock.split("template[0].revision").length - 1 !== 1 ||
+  previewLifecycleBlock.split("      template[0].revision,\n").length - 1 !== 1
+) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: Preview must ignore exactly one workflow-owned revision name.",
   );
 }
 const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.tf"];
