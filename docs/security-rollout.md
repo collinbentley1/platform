@@ -111,95 +111,128 @@ the recovery object and stop; never rerun from empty state.
 
 ## Phase A: add the new path
 
-1. Create `preview-build` and `production-build` with only rotated DHI
-   credentials, an admin-visible `packages:list`-only `SOCKET_API_TOKEN`, the exact reviewed
-   `GRYPE_DB_MANIFEST_JSON` environment secret, and owner approval. The manifest
-   is non-confidential, but the secret context prevents repository-variable
-   substitution. Create an
-   owner-approved `dependency-scan` environment in the platform repository
-   containing only the same Socket token. Consumer verification jobs do not use
-   that environment or credential: the actual preview/production build performs
-   exactly one organization-policy `bun pm scan` before package extraction, and
-   duplicate application/firewall installs plus Docker use the public policy.
-   Platform CI must have imported and validated the
-   identical `tools/ci/grype-db.json` object first. Never define the manifest or
-   these credentials at repository scope. Rotate both protected environment
-   manifest copies from a reviewed manifest PR before its 48-hour build-time
-   expiry; this does not alter the WIF workflow SHA. Create secretless,
-   owner-approved `preview-publish` environments and owner-approved
-   `preview-cloud` environments, plus
-   `preview-operations` without secrets/reviewers for automatic teardown and
-   `supply-chain` without secrets. Create secretless `production-publish` with
-   the same protected-main restriction and owner review as `production`. For
-   Critical History only, store the rotated public Mapbox `pk.*` values in the
-   `MAPBOX_PUBLIC_TOKEN` environment-secret slots in `preview-cloud` and
-   `production`. These values are browser-visible public configuration; the
-   secret slots provide approval gating and log masking, not confidentiality.
-   The simplest setup reuses one least-scope value restricted to
-   `https://ycriticalhistory.org`, which Mapbox also permits on every subdomain.
-   If separate values are desired, restrict the preview value to
-   `https://preview.ycriticalhistory.org`; that narrows preview-to-production use
-   but the production parent still includes preview subdomains. Mapbox URL
-   restrictions are best-effort abuse controls, not authorization. Do not enter
-   unsupported wildcard syntax. For Medlock only, generate a 32-byte base64url
-   `WAITLIST_IDENTITY_KEYSET` in `production`; during rotation it may temporarily
-   be `new,old` so the application can accept and re-sign old cookies. The trusted
-   production deploy streams that value over standard input into a new immutable
-   version of the platform-owned `waitlist-identity-keyset` Secret Manager secret,
-   then binds Cloud Run to the returned numeric version. The deploy identity may
-   add versions only to that one secret and cannot read or destroy them; the
-   production runtime may access only that secret. The payload therefore never
-   enters Terraform state, an image layer, deployment arguments, or Cloud Run's
-   readable literal environment configuration. A 192-bit SHA-256 fingerprint in
-   the service label lets an unchanged keyset reuse the current numeric version,
-   so ordinary application releases do not create duplicates. After a successful
-   rotation, an owner-reviewed operation must retain no more than the current and
-   one rollback version enabled, disable older unreferenced versions, and destroy
-   them after the 30-day cookie window. The deploy pipeline deliberately lacks
-   version read, list, disable, and destroy permissions. The trusted preview
-   deploy generates a revision-local key, so no reusable credential reaches PR
-   code. All other deploy environments remain free of runtime values.
-   Do this before any caller references the new workflow.
-   The reusable deploy contracts must explicitly declare each secret name they
-   consume, and callers must forward exactly those names without using
-   `secrets: inherit`; the protected called-job environment then supplies and
-   overrides the value. Otherwise cross-repository `workflow_call` jobs receive
-   empty secret values.
-   GitHub never releases environment secrets to external-fork or Dependabot
-   pull-request jobs. They run only the credential-free checks and never receive
-   the org token, DHI credentials, or a cloud preview. Same-repository preview
-   builds and production-main builds fail unless their protected build
-   environment supplies the token. The canonical local scanner is byte-bound to
-   the platform template before release, uses one org-scoped request for at most
-   128 lock entries, checks the free quota endpoint first, polls fail closed, and
-   rejects malformed, duplicate, missing, unresolved, pending, or unexpected
-   results. Bun 1.4 does not submit git, GitHub, remote-tarball, file, link, or
-   workspace resolutions to a security scanner, so the immutable contract and
-   platform-main pre-token boundary must reject every such direct or transitive
-   lock source before claiming complete coverage. Allow only canonical npm
-   registry lock tuples with exact resolved versions and sha512 integrity. At
-   100 quota units per batch and 500 units per hour, serialize the
-   rollout to no more than five protected scans per quota window unless Socket
-   raises the limit; never retry the paid POST automatically.
-   Platform pull requests are a separate trust-root case: they always use
-   Socket's secretless public policy because the PR controls the workflow and
-   dependency configuration. Only the post-merge `main` platform run may enter
-   `dependency-scan` and receive the organization token. Disable GitHub runner
-   workflow-command parsing across the entire untrusted Docker build action with
-   a fresh random token held only in the runner temporary directory, then restore
-   it in an unconditional next step. This prevents application tests, build code,
-   package diagnostics, and BuildKit relays from forging modern or legacy runner
-   commands or post-action state.
+1. Keep every consumer's Actions disabled while establishing the new
+   credential and environment boundary. GitHub auto-creates a referenced missing
+   environment without the required policy, so create and protect every
+   environment explicitly before any workflow names it. The exact steady-state
+   matrix for each consumer is:
+
+   - `dhi-base-prefetch-20260822-098dca9280b3`, `preview-publish`,
+     `preview-cloud`, `preview-operations`, and `supply-chain`: selected branch
+     `main` only, zero reviewers, and administrator bypass disabled.
+   - `production` and `production-publish`: selected branch `main` only, the
+     owner reviewer, and administrator bypass disabled.
+
+   A missing selected-branch rule on any of these environments is a stop
+   condition. In particular, do not enable Actions while `preview-operations`,
+   `preview-cloud`, `preview-publish`, or `supply-chain` remains unprotected in
+   any consumer. Verify the exact environment inventory and policies through the
+   REST API, including zero unwanted reviewers, secrets, variables, tag rules,
+   and bypass actors. The DHI environment is intentionally shared by preview
+   and production so exact base parity is structural rather than two separately
+   managed credential copies.
+
+   Create the DHI environment with no secrets or variables first. Prove a
+   default-branch, exact-SHA `pull_request_target` caller can enter it without a
+   credential and fails only at the explicit missing-DHI-credential check. Then
+   prove a temporary ordinary `pull_request` workflow authored by the PR and
+   naming the same environment is denied by the selected-branch policy. Confirm
+   the target-controller check is attached to the trusted base SHA while its
+   event payload names the different exact PR head SHA; it is not a required
+   head-SHA PR check. Remove the temporary negative-canary workflow before merge
+   and re-read the policy. Only after both canaries pass may the owner populate
+   the one confidential GitHub value,
+   `DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3`, and the non-confidential
+   `DHI_USERNAME` variable in that environment. The token must be public-read
+   only and short-lived/rotatable; never define it at repository or organization
+   scope.
+
+   Preview and production prefetch the same exact DHI development/runtime and
+   Oven Bun children before any application checkout. The isolated prefetch job
+   verifies frozen Docker signatures, subject-bound signed SBOM, provenance,
+   source, and license evidence; erases registry authentication; then publishes
+   only the closed public linux/amd64 OCI closure as a one-day raw artifact. The
+   credentialless build gets no OIDC, packages permission, runtime secret, or
+   registry credential. It executes the same-repository PR head only inside
+   pinned BuildKit and consumes literal local OCI contexts. A fresh verifier
+   canonicalizes the result and runs Syft/Grype in a networkless, read-only,
+   capability-free container. A separate publisher revalidates the raw artifact
+   ID/digest, canonical OCI graph, published inner-index digest, runnable digest,
+   DHI runtime lineage, and exact source identity before OIDC and upload. Raw
+   build archives and DHI credentials never cross into the publisher.
+   The vendored DHI public key is the exact
+   `docker-hardened-images/keyring` `publickey/dhi-2.pub` blob from commit
+   `d6b11e0475ac7ddf74687268d16a4201a15e163f`, SHA-256
+   `1d02bbccf149283ae6288d96264dcad3fb23ee1911d90324a48eab28e4cb8a5f`.
+   The catalog license is the exact `LICENSE.txt` from commit
+   `140f79eaba13b83e280f6f554f80f9633fae987e`, SHA-256
+   `58881e3f5171ed2e98db7a4dbd64c16b9b5dbb2f5cbd9a56e79608a2360ad5f3`.
+   The DHI evidence attests the hardened Alpine rootfs/base lineage, not the
+   separately provenance-bound Oven Bun 1.4.0 binary overlaid by the canonical
+   Dockerfile; the final image scan covers the complete hybrid.
+
+   Do not create `GRYPE_DB_MANIFEST_JSON` or `DB_MANIFEST_JSON` at any GitHub
+   variable scope. The verifier loads only the byte-pinned
+   `tools/ci/grype-db.json` from the exact platform policy archive. Refresh it by
+   reviewed PR before its 48-hour expiry, then authorize and repin the resulting
+   platform SHA across every consumer. Treat inability to complete that cadence
+   as a release stop condition; it is not the intended long-term update path.
+   Socket uses no GitHub secret or paid
+   scanner token. Every local scan runs the public policy, and branch protection
+   requires the exact successful Socket GitHub App id `156372` checks. Delete
+   every `SOCKET_API_TOKEN*` name and the retired `dependency-scan` environment
+   after inventory proof, and revoke old Socket provider tokens.
+
+   For Critical History, set `MAPBOX_PUBLIC_TOKEN` as a non-confidential
+   protected-environment variable in `preview-cloud` and `production`. It must be
+   a least-scope, non-default public `pk.*` value; Mapbox's default public token
+   is forbidden because its scopes and URL restrictions cannot be changed.
+   Reusing one value restricted to
+   `https://ycriticalhistory.org` covers the parent and its preview subdomains;
+   a separate preview value may be restricted to
+   `https://preview.ycriticalhistory.org`. Mapbox URL restrictions are
+   best-effort abuse controls, not authorization, and unsupported wildcard
+   syntax or any `sk.*` token is forbidden.
+
+   Medlock/Health has no GitHub waitlist key. Delete
+   `WAITLIST_IDENTITY_KEYSET*` from every GitHub environment, repository, and
+   organization scope. The trusted production deploy must fail closed unless
+   Cloud Run has either zero exact keyset entries or one exact numeric
+   `waitlist-identity-keyset` version. With one entry it reuses that enabled
+   numeric version; with zero entries it requires zero enabled versions, streams
+   a freshly generated key directly to Secret Manager, validates the returned
+   resource, and binds Cloud Run to that version. Foreign, malformed, multiple,
+   or unbound existing versions are stop conditions. The deploy identity may add
+   versions and read version metadata but never access payloads, and the runtime
+   may access only this secret.
+
+   Before re-enabling Actions, semantically prove every workflow and caller has
+   no secret forwarding, no `secrets: inherit`, no Socket or Health GitHub secret
+   reference, and only the epoch DHI prefetch reference. Delete the old
+   `preview-build`, `production-build`, and `dependency-scan` environments only
+   after their values have been removed and the old DHI/Socket provider tokens
+   are revoked. Re-read environment, repository, and organization secret
+   inventories and require exact agreement: four consumer DHI environments each
+   contain the sole epoch DHI token; every other scoped confidential inventory
+   is empty. Any extra, stale, duplicate, shadowed, or differently scoped value
+   is a stop condition. Re-enable consumers one at a time only after the new
+   workflow commit, consumer pins, WIF transition, and cloud/environment canaries
+   all pass; populating a secret alone is never sufficient.
 2. Prepare, but do not merge, consumer PRs that pin every caller and Terraform
    mirror to the reviewed full platform SHA, remove caller-controlled commands
    and cloud inputs, remove production `workflow_dispatch`, remove
    `secrets: inherit`, and adopt the canonical Docker/Bun contract.
-   For Critical History, rotate the old repository-scoped Mapbox value to
-   a public `pk.*` client value with only the required read scopes and the parent
-   URL restriction above. Reuse it in both protected environment
-   `MAPBOX_PUBLIC_TOKEN` slots, or use the optional narrower preview value, then
-   verify Mapbox usage and browser referrer behavior and delete the old
-   repository secret. The
+   Squash/merge this precursor workflow hardening only after review and call its
+   immutable commit `S`. A follow-on protected controller commit `C` must
+   hardcode and audit `S`; bootstrap exact WIF trust for `S`, then repin all
+   consumers to `S`. The historical `161ac5c` tree predates this pipeline and
+   must never be substituted for `S`.
+   For Critical History, replace the old repository-scoped Mapbox value with
+   a non-default public `pk.*` client value with only the required read scopes
+   and the parent URL restriction above. Reuse it as the protected `MAPBOX_PUBLIC_TOKEN`
+   environment variable in preview and production, or use the optional narrower
+   preview value, then verify Mapbox usage and browser referrer behavior and
+   delete the old repository secret. The
    workflow maps a value to the runtime `MAPBOX_PUBLIC_TOKEN` only after format
    validation. Never put an `sk.*` token in Cloud Run service metadata.
 3. Complete the default-service-account workload inventory above. Wait for all
@@ -388,7 +421,8 @@ verified digest rather than trusting the mutable tag. Treat tag/metadata and
 attachment mutation within the one assigned repository as the remaining
 publisher blast radius. A future custom role may remove unrelated permissions
 only after an owner-reviewed pipeline test captures every permission required
-by `crane copy` and `crane digest`; do not guess the set and silently lock out
+by the pinned `regctl image import` and digest verification path; do not guess
+the set and silently lock out
 release publication.
 
 Cloud Run's documented deployment contract separately requires

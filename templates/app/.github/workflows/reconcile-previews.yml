@@ -1,6 +1,9 @@
 name: Reconcile previews
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     # Reconcile hourly even though mutation jobs use the bounded FIFO queue;
     # this is the durable backstop for interrupted or externally drifted runs.

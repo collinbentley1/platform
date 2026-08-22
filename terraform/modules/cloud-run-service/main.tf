@@ -172,6 +172,15 @@ resource "google_secret_manager_secret_iam_member" "prod_deploy_version_adder" {
   member    = "serviceAccount:${var.prod_deploy_service_account_email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "prod_deploy_version_metadata_reader" {
+  for_each = var.runtime_secret_version_adder_ids
+
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.runtime[each.value].secret_id
+  role      = "projects/${var.project_id}/roles/secretVersionMetadataReader"
+  member    = "serviceAccount:${var.prod_deploy_service_account_email}"
+}
+
 resource "google_firestore_database" "firestore" {
   count = length(local.firestore_database)
 

@@ -6,13 +6,32 @@ on:
 permissions: {}
 
 jobs:
+  rerun-guard:
+    name: Reject privileged workflow reruns
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
   terraform-validate:
     name: Terraform validate
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -199,10 +218,17 @@ jobs:
   checkov:
     name: Checkov
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -279,6 +305,7 @@ jobs:
   terraform-convergence:
     name: Terraform convergence
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs:
       - terraform-validate
       - checkov
@@ -293,6 +320,12 @@ jobs:
       id-token: write # Prove exact-SHA WIF and read cloud metadata for convergence only.
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Reject a stale main-branch run after acquiring the production lock
         env:
           GH_TOKEN: ${{ github.token }}

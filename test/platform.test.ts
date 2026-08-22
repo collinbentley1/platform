@@ -18,6 +18,37 @@ afterEach(async () => {
 });
 
 describe("platform scaffold and doctor", () => {
+  test("every runner-backed workflow job has a bounded timeout", async () => {
+    const workflowDirectories = [
+      join(repoRoot, ".github/workflows"),
+      join(repoRoot, "templates/app/.github/workflows"),
+    ];
+    const runnerJobs: string[] = [];
+
+    for (const directory of workflowDirectories) {
+      for (const entry of (await readdir(directory)).sort()) {
+        if (!entry.endsWith(".yml")) continue;
+        const workflow = Bun.YAML.parse(await readFile(join(directory, entry), "utf8")) as {
+          jobs?: Record<string, Record<string, unknown>>;
+        };
+        for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+          if (job["runs-on"] === undefined) continue;
+          runnerJobs.push(`${entry}:${jobName}`);
+          const timeout = job["timeout-minutes"];
+          expect(Number.isInteger(timeout), `${entry}:${jobName} must declare an integer timeout`).toBe(
+            true,
+          );
+          expect(timeout as number, `${entry}:${jobName} timeout must be positive`).toBeGreaterThan(0);
+          expect(timeout as number, `${entry}:${jobName} timeout must not exceed 35 minutes`).toBeLessThanOrEqual(
+            35,
+          );
+        }
+      }
+    }
+
+    expect(runnerJobs.length).toBeGreaterThan(0);
+  });
+
   test("scaffold replaces identity and pins every consumer", async () => {
     const app = await scaffold("secure-app");
     const config = JSON.parse(await readFile(join(app, ".platform/config.json"), "utf8")) as {
@@ -504,28 +535,31 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("uses secrets: inherit");
   });
 
-  test("doctor rejects missing, redirected, or additional deploy secret mappings", async () => {
+  test("doctor rejects missing, redirected, or secret-bearing preview callers", async () => {
     const mutations = [
       [
         "missing-deploy-secret",
         (workflow: string) =>
-          workflow.replace("      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}\n", ""),
+          workflow.replace(
+            "      pull-requests: read # Let the reusable cleanup re-read current lifecycle state.\n",
+            "",
+          ),
       ],
       [
         "redirected-deploy-secret",
         (workflow: string) =>
           workflow.replace(
-            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
-            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_USERNAME }}",
+            "  pull_request_target:\n",
+            "  pull_request:\n",
           ),
       ],
       [
         "additional-deploy-secret",
         (workflow: string) =>
           workflow.replace(
-            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}\n" +
-              "      UNREVIEWED_TOKEN: ${{ secrets.UNREVIEWED_TOKEN }}",
+            `    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@${platformSha}`,
+            `    uses: collinbentley1/platform/.github/workflows/deploy-preview.yml@${platformSha}\n` +
+              "    secrets: inherit",
           ),
       ],
     ] as const;
@@ -1070,7 +1104,7 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("does not match consumer pin");
   });
 
-  test("Socket credentials are confined to one pre-extraction deploy step", async () => {
+  test("only the protected base prefetch receives the sole external credential", async () => {
     expect(await readFile(join(repoRoot, "tools/socket-security-scanner.ts"), "utf8")).toBe(
       await readFile(join(repoRoot, "templates/app/tools/socket-security-scanner.ts"), "utf8"),
     );
@@ -1081,210 +1115,165 @@ describe("platform scaffold and doctor", () => {
       expect(text).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
       expect(text).toContain("Socket Security Scanner free mode");
     }
+
     for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
-      const expectedSecretContextReferences: SecretContextReference[] = [
-        { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
+      expect(semanticSecretContextReferences(text)).toEqual([
         {
-          job: "build",
-          path: "jobs.build.steps.7.env.SOCKET_API_TOKEN",
-          value: "${{ secrets.SOCKET_API_TOKEN }}",
+          job: "prefetch-bases",
+          path: "jobs.prefetch-bases.steps.2.env.DHI_PUBLIC_READ_TOKEN",
+          value: "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
         },
-        {
-          job: "build",
-          path: "jobs.build.steps.9.with.username",
-          value: "${{ secrets.DHI_USERNAME }}",
-        },
-        {
-          job: "build",
-          path: "jobs.build.steps.9.with.password",
-          value: "${{ secrets.DHI_ACCESS_TOKEN }}",
-        },
-        {
-          job: "build",
-          path: "jobs.build.steps.17.env.DB_MANIFEST_JSON",
-          value: "${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
-        },
-        {
-          job: "deploy",
-          path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
-          value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
-        },
-      ];
-      if (workflow === "deploy-prod.yml") {
-        expectedSecretContextReferences.push({
-          job: "deploy",
-          path: "jobs.deploy.steps.4.env.WAITLIST_IDENTITY_KEYSET",
-          value: "${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
-        });
-      }
-      expect(semanticSecretContextReferences(text)).toEqual(expectedSecretContextReferences);
-      const cloudCliNoun = text.replace(
-        "  canary:\n",
-        "  canary:\n    env:\n      CLOUD_COMMAND: gcloud secrets versions add reviewed-secret\n",
-      );
-      expect(semanticSecretContextReferences(cloudCliNoun)).toEqual(
-        expectedSecretContextReferences,
-      );
-      for (const hostileScalar of [
-        "${{ secrets.socket_api_token }}",
-        "${{ secrets['socket_api_token'] }}",
-        "${{ format('{0}', secrets.DHI_ACCESS_TOKEN) }}",
-        "${{ format('}}{0}', secrets.DHI_ACCESS_TOKEN) }}",
-        "${{ toJSON(secrets) }}",
-        "\"${{ \\u0073ecrets.socket_api_token }}\"",
-        "\"${{ \\x73ecrets.socket_api_token }}\"",
-      ]) {
-        const mutated = text.replace(
-          "  canary:\n",
-          `  canary:\n    env:\n      HOSTILE_SECRET_REFERENCE: ${hostileScalar}\n`,
-        );
-        expect(semanticSecretContextReferences(mutated)).not.toEqual(
-          expectedSecretContextReferences,
-        );
-      }
-      const anchoredEnvironment = text
-        .replace(
-          "        env:\n          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-          "        env: &platform_secret_env\n" +
-            "          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-        )
-        .replace("  canary:\n", "  canary:\n    env: *platform_secret_env\n");
-      expect(semanticSecretContextReferences(anchoredEnvironment)).not.toEqual(
-        expectedSecretContextReferences,
-      );
-      let anchoredStep = text.replace(
-        "      - name: Enforce the organization Socket policy before package extraction",
-        "      - &platform_secret_step\n" +
-          "        name: Enforce the organization Socket policy before package extraction",
-      );
-      const canaryStart = anchoredStep.indexOf("\n  canary:\n");
-      const canarySteps = anchoredStep.indexOf("    steps:\n", canaryStart);
-      const canaryStepsBody = canarySteps + "    steps:\n".length;
-      anchoredStep =
-        anchoredStep.slice(0, canaryStepsBody) +
-        "      - *platform_secret_step\n" +
-        anchoredStep.slice(canaryStepsBody);
-      expect(semanticSecretContextReferences(anchoredStep)).not.toEqual(
-        expectedSecretContextReferences,
-      );
-      const workflowCall = text.slice(0, text.indexOf("\npermissions:"));
-      const expectedDeclarations = [
-          "    secrets:",
-          "      DHI_ACCESS_TOKEN:",
-          "        required: true",
-          "      DHI_USERNAME:",
-          "        required: true",
-          "      GRYPE_DB_MANIFEST_JSON:",
-          "        required: true",
-          "      MAPBOX_PUBLIC_TOKEN:",
-          "        required: false",
-          "      SOCKET_API_TOKEN:",
-          "        required: true",
-      ];
-      if (workflow === "deploy-prod.yml") {
-        expectedDeclarations.push(
-          "      WAITLIST_IDENTITY_KEYSET:",
-          "        required: false",
-        );
-      }
-      expect(workflowCall.slice(workflowCall.indexOf("    secrets:\n")).trimEnd()).toBe(
-        expectedDeclarations.join("\n"),
-      );
-      expect(text.split("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}")).toHaveLength(2);
-      expect(text).toContain(
-        '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
-      );
-      expect(text).not.toContain("socket_api_token=");
-      expect(text.indexOf("Enforce the trusted application and container contract")).toBeLessThan(
-        text.indexOf("Enforce the organization Socket policy before package extraction"),
-      );
-      expect(
-        text.indexOf("Enforce the organization Socket policy before package extraction"),
-      ).toBeLessThan(text.indexOf("Login to Docker Hardened Images"));
-      const buildJob = text.slice(text.indexOf("  build:\n"), text.indexOf("\n  canary:\n"));
-      const deployStart = text.indexOf("  deploy:\n");
-      const deployEnd =
-        workflow === "deploy-preview.yml" ? text.indexOf("\n  invalidate:\n") : text.length;
-      const deployJob = text.slice(deployStart, deployEnd);
-      for (const secret of [
-        "DHI_ACCESS_TOKEN",
-        "DHI_USERNAME",
-        "GRYPE_DB_MANIFEST_JSON",
-        "SOCKET_API_TOKEN",
-      ]) {
-        const reference = `\${{ secrets.${secret} }}`;
-        expect(text.split(reference)).toHaveLength(2);
-        expect(buildJob).toContain(reference);
-        expect(deployJob).not.toContain(reference);
-      }
-      const deploySecrets = workflow === "deploy-prod.yml"
-        ? ["MAPBOX_PUBLIC_TOKEN", "WAITLIST_IDENTITY_KEYSET"]
-        : ["MAPBOX_PUBLIC_TOKEN"];
-      for (const secret of deploySecrets) {
-        const reference = `\${{ secrets.${secret} }}`;
-        expect(text.split(reference)).toHaveLength(2);
-        expect(deployJob).toContain(reference);
-        expect(buildJob).not.toContain(reference);
-      }
+      ]);
+      expect(text).toContain("environment: dhi-base-prefetch-20260822-098dca9280b3");
+      expect(text).toContain("DHI_USERNAME: ${{ vars.DHI_USERNAME }}");
+      expect(text).not.toContain("GRYPE_DB_MANIFEST_JSON");
+      expect(text).not.toContain("DB_MANIFEST_JSON:");
+      expect(text).toContain("MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}");
+      expect(text).not.toContain("on:\n  workflow_call:\n    secrets:");
+      expect(text).not.toContain("secrets.SOCKET_API_TOKEN");
+      expect(text).not.toContain("secrets.WAITLIST_IDENTITY_KEYSET");
+      const build = text.slice(text.indexOf("  build:\n"), text.indexOf("\n  verify-image:\n"));
+      expect(build).not.toContain("${{ secrets.");
+      expect(build).toContain("github-token: \"\"");
+      expect(build).toContain("DOCKER_BUILD_RECORD_UPLOAD: \"false\"");
+      expect(build).toContain("DOCKER_BUILD_SUMMARY: \"false\"");
+      expect(build).toContain("DOCKER_BUILD_CHECKS_ANNOTATIONS: \"false\"");
     }
+
     for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const caller = await readFile(
         join(repoRoot, "templates/app/.github/workflows", workflow),
         "utf8",
       );
-      const secretMap = caller.slice(caller.indexOf("    secrets:\n")).trimEnd();
-      const expectedSecretMap = [
-          "    secrets:",
-          "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
-          "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
-          "      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
-          "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
-          "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-      ];
-      if (workflow === "deploy-prod.yml") {
-        expectedSecretMap.push(
-          "      WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
-        );
-      }
-      expect(secretMap).toBe(expectedSecretMap.join("\n"));
+      expect(caller).not.toContain("secrets:");
+      expect(caller).not.toContain("secrets: inherit");
     }
+
     const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
-    expect(dockerfile).toContain(
-      "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
-    );
-    expect(dockerfile).toContain(
-      "dhi.io/bun:1-alpine-dev@sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8",
-    );
-    expect(dockerfile).toContain(
-      "dhi.io/bun:1-alpine@sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3",
-    );
-    expect(dockerfile).not.toContain("dhi.io/bun:1-dev@");
-    expect(dockerfile).not.toContain("dhi.io/bun:1@");
-    expect(dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676")).toHaveLength(3);
+    expect(dockerfile).toContain("FROM platform.invalid/bun-release AS bun-release");
+    expect(dockerfile).toContain("FROM platform.invalid/dhi-bun-dev AS deps");
+    expect(dockerfile).toContain("FROM platform.invalid/dhi-bun-runtime AS runtime");
     expect(dockerfile).not.toContain("--mount=type=secret");
-    expect(dockerfile).toContain(
-      "COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts",
-    );
-    expect(dockerfile).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
+    expect(dockerfile).toContain("USER 65532:65532");
+    expect(dockerfile).toContain("ENTRYPOINT []");
+    expect(dockerfile).toContain('CMD ["/usr/local/bin/bun", "/app/dist/server.js"]');
   });
 
   test("platform pull requests cannot receive the Socket organization token", async () => {
     const workflow = await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8");
-    expect(workflow).toContain(
-      "SOCKET_API_TOKEN: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
-    );
-    expect(workflow).not.toContain("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}");
+    expect(workflow).not.toContain("${{ secrets.");
+    expect(workflow).not.toContain("SOCKET_API_TOKEN:");
     expect(workflow).toContain('--config="$GITHUB_WORKSPACE/bunfig.toml" pm scan');
-    expect(workflow).toContain("Platform pull requests must remain credential-free.");
+    expect(workflow).toContain("Socket Security Scanner free mode");
     expect(workflow).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
+  test("executable workflow secret contexts reject pre-epoch credential names", async () => {
+    for (const path of [
+      ".github/workflows/application.yml",
+      ".github/workflows/socket-firewall.yml",
+      ".github/workflows/infrastructure.yml",
+      ".github/workflows/deploy-preview.yml",
+      ".github/workflows/deploy-prod.yml",
+      ".github/workflows/cleanup-preview.yml",
+      ".github/workflows/reconcile-previews.yml",
+      ".github/workflows/platform.yml",
+      "templates/app/.github/workflows/deploy-preview.yml",
+      "templates/app/.github/workflows/deploy-prod.yml",
+    ]) {
+      const references = semanticSecretContextReferences(
+        await readFile(join(repoRoot, path), "utf8"),
+      );
+      for (const reference of references) {
+        for (const retired of [
+          "DHI_ACCESS_TOKEN",
+          "SOCKET_API_TOKEN",
+          "WAITLIST_IDENTITY_KEYSET",
+        ]) {
+          expect(reference.value).not.toMatch(
+            new RegExp(
+              `secrets(?:\\.${retired}(?![A-Z0-9_])|\\[['\"]${retired}['\"]\\])`,
+            ),
+          );
+        }
+      }
+    }
+  });
+
+  test("security rollout orders protected-environment canaries and the sole DHI credential before Actions re-enable", async () => {
+    const rollout = await readFile(join(repoRoot, "docs/security-rollout.md"), "utf8");
+    const orderedGates = [
+      "Keep every consumer's Actions disabled while establishing the new",
+      "create and protect every\n   environment explicitly before any workflow names it",
+      "Create the DHI environment with no secrets or variables first",
+      "Prove a\n   default-branch, exact-SHA `pull_request_target` caller can enter it",
+      "prove a temporary ordinary `pull_request` workflow authored by the PR",
+      "Only after both canaries pass may the owner populate",
+      "Before re-enabling Actions, semantically prove every workflow and caller has",
+      "Delete the old\n   `preview-build`, `production-build`, and `dependency-scan` environments only",
+      "Re-read environment, repository, and organization secret\n   inventories",
+      "Re-enable consumers one at a time only after the new",
+    ];
+    let previous = -1;
+    for (const gate of orderedGates) {
+      const current = rollout.indexOf(gate);
+      expect(current).toBeGreaterThan(previous);
+      previous = current;
+    }
+    for (const environment of [
+      "`dhi-base-prefetch-20260822-098dca9280b3`",
+      "`preview-publish`",
+      "`preview-cloud`",
+      "`preview-operations`",
+      "`supply-chain`",
+      "`production`",
+      "`production-publish`",
+    ]) {
+      expect(rollout).toContain(environment);
+    }
+    expect(rollout).toContain("selected branch\n     `main` only, zero reviewers, and administrator bypass disabled");
+    expect(rollout).toContain("owner reviewer, and administrator bypass disabled");
+    expect(rollout).toContain("`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3`");
+    expect(rollout).toContain("four consumer DHI environments each\n   contain the sole epoch DHI token");
+    expect(rollout).toContain("Socket uses no GitHub secret or paid\n   scanner token");
+    expect(rollout).toContain("Medlock/Health has no GitHub waitlist key");
+    expect(rollout).toContain("least-scope, non-default public `pk.*` value");
+    expect(rollout).toContain("default public token\n   is forbidden");
+    expect(rollout).toContain("no secret forwarding, no `secrets: inherit`");
+    expect(rollout).toContain("The historical `161ac5c` tree predates this pipeline");
+  });
+
+  test("the app contract documents the credentialless artifact boundary and exact environment matrix", async () => {
+    const contract = await readFile(join(repoRoot, "docs/app-contract.md"), "utf8");
+    expect(contract).toContain("Deploy callers forward no secrets");
+    expect(contract).toContain("`pull_request_target` definition");
+    expect(contract).toContain("`dhi-base-prefetch-20260822-098dca9280b3`");
+    expect(contract).toContain("`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3`");
+    expect(contract).toContain("No GHCR staging package or packages permission");
+    expect(contract).toContain("Socket GitHub App id `156372`");
+    expect(contract).toContain("Medlock/Health has no GitHub signing-key secret");
+    expect(contract).toContain("DHI's signature does not attest the overlaid Bun binary");
+    expect(contract).toContain("environments carry it as the non-confidential `MAPBOX_PUBLIC_TOKEN` variable");
+    expect(contract).toContain("have zero reviewers, and disable administrator bypass");
+    expect(contract).toContain("require the owner reviewer, and disable\nadministrator bypass");
+    for (const stale of [
+      "reviewed five-name preview",
+      "six-name production secret contract",
+      "DHI_ACCESS_TOKEN_20260822",
+      "SOCKET_API_TOKEN_20260822",
+      "WAITLIST_IDENTITY_KEYSET_20260822",
+      "MAPBOX_PUBLIC_TOKEN` secret slots",
+    ]) {
+      expect(contract).not.toContain(stale);
+    }
+  });
+
   test("PR-controlled Docker output cannot issue GitHub runner commands", async () => {
     for (const [workflowName, buildName] of [
-      ["deploy-preview.yml", "Build untrusted preview image without cloud credentials"],
-      ["deploy-prod.yml", "Build production image without cloud credentials"],
+      ["deploy-preview.yml", "Build untrusted preview image into a local OCI archive"],
+      ["deploy-prod.yml", "Build production image into a local OCI archive"],
     ] as const) {
       const workflow = await readFile(
         join(repoRoot, ".github/workflows", workflowName),
@@ -1304,13 +1293,16 @@ describe("platform scaffold and doctor", () => {
       expect(workflow).toContain("cat /proc/sys/kernel/random/uuid");
       expect(workflow).toContain("printf '::stop-commands::%s\\n'");
       expect(workflow.slice(restore, workflow.indexOf("\n      - name:", restore + 1))).toContain(
-        "if: always()",
+        "if: always() && github.run_attempt == '1'",
       );
       const actionWindow = workflow.slice(build, restore);
       expect(actionWindow).toContain(
         "uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf",
       );
       expect(actionWindow).toContain('DOCKER_BUILD_RECORD_UPLOAD: "false"');
+      expect(actionWindow).toContain('DOCKER_BUILD_SUMMARY: "false"');
+      expect(actionWindow).toContain('DOCKER_BUILD_CHECKS_ANNOTATIONS: "false"');
+      expect(actionWindow).toContain('github-token: ""');
       expect(actionWindow).not.toContain("platform-build-command-token");
     }
   });
@@ -1469,30 +1461,27 @@ describe("platform scaffold and doctor", () => {
         join(repoRoot, ".github/workflows", workflowName),
         "utf8",
       );
-      const build = workflow.slice(workflow.indexOf("  build:\n"), workflow.indexOf("\n  canary:\n"));
+      const verify = workflow.slice(workflow.indexOf("  verify-image:\n"), workflow.indexOf("\n  canary:\n"));
       const attest = workflow.slice(workflow.indexOf("  attest:\n"), workflow.indexOf("\n  deploy:\n"));
 
-      expect(build).toContain(
-        "sbom-artifact-id: ${{ steps.upload_sbom.outputs.artifact-id }}",
+      expect(verify).toContain(
+        "artifact-id: ${{ steps.upload.outputs.artifact-id }}",
       );
-      expect(build).toContain(
-        "sbom-content-digest: ${{ steps.sbom_digest.outputs.digest }}",
+      expect(verify).toContain(
+        "sbom-content-digest: ${{ steps.promote.outputs.sbom_sha256 }}",
       );
-      expect(build).toContain("id: sbom_digest");
-      expect(build).toContain("sha256sum platform-build/sbom.spdx.json");
-      expect(build).toContain("id: upload_sbom");
-      expect(build.indexOf("id: sbom_digest")).toBeLessThan(
-        build.indexOf("id: upload_sbom"),
-      );
+      expect(verify).toContain("id: promote");
+      expect(verify).toContain("id: upload");
+      expect(verify.indexOf("id: promote")).toBeLessThan(verify.indexOf("id: upload"));
       expect(attest).toContain(
-        "artifact-ids: ${{ needs.build.outputs.sbom-artifact-id }}",
+        "artifact-ids: ${{ needs.verify-image.outputs.artifact-id }}",
       );
       expect(attest).toContain("digest-mismatch: error");
       expect(attest).toContain(
-        "EXPECTED_SBOM_DIGEST: ${{ needs.build.outputs.sbom-content-digest }}",
+        "EXPECTED_SBOM_DIGEST: ${{ needs.verify-image.outputs.sbom-content-digest }}",
       );
       expect(attest).toContain("sha256sum --check --strict");
-      expect(attest).not.toMatch(/\n\s+name:\s+.*sbom-/);
+      expect(attest).toContain("./dhi-runtime.manifest.json");
     }
   });
 
@@ -1511,6 +1500,10 @@ describe("platform scaffold and doctor", () => {
     );
     const reconcile = await readFile(
       join(repoRoot, ".github/workflows/reconcile-previews.yml"),
+      "utf8",
+    );
+    const reconcileCaller = await readFile(
+      join(repoRoot, "templates/app/.github/workflows/reconcile-previews.yml"),
       "utf8",
     );
 
@@ -1603,8 +1596,19 @@ describe("platform scaffold and doctor", () => {
     ]);
     expect(invalidation).toContain("EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}");
     expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
-    expect(reconcile).toContain("expected_revision_prefix");
-    expect(reconcile).toContain("head_sha:0:12");
+    expect(deploy).toContain("git-head-sha=${EXPECTED_HEAD_SHA}");
+    expect(deploy).toContain("github-repository-id=${REPOSITORY_ID}");
+    expect(deploy).toContain("platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}");
+    expect(deploy).toContain("PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}");
+    expect(deploy).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
+    expect(deploy).toContain('gcloud run revisions describe "$preview_revision"');
+    expect(reconcile).toContain('gcloud run revisions describe "$revision_name"');
+    expect(reconcile).toContain('.metadata.labels["git-head-sha"] == $head');
+    expect(reconcile).toContain('.metadata.labels["github-repository-id"] == $repository_id');
+    expect(reconcile).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
+    expect(reconcile).toContain("PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}");
+    expect(reconcileCaller).toContain("on:\n  push:\n    branches:\n      - main\n  schedule:");
+    expect(reconcile).not.toContain("expected_revision_prefix");
     expect(reconcile).toContain("gha-preview-deploy@");
     expect(reconcile).not.toContain("gha-preview-operator@");
     expect(reconcile).not.toContain("actions/checkout@");
@@ -1762,7 +1766,7 @@ describe("platform scaffold and doctor", () => {
     const serviceModule = serviceModuleFiles[0]!;
     const allServiceModuleTerraform = serviceModuleFiles.join("\n");
     expect(createHash("sha256").update(serviceModule).digest("hex")).toBe(
-      "bb0be7c548794254309371db48e4800770cad59a72c7457b028bbeff1f6c7682",
+      "8491d3a4c1acd5b5e463ff5e154ba601581d1cc3c777526c5a3ea22a4b521c21",
     );
     const productionServiceStart = serviceModule.indexOf(
       'resource "google_cloud_run_v2_service" "site"',
@@ -1867,6 +1871,7 @@ describe("platform scaffold and doctor", () => {
         "google_cloud_run_v2_service_iam_member.preview_deploy",
         "google_cloud_run_v2_service_iam_member.prod_deploy",
         "google_secret_manager_secret_iam_member.prod_deploy_version_adder",
+        "google_secret_manager_secret_iam_member.prod_deploy_version_metadata_reader",
         "google_secret_manager_secret_iam_member.runtime_accessor",
       ].sort(),
     );
@@ -2006,7 +2011,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "42b12bb7f5eda9ac0f2131660e54d44fed4174db8a7e4735c48c0f3b995ab7f1",
+      "cd0642a94606dba447bddaed2eb1ba20cfb4ed98d8ecf2d79e75e362104645c6",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2216,313 +2221,106 @@ describe("platform scaffold and doctor", () => {
     );
   });
 
-  test("verified registry copies are isolated from exact-package staging cleanup", async () => {
-    const copyRuns: string[] = [];
-    const cleanupRuns: string[] = [];
-    const occurrences = (value: string, needle: string) => value.split(needle).length - 1;
-    for (const [workflowName, stagingKind] of [
-      ["deploy-prod.yml", "production"],
-      ["deploy-preview.yml", "preview"],
-    ] as const) {
+  test("credentialless artifacts are canonicalized and independently rebound before publication", async () => {
+    const helper = await readFile(
+      join(repoRoot, "tools/ci/container-artifact-contract.sh"),
+      "utf8",
+    );
+    expect(helper).toContain('write_deterministic_tar "$image_root" "$canonical"');
+    expect(helper).toContain('validate_base_bundle "$trusted_base_root"');
+    expect(helper).toContain(
+      'validate_application_oci "$image_root" "$EXPECTED_PUBLISHED_INDEX_DIGEST" "$EXPECTED_RUNNABLE_MANIFEST_DIGEST" "$trusted_base_root"',
+    );
+    expect(helper).toContain('cmp "$trusted_runtime_manifest" "$embedded_runtime_manifest"');
+    expect(helper).toContain("BUILDKIT_PROVENANCE_URI_POLICY_IMPLEMENTED=true");
+    expect(helper).toContain(
+      "scanner_sandbox_image_id=\"$(docker image inspect --format '{{.Id}}' \"$SCANNER_SANDBOX_IMAGE\")\"",
+    );
+    expect(helper).toContain(
+      "docker image inspect --format '{{json .RepoDigests}}' \"$scanner_sandbox_image_id\"",
+    );
+    expect(helper).toContain('--entrypoint "$entrypoint" "$scanner_sandbox_image_id"');
+    expect(helper).toContain('docker pull "$SCANNER_SANDBOX_IMAGE"');
+    expect(helper.indexOf('docker pull "$SCANNER_SANDBOX_IMAGE"')).toBeLessThan(
+      helper.indexOf('safe_extract_tar "$built"'),
+    );
+    expect(helper).toContain("--pull never --network none --read-only --cap-drop ALL");
+    expect(helper).toContain("--security-opt no-new-privileges --user 65534:65534");
+    expect(helper).toContain('test ! -e "$HOST_ONLY_MARKER"');
+    expect(helper).toContain('! touch /input/parser-rce-write');
+    expect(helper).toContain('test ! -S /var/run/docker.sock');
+    expect(helper).toContain('cmp "$scanner_before" "$scanner_after"');
+
+    for (const workflowName of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const workflow = await readFile(
         join(repoRoot, ".github/workflows", workflowName),
         "utf8",
       );
-      const runTag = "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}";
-      expect(workflow).toContain(
-        `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      expect(workflow).not.toContain("ghcr.io");
+      expect(workflow).not.toContain("packages: write");
+      expect(workflow).not.toContain("cleanup-staging:");
+      expect(workflow).toContain("archive: false");
+      expect(workflow).toContain("skip-decompress: true");
+      expect(workflow).toContain("digest-mismatch: error");
+      expect(workflow).toContain(".workflow_run.repository_id == $repo");
+      expect(workflow).toContain(".workflow_run.head_repository_id == $repo");
+      const publish = workflow.slice(
+        workflow.indexOf("  publish:\n"),
+        workflow.indexOf("\n  attest:\n"),
       );
-      expect(workflow).not.toContain(
-        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      expect(publish).toContain("needs.prefetch-bases.result == 'success'");
+      expect(publish).toContain(
+        "artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}",
       );
-      expect(workflow).not.toContain(`-${stagingKind}-staging:${runTag}`);
-      const parsed = Bun.YAML.parse(workflow) as {
-        jobs: Record<string, Record<string, unknown>>;
-      };
-      const build = parsed.jobs.build;
-      expect(build.outputs).toEqual({
-        digest: "${{ steps.publish.outputs.digest }}",
-        "sbom-artifact-id": "${{ steps.upload_sbom.outputs.artifact-id }}",
-        "sbom-content-digest": "${{ steps.sbom_digest.outputs.digest }}",
-        "staging-image": "${{ steps.metadata.outputs.staging_image }}",
-      });
-      const publish = parsed.jobs.publish;
-      const publishSteps = publish.steps as Array<Record<string, unknown>>;
-      const app = publishSteps.find((step) => step.name === "Resolve trusted application configuration");
-      expect(app).toBeDefined();
-      expect((app?.env as Record<string, string>).BUILD_STAGING_IMAGE).toBe(
-        "${{ needs.build.outputs.staging-image }}",
+      expect(publish.indexOf("validate-promoted")).toBeLessThan(
+        publish.indexOf("Authenticate"),
       );
-      const appRun = app?.run as string;
-      expect(appRun).toContain(
-        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*):run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)`,
-      );
-      expect(appRun).toContain('[[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]]');
-      expect(appRun).toContain('[[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]');
-      expect(appRun).toContain('echo "staging_image=$BUILD_STAGING_IMAGE"');
-      const copyIndex = publishSteps.findIndex(
-        (step) => step.name === "Copy the opaque image by digest",
-      );
-      const verifyIndex = publishSteps.findIndex(
-        (step) => step.name === "Verify registry credentials were retired",
-      );
-      const authIndex = publishSteps.findIndex((step) => step.id === "auth");
-      expect(copyIndex).toBe(authIndex + 1);
-      expect(verifyIndex).toBe(copyIndex + 1);
-      expect(verifyIndex).toBe(publishSteps.length - 1);
-      expect(publish.permissions).toEqual({
-        contents: "read",
-        "id-token": "write",
-        packages: "read",
-      });
-
-      const copy = publishSteps[copyIndex];
-      expect(Object.keys(copy).sort()).toEqual(["env", "id", "name", "run"]);
-      expect(copy.id).toBe("copy");
-      expect(copy.env).toEqual({
-        AR_ACCESS_TOKEN: "${{ steps.auth.outputs.access_token }}",
-        GH_TOKEN: "${{ github.token }}",
-        REMOTE_IMAGE: "${{ steps.app.outputs.remote_image }}",
-        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
-        STAGING_IMAGE: "${{ steps.app.outputs.staging_image }}",
-      });
-      const copyRun = copy.run as string;
-      copyRuns.push(copyRun);
-      expect(copyRun.startsWith("set -euo pipefail\n")).toBe(true);
-      expect(occurrences(copyRun, '"$crane" auth login')).toBe(2);
-      expect(
-        occurrences(copyRun, '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"'),
-      ).toBe(1);
-      expect(occurrences(copyRun, '"$crane" digest "$REMOTE_IMAGE"')).toBe(1);
-      expect(occurrences(copyRun, 'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"')).toBe(1);
-      expect(copyRun).toContain('docker_config="$RUNNER_TEMP/platform-publisher-docker"');
-      expect(copyRun).toContain('trap retire_registry_credentials EXIT');
-      expect(copyRun).toContain('export DOCKER_CONFIG="$docker_config"');
-      expect(copyRun).toContain('rm -f -- "$docker_config/config.json"');
-      expect(copyRun.indexOf('"$crane" copy')).toBeLessThan(
-        copyRun.indexOf('remote_digest="$("$crane" digest'),
-      );
-      expect(copyRun.indexOf('if [ "$remote_digest" != "$STAGING_DIGEST" ]')).toBeLessThan(
-        copyRun.indexOf('echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"'),
-      );
-      expect(copyRun).not.toContain("|| true");
-
-      const verify = publishSteps[verifyIndex];
-      expect(Object.keys(verify).sort()).toEqual(["name", "run"]);
-      expect(verify.run).toBe(
-        "set -euo pipefail\n" +
-          'credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"\n' +
-          'if [ -e "$credential_file" ] || [ -L "$credential_file" ]; then\n' +
-          '  echo "Registry credentials survived the verified copy step." >&2\n' +
-          "  exit 1\n" +
-          "fi\n",
-      );
-
-      const cleanup = parsed.jobs["cleanup-staging"];
-      expect(Object.keys(cleanup).sort()).toEqual([
-        "if",
-        "name",
-        "needs",
-        "permissions",
-        "runs-on",
-        "steps",
-        "timeout-minutes",
-      ]);
-      expect(cleanup.needs).toEqual(["build", "publish"]);
-      expect(cleanup.if).toBe("always() && needs.publish.result == 'success'");
-      expect(cleanup["timeout-minutes"]).toBe(5);
-      expect(cleanup.permissions).toEqual({ packages: "write" });
-      const cleanupSteps = cleanup.steps as Array<Record<string, unknown>>;
-      expect(cleanupSteps).toHaveLength(1);
-      const cleanupStep = cleanupSteps[0];
-      expect(Object.keys(cleanupStep).sort()).toEqual([
-        "env",
-        "name",
-        "run",
-        "timeout-minutes",
-      ]);
-      expect(cleanupStep["timeout-minutes"]).toBe(2);
-      expect(cleanupStep.env).toEqual({
-        GH_TOKEN: "${{ github.token }}",
-        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
-        STAGING_IMAGE: "${{ needs.build.outputs.staging-image }}",
-      });
-      const cleanupRun = cleanupStep.run as string;
-      cleanupRuns.push(cleanupRun);
-      expect(cleanupRun.startsWith("set -euo pipefail\n")).toBe(true);
-      expect(cleanupRun).toContain(
-        `(platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)):(run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*))`,
-      );
-      expect(cleanupRun).toContain('[[ ! "$STAGING_IMAGE" =~ $staging_pattern ]]');
-      expect(cleanupRun).toContain('[[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]');
-      expect(cleanupRun).toContain('package="${BASH_REMATCH[1]}"');
-      expect(cleanupRun).toContain('tag="${BASH_REMATCH[3]}"');
-      expect(cleanupRun).not.toContain('package="platform-${repository}');
-      expect(cleanupRun).not.toContain("--paginate");
-      expect(cleanupRun).not.toContain("AR_ACCESS_TOKEN");
-      expect(cleanupRun).not.toContain("DOCKER_CONFIG");
-      expect(cleanupRun).not.toContain("steps.auth");
-      expect(cleanupRun).not.toContain("us-east4-docker.pkg.dev");
-      expect(occurrences(cleanupRun, "gh api")).toBe(2);
-      expect(occurrences(cleanupRun, "gh api --method DELETE")).toBe(1);
-      expect(occurrences(cleanupRun, '/packages/container/${package}"')).toBe(1);
-      expect(cleanupRun).not.toContain('/versions/${version_id}');
-      expect(occurrences(cleanupRun, "versions?state=active&per_page=100")).toBe(1);
-      expect(cleanupRun).not.toContain("continue-on-error");
-      expect(cleanupRun).not.toContain("|| true");
     }
 
-    expect(copyRuns[0]).toBe(copyRuns[1]);
-    expect(cleanupRuns[0].replace("production-staging-", "KIND-staging-")).toBe(
-      cleanupRuns[1].replace("preview-staging-", "KIND-staging-"),
+    const parsedBuilds = await Promise.all(
+      ["deploy-preview.yml", "deploy-prod.yml"].map(async (workflowName) =>
+        Bun.YAML.parse(
+          await readFile(join(repoRoot, ".github/workflows", workflowName), "utf8"),
+        ) as { jobs: { build: { steps: Array<Record<string, any>> } } },
+      ),
     );
-
-    const digest = `sha256:${"a".repeat(64)}`;
-    const tag = "run-123-1";
-    const exact = {
-      id: 123,
-      metadata: { container: { tags: [tag] }, package_type: "container" },
-      name: digest,
-    };
-    const fixtures = [
-      { versions: [exact], valid: true },
-      { versions: null, valid: false },
-      { versions: {}, valid: false },
-      { versions: [{ ...exact, name: `sha256:${"b".repeat(64)}` }], valid: false },
-      {
-        versions: [{ ...exact, metadata: { ...exact.metadata, container: { tags: ["wrong"] } } }],
-        valid: false,
-      },
-      {
-        versions: [
-          { ...exact, metadata: { ...exact.metadata, container: { tags: [tag, "other"] } } },
-        ],
-        valid: false,
-      },
-      { versions: [{ ...exact, metadata: { ...exact.metadata, package_type: "npm" } }], valid: false },
-      { versions: [{ id: 123, name: digest }], valid: false },
-      { versions: [exact, { ...exact, id: 124 }], valid: false },
-      {
-        versions: [exact, { ...exact, id: 124, name: `sha256:${"b".repeat(64)}` }],
-        valid: false,
-      },
-      { versions: [{ ...exact, id: "123" }], valid: false },
-      { versions: [{ ...exact, id: 123.5 }], valid: false },
-      { versions: [{ ...exact, id: 0 }], valid: false },
-      { versions: [{ ...exact, id: -1 }], valid: false },
-      { versions: [{ ...exact, id: null }], valid: false },
-      { versions: [{ ...exact, id: true }], valid: false },
-    ];
-    for (const cleanupRun of cleanupRuns) {
-      const match = cleanupRun.match(
-        /jq -er --arg digest "\$STAGING_DIGEST" --arg tag "\$tag" '\n([\s\S]*?)\n\s+' "\$versions" 2>\/dev\/null/,
+    const buildSteps = parsedBuilds.map((workflow) =>
+      workflow.jobs.build.steps.find(
+        (step) => step.uses === "docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf",
+      ),
+    );
+    expect(buildSteps[0]).toBeDefined();
+    expect(buildSteps[1]).toBeDefined();
+    for (const key of [
+      "builder",
+      "build-contexts",
+      "context",
+      "file",
+      "github-token",
+      "outputs",
+      "platforms",
+      "provenance",
+      "pull",
+      "push",
+    ]) {
+      expect(buildSteps[0]?.with[key], `preview/production ${key} drifted`).toEqual(
+        buildSteps[1]?.with[key],
       );
-      expect(match).not.toBeNull();
-      const predicate = match?.[1] ?? "";
-      for (const fixture of fixtures) {
-        const child = Bun.spawn(
-          ["jq", "-er", "--arg", "digest", digest, "--arg", "tag", tag, predicate],
-          {
-            stdin: new Blob([JSON.stringify(fixture.versions)]),
-            stdout: "ignore",
-            stderr: "ignore",
-          },
-        );
-        expect((await child.exited) === 0).toBe(fixture.valid);
-      }
     }
-
-    const harnessRoot = await mkdtemp(join(tmpdir(), "platform-ghcr-cleanup-"));
-    temporaryRoots.push(harnessRoot);
-    const fakeBin = join(harnessRoot, "bin");
-    await mkdir(fakeBin);
-    const fakeGh = join(fakeBin, "gh");
-    await writeFile(
-      fakeGh,
-      [
-        "#!/bin/sh",
-        "set -eu",
-        '[ "$1" = "api" ]',
-        "shift",
-        'delete_request="0"',
-        'previous=""',
-        'endpoint=""',
-        'for argument in "$@"; do',
-        '  if [ "$previous" = "--method" ] && [ "$argument" = "DELETE" ]; then',
-        '    delete_request="1"',
-        "  fi",
-        '  previous="$argument"',
-        '  endpoint="$argument"',
-        "done",
-        'if [ "$delete_request" = "1" ]; then',
-        '  case "$endpoint" in',
-        '    */versions/*) exit 64 ;;',
-        '    */packages/container/platform-*) ;;',
-        '    *) exit 65 ;;',
-        '  esac',
-        '  printf \'%s\\n\' "$endpoint" >> "$FAKE_GH_CAPTURE"',
-        "  exit 0",
-        "fi",
-        'case "$endpoint" in',
-        '  /user/packages/*) [ "${FAKE_GH_FAIL_USER:-0}" != "1" ] || exit 1 ;;',
-        "esac",
-        'cat "$FAKE_GH_FIXTURE"',
-        "",
-      ].join("\n"),
-    );
-    await chmod(fakeGh, 0o755);
-
-    const functionalFixtures = [
-      { versions: [exact], expectedId: 123, failUser: false },
-      { versions: [{ ...exact, id: 987654321 }], expectedId: 987654321, failUser: true },
-      ...fixtures.filter((fixture) => !fixture.valid).map((fixture) => ({
-        versions: fixture.versions,
-        expectedId: null,
-        failUser: false,
-      })),
-    ];
-    for (const [runIndex, cleanupRun] of cleanupRuns.entries()) {
-      const stagingKind = runIndex === 0 ? "production" : "preview";
-      for (const [fixtureIndex, fixture] of functionalFixtures.entries()) {
-        const runnerTemp = join(harnessRoot, `runner-${runIndex}-${fixtureIndex}`);
-        await mkdir(runnerTemp);
-        const fixturePath = join(runnerTemp, "fixture.json");
-        const capturePath = join(runnerTemp, "delete.txt");
-        await writeFile(fixturePath, JSON.stringify(fixture.versions));
-        const child = Bun.spawn(["/bin/bash", "-c", cleanupRun], {
-          env: {
-            FAKE_GH_CAPTURE: capturePath,
-            FAKE_GH_FAIL_USER: fixture.failUser ? "1" : "0",
-            FAKE_GH_FIXTURE: fixturePath,
-            GH_TOKEN: "test-token",
-            GITHUB_REPOSITORY: "collinbentley1/cdbentley",
-            GITHUB_REPOSITORY_OWNER: "collinbentley1",
-            GITHUB_RUN_ATTEMPT: "2",
-            GITHUB_RUN_ID: "123",
-            PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
-            RUNNER_TEMP: runnerTemp,
-            STAGING_DIGEST: digest,
-            STAGING_IMAGE: `ghcr.io/collinbentley1/platform-cdbentley-${stagingKind}-staging-123-1:run-123-1`,
-          },
-          stdout: "ignore",
-          stderr: "pipe",
-        });
-        const exitCode = await child.exited;
-        const stderr = await new Response(child.stderr).text();
-        const deletes = (await Bun.file(capturePath).exists())
-          ? (await Bun.file(capturePath).text()).trim().split("\n").filter(Boolean)
-          : [];
-        if (fixture.expectedId === null) {
-          expect(exitCode).not.toBe(0);
-          expect(deletes).toEqual([]);
-        } else {
-          const apiRoot = fixture.failUser ? "/users/collinbentley1" : "/user";
-          expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-          expect(deletes).toEqual([
-            `${apiRoot}/packages/container/platform-cdbentley-${stagingKind}-staging-123-1`,
-          ]);
-        }
-      }
+    expect(buildSteps[0]?.env).toEqual(buildSteps[1]?.env);
+    expect(buildSteps[0]?.env).toEqual({
+      DOCKER_BUILD_CHECKS_ANNOTATIONS: "false",
+      DOCKER_BUILD_RECORD_UPLOAD: "false",
+      DOCKER_BUILD_SUMMARY: "false",
+    });
+    for (const stepName of [
+      "Install checksum-pinned Docker Buildx and create pinned BuildKit",
+      "Destroy BuildKit and runner-local bases",
+    ]) {
+      const steps = parsedBuilds.map((workflow) =>
+        workflow.jobs.build.steps.find((step) => step.name === stepName),
+      );
+      expect(steps[0]?.run, `${stepName} drifted`).toBe(steps[1]?.run);
     }
   });
 
@@ -2576,7 +2374,9 @@ describe("platform scaffold and doctor", () => {
       "platform.yml",
     ]) {
       const workflow = await readFile(join(repoRoot, ".github/workflows", workflowName), "utf8");
-      expect(workflow).not.toContain("${{ vars.");
+      for (const forbidden of ["vars.GCP_", "vars.PROJECT_ID", "vars.SERVICE_ACCOUNT", "vars.WORKLOAD_IDENTITY_PROVIDER"]) {
+        expect(workflow).not.toContain(forbidden);
+      }
     }
 
     const production = await readFile(join(repoRoot, ".github/workflows/deploy-prod.yml"), "utf8");
@@ -2588,33 +2388,321 @@ describe("platform scaffold and doctor", () => {
     expect(preview).not.toContain("GCP_CLOUD_PREVIEW_ENABLED");
   });
 
+  test("every platform job and WIF provider path rejects reruns", async () => {
+    const guardedJobs = new Map<string, string[]>([
+      ["application.yml", ["verify"]],
+      ["socket-firewall.yml", ["firewall"]],
+      ["platform.yml", ["verify", "terraform"]],
+      [
+        "deploy-preview.yml",
+        [
+          "rerun-guard",
+          "prefetch-bases",
+          "build",
+          "verify-image",
+          "canary",
+          "publish-canary",
+          "publish",
+          "attest",
+          "deploy",
+          "invalidate",
+        ],
+      ],
+      [
+        "deploy-prod.yml",
+        [
+          "rerun-guard",
+          "prefetch-bases",
+          "build",
+          "verify-image",
+          "canary",
+          "publish",
+          "attest",
+          "deploy",
+        ],
+      ],
+      ["cleanup-preview.yml", ["rerun-guard", "cleanup"]],
+      ["reconcile-previews.yml", ["rerun-guard", "reconcile"]],
+      [
+        "infrastructure.yml",
+        ["rerun-guard", "terraform-validate", "checkov", "terraform-convergence"],
+      ],
+    ]);
+    const expectedJobConditions: Record<string, Record<string, string | null>> = {
+      "application.yml": { verify: null },
+      "socket-firewall.yml": { firewall: null },
+      "platform.yml": { terraform: null, verify: null },
+      "deploy-preview.yml": {
+        "rerun-guard": null,
+        "prefetch-bases":
+          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
+        build:
+          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false && needs.prefetch-bases.result == 'success'",
+        "verify-image": "needs.build.result == 'success' && needs.prefetch-bases.result == 'success'",
+        canary:
+          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
+        "publish-canary":
+          "github.event_name == 'pull_request_target' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
+        publish:
+          "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish-canary.result == 'success' && needs.verify-image.result == 'success'",
+        attest: "needs.publish.result == 'success'",
+        deploy: "needs.attest.result == 'success' && needs.publish.result == 'success'",
+        invalidate: "always() && needs.deploy.outputs.deployed-revision != '' && needs.deploy.outputs.lifecycle-keep != 'true'",
+      },
+      "deploy-prod.yml": {
+        "rerun-guard": null,
+        "prefetch-bases": "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        build: "github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.prefetch-bases.result == 'success'",
+        "verify-image": "needs.build.result == 'success' && needs.prefetch-bases.result == 'success'",
+        canary: "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        publish: "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.verify-image.result == 'success'",
+        attest: "needs.publish.result == 'success'",
+        deploy: "needs.attest.result == 'success' && needs.publish.result == 'success'",
+      },
+      "cleanup-preview.yml": {
+        "rerun-guard": null,
+        cleanup:
+          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && (github.event.action == 'closed' ||\n github.event.action == 'synchronize' ||\n github.event.action == 'converted_to_draft') &&\ngithub.event.pull_request.head.repo.full_name == github.repository",
+      },
+      "reconcile-previews.yml": {
+        "rerun-guard": null,
+        reconcile:
+          "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'",
+      },
+      "infrastructure.yml": {
+        "rerun-guard": null,
+        "terraform-validate": null,
+        checkov: null,
+        "terraform-convergence": "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+      },
+    };
+
+    const hasExactGuardStructure = (
+      workflowName: string,
+      workflow: string,
+      jobs: string[],
+    ): boolean => {
+      try {
+        const normalizeSimpleYamlKey = (token: string): string | undefined => {
+          if (/^[A-Za-z][A-Za-z0-9_-]*$/.test(token)) return token;
+          const quoted = /^(?:"([A-Za-z][A-Za-z0-9_-]*)"|'([A-Za-z][A-Za-z0-9_-]*)')$/.exec(
+            token,
+          );
+          return quoted?.[1] ?? quoted?.[2];
+        };
+        const jobsMarker = "\njobs:\n";
+        if (workflow.indexOf(jobsMarker) !== workflow.lastIndexOf(jobsMarker)) return false;
+        const jobsSection = workflow.slice(workflow.indexOf(jobsMarker) + jobsMarker.length);
+        const rawJobKeys = jobsSection
+          .split("\n")
+          .filter((line) => /^  \S/.test(line))
+          .map((line) => line.trim());
+        if (JSON.stringify(rawJobKeys) !== JSON.stringify(jobs.map((job) => `${job}:`))) return false;
+        const parsedDocument = Bun.YAML.parse(workflow) as {
+          jobs?: Record<string, { steps?: Array<Record<string, unknown>> }>;
+          defaults?: unknown;
+          env?: unknown;
+        };
+        if (parsedDocument.defaults !== undefined || parsedDocument.env !== undefined) return false;
+        const parsed = parsedDocument;
+        if (JSON.stringify(Object.keys(parsed.jobs ?? {})) !== JSON.stringify(jobs)) return false;
+        const expectedStep = {
+          name: "Reject workflow reruns before any privileged action",
+          shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
+          run: 'set -euo pipefail\ntest "$GITHUB_RUN_ATTEMPT" = "1"\n',
+        };
+        for (const [index, job] of jobs.entries()) {
+          const start = workflow.indexOf(`  ${job}:\n`);
+          const nextJob = jobs[index + 1];
+          const end = nextJob === undefined
+            ? workflow.length
+            : workflow.indexOf(`\n  ${nextJob}:\n`, start);
+          if (start < 0 || end < 0) return false;
+          const rawJob = workflow.slice(start, end);
+          const rawJobKeysAtDepth: string[] = [];
+          for (const line of rawJob.split("\n")) {
+            if (!/^    \S/.test(line)) continue;
+            if (line.slice(4).startsWith("#")) continue;
+            const separator = line.indexOf(":", 4);
+            if (separator < 0) return false;
+            const key = normalizeSimpleYamlKey(line.slice(4, separator).trim());
+            if (key === undefined) return false;
+            rawJobKeysAtDepth.push(key);
+          }
+          if (new Set(rawJobKeysAtDepth).size !== rawJobKeysAtDepth.length) return false;
+          const parsedJob = parsed.jobs?.[job] as Record<string, unknown> | undefined;
+          if (parsedJob?.["runs-on"] !== "ubuntu-24.04") return false;
+          for (const forbidden of [
+            "container",
+            "continue-on-error",
+            "defaults",
+            "env",
+            "services",
+            "uses",
+          ]) {
+            if (parsedJob?.[forbidden] !== undefined) return false;
+          }
+          if ((parsedJob?.if ?? null) !== expectedJobConditions[workflowName]?.[job]) return false;
+          const parsedSteps = parsedJob?.steps as Array<Record<string, unknown>> | undefined;
+          if (JSON.stringify(parsedSteps?.[0]) !== JSON.stringify(expectedStep)) {
+            return false;
+          }
+          for (const step of parsedSteps?.slice(1) ?? []) {
+            const condition = step.if;
+            if (
+              typeof condition === "string" &&
+              /\b(?:always|cancelled|failure|success)\s*\(\s*\)/.test(condition) &&
+              condition !== "always() && github.run_attempt == '1'"
+            ) {
+              return false;
+            }
+          }
+        }
+        return !workflow.includes("needs: rerun-guard");
+      } catch {
+        return false;
+      }
+    };
+
+    for (const [workflowName, jobs] of guardedJobs) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      expect(hasExactGuardStructure(workflowName, workflow, jobs)).toBe(true);
+      const jobsSection = workflow.slice(workflow.indexOf("\njobs:\n") + "\njobs:\n".length);
+      const rawJobKeys = jobsSection
+        .split("\n")
+        .filter((line) => /^  \S/.test(line))
+        .map((line) => line.trim());
+      expect(rawJobKeys).toEqual(jobs.map((job) => `${job}:`));
+
+      const parsed = Bun.YAML.parse(workflow) as {
+        jobs: Record<string, { steps: Array<Record<string, unknown>> }>;
+      };
+      expect(Object.keys(parsed.jobs)).toEqual(jobs);
+      for (const [index, job] of jobs.entries()) {
+        const start = workflow.indexOf(`  ${job}:\n`);
+        const nextJob = jobs[index + 1];
+        const end = nextJob === undefined ? workflow.length : workflow.indexOf(`\n  ${nextJob}:\n`, start);
+        const rawJob = workflow.slice(start, end);
+        const rawJobKeysAtDepth = rawJob
+          .split("\n")
+          .filter((line) => /^    [A-Za-z][A-Za-z0-9_-]*:/.test(line))
+          .map((line) => line.trim().split(":", 1)[0]);
+        expect(new Set(rawJobKeysAtDepth).size).toBe(rawJobKeysAtDepth.length);
+        const firstStep = parsed.jobs[job]?.steps?.[0];
+        expect(firstStep).toEqual({
+          name: "Reject workflow reruns before any privileged action",
+          shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
+          run: 'set -euo pipefail\ntest "$GITHUB_RUN_ATTEMPT" = "1"\n',
+        });
+        expect(rawJob).toContain(
+          '    steps:\n      - name: Reject workflow reruns before any privileged action\n        shell: /bin/bash --noprofile --norc -euo pipefail {0}\n        run: |\n          set -euo pipefail\n          test "$GITHUB_RUN_ATTEMPT" = "1"\n',
+        );
+      }
+      expect(workflow).not.toContain("needs: rerun-guard");
+
+      if (jobs.includes("rerun-guard")) {
+        const sentinel = parsed.jobs["rerun-guard"] as unknown as Record<string, unknown>;
+        expect(sentinel.permissions).toEqual({});
+      }
+    }
+
+    const application = await readFile(
+      join(repoRoot, ".github/workflows/application.yml"),
+      "utf8",
+    );
+    for (const hostile of [
+      application.replace("  verify:\n", '  "verify":\n'),
+      application.replace("  verify:\n", "  Verify_Job:\n"),
+      `${application}\n  verify:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n`,
+      application.replace("    steps:\n", "    steps:\n      - uses: attacker/action@main\n"),
+      application.replace("    steps:\n", "    steps:\n      - run: echo hostile\n"),
+      application.replace(
+        "    steps:\n",
+        "    steps:\n      - uses: attacker/action@main\n    steps:\n",
+      ),
+      application.replace(
+        "    steps:\n",
+        '    "permissions":\n      contents: write\n    steps:\n',
+      ),
+      application.replace(
+        "    steps:\n",
+        '    "steps":\n      - uses: attacker/action@main\n    steps:\n',
+      ),
+      application.replace(
+        "      - name: Checkout\n",
+        "      - name: Hostile post-guard cleanup\n        if: always()\n        run: echo hostile\n\n      - name: Checkout\n",
+      ),
+      application.replace("jobs:\n", "env:\n  BASH_ENV: /tmp/hostile\njobs:\n"),
+      application.replace("jobs:\n", "defaults:\n  run:\n    shell: hostile {0}\njobs:\n"),
+      application.replace("  verify:\n", "  verify:\n    env:\n      BASH_ENV: /tmp/hostile\n"),
+      application.replace("  verify:\n", "  verify:\n    defaults:\n      run:\n        shell: hostile {0}\n"),
+      application.replace("  verify:\n", "  verify:\n    container: hostile:latest\n"),
+      application.replace("  verify:\n", "  verify:\n    services:\n      hostile:\n        image: hostile:latest\n"),
+      application.replace("  verify:\n", "  verify:\n    uses: hostile/repo/.github/workflows/pwn.yml@main\n"),
+      application.replace("  verify:\n", "  verify:\n    continue-on-error: true\n"),
+      application.replace("  verify:\n", "  verify:\n    if: false\n"),
+      application.replace("runs-on: ubuntu-24.04", "runs-on: self-hosted"),
+    ]) {
+      expect(hasExactGuardStructure("application.yml", hostile, ["verify"])).toBe(false);
+    }
+    for (const workflowName of ["deploy-preview.yml", "deploy-prod.yml"]) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      expect(workflow).toContain(
+        "- name: Restore workflow commands after untrusted build output\n        if: always() && github.run_attempt == '1'",
+      );
+    }
+
+    for (const attempt of ["1", "2"]) {
+      const child = Bun.spawn(["/bin/bash", "--noprofile", "--norc", "-c", 'test "$GITHUB_RUN_ATTEMPT" = "1"'], {
+        env: { GITHUB_RUN_ATTEMPT: attempt, PATH: "/usr/bin:/bin" },
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      expect(await child.exited).toBe(attempt === "1" ? 0 : 1);
+    }
+
+    const bootstrap = await readFile(
+      join(repoRoot, "terraform/modules/bootstrap/main.tf"),
+      "utf8",
+    );
+    expect(bootstrap).toContain('"has(assertion.run_attempt)",');
+    expect(bootstrap).toContain('"assertion.run_attempt == \'1\'",');
+    expect(bootstrap).toContain(
+      "has(assertion.job_workflow_sha) && has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted'",
+    );
+  });
+
   test("runtime configuration is immutable per repository and Runsetta stays offline", async () => {
     const production = await readFile(join(repoRoot, ".github/workflows/deploy-prod.yml"), "utf8");
     const preview = await readFile(join(repoRoot, ".github/workflows/deploy-preview.yml"), "utf8");
 
     for (const workflow of [production, preview]) {
-      expect(workflow).toContain("DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}");
-      expect(workflow).toContain("MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}");
+      expect(workflow).not.toContain("GRYPE_DB_MANIFEST_JSON");
+      expect(workflow).not.toContain("DB_MANIFEST_JSON:");
+      expect(workflow).toContain("MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}");
       expect(workflow).toContain('[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]');
       expect(workflow).toContain('. + {MAPBOX_PUBLIC_TOKEN: $token}');
       expect(workflow).toContain('RUNSETTA_OFFLINE: "1"');
     }
-    expect(production).toContain("WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}");
-    expect(production).toContain('[[ ! "$WAITLIST_IDENTITY_KEYSET" =~ ^[A-Za-z0-9_-]{43}(,[A-Za-z0-9_-]{43})?$ ]]');
+    expect(production).not.toContain("${{ secrets.WAITLIST_IDENTITY_KEYSET");
+    expect(production).toContain('waitlist_entry_count="$(jq -er \'length\' <<< "$waitlist_entries")"');
+    expect(production).toContain('if [ "$waitlist_entry_count" = "1" ]; then');
+    expect(production).toContain('elif [ "$waitlist_entry_count" = "0" ]; then');
     expect(production).toContain("gcloud secrets versions add waitlist-identity-keyset");
-    expect(production).toContain("canonical_base64url_32");
-    expect(production).toContain("base64 --decode");
-    expect(production).toContain("base64 --wrap=0");
+    expect(production).toContain("gcloud secrets versions list");
+    expect(production).toContain("Refusing to guess an unbound existing Medlock secret version.");
     expect(production).toContain("gcloud run services describe");
-    expect(production).toContain("waitlist-keyset-fingerprint");
+    expect(production).toContain('select(.name == "WAITLIST_IDENTITY_KEYSET")');
     expect(production).toContain('select(.name == "waitlist-identity-keyset")');
-    expect(
-      production.indexOf('if ! canonical_base64url_32 "$waitlist_primary"'),
-    ).toBeLessThan(production.indexOf("gcloud secrets versions add waitlist-identity-keyset"));
     expect(
       production.indexOf("gcloud run services describe"),
     ).toBeLessThan(production.indexOf("gcloud secrets versions add waitlist-identity-keyset"));
-    expect(production).toContain("env -u WAITLIST_IDENTITY_KEYSET");
     expect(production).toContain("--data-file=-");
     expect(production).toContain("--format='value(name)'");
     expect(production).toContain(
@@ -2623,7 +2711,7 @@ describe("platform scaffold and doctor", () => {
     expect(production).toContain(
       'secret_args=(--set-secrets="WAITLIST_IDENTITY_KEYSET=waitlist-identity-keyset:${secret_version}")',
     );
-    expect(production).not.toContain("jq --arg waitlist_identity_keyset");
+    expect(production).not.toContain("WAITLIST_IDENTITY_KEYSET: ${{ secrets.");
     expect(production.split("--set-secrets")).toHaveLength(2);
     expect(production).not.toContain("--update-secrets");
     expect(preview).not.toContain("secrets.WAITLIST_IDENTITY_KEYSET");

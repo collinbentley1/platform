@@ -2,67 +2,55 @@ name: Deploy preview
 
 on:
   workflow_call:
-    # Cross-repository reusable workflows expose only declared and forwarded secret
-    # names. Callers forward exactly these names without inheriting broader scope;
-    # the approved job environments below supply and override their values.
-    secrets:
-      DHI_ACCESS_TOKEN:
-        required: true
-      DHI_USERNAME:
-        required: true
-      GRYPE_DB_MANIFEST_JSON:
-        required: true
-      MAPBOX_PUBLIC_TOKEN:
-        required: false
-      SOCKET_API_TOKEN:
-        required: true
 
 permissions: {}
 
 jobs:
-  build:
-    name: Build untrusted preview
+  rerun-guard:
+    name: Reject privileged workflow reruns
     runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+  prefetch-bases:
+    name: Prefetch exact public DHI bases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type == 'User' &&
       github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false
-    # DHI and Socket credentials live only in this owner-approved environment. This job
-    # intentionally cannot request an OIDC token or reach Google Cloud.
-    environment: preview-build
-    permissions:
-      contents: read
-      packages: write # Publish only the digest-addressed isolated GHCR staging image.
+    # This fresh environment must allow only the selected protected main branch. It
+    # contains one read-public-only DHI token and is never entered by PR code.
+    environment: dhi-base-prefetch-20260822-098dca9280b3
+    permissions: {}
     outputs:
-      digest: ${{ steps.publish.outputs.digest }}
-      sbom-artifact-id: ${{ steps.upload_sbom.outputs.artifact-id }}
-      sbom-content-digest: ${{ steps.sbom_digest.outputs.digest }}
-      staging-image: ${{ steps.metadata.outputs.staging_image }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      content-sha256: ${{ steps.bundle.outputs.content_sha256 }}
+      manifest-sha256: ${{ steps.bundle.outputs.manifest_sha256 }}
 
     steps:
-      - name: Resolve fixed build metadata
-        id: metadata
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
           set -euo pipefail
-          repository="${GITHUB_REPOSITORY#*/}"
-          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-          if [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] || [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            echo "Unexpected repository identity." >&2
-            exit 1
-          fi
-          {
-            echo "local_image=platform-preview:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "staging_image=ghcr.io/${owner}/platform-${repository}-preview-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          } >> "$GITHUB_OUTPUT"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
 
-      - name: Checkout pull request
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Resolve the exact reusable-workflow source
+      - name: Fetch the exact reusable-workflow policy source before secret use
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
           WORKFLOW_SHA: ${{ job.workflow_sha }}
@@ -70,25 +58,181 @@ jobs:
           set -euo pipefail
           test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
           [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
-          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
-            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+          destination="$RUNNER_TEMP/platform-prefetch-policy"
+          git_home="$RUNNER_TEMP/platform-prefetch-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          test ! -e "$git_home" && test ! -L "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          git_safe -C "$destination" init --quiet
+          git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          test "$(git_safe -C "$destination" status --porcelain=v1 --untracked-files=all)" = ""
+          helper="$destination/tools/ci/container-artifact-contract.sh"
+          test -f "$helper" && test ! -L "$helper"
+          expected="$(git_safe -C "$destination" rev-parse "$WORKFLOW_SHA:tools/ci/container-artifact-contract.sh")"
+          test "$(git_safe -C "$destination" hash-object --no-filters "$helper")" = "$expected"
+          rm -rf -- "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch, verify, and close the exact public base graph
+        id: bundle
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ARTIFACT_KIND: preview
+          DHI_PUBLIC_READ_TOKEN: ${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}
+          DHI_USERNAME: ${{ vars.DHI_USERNAME }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" prefetch
+
+      - name: Verify DHI credentials were retired before artifact publication
+        if: always() && github.run_attempt == '1'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          auth_root="$RUNNER_TEMP/platform-regctl-auth"
+          artifact="${{ steps.bundle.outputs.artifact }}"
+          if [ -e "$auth_root" ] || [ -L "$auth_root" ]; then
+            echo "DHI registry credentials survived prefetch." >&2
+            rm -rf -- "$auth_root" "$RUNNER_TEMP/platform-base-bundle" "$artifact"
+            exit 1
+          fi
+          if [ ! -f "$artifact" ] || [ -L "$artifact" ]; then
+            echo "Base-image artifact was not produced safely." >&2
             exit 1
           fi
 
-      - name: Checkout the exact platform policy source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Upload the one-day public base closure as one raw artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          repository: ${{ job.workflow_repository }}
-          ref: ${{ job.workflow_sha }}
-          path: _platform_policy
-          persist-credentials: false
+          path: ${{ steps.bundle.outputs.artifact }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Verify the checked-out platform policy commit
-        env:
-          EXPECTED_SHA: ${{ job.workflow_sha }}
+  build:
+    name: Build untrusted preview without credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: prefetch-bases
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false &&
+      needs.prefetch-bases.result == 'success'
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      content-sha256: ${{ steps.oci.outputs.content_sha256 }}
+
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
           set -euo pipefail
-          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Fetch the exact reusable-workflow policy source
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-build-policy"
+          repository="$RUNNER_TEMP/platform-build-repository"
+          git_home="$RUNNER_TEMP/platform-build-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools templates | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Download only the exact base artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-base-download
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Validate and extract the closed base artifact
+        id: base_images
+        env:
+          ARTIFACT_DOWNLOAD_DIR: ${{ runner.temp }}/platform-base-download
+          EXPECTED_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" verify-base
+
+      - name: Resolve fixed build metadata
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head_sha='${{ github.event.pull_request.head.sha }}'
+          base_sha='${{ github.event.pull_request.base.sha }}'
+          pr_number='${{ github.event.pull_request.number }}'
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]
+          test "$base_sha" = "$GITHUB_SHA"
+          pr="$RUNNER_TEMP/current-pr.json"
+          main="$RUNNER_TEMP/current-main.json"
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" > "$pr"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" > "$main"
+          jq -e --arg head "$head_sha" --arg base "$base_sha" --arg repository "$GITHUB_REPOSITORY" '
+            .state == "open" and .draft == false and .head.sha == $head and
+            .head.repo.full_name == $repository and .base.ref == "main" and .base.sha == $base
+          ' "$pr" >/dev/null
+          test "$(jq -er '.object.sha' "$main")" = "$base_sha"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pull request
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Verify the exact checked-out pull request head
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(/usr/bin/git rev-parse --verify 'HEAD^{commit}')" = "$EXPECTED_HEAD_SHA"
+          test "$(/usr/bin/git status --porcelain=v1 --untracked-files=all)" = ""
 
       - name: Install checksum-pinned Bun 1.4.0 for structural policy checks
         env:
@@ -105,7 +249,7 @@ jobs:
           unzip -q "$archive" -d "$destination"
           echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
           (
-            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            cd "${{ steps.policy.outputs.root }}/tools/ci"
             "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
               -e 'if (Bun.version !== "1.4.0") process.exit(1)'
           )
@@ -114,17 +258,15 @@ jobs:
         run: |
           set -euo pipefail
           (
-            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            cd "${{ steps.policy.outputs.root }}/tools/ci"
             bun --no-env-file --no-orphans ./enforce-app-contract.ts \
               "$GITHUB_WORKSPACE" \
-              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ steps.policy.outputs.root }}/templates/app" \
               "${{ github.event.repository.id }}" \
               "${{ job.workflow_sha }}"
           )
 
-      - name: Enforce the organization Socket policy before package extraction
-        env:
-          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}
+      - name: Scan the resolved lock with the public Socket policy
         run: |
           set -euo pipefail
           print_untrusted_output() {
@@ -134,21 +276,20 @@ jobs:
             printf '%s\n' "$1"
             printf '::%s::\n' "$stop_marker"
           }
-          test -n "$SOCKET_API_TOKEN"
           if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
-            echo "Committed node_modules content is forbidden before the protected Socket scan." >&2
+            echo "Committed node_modules content is forbidden before the public Socket scan." >&2
             exit 1
           fi
           before="$(sha256sum package.json bun.lock)"
-          unset SOCKET_API_KEY
+          unset SOCKET_API_TOKEN SOCKET_API_KEY
           unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
-          if ! scan_output="$(bun --no-env-file --config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan 2>&1)"; then
+          if ! scan_output="$(bun --no-env-file --config="${{ steps.policy.outputs.root }}/tools/ci/bunfig.toml" pm scan 2>&1)"; then
             print_untrusted_output "$scan_output"
             exit 1
           fi
           print_untrusted_output "$scan_output"
-          if grep -Fq 'Socket Security Scanner free mode' <<< "$scan_output"; then
-            echo "The protected preview build must enforce the organization Socket policy." >&2
+          if ! grep -Fq 'Socket Security Scanner free mode' <<< "$scan_output"; then
+            echo "The preview lock scan must remain credential-free." >&2
             exit 1
           fi
           if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
@@ -185,13 +326,6 @@ jobs:
           DOCKER_CONFIG="$docker_config" docker buildx inspect "$builder" --bootstrap
           echo "name=$builder" >> "$GITHUB_OUTPUT"
 
-      - name: Login to Docker Hardened Images
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: dhi.io
-          username: ${{ secrets.DHI_USERNAME }}
-          password: ${{ secrets.DHI_ACCESS_TOKEN }}
-
       - name: Disable workflow commands for untrusted build output
         run: |
           set -euo pipefail
@@ -205,21 +339,34 @@ jobs:
           (umask 077; printf '%s\n' "$token" > "$token_file")
           printf '::stop-commands::%s\n' "$token"
 
-      - name: Build untrusted preview image without cloud credentials
+      - name: Build untrusted preview image into a local OCI archive
+        id: image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         env:
           DOCKER_BUILD_RECORD_UPLOAD: "false"
+          DOCKER_BUILD_SUMMARY: "false"
+          DOCKER_BUILD_CHECKS_ANNOTATIONS: "false"
         with:
           builder: ${{ steps.buildx.outputs.name }}
+          github-token: ""
+          build-contexts: |
+            platform.invalid/bun-release=oci-layout://${{ steps.base_images.outputs.oven_layout }}@${{ steps.base_images.outputs.oven_child_digest }}
+            platform.invalid/dhi-bun-dev=oci-layout://${{ steps.base_images.outputs.dhi_dev_layout }}@${{ steps.base_images.outputs.dhi_dev_child_digest }}
+            platform.invalid/dhi-bun-runtime=oci-layout://${{ steps.base_images.outputs.dhi_runtime_layout }}@${{ steps.base_images.outputs.dhi_runtime_child_digest }}
           context: .
           file: Dockerfile
-          load: true
+          platforms: linux/amd64
+          pull: false
           push: false
-          tags: ${{ steps.metadata.outputs.local_image }}
-          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          outputs: type=oci,dest=${{ runner.temp }}/platform-image.oci.tar,oci-mediatypes=true,oci-artifact=true
+          provenance: mode=max,version=v1
+          tags: platform-preview:${{ steps.metadata.outputs.head_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Restore workflow commands after untrusted build output
-        if: always()
+        if: always() && github.run_attempt == '1'
         run: |
           set -euo pipefail
           token_file="$RUNNER_TEMP/platform-build-command-token"
@@ -232,161 +379,173 @@ jobs:
           unlink "$token_file"
           printf '::%s::\n' "$token"
 
-      - name: Remove Docker Hardened Images credentials
-        run: docker logout dhi.io
-
-      - name: Destroy BuildKit before any publish credential exists
+      - name: Destroy BuildKit and runner-local bases
+        if: always() && github.run_attempt == '1'
         env:
           BUILDER_NAME: ${{ steps.buildx.outputs.name }}
         run: |
           set -euo pipefail
-          test -n "$BUILDER_NAME"
-          docker buildx rm "$BUILDER_NAME"
-          if docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
+          if [ -n "$BUILDER_NAME" ] && docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
+            docker buildx rm "$BUILDER_NAME"
+          fi
+          if [ -n "$BUILDER_NAME" ] && docker buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
             echo "BuildKit builder still exists after removal." >&2
             exit 1
           fi
-
-      - name: Install checksum-pinned Syft and Grype
-        env:
-          GRYPE_SHA256: 38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26
-          SYFT_SHA256: 2a2e837a2c8d59ec9af5472ee22d3b04ee463c4e44476ecf993fd1e5ab6ebc7f
-        run: |
-          set -euo pipefail
-          grype_archive="$RUNNER_TEMP/grype.tgz"
-          syft_archive="$RUNNER_TEMP/syft.tgz"
-          tools="$RUNNER_TEMP/platform-tools"
-          mkdir -p "$tools" platform-build
-          curl --fail --show-error --silent --location \
-            --output "$syft_archive" \
-            https://github.com/anchore/syft/releases/download/v1.51.0/syft_1.51.0_linux_amd64.tar.gz
-          echo "${SYFT_SHA256}  ${syft_archive}" | sha256sum --check --strict
-          tar -xzf "$syft_archive" -C "$tools" syft
-          curl --fail --show-error --silent --location \
-            --output "$grype_archive" \
-            https://github.com/anchore/grype/releases/download/v0.117.0/grype_0.117.0_linux_amd64.tar.gz
-          echo "${GRYPE_SHA256}  ${grype_archive}" | sha256sum --check --strict
-          tar -xzf "$grype_archive" -C "$tools" grype
-          "$tools/syft" version
-          "$tools/grype" version -o json | jq -e \
-            '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"'
-
-      - name: Generate the preview SBOM before registry login
-        env:
-          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
-        run: |
-          set -euo pipefail
-          config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/syft.yaml"
-          export DOCKER_CONFIG="$RUNNER_TEMP/syft-empty-docker-config"
-          mkdir -p "$DOCKER_CONFIG"
-          unset SYFT_CONFIG SYFT_REGISTRY_AUTH_USERNAME SYFT_REGISTRY_AUTH_PASSWORD SYFT_REGISTRY_AUTH_TOKEN
-          "$RUNNER_TEMP/platform-tools/syft" --config "$config" "docker:${LOCAL_IMAGE}" \
-            --output spdx-json=platform-build/sbom.spdx.json
-          test -s platform-build/sbom.spdx.json
-
-      - name: Gate the final runtime image against the reviewed vulnerability database
-        env:
-          DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}
-          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
-        run: |
-          set -euo pipefail
-          config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/grype.yaml"
-          grype="$RUNNER_TEMP/platform-tools/grype"
-          report="platform-build/grype.json"
-          export DOCKER_CONFIG="$RUNNER_TEMP/grype-empty-docker-config"
-          export GRYPE_DB_CACHE_DIR="$RUNNER_TEMP/platform-grype-db"
-          mkdir -p "$DOCKER_CONFIG" "$GRYPE_DB_CACHE_DIR"
-          unset GRYPE_CONFIG GRYPE_REGISTRY_AUTH_USERNAME GRYPE_REGISTRY_AUTH_PASSWORD GRYPE_REGISTRY_AUTH_TOKEN
-          db_url="$(jq -er '
-            select((keys | sort) == ["built", "schemaVersion", "sha256", "url"])
-            |
-            .url as $url
-            | .sha256 as $sha
-            | select($sha | test("^[0-9a-f]{64}$"))
-            | select($url | test(("^https://grype\\.anchore\\.io/databases/v6/vulnerability-db_v6\\.[0-9]+\\.[0-9]+_[0-9TZ:-]+_[0-9]+\\.tar\\.zst\\?checksum=sha256%3A" + $sha + "$")))
-            | $url
-          ' <<< "$DB_MANIFEST_JSON")"
-          expected_schema="$(jq -er '.schemaVersion | select(test("^v6\\.[0-9]+\\.[0-9]+$"))' <<< "$DB_MANIFEST_JSON")"
-          expected_built="$(jq -er '.built | fromdateiso8601 | todateiso8601' <<< "$DB_MANIFEST_JSON")"
-          "$grype" --config "$config" db import "$db_url"
-          "$grype" --config "$config" db status -o json | jq -e \
-            --arg from "$db_url" \
-            --arg schema "$expected_schema" \
-            --arg built "$expected_built" '
-            .valid == true and
-            .schemaVersion == $schema and
-            .built == $built and
-            .from == $from and
-            ((now - (.built | fromdateiso8601)) >= -3600) and
-            ((now - (.built | fromdateiso8601)) <= 172800)
-          '
-          "$grype" --config "$config" "docker:${LOCAL_IMAGE}" \
-            --scope squashed \
-            --output json > "$report"
-          test -s "$report"
-          blocking="$RUNNER_TEMP/grype-blocking.json"
-          jq -f "$GITHUB_WORKSPACE/_platform_policy/tools/ci/grype-blocking.jq" \
-            "$report" > "$blocking"
-          total_findings="$(jq -er '.matches | length' "$report")"
-          jq -c --argjson total "$total_findings" '
-            {
-              policy: "all Critical and High findings are blocked",
-              blockingCount: length,
-              blocking: .,
-              totalFindings: $total
-            }
-          ' "$blocking"
-          jq -e 'length == 0' "$blocking"
-
-      - name: Login to the isolated GitHub staging registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Publish the already-built staging image
-        id: publish
-        env:
-          LOCAL_IMAGE: ${{ steps.metadata.outputs.local_image }}
-          STAGING_IMAGE: ${{ steps.metadata.outputs.staging_image }}
-        run: |
-          set -euo pipefail
-          docker image tag "$LOCAL_IMAGE" "$STAGING_IMAGE"
-          docker image push "$STAGING_IMAGE"
-          reference="$(docker image inspect --format='{{index .RepoDigests 0}}' "$STAGING_IMAGE")"
-          digest="${reference##*@}"
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "Registry returned an invalid image digest." >&2
+          rm -rf -- "${{ steps.base_images.outputs.base_root }}"
+          if [ -e "${{ steps.base_images.outputs.base_root }}" ] ||
+             [ -L "${{ steps.base_images.outputs.base_root }}" ]; then
+            echo "Runner-local base-image layouts survived the build." >&2
             exit 1
           fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
-      - name: Remove GitHub staging credentials
-        run: docker logout ghcr.io
-
-      - name: Record the exact SBOM content digest
-        id: sbom_digest
+      - name: Hash the opaque untrusted OCI output
+        id: oci
         run: |
           set -euo pipefail
-          digest="$(sha256sum platform-build/sbom.spdx.json | cut -d ' ' -f 1)"
-          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          image="$RUNNER_TEMP/platform-image.oci.tar"
+          test -f "$image" && test ! -L "$image"
+          test "$(stat -c %s "$image")" -le 1073741824
+          content_sha256="$(sha256sum "$image" | cut -d ' ' -f 1)"
+          echo "content_sha256=$content_sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload the SBOM only
-        id: upload_sbom
+      - name: Upload the opaque OCI output as one raw artifact
+        id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: preview-sbom-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: platform-build/sbom.spdx.json
+          path: ${{ runner.temp }}/platform-image.oci.tar
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-image:
+    name: Verify and promote preview OCI image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - build
+      - prefetch-bases
+    if: needs.build.result == 'success' && needs.prefetch-bases.result == 'success'
+    permissions:
+      actions: read
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      content-sha256: ${{ steps.promote.outputs.content_sha256 }}
+      image-digest: ${{ steps.promote.outputs.published_index_digest }}
+      runnable-digest: ${{ steps.promote.outputs.runnable_manifest_digest }}
+      sbom-content-digest: ${{ steps.promote.outputs.sbom_sha256 }}
+
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Fetch the exact reusable-workflow policy source
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-promoter-policy"
+          repository="$RUNNER_TEMP/platform-promoter-repository"
+          git_home="$RUNNER_TEMP/platform-promoter-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Bind both exact source artifacts to this run
+        env:
+          BASE_ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
+          BASE_ARTIFACT_ID: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          BUILT_ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact-digest }}
+          BUILT_ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for value in "$BASE_ARTIFACT_DIGEST" "$BUILT_ARTIFACT_DIGEST"; do [[ "$value" =~ ^[0-9a-f]{64}$ ]]; done
+          for value in "$BASE_ARTIFACT_ID" "$BUILT_ARTIFACT_ID"; do [[ "$value" =~ ^[1-9][0-9]*$ ]]; done
+          verify_artifact() {
+            local id="$1" digest="$2" name="$3" max="$4"
+            local response="$RUNNER_TEMP/artifact-${id}.json"
+            gh api --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" > "$response"
+            jq -e --arg id "$id" --arg digest "sha256:${digest}" --arg name "$name" --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson max "$max" --argjson repo "$EXPECTED_REPOSITORY_ID" '
+              (.id | tostring) == $id and .name == $name and .expired == false and .digest == $digest and
+              (.workflow_run.id | tostring) == $run and .workflow_run.head_sha == $sha and
+              .workflow_run.repository_id == $repo and .workflow_run.head_repository_id == $repo and
+              (.size_in_bytes > 0 and .size_in_bytes <= $max)
+            ' "$response" >/dev/null
+          }
+          verify_artifact "$BASE_ARTIFACT_ID" "$BASE_ARTIFACT_DIGEST" "platform-preview-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" 1611661312
+          verify_artifact "$BUILT_ARTIFACT_ID" "$BUILT_ARTIFACT_DIGEST" platform-image.oci.tar 1073741824
+
+      - name: Download only the exact opaque image artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-image-download
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Download only the exact reviewed base artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-promoter-bases
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Validate, scan, and promote in a fresh credentialless job
+        id: promote
+        env:
+          ARTIFACT_KIND: preview
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-promoter-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          BUILT_CONTENT_SHA256: ${{ needs.build.outputs.content-sha256 }}
+          BUILT_DOWNLOAD_DIR: ${{ runner.temp }}/platform-image-download
+          EXPECTED_EVENT_NAME: pull_request_target
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" promote
+
+      - name: Upload the promoted image as one raw artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.promote.outputs.artifact }}
+          archive: false
           if-no-files-found: error
           retention-days: 1
 
   canary:
     name: Prove exact preview WIF trust
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type == 'User' &&
       github.actor != 'dependabot[bot]' &&
@@ -396,6 +555,12 @@ jobs:
       id-token: write # Exchange only for the no-role exact-WIF canary identity.
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Resolve trusted canary configuration
         id: app
         env:
@@ -428,8 +593,12 @@ jobs:
   publish-canary:
     name: Prove exact preview publisher WIF trust
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     if: >-
-      github.event_name == 'pull_request' &&
+      github.event_name == 'pull_request_target' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.ref == 'refs/heads/main' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.type == 'User' &&
       github.actor != 'dependabot[bot]' &&
@@ -439,6 +608,12 @@ jobs:
       id-token: write # Exchange only for the no-role exact-WIF canary identity.
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Resolve trusted publisher-canary configuration
         id: app
         env:
@@ -469,84 +644,151 @@ jobs:
           export_environment_variables: false
 
   publish:
-    name: Copy preview image into Artifact Registry
+    name: Publish verified preview OCI image
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs:
-      - build
       - canary
+      - prefetch-bases
       - publish-canary
+      - verify-image
     if: >-
       always() &&
-      needs.build.result == 'success' &&
       needs.canary.result == 'success' &&
-      needs.publish-canary.result == 'success'
+      needs.prefetch-bases.result == 'success' &&
+      needs.publish-canary.result == 'success' &&
+      needs.verify-image.result == 'success'
     environment: preview-publish
     permissions:
-      contents: read
-      id-token: write # Exchange only for the exact-SHA preview image-copy identity.
-      packages: read # Read only the digest-addressed isolated GHCR staging image.
+      actions: read # Read only the exact promoted artifact id from this run.
+      id-token: write # Exchange only for the exact-SHA publisher identity.
     outputs:
       image-digest: ${{ steps.copy.outputs.digest }}
       image-name: ${{ steps.app.outputs.image_name }}
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Fetch the exact reusable-workflow policy source before OIDC
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-publisher-policy"
+          repository="$RUNNER_TEMP/platform-publisher-repository"
+          git_home="$RUNNER_TEMP/platform-publisher-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
       - name: Resolve trusted application configuration
         id: app
         env:
-          BUILD_STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
-          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site-preview" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api-preview" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site-preview" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site-preview" ;;
-            *) echo "Repository id $REPOSITORY_ID is not registered for preview deployment." >&2; exit 1 ;;
+            *) echo "Repository id $REPOSITORY_ID is not registered for preview publication." >&2; exit 1 ;;
           esac
           image_name="us-east4-docker.pkg.dev/${project_id}/${repository}/${service_name}"
-          source_repository="${GITHUB_REPOSITORY#*/}"
-          source_owner="${GITHUB_REPOSITORY_OWNER,,}"
-          if [[ ! "$source_repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] || [[ ! "$source_owner" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
-            echo "Unexpected repository identity." >&2
-            exit 1
-          fi
-          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Unexpected workflow run identity." >&2
-            exit 1
-          fi
-          staging_pattern="^ghcr\\.io/${source_owner}/platform-${source_repository}-preview-staging-${GITHUB_RUN_ID}-([1-9][0-9]*):run-${GITHUB_RUN_ID}-([1-9][0-9]*)$"
-          if [[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]] ||
-             [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]; then
-            echo "Invalid inherited preview staging image identity." >&2
-            exit 1
-          fi
           {
             echo "project_id=$project_id"
             echo "image_name=$image_name"
-            echo "remote_image=${image_name}:pr-${PR_NUMBER}-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "staging_image=$BUILD_STAGING_IMAGE"
+            echo "remote_image=${image_name}:pr-${PR_NUMBER}-${{ github.event.pull_request.head.sha }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "publisher_service_account=gha-preview-publish@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install checksum-pinned crane
+      - name: Bind the exact promoted artifact metadata before OIDC
         env:
-          CRANE_SHA256: 5c16d8ddb971cb1d5e6ed8b1e743da8224414eeba2c2762d8f1a61b2f095699e
+          ARTIFACT_DIGEST: ${{ needs.verify-image.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ needs.verify-image.outputs.artifact-id }}
+          BASE_ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
+          BASE_ARTIFACT_ID: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          archive="$RUNNER_TEMP/crane.tgz"
-          tools="$RUNNER_TEMP/platform-tools"
-          mkdir -p "$tools"
-          curl --fail --show-error --silent --location \
-            --output "$archive" \
-            https://github.com/google/go-containerregistry/releases/download/v0.21.9/go-containerregistry_Linux_x86_64.tar.gz
-          echo "${CRANE_SHA256}  ${archive}" | sha256sum --check --strict
-          tar -xzf "$archive" -C "$tools" crane
-          "$tools/crane" version
+          for value in "$ARTIFACT_ID" "$BASE_ARTIFACT_ID"; do [[ "$value" =~ ^[1-9][0-9]*$ ]]; done
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BASE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          verify_artifact() {
+            local id="$1" digest="$2" name="$3" max="$4"
+            local response="$RUNNER_TEMP/publisher-artifact-${id}.json"
+            gh api --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}" > "$response"
+            jq -e --arg digest "sha256:${digest}" --arg id "$id" --arg name "$name" --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson max "$max" --argjson repo "$EXPECTED_REPOSITORY_ID" '
+              (.id | tostring) == $id and .name == $name and .expired == false and .digest == $digest and
+              (.workflow_run.id | tostring) == $run and .workflow_run.head_sha == $sha and
+              .workflow_run.repository_id == $repo and .workflow_run.head_repository_id == $repo and
+              (.size_in_bytes > 0 and .size_in_bytes <= $max)
+            ' "$response" >/dev/null
+          }
+          verify_artifact "$ARTIFACT_ID" "$ARTIFACT_DIGEST" "platform-preview-promoted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" 1074790400
+          verify_artifact "$BASE_ARTIFACT_ID" "$BASE_ARTIFACT_DIGEST" "platform-preview-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" 1611661312
+
+      - name: Download only the exact promoted artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-image.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-promoted-download
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Download the exact trusted base artifact independently
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-publisher-bases
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Revalidate the promoted artifact without extracting layers
+        id: artifact
+        env:
+          ARTIFACT_DOWNLOAD_DIR: ${{ runner.temp }}/platform-promoted-download
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-publisher-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          EXPECTED_CONTENT_SHA256: ${{ needs.verify-image.outputs.content-sha256 }}
+          EXPECTED_EVENT_NAME: pull_request_target
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_PUBLISHED_INDEX_DIGEST: ${{ needs.verify-image.outputs.image-digest }}
+          EXPECTED_RUNNABLE_MANIFEST_DIGEST: ${{ needs.verify-image.outputs.runnable-digest }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" validate-promoted
+
+      - name: Prepare the checksum-pinned streaming publisher before OIDC
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" prepare-publisher
 
       - name: Prove exact preview publisher workflow-SHA WIF trust
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -569,136 +811,30 @@ jobs:
           create_credentials_file: false
           export_environment_variables: false
 
-      - name: Copy the opaque image by digest
+      - name: Stream the verified OCI graph into the fixed Artifact Registry repository
         id: copy
         env:
           AR_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
-          GH_TOKEN: ${{ github.token }}
+          EXPECTED_PUBLISHED_INDEX_DIGEST: ${{ needs.verify-image.outputs.image-digest }}
+          IMAGE_ARCHIVE: ${{ steps.artifact.outputs.image_archive }}
           REMOTE_IMAGE: ${{ steps.app.outputs.remote_image }}
-          STAGING_DIGEST: ${{ needs.build.outputs.digest }}
-          STAGING_IMAGE: ${{ steps.app.outputs.staging_image }}
         run: |
           set -euo pipefail
-          crane="$RUNNER_TEMP/platform-tools/crane"
-          docker_config="$RUNNER_TEMP/platform-publisher-docker"
-          if [ -z "$RUNNER_TEMP" ] || [ -e "$docker_config" ] || [ -L "$docker_config" ]; then
-            echo "Refusing an unsafe registry credential directory." >&2
-            exit 1
-          fi
-          install -d -m 0700 "$docker_config"
-          retire_registry_credentials() {
-            rm -f -- "$docker_config/config.json"
-          }
-          trap retire_registry_credentials EXIT
-          export DOCKER_CONFIG="$docker_config"
-          if [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "Invalid staging digest." >&2
-            exit 1
-          fi
-          printf '%s' "$GH_TOKEN" | "$crane" auth login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          printf '%s' "$AR_ACCESS_TOKEN" | "$crane" auth login us-east4-docker.pkg.dev --username oauth2accesstoken --password-stdin
-          "$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"
-          remote_digest="$("$crane" digest "$REMOTE_IMAGE")"
-          if [ "$remote_digest" != "$STAGING_DIGEST" ]; then
-            echo "Artifact Registry changed the image digest during copy." >&2
-            exit 1
-          fi
-          echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" publish
 
-      - name: Verify registry credentials were retired
+      - name: Verify publisher credentials were retired
         run: |
           set -euo pipefail
-          credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"
-          if [ -e "$credential_file" ] || [ -L "$credential_file" ]; then
-            echo "Registry credentials survived the verified copy step." >&2
-            exit 1
-          fi
-
-  cleanup-staging:
-    name: Retire copied GitHub staging package
-    runs-on: ubuntu-24.04
-    needs:
-      - build
-      - publish
-    if: always() && needs.publish.result == 'success'
-    timeout-minutes: 5
-    permissions:
-      packages: write # Delete only the verified run-and-attempt-unique GHCR staging package.
-
-    steps:
-      - name: Delete the verified isolated staging package
-        timeout-minutes: 2
-        env:
-          GH_TOKEN: ${{ github.token }}
-          STAGING_DIGEST: ${{ needs.build.outputs.digest }}
-          STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}
-        run: |
-          set -euo pipefail
-          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
-          repository="${GITHUB_REPOSITORY#*/}"
-          if [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-             [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
-             [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] ||
-             [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::warning::Refusing malformed isolated staging package cleanup."
-            exit 1
-          fi
-          staging_pattern="^ghcr\\.io/${owner}/(platform-${repository}-preview-staging-${GITHUB_RUN_ID}-([1-9][0-9]*)):(run-${GITHUB_RUN_ID}-([1-9][0-9]*))$"
-          if [[ ! "$STAGING_IMAGE" =~ $staging_pattern ]] ||
-             [[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]; then
-            echo "::warning::Refusing an invalid inherited staging image identity."
-            exit 1
-          fi
-          package="${BASH_REMATCH[1]}"
-          tag="${BASH_REMATCH[3]}"
-
-          versions="$RUNNER_TEMP/staging-package-versions.json"
-          version_id=""
-          package_api_root=""
-          for candidate_root in user "users/${owner}"; do
-            if gh api \
-              --header 'Accept: application/vnd.github+json' \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "/${candidate_root}/packages/container/${package}/versions?state=active&per_page=100" \
-              > "$versions"; then
-              candidate_id=""
-              if candidate_id="$(jq -er --arg digest "$STAGING_DIGEST" --arg tag "$tag" '
-                if type == "array" and
-                   length == 1 and
-                   .[0].name == $digest and
-                   .[0].metadata.package_type == "container" and
-                   .[0].metadata.container.tags == [$tag] and
-                   (.[0].id | type) == "number" and
-                   .[0].id > 0 and
-                   (.[0].id | floor) == .[0].id
-                then .[0].id
-                else error("expected one exact isolated staging version")
-                end
-              ' "$versions" 2>/dev/null)" && [[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]; then
-                version_id="$candidate_id"
-                package_api_root="$candidate_root"
-                break
-              fi
-            fi
-          done
-          if [[ ! "$version_id" =~ ^[1-9][0-9]*$ ]] || [ -z "$package_api_root" ]; then
-            echo "::warning::GitHub staging package cleanup found no unique exact version."
-            exit 1
-          fi
-          if ! gh api --method DELETE \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "/${package_api_root}/packages/container/${package}"; then
-            echo "::warning::GitHub staging package cleanup failed after the verified registry copy."
-            exit 1
-          fi
+          test ! -e "$RUNNER_TEMP/platform-publisher-auth"
+          test ! -L "$RUNNER_TEMP/platform-publisher-auth"
 
   attest:
     name: Attest preview image and SBOM
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     needs:
-      - build
       - publish
+      - verify-image
     if: needs.publish.result == 'success'
     environment: supply-chain
     permissions:
@@ -708,24 +844,35 @@ jobs:
       id-token: write # Obtain the GitHub artifact-attestation signing identity.
 
     steps:
-      - name: Download the generated SBOM
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          artifact-ids: ${{ needs.build.outputs.sbom-artifact-id }}
-          path: platform-build
-          digest-mismatch: error
-
-      - name: Verify the exact SBOM content digest
-        env:
-          EXPECTED_SBOM_DIGEST: ${{ needs.build.outputs.sbom-content-digest }}
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
           set -euo pipefail
-          if [[ ! "$EXPECTED_SBOM_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Uploader returned an invalid SBOM digest." >&2
-            exit 1
-          fi
-          printf '%s  %s\n' "$EXPECTED_SBOM_DIGEST" platform-build/sbom.spdx.json \
-            | sha256sum --check --strict
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Download the exact promoted image artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-image.outputs.artifact-id }}
+          path: ${{ runner.temp }}/platform-attest-download
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Extract and verify only the exact SBOM bytes
+        env:
+          EXPECTED_CONTENT_SHA256: ${{ needs.verify-image.outputs.content-sha256 }}
+          EXPECTED_SBOM_DIGEST: ${{ needs.verify-image.outputs.sbom-content-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_CONTENT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SBOM_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          mapfile -t files < <(find "$RUNNER_TEMP/platform-attest-download" -mindepth 1 -maxdepth 1 -type f -print)
+          test "${#files[@]}" -eq 1
+          printf '%s  %s\n' "$EXPECTED_CONTENT_SHA256" "${files[0]}" | sha256sum --check --strict
+          test "$(sort -u < <(tar -tf "${files[0]}") | tr '\n' ' ')" = "./ ./dhi-runtime.manifest.json ./image.oci.tar ./manifest.json ./sbom.spdx.json "
+          mkdir -p platform-build
+          tar -xOf "${files[0]}" ./sbom.spdx.json > platform-build/sbom.spdx.json
+          printf '%s  %s\n' "$EXPECTED_SBOM_DIGEST" platform-build/sbom.spdx.json | sha256sum --check --strict
 
       - name: Require a valid JSON SBOM
         run: jq -e '(.spdxVersion | startswith("SPDX-")) and (.packages | type == "array")' platform-build/sbom.spdx.json >/dev/null
@@ -746,6 +893,7 @@ jobs:
   deploy:
     name: Deploy isolated preview
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs:
       - attest
       - publish
@@ -766,6 +914,12 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Resolve trusted application configuration
         id: app
         env:
@@ -829,16 +983,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
-          state="$(jq -r .state <<< "$pr_json")"
-          draft="$(jq -r .draft <<< "$pr_json")"
-          head_sha="$(jq -r .head.sha <<< "$pr_json")"
-          if [ "$state" != "open" ] || [ "$draft" != "false" ] || [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
-            echo "Refusing stale preview deploy: state=$state draft=$draft head=$head_sha" >&2
+          jq -e --arg head "$EXPECTED_HEAD_SHA" --arg repository "$EXPECTED_REPOSITORY" --arg repository_id "$EXPECTED_REPOSITORY_ID" '
+            .state == "open" and .draft == false and .head.sha == $head and
+            (.head.repo.id | tostring) == $repository_id and .head.repo.full_name == $repository and
+            .base.ref == "main"
+          ' <<< "$pr_json" >/dev/null || {
+            echo "Refusing stale or retargeted preview deploy." >&2
             exit 1
-          fi
+          }
 
       - name: Deploy preview to Cloud Run
         id: deploy
@@ -846,7 +1003,8 @@ jobs:
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
           IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
-          MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
+          MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}
+          PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
           PREVIEW_INGRESS: ${{ steps.app.outputs.preview_ingress }}
           PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -860,6 +1018,7 @@ jobs:
           set -euo pipefail
           if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
              [[ ! "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ ! "$PLATFORM_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] ||
              [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
              [[ ! "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] ||
              [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] ||
@@ -899,6 +1058,7 @@ jobs:
           umask 077
           env_file="$RUNNER_TEMP/preview-env.json"
           response="$RUNNER_TEMP/cloud-run-preview-deploy.json"
+          revision_response="$RUNNER_TEMP/cloud-run-preview-revision.json"
           health_body="$RUNNER_TEMP/preview-health.json"
           rollback_response="$RUNNER_TEMP/cloud-run-preview-rollback.json"
           rollback_tag=false
@@ -951,7 +1111,7 @@ jobs:
                 echo "Could not inspect $tag during failed-deploy rollback; reconciliation is required." >&2
               fi
             fi
-            rm -f "$env_file" "${env_file}.next" "$response" "$health_body" "$rollback_response"
+            rm -f "$env_file" "${env_file}.next" "$response" "$revision_response" "$health_body" "$rollback_response"
             trap - EXIT
             exit "$exit_status"
           }
@@ -1035,7 +1195,7 @@ jobs:
             --cpu=1 \
             --concurrency=80 \
             --timeout=300s \
-            --labels=managed-by=github-actions,environment=preview \
+            --labels="managed-by=github-actions,environment=preview,git-head-sha=${EXPECTED_HEAD_SHA},github-repository-id=${REPOSITORY_ID},github-pr=${PR_NUMBER},github-run-id=${GITHUB_RUN_ID},github-run-attempt=${GITHUB_RUN_ATTEMPT},platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}" \
             --quiet \
             --format=json > "$response"
           preview_record="$(jq -cer --arg tag "$tag" \
@@ -1047,6 +1207,31 @@ jobs:
             echo "Cloud Run tagged an unexpected revision: $preview_revision" >&2
             exit 1
           fi
+          gcloud run revisions describe "$preview_revision" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --format=json > "$revision_response"
+          jq -e \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head "$EXPECTED_HEAD_SHA" \
+            --arg name "$preview_revision" \
+            --arg pr "$PR_NUMBER" \
+            --arg repository_id "$REPOSITORY_ID" \
+            --arg run "$GITHUB_RUN_ID" \
+            --arg workflow_sha "$PLATFORM_WORKFLOW_SHA" '
+            .metadata.name == $name and
+            .metadata.labels["git-head-sha"] == $head and
+            .metadata.labels["github-repository-id"] == $repository_id and
+            .metadata.labels["github-pr"] == $pr and
+            .metadata.labels["github-run-id"] == $run and
+            .metadata.labels["github-run-attempt"] == $attempt and
+            .metadata.labels["managed-by"] == "github-actions" and
+            .metadata.labels.environment == "preview" and
+            .metadata.labels["platform-workflow-sha"] == $workflow_sha
+          ' "$revision_response" >/dev/null || {
+            echo "Cloud Run revision provenance labels do not match this exact source and run." >&2
+            exit 1
+          }
           deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
           if [ "$preview_url" != "$deterministic_url" ] &&
              [[ ! "$preview_url" =~ ^https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-[a-z0-9.-]+\.run\.app$ ]]; then
@@ -1094,13 +1279,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
-          state="$(jq -r .state <<< "$pr_json")"
-          draft="$(jq -r .draft <<< "$pr_json")"
-          head_sha="$(jq -r .head.sha <<< "$pr_json")"
-          if [ "$state" = "open" ] && [ "$draft" = "false" ] && [ "$head_sha" = "$EXPECTED_HEAD_SHA" ]; then
+          pr_json="$RUNNER_TEMP/post-deploy-pr.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$pr_json"; then
+            echo "keep=false" >> "$GITHUB_OUTPUT"
+            echo "Current pull request state could not be proven; the exact deployed revision will be invalidated." >&2
+            exit 0
+          fi
+          if jq -e --arg head "$EXPECTED_HEAD_SHA" --arg repository "$EXPECTED_REPOSITORY" --arg repository_id "$EXPECTED_REPOSITORY_ID" '
+            .state == "open" and .draft == false and .head.sha == $head and
+            (.head.repo.id | tostring) == $repository_id and .head.repo.full_name == $repository and
+            .base.ref == "main"
+          ' "$pr_json" >/dev/null; then
             echo "keep=true" >> "$GITHUB_OUTPUT"
           else
             echo "keep=false" >> "$GITHUB_OUTPUT"
@@ -1121,9 +1314,11 @@ jobs:
   invalidate:
     name: Invalidate stale preview
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     needs: deploy
     if: >-
-      needs.deploy.result == 'success' &&
+      always() &&
+      needs.deploy.outputs.deployed-revision != '' &&
       needs.deploy.outputs.lifecycle-keep != 'true'
     environment: preview-operations
     permissions:
@@ -1134,6 +1329,12 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Resolve trusted application configuration
         id: app
         env:

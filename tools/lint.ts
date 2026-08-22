@@ -24,79 +24,17 @@ const reusableWorkflows = [
 ];
 const platformWorkflows = [...reusableWorkflows, "platform.yml"];
 const declaredEnvironmentSecrets = [
-  "DHI_ACCESS_TOKEN",
-  "DHI_USERNAME",
-  "GRYPE_DB_MANIFEST_JSON",
-  "MAPBOX_PUBLIC_TOKEN",
-  "SOCKET_API_TOKEN",
-  "WAITLIST_IDENTITY_KEYSET",
+  "DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3",
 ];
-const expectedPreviewEnvironmentSecretDeclarations = [
-  "    secrets:",
-  "      DHI_ACCESS_TOKEN:",
-  "        required: true",
-  "      DHI_USERNAME:",
-  "        required: true",
-  "      GRYPE_DB_MANIFEST_JSON:",
-  "        required: true",
-  "      MAPBOX_PUBLIC_TOKEN:",
-  "        required: false",
-  "      SOCKET_API_TOKEN:",
-  "        required: true",
-].join("\n");
-const expectedProductionEnvironmentSecretDeclarations = [
-  expectedPreviewEnvironmentSecretDeclarations,
-  "      WAITLIST_IDENTITY_KEYSET:",
-  "        required: false",
-].join("\n");
-const expectedPreviewCallerSecretMap = [
-  "    secrets:",
-  "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
-  "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
-  "      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
-  "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
-  "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-].join("\n");
-const expectedProductionCallerSecretMap = [
-  expectedPreviewCallerSecretMap,
-  "      WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
-].join("\n");
 const expectedPreviewSecretContextReferences: SecretContextReference[] = [
-  { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
   {
-    job: "build",
-    path: "jobs.build.steps.7.env.SOCKET_API_TOKEN",
-    value: "${{ secrets.SOCKET_API_TOKEN }}",
-  },
-  {
-    job: "build",
-    path: "jobs.build.steps.9.with.username",
-    value: "${{ secrets.DHI_USERNAME }}",
-  },
-  {
-    job: "build",
-    path: "jobs.build.steps.9.with.password",
-    value: "${{ secrets.DHI_ACCESS_TOKEN }}",
-  },
-  {
-    job: "build",
-    path: "jobs.build.steps.17.env.DB_MANIFEST_JSON",
-    value: "${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
-  },
-  {
-    job: "deploy",
-    path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
-    value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+    job: "prefetch-bases",
+    path: "jobs.prefetch-bases.steps.2.env.DHI_PUBLIC_READ_TOKEN",
+    value: "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
   },
 ];
-const expectedProductionSecretContextReferences: SecretContextReference[] = [
-  ...expectedPreviewSecretContextReferences,
-  {
-    job: "deploy",
-    path: "jobs.deploy.steps.4.env.WAITLIST_IDENTITY_KEYSET",
-    value: "${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
-  },
-];
+const expectedProductionSecretContextReferences: SecretContextReference[] =
+  expectedPreviewSecretContextReferences;
 
 for (const workflow of reusableWorkflows) {
   const path = `.github/workflows/${workflow}`;
@@ -118,12 +56,22 @@ for (const workflow of platformWorkflows) {
       `${path}: Security searches must force binary-classified files to text instead of skipping them with grep -I.`,
     );
   }
-  rejectContains(
-    path,
-    text,
-    "${{ vars.",
-    "Security-sensitive workflow policy must never be controlled by a repository or environment variable.",
-  );
+  const allowedVariables = path.endsWith("deploy-preview.yml") || path.endsWith("deploy-prod.yml")
+    ? [
+        "${{ vars.DHI_USERNAME }}",
+        "${{ vars.MAPBOX_PUBLIC_TOKEN }}",
+      ]
+    : [];
+  let unreviewedVariables = text;
+  for (const variable of allowedVariables) {
+    if (unreviewedVariables.split(variable).length !== 2) {
+      failures.push(`${path}: ${variable} must appear exactly once in its reviewed non-secret slot.`);
+    }
+    unreviewedVariables = unreviewedVariables.replace(variable, "");
+  }
+  if (unreviewedVariables.includes("${{ vars.")) {
+    failures.push(`${path}: unreviewed repository or environment variable reference.`);
+  }
 }
 
 const deployProd = await read(".github/workflows/deploy-prod.yml");
@@ -142,14 +90,13 @@ requireContains(
 
 const deployPreview = await read(".github/workflows/deploy-preview.yml");
 
-for (const [path, workflow, expectedDeclarations, count] of [
-  [".github/workflows/deploy-preview.yml", deployPreview, expectedPreviewEnvironmentSecretDeclarations, "five"],
-  [".github/workflows/deploy-prod.yml", deployProd, expectedProductionEnvironmentSecretDeclarations, "six"],
+for (const [path, workflow] of [
+  [".github/workflows/deploy-preview.yml", deployPreview],
+  [".github/workflows/deploy-prod.yml", deployProd],
 ] as const) {
   const workflowCall = sectionBetween(workflow, "  workflow_call:\n", "\npermissions:");
-  const declarationBlock = sectionFrom(workflowCall, "    secrets:\n").trimEnd();
-  if (declarationBlock !== expectedDeclarations) {
-    failures.push(`${path}: workflow_call secrets must exactly match the reviewed ${count}-name contract.`);
+  if (workflowCall.trim() !== "workflow_call:") {
+    failures.push(`${path}: reusable deploy workflows must not declare caller-provided secrets or inputs.`);
   }
 }
 
@@ -167,7 +114,7 @@ rejectContains(
 );
 for (const needle of [
   "Enforce the trusted application and container contract",
-  "environment: preview-build",
+  "environment: dhi-base-prefetch-20260822-098dca9280b3",
   "environment: preview-cloud",
   "environment: preview-publish",
   "environment: supply-chain",
@@ -205,19 +152,15 @@ for (const needle of [
   );
 }
 const previewDeployJob = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
-for (const [path, workflow, buildJob, deployJob, expectedReferences] of [
+for (const [path, workflow, expectedReferences] of [
   [
     ".github/workflows/deploy-preview.yml",
     deployPreview,
-    sectionBetween(deployPreview, "  build:\n", "\n  canary:\n"),
-    previewDeployJob,
     expectedPreviewSecretContextReferences,
   ],
   [
     ".github/workflows/deploy-prod.yml",
     deployProd,
-    sectionBetween(deployProd, "  build:\n", "\n  canary:\n"),
-    sectionFrom(deployProd, "  deploy:\n"),
     expectedProductionSecretContextReferences,
   ],
 ] as const) {
@@ -231,24 +174,16 @@ for (const [path, workflow, buildJob, deployJob, expectedReferences] of [
   if (JSON.stringify(references) !== JSON.stringify(expectedReferences)) {
     failures.push(`${path}: decoded secret-context references must exactly match the reviewed job paths.`);
   }
-  for (const secret of [
+  for (const forbidden of [
     "DHI_ACCESS_TOKEN",
-    "DHI_USERNAME",
-    "GRYPE_DB_MANIFEST_JSON",
+    "DHI_ACCESS_TOKEN_20260822",
     "SOCKET_API_TOKEN",
+    "SOCKET_API_TOKEN_20260822",
+    "WAITLIST_IDENTITY_KEYSET",
+    "WAITLIST_IDENTITY_KEYSET_20260822",
   ]) {
-    const reference = `\${{ secrets.${secret} }}`;
-    if (workflow.split(reference).length !== 2 || !buildJob.includes(reference)) {
-      failures.push(`${path}: ${secret} must be referenced exactly once and only by the build job.`);
-    }
-  }
-  const deploySecrets = path.endsWith("deploy-prod.yml")
-    ? ["MAPBOX_PUBLIC_TOKEN", "WAITLIST_IDENTITY_KEYSET"]
-    : ["MAPBOX_PUBLIC_TOKEN"];
-  for (const secret of deploySecrets) {
-    const reference = `\${{ secrets.${secret} }}`;
-    if (workflow.split(reference).length !== 2 || !deployJob.includes(reference)) {
-      failures.push(`${path}: ${secret} must be referenced exactly once and only by the deploy job.`);
+    if (workflow.includes(`\${{ secrets.${forbidden} }}`)) {
+      failures.push(`${path}: obsolete or replayable secret ${forbidden} is forbidden.`);
     }
   }
 }
@@ -314,13 +249,13 @@ requireContains("tools/ci/grype.yaml", grypeConfig, "auto-update: false", "Grype
 requireContains("tools/ci/grype.yaml", grypeConfig, "max-allowed-built-age: 48h", "The reviewed vulnerability DB must expire closed.");
 const grypeBlockingPolicy = await read("tools/ci/grype-blocking.jq");
 requireContains(
-  "tools/ci/grype-blocking.jq",
+  "$CONTRACT_ROOT/grype-blocking.jq",
   grypeBlockingPolicy,
   '.vulnerability.severity == "High"',
   "Every High vulnerability must block publication even when no upstream fix exists.",
 );
 rejectContains(
-  "tools/ci/grype-blocking.jq",
+  "grype-blocking.jq",
   grypeBlockingPolicy,
   ".vulnerability.fix.state ==",
   "Vulnerability blocking must not depend on upstream fix availability.",
@@ -337,10 +272,10 @@ try {
     !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.url !== "string" ||
     manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-08-20T16:14:23Z_1787293044.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "dca26dd65bd0c4ba626af404a2e60d983d9302863eabdd8a7e7d42008fb4da3c" ||
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-08-22T00:16:46Z_1787379256.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "2001dece3df7eed9a37d019e5118a6a59b09ab6150e91a1872fee565772661ee" ||
     manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-08-21T06:17:24Z"
+    manifest.built !== "2026-08-22T06:14:16Z"
   ) {
     failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
   }
@@ -357,58 +292,35 @@ for (const [path, workflow] of [
   [".github/workflows/deploy-prod.yml", deployProd],
   [".github/workflows/deploy-preview.yml", deployPreview],
 ] as const) {
-  requireContains(
+  rejectContains(
     path,
     workflow,
-    "DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
-    "Image scanning must use the owner-controlled build-environment vulnerability DB manifest secret.",
+    "GRYPE_DB_MANIFEST_JSON",
+    "The credentialless promoter must load the vulnerability DB manifest only from immutable platform policy.",
   );
-  requireContains(path, workflow, '<<< "$DB_MANIFEST_JSON"', "The vulnerability DB manifest must be parsed as inert JSON.");
-  requireContains(path, workflow, 'db import "$db_url"', "Image scanning must import the exact checksum-qualified DB archive.");
-  rejectContains(path, workflow, "db update", "Image scanning must not trust mutable database metadata.");
-  requireContains(
+  rejectContains(
     path,
     workflow,
-    "tools/ci/grype-blocking.jq",
-    "Image publication must use the reviewed High-and-Critical blocking policy.",
-  );
-  requireContains(path, workflow, "jq -e 'length == 0'", "Image publication must fail when the blocking policy finds a vulnerability.");
-  requireContains(
-    path,
-    workflow,
-    '--config "$config" "docker:${LOCAL_IMAGE}"',
-    "SBOM generation must use the trusted platform-owned Syft configuration.",
-  );
-  requireContains(
-    path,
-    workflow,
-    "syft-empty-docker-config",
-    "SBOM generation must not inherit registry credentials from the build.",
-  );
-  requireContains(
-    path,
-    workflow,
-    "SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-    "The pre-extraction lock scan must receive the protected Socket organization token.",
-  );
-  requireContains(
-    path,
-    workflow,
-    '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
-    "The protected Socket scan must use the exact checked-out platform policy.",
+    "DB_MANIFEST_JSON:",
+    "The credentialless promoter must reject mutable manifest injection from every GitHub variable scope.",
   );
   requireContains(
     path,
     workflow,
     "bun pm scan must not mutate package.json or bun.lock.",
-    "The protected Socket scan must prove it is non-mutating.",
+    "The free Socket scan must prove it is non-mutating.",
   );
   rejectContains(
     path,
     workflow,
-    "socket_api_token=",
-    "The Socket organization token must never enter BuildKit or an image layer.",
+    "SOCKET_API_TOKEN:",
+    "The workflow must not receive a Socket token; the installed GitHub App owns the external gate.",
   );
+  requireContains(path, workflow, "Socket Security Scanner free mode", "The local lock scan must remain credentialless.");
+  requireContains(path, workflow, "github-token: \"\"", "BuildKit must not receive an implicit GitHub token.");
+  requireContains(path, workflow, "archive: false", "OCI handoffs must use one raw artifact with explicit content hashing.");
+  requireContains(path, workflow, "digest-mismatch: error", "Every artifact download must reject an API digest mismatch.");
+  requireContains(path, workflow, "skip-decompress: true", "Raw artifact downloads must never be implicitly extracted.");
   for (const boundary of [
     "Disable workflow commands for untrusted build output",
     "Restore workflow commands after untrusted build output",
@@ -420,6 +332,8 @@ for (const [path, workflow] of [
     'unlink "$token_file"',
     "printf '::%s::\\n'",
     'DOCKER_BUILD_RECORD_UPLOAD: "false"',
+    'DOCKER_BUILD_SUMMARY: "false"',
+    'DOCKER_BUILD_CHECKS_ANNOTATIONS: "false"',
   ]) {
     requireContains(
       path,
@@ -429,8 +343,8 @@ for (const [path, workflow] of [
     );
   }
   const buildName = path.endsWith("deploy-preview.yml")
-    ? "Build untrusted preview image without cloud credentials"
-    : "Build production image without cloud credentials";
+    ? "Build untrusted preview image into a local OCI archive"
+    : "Build production image into a local OCI archive";
   requireBefore(
     path,
     workflow,
@@ -456,6 +370,35 @@ for (const [path, workflow] of [
     "The random runner-command resume token must not be passed to the container build action.",
   );
 }
+const artifactContract = await read("tools/ci/container-artifact-contract.sh");
+for (const boundary of [
+  "GRYPE_DB_MANIFEST_SHA256=44b2ee6b48e33300cdd85b2814248704bb2aab8d9899263e28e20a5a013c5f15",
+  'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
+  'test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST"',
+  'verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"',
+  'db import /database/grype-db.tar.zst',
+  '"$scanner_policy/grype-blocking.jq"',
+  "jq -e 'length == 0'",
+  "/tools/syft",
+  "--config /policy/syft.yaml oci-dir:/input",
+  "DHI_ATTESTATION_POLICY_IMPLEMENTED=true",
+  "COSIGN_SHA256=4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71",
+  "sha256:58a392f5dec3be5cb20a2495baca84ac785f237a2d2904c5b9cad7ba11f3e475",
+  "sha256:0f9e5f506d653e0f87e44bb5c24fece19f9fb7253016f6e49d7a4783026f876d",
+]) {
+  requireContains(
+    "tools/ci/container-artifact-contract.sh",
+    artifactContract,
+    boundary,
+    `The shared container artifact contract is missing ${boundary}.`,
+  );
+}
+rejectContains(
+  "tools/ci/container-artifact-contract.sh",
+  artifactContract,
+  "db update",
+  "The credentialless promoter must not trust mutable vulnerability metadata.",
+);
 const syftConfig = await read("tools/ci/syft.yaml");
 if (syftConfig.trim() !== "{}") {
   failures.push("tools/ci/syft.yaml: trusted Syft policy must retain complete default cataloging without caller exclusions.");
@@ -488,7 +431,7 @@ rejectContains(
 );
 for (const needle of [
   "Enforce the trusted application and container contract",
-  "environment: production-build",
+  "environment: dhi-base-prefetch-20260822-098dca9280b3",
   "environment: production",
   "environment: production-publish",
   "environment: supply-chain",
@@ -507,18 +450,11 @@ for (const needle of [
   );
 }
 for (const needle of [
-  "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
-  "WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
-  '[[ ! "$WAITLIST_IDENTITY_KEYSET" =~ ^[A-Za-z0-9_-]{43}(,[A-Za-z0-9_-]{43})?$ ]]',
-  "canonical_base64url_32",
-  "base64 --decode",
-  "base64 --wrap=0",
-  'waitlist_fingerprint="$(printf',
+  "MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}",
   "gcloud run services describe",
-  'waitlist-keyset-fingerprint',
-  'select(.name == "waitlist-identity-keyset")',
+  'select(.name == "WAITLIST_IDENTITY_KEYSET")',
+  "gcloud secrets versions list",
   "gcloud secrets versions add waitlist-identity-keyset",
-  "env -u WAITLIST_IDENTITY_KEYSET",
   "--data-file=-",
   "--format='value(name)'",
   "^projects/(229383559510|medlock-1025243085)/secrets/waitlist-identity-keyset/versions/([1-9][0-9]*)$",
@@ -540,27 +476,18 @@ for (const needle of [
 rejectContains(
   ".github/workflows/deploy-prod.yml",
   deployProduction,
-  "jq --arg waitlist_identity_keyset",
-  "The Medlock signing payload must never enter the literal Cloud Run environment JSON.",
+  "secrets.WAITLIST_IDENTITY_KEYSET",
+  "The Medlock signing key must never transit GitHub Actions secrets.",
 );
 if (deployProduction.split("--set-secrets").length - 1 !== 1) {
-  failures.push(
-    ".github/workflows/deploy-prod.yml: Exactly one reviewed Secret Manager mapping is permitted.",
-  );
+  failures.push(".github/workflows/deploy-prod.yml: Exactly one reviewed Secret Manager mapping is permitted.");
 }
 requireBefore(
   ".github/workflows/deploy-prod.yml",
   deployProduction,
-  'if ! canonical_base64url_32 "$waitlist_primary"',
+  "gcloud secrets versions list",
   "gcloud secrets versions add waitlist-identity-keyset",
-  "Canonical key validation must finish before any immutable secret version is created.",
-);
-requireBefore(
-  ".github/workflows/deploy-prod.yml",
-  deployProduction,
-  "gcloud run services describe",
-  "gcloud secrets versions add waitlist-identity-keyset",
-  "The trusted deploy must reuse the exact current version when the keyset fingerprint is unchanged.",
+  "The trusted deploy must prove there is no enabled unbound version before creating the first key.",
 );
 for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP_PROD_SECRETS"]) {
   rejectContains(
@@ -571,7 +498,7 @@ for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP
   );
 }
 for (const needle of [
-  "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  "MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}",
   "openssl rand -base64 32",
   '[[ ! "$waitlist_identity_keyset" =~ ^[A-Za-z0-9_-]{43}$ ]]',
   'WAITLIST_IDENTITY_KEYSET: $waitlist_identity_keyset',
@@ -614,150 +541,42 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
     "Prove exact preview publisher workflow-SHA WIF trust",
   ],
 ] as const) {
-  const stagingKind = path === ".github/workflows/deploy-preview.yml" ? "preview" : "production";
   const publish = sectionBetween(workflow, "  publish:\n", "\n  attest:\n");
-  const deploy =
-    path === ".github/workflows/deploy-preview.yml"
-      ? sectionBetween(workflow, "  deploy:\n", "\n  invalidate:\n")
-      : sectionFrom(workflow, "  deploy:\n");
+  const build = sectionBetween(workflow, "  build:\n", "\n  verify-image:\n");
+  const promoter = sectionBetween(workflow, "  verify-image:\n", "\n  canary:\n");
+  const deploy = path.endsWith("deploy-preview.yml")
+    ? sectionBetween(workflow, "  deploy:\n", "\n  invalidate:\n")
+    : sectionFrom(workflow, "  deploy:\n");
   requireContains(path, publish, publishEnvironment, "Image publication must use its distinct protected environment claim.");
   requireContains(path, publish, publisherAccount, "Image publication must use the dedicated publisher service account.");
   requireContains(path, publish, publisherCanary, "Each publisher claim must have an independent no-role canary exchange.");
   rejectContains(path, publish, deployAccount, "An image publisher job must not authenticate the Cloud Run operator.");
-  requireContains(
-    path,
-    workflow,
-    `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
-    "The build must create a run-and-attempt-unique GHCR package and tag.",
-  );
-  requireContains(
-    path,
-    workflow,
-    'staging-image: ${{ steps.metadata.outputs.staging_image }}',
-    "The build must export its exact staging image identity.",
-  );
-  rejectContains(
-    path,
-    publish,
-    `staging_image=ghcr.io/${"${source_owner}"}/platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
-    "A rerun must not reconstruct the producer attempt from the current attempt.",
-  );
-  for (const needle of [
-    'BUILD_STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}',
-    `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*):run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)`,
-    '[[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]]',
-    '[[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]',
-    'echo "staging_image=$BUILD_STAGING_IMAGE"',
-  ]) {
-    requireContains(path, publish, needle, `Publisher staging identity handoff is missing: ${needle}`);
-  }
-  rejectContains(
-    path,
-    workflow,
-    `-${stagingKind}-staging:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
-    "A shared staging package permits cross-run manifest-version races.",
-  );
-  const copy = sectionBetween(
-    publish,
-    "      - name: Copy the opaque image by digest\n",
-    "\n      - name: Verify registry credentials were retired\n",
-  );
-  const credentialVerification = sectionFrom(
-    publish,
-    "      - name: Verify registry credentials were retired\n",
-  );
-  const cleanup = sectionBetween(
-    workflow,
-    "  cleanup-staging:\n",
-    "\n  attest:\n",
-  );
-  for (const needle of [
-    "set -euo pipefail",
-    'docker_config="$RUNNER_TEMP/platform-publisher-docker"',
-    'trap retire_registry_credentials EXIT',
-    'export DOCKER_CONFIG="$docker_config"',
-    'rm -f -- "$docker_config/config.json"',
-    '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"',
-    'remote_digest="$("$crane" digest "$REMOTE_IMAGE")"',
-    'if [ "$remote_digest" != "$STAGING_DIGEST" ]',
-    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
-  ]) {
-    requireContains(path, copy, needle, `Verified registry copy transaction is missing: ${needle}`);
-  }
-  requireBefore(
-    path,
-    copy,
-    '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"',
-    'remote_digest="$("$crane" digest "$REMOTE_IMAGE")"',
-    "The registry digest must be read only after the opaque copy completes.",
-  );
-  requireBefore(
-    path,
-    copy,
-    'if [ "$remote_digest" != "$STAGING_DIGEST" ]',
-    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
-    "The publisher must reject a changed digest before exporting it.",
-  );
-  rejectContains(path, copy, "continue-on-error", "The verified registry copy transaction must fail closed.");
-  rejectContains(path, copy, "|| true", "The verified registry copy transaction must not suppress failures.");
-  rejectContains(path, publish, '"$crane" delete', "GHCR does not support distribution-spec manifest deletion.");
-  for (const needle of [
-    "set -euo pipefail",
-    'credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"',
-    '[ -e "$credential_file" ] || [ -L "$credential_file" ]',
-  ]) {
-    requireContains(path, credentialVerification, needle, `Registry credential retirement proof is missing: ${needle}`);
-  }
-  for (const needle of [
-    "needs:\n      - build\n      - publish",
-    "if: always() && needs.publish.result == 'success'",
-    "timeout-minutes: 5",
-    "permissions:\n      packages: write",
-    "timeout-minutes: 2",
-    'STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}',
-    `staging_pattern="^ghcr\\\\.io/${"${owner}"}/(platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)):(run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*))$"`,
-    '[[ ! "$STAGING_IMAGE" =~ $staging_pattern ]]',
-    '[[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]',
-    'package="${BASH_REMATCH[1]}"',
-    'tag="${BASH_REMATCH[3]}"',
-    '[[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]',
-    'for candidate_root in user "users/${owner}"; do',
-    '/${candidate_root}/packages/container/${package}/versions?state=active&per_page=100',
-    '.name == $digest',
-    '.metadata.package_type == "container"',
-    '.metadata.container.tags == [$tag]',
-    'if type == "array" and',
-    'length == 1 and',
-    'else error("expected one exact isolated staging version")',
-    '[[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]',
-    '/packages/container/${package}',
-    "X-GitHub-Api-Version: 2022-11-28",
-  ]) {
-    requireContains(path, cleanup, needle, `Staging package cleanup is missing: ${needle}`);
-  }
-  rejectContains(path, cleanup, "AR_ACCESS_TOKEN", "Post-copy staging cleanup must not retain Artifact Registry credentials.");
-  rejectContains(path, cleanup, "DOCKER_CONFIG", "Post-copy staging cleanup must run outside the publisher credential directory.");
-  rejectContains(path, cleanup, "id-token", "Post-copy staging cleanup must not be able to mint cloud credentials.");
-  rejectContains(path, cleanup, "environment:", "Post-copy staging cleanup must not enter a protected cloud environment.");
-  rejectContains(path, cleanup, "--paginate", "Post-copy staging cleanup must bound GitHub package enumeration.");
-  rejectContains(path, cleanup, '"$crane" copy', "Post-copy staging cleanup must not recopy the image.");
-  rejectContains(path, cleanup, "continue-on-error", "Staging package cleanup failures must remain visible.");
-  rejectContains(path, cleanup, "|| true", "Staging package cleanup must use explicit fallback branches.");
-  rejectContains(
-    path,
-    cleanup,
-    'package="platform-${repository}',
-    "Cleanup must use the producer-exported package rather than the current rerun attempt.",
-  );
-  requireBefore(
-    path,
-    workflow,
-    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
-    "  cleanup-staging:",
-    "Staging cleanup must occur only after a verified copy exports its digest.",
-  );
   requireContains(path, deploy, deployAccount, "Cloud Run mutation must use the dedicated deploy/operator service account.");
   rejectContains(path, deploy, publisherAccount, "A Cloud Run deploy job must not authenticate the Artifact Registry publisher.");
+  for (const [jobName, job] of [["build", build], ["promoter", promoter]] as const) {
+    rejectContains(path, job, "id-token: write", `The credentialless ${jobName} job must not mint cloud credentials.`);
+    rejectContains(path, job, "packages: write", `The credentialless ${jobName} job must not write GitHub packages.`);
+  }
+  rejectContains(path, workflow, "ghcr.io", "The container pipeline must not use a public GHCR staging package.");
+  rejectContains(path, workflow, "packages: write", "The container pipeline must not retain GitHub Packages write access.");
+  for (const boundary of [
+    '[[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]',
+    '--arg digest "sha256:${digest}"',
+    "artifact-ids: ${{ needs.verify-image.outputs.artifact-id }}",
+    "digest-mismatch: error",
+    "skip-decompress: true",
+    'container-artifact-contract.sh" validate-promoted',
+    'container-artifact-contract.sh" prepare-publisher',
+    'container-artifact-contract.sh" publish',
+    "Verify publisher credentials were retired",
+  ]) {
+    requireContains(path, publish, boundary, `The fixed promoted-artifact publisher is missing ${boundary}.`);
+  }
+  requireBefore(path, publish, "validate-promoted", "prepare-publisher", "The canonical OCI graph must be validated before the publisher tool is prepared.");
+  requireBefore(path, publish, "prepare-publisher", publisherCanary, "All non-credential tooling must be checksum-pinned before OIDC.");
+  requireBefore(path, publish, "validate-promoted", "Authenticate", "The promoted graph must be revalidated before any registry access token is requested.");
+  rejectContains(path, publish, "actions/checkout@", "The privileged publisher must never checkout caller code.");
+  rejectContains(path, publish, "docker load", "The privileged publisher must not extract or execute image layers.");
 }
 const previewInvalidation = sectionFrom(deployPreview, "  invalidate:\n");
 const previewDeploy = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
@@ -881,7 +700,7 @@ for (const boundary of [
 }
 const reconcilePreviews = await read(".github/workflows/reconcile-previews.yml");
 for (const boundary of [
-  "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
+  "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
   "github.ref == 'refs/heads/main'",
   'gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}"',
 ]) {
@@ -892,34 +711,14 @@ for (const boundary of [
     `Preview reconciliation must derive its decisions from trusted default-branch state: ${boundary}`,
   );
 }
-requireBefore(
-  ".github/workflows/deploy-preview.yml",
-  deployPreview,
-  "Enforce the trusted application and container contract",
-  "Enforce the organization Socket policy before package extraction",
-  "Preview contract validation must finish before the Socket token is exposed.",
-);
-requireBefore(
-  ".github/workflows/deploy-preview.yml",
-  deployPreview,
-  "Enforce the organization Socket policy before package extraction",
-  "Login to Docker Hardened Images",
-  "Preview Socket policy must finish before registry credentials are exposed.",
-);
-requireBefore(
-  ".github/workflows/deploy-prod.yml",
-  deployProduction,
-  "Enforce the trusted application and container contract",
-  "Enforce the organization Socket policy before package extraction",
-  "Production contract validation must finish before the Socket token is exposed.",
-);
-requireBefore(
-  ".github/workflows/deploy-prod.yml",
-  deployProduction,
-  "Enforce the organization Socket policy before package extraction",
-  "Login to Docker Hardened Images",
-  "Production Socket policy must finish before registry credentials are exposed.",
-);
+for (const [path, workflow] of [
+  [".github/workflows/deploy-preview.yml", deployPreview],
+  [".github/workflows/deploy-prod.yml", deployProduction],
+] as const) {
+  rejectContains(path, workflow, "Login to Docker Hardened Images", "Only the isolated prefetch helper may receive the DHI token.");
+  rejectContains(path, workflow, "secrets.SOCKET_API_TOKEN", "Socket GitHub App checks replace all workflow Socket credentials.");
+  requireBefore(path, workflow, "Fetch, verify, and close the exact public base graph", "Checkout", "DHI credentials must be retired before any application checkout.");
+}
 
 for (const workflow of ["application.yml", "socket-firewall.yml", "platform.yml"]) {
   const path = `.github/workflows/${workflow}`;
@@ -988,23 +787,17 @@ for (const path of [
   }
 }
 const platformDependencyWorkflow = await read(".github/workflows/platform.yml");
-requireContains(
+rejectContains(
   ".github/workflows/platform.yml",
   platformDependencyWorkflow,
-  "environment: ${{ github.event_name == 'push' && 'dependency-scan' || 'platform-pull-request' }}",
-  "Platform pull requests must use a secretless environment distinct from trusted main.",
-);
-requireContains(
-  ".github/workflows/platform.yml",
-  platformDependencyWorkflow,
-  "SOCKET_API_TOKEN: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
-  "The Socket organization token must be unavailable to platform pull requests.",
+  "environment:",
+  "Platform verification is credentialless and must not enter a secret-bearing environment.",
 );
 rejectContains(
   ".github/workflows/platform.yml",
   platformDependencyWorkflow,
-  "SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
-  "Platform pull requests must never receive the Socket token through an unconditional mapping.",
+  "secrets.SOCKET_API_TOKEN",
+  "The Socket GitHub App gate replaces every platform workflow token.",
 );
 rejectContains(
   ".github/workflows/platform.yml",
@@ -1056,7 +849,7 @@ rejectContains(
   "run: bun run verify",
   "Platform CI must not execute dependency-shadowable package-script orchestration.",
 );
-for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-preview.yml", "deploy-prod.yml"]) {
+for (const workflow of ["application.yml", "socket-firewall.yml"]) {
   const path = `.github/workflows/${workflow}`;
   const text = await read(path);
   requireContains(path, text, "repository: ${{ job.workflow_repository }}", "Policy source must be the reusable workflow repository.");
@@ -1081,6 +874,26 @@ for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-previe
     "--no-env-file --no-orphans",
     "Trusted Bun commands must disable env files and kill descendants.",
   );
+  rejectContains(path, text, "declare -A stages", "Untrusted Docker tokens must never enter Bash associative arrays.");
+}
+for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+  const path = `.github/workflows/${workflow}`;
+  const text = await read(path);
+  for (const boundary of [
+    "WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}",
+    "WORKFLOW_SHA: ${{ job.workflow_sha }}",
+    'test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"',
+    "GIT_CONFIG_NOSYSTEM=1",
+    "core.hooksPath=/dev/null",
+    "protocol.ext.allow=never",
+    "container-artifact-contract.sh",
+    "enforce-app-contract.ts",
+    '"${{ github.event.repository.id }}"',
+    '"${{ job.workflow_sha }}"',
+    "--no-env-file --no-orphans",
+  ]) {
+    requireContains(path, text, boundary, `Exact reusable-workflow policy materialization is missing ${boundary}.`);
+  }
   rejectContains(path, text, "declare -A stages", "Untrusted Docker tokens must never enter Bash associative arrays.");
 }
 
@@ -1287,17 +1100,13 @@ if (socketScanner !== templateSocketScanner) {
   );
 }
 for (const boundary of [
-  'const socketOrganization = "collinbentley1"',
-  'const authenticatedPackageLimit = 128',
-  'const authenticatedBatchCost = 100',
+  'const socketFirewallBase = "https://firewall-api.socket.dev/purl"',
+  "const reviewedPackageLimit = 128",
+  "const publicConcurrency = 10",
   "const maxAlertsPerArtifact = 256",
-  '`${socketApiBase}/quota`',
-  '/orgs/${encodeURIComponent(socketOrganization)}/purl?',
-  'alerts: "true"',
-  'actions: "error,warn"',
-  'poll: "true"',
-  'purlErrors: "true"',
-  'summary: "true"',
+  '`${socketFirewallBase}/${encodeURIComponent(purl)}`',
+  'headers: { Accept: "application/x-ndjson", "User-Agent": userAgent }',
+  'logger("Socket Security Scanner free mode.")',
   'redirect: "error"',
   'parsed._type === "purlError"',
   'parsed._type === "summary"',
@@ -1319,7 +1128,13 @@ rejectContains(
   "tools/socket-security-scanner.ts",
   socketScanner,
   "SOCKET_API_KEY",
-  "The local Socket scanner must accept only the canonical least-scope token variable.",
+  "The local Socket scanner must remain credentialless.",
+);
+rejectContains(
+  "tools/socket-security-scanner.ts",
+  socketScanner,
+  "SOCKET_API_TOKEN",
+  "The local Socket scanner must remain credentialless.",
 );
 rejectContains(
   "tools/socket-security-scanner.ts",
@@ -1553,16 +1368,10 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
   checkActionPins(path, text, true);
 }
 
-for (const [workflow, expectedSecretMap, count] of [
-  ["deploy-preview.yml", expectedPreviewCallerSecretMap, "five"],
-  ["deploy-prod.yml", expectedProductionCallerSecretMap, "six"],
-] as const) {
+for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
   const path = `templates/app/.github/workflows/${workflow}`;
   const text = await read(path);
-  const secretMap = sectionFrom(text, "    secrets:\n").trimEnd();
-  if (secretMap !== expectedSecretMap) {
-    failures.push(`${path}: deploy caller secret map must exactly match the reviewed ${count}-name contract.`);
-  }
+  rejectContains(path, text, "    secrets:", "Deploy callers must not forward any secret map to a reusable workflow.");
 }
 requireContains(
   "templates/app/.github/workflows/deploy-preview.yml",
@@ -1570,6 +1379,23 @@ requireContains(
   "github.event.pull_request.draft == false",
   "Preview callers must not deploy draft pull requests.",
 );
+for (const boundary of [
+  "pull_request_target:",
+  "branches:",
+  "- main",
+  "- opened",
+  "- synchronize",
+  "- reopened",
+  "- ready_for_review",
+  "- converted_to_draft",
+]) {
+  requireContains(
+    "templates/app/.github/workflows/deploy-preview.yml",
+    await read("templates/app/.github/workflows/deploy-preview.yml"),
+    boundary,
+    `Preview callers must use the trusted default-branch definition and include ${boundary}.`,
+  );
+}
 
 const dockerfile = await read("templates/app/Dockerfile");
 const bunfig = await read("templates/app/bunfig.toml");
@@ -1645,8 +1471,8 @@ rejectContains("templates/app/Dockerfile", dockerfile, "curl -fsSL https://bun.c
 requireContains(
   "templates/app/Dockerfile",
   dockerfile,
-  "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
-  "The exact Bun binary source image must be digest pinned.",
+  "FROM platform.invalid/bun-release AS bun-release",
+  "The Bun binary stage must use only the platform-supplied closed OCI context.",
 );
 if (dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676").length !== 3) {
   failures.push(
@@ -1681,18 +1507,8 @@ requireContains(
   "--registry=https://registry.npmjs.org",
   "Docker dependency installs must pin the official registry.",
 );
-requireContains(
-  "templates/app/Dockerfile",
-  dockerfile,
-  "dhi.io/bun:1-alpine-dev@sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8",
-  "The reviewed zero-High/Critical build base image must stay digest pinned.",
-);
-requireContains(
-  "templates/app/Dockerfile",
-  dockerfile,
-  "dhi.io/bun:1-alpine@sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3",
-  "The reviewed zero-vulnerability runtime base image must stay digest pinned.",
-);
+requireContains("templates/app/Dockerfile", dockerfile, "FROM platform.invalid/dhi-bun-dev AS deps", "Builds must use only the exact verified DHI dev context.");
+requireContains("templates/app/Dockerfile", dockerfile, "FROM platform.invalid/dhi-bun-runtime AS runtime", "Runtime must use only the exact verified DHI runtime context.");
 rejectContains(
   "templates/app/Dockerfile",
   dockerfile,
@@ -1735,7 +1551,7 @@ const moduleVariables = await read("terraform/modules/cloud-run-service/variable
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
 if (
   createHash("sha256").update(moduleMain).digest("hex") !==
-  "bb0be7c548794254309371db48e4800770cad59a72c7457b028bbeff1f6c7682"
+  "8491d3a4c1acd5b5e463ff5e154ba601581d1cc3c777526c5a3ea22a4b521c21"
 ) {
   failures.push(
     "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
@@ -2138,6 +1954,7 @@ const approvedIamResources = [
   "google_cloud_run_v2_service_iam_member.preview_deploy",
   "google_cloud_run_v2_service_iam_member.prod_deploy",
   "google_secret_manager_secret_iam_member.prod_deploy_version_adder",
+  "google_secret_manager_secret_iam_member.prod_deploy_version_metadata_reader",
   "google_secret_manager_secret_iam_member.runtime_accessor",
 ].sort();
 if (JSON.stringify(allIamResources) !== JSON.stringify(approvedIamResources)) {
@@ -2309,7 +2126,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "42b12bb7f5eda9ac0f2131660e54d44fed4174db8a7e4735c48c0f3b995ab7f1"
+  "cd0642a94606dba447bddaed2eb1ba20cfb4ed98d8ecf2d79e75e362104645c6"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2594,6 +2411,18 @@ requireContains(
   '"(${local.trusted_workflow_sha_condition})",',
   "The WIF provider itself must reject unapproved workflow SHAs.",
 );
+for (const attemptGuard of [
+  '"has(assertion.run_attempt)",',
+  '"assertion.run_attempt == \'1\'",',
+  "has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted'",
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    attemptGuard,
+    "Both exact and legacy WIF provider paths must reject workflow reruns.",
+  );
+}
 for (const boundary of [
   'account_id   = "gha-prod-publish"',
   'account_id   = "gha-preview-publish"',
@@ -3079,11 +2908,20 @@ function checkActionPins(path: string, text: string, allowPlatformPlaceholder: b
 
 function checkDockerPins(path: string, text: string): void {
   const stages = new Set<string>();
+  const exactNamedContexts = new Set([
+    "platform.invalid/bun-release",
+    "platform.invalid/dhi-bun-dev",
+    "platform.invalid/dhi-bun-runtime",
+  ]);
 
   for (const match of text.matchAll(/^FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$/gim)) {
     const image = match[1]!;
     const alias = match[2]?.toLowerCase();
-    if (!stages.has(image.toLowerCase()) && !/@sha256:[0-9a-f]{64}$/.test(image)) {
+    if (
+      !stages.has(image.toLowerCase()) &&
+      !exactNamedContexts.has(image.toLowerCase()) &&
+      !/@sha256:[0-9a-f]{64}$/.test(image)
+    ) {
       failures.push(`${path}: external base image ${image} must be pinned to a sha256 digest.`);
     }
     if (alias) {

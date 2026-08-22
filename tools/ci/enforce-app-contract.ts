@@ -66,6 +66,7 @@ const forbiddenSyftConfigs = new Set([
   ".syft/config.yaml",
   ".syft/config.yml",
 ]);
+const forbiddenSocketConfigs = new Set(["socket.yml", "socket.yaml"]);
 
 const [appArg, templateArg, trustedRepositoryId, expectedPlatformSha] = Bun.argv.slice(2);
 if (
@@ -247,7 +248,8 @@ for await (const file of walk(appRoot)) {
     name === "npmrc" ||
     name === ".env" ||
     (name.startsWith(".env.") && name !== ".env.example") ||
-    forbiddenSyftConfigs.has(relativeFile)
+    forbiddenSyftConfigs.has(relativeFile) ||
+    forbiddenSocketConfigs.has(relativeFile)
   ) {
     throw new Error(`Forbidden package-manager environment/config file: ${relative(appRoot, file)}`);
   }
