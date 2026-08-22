@@ -11,24 +11,24 @@ locals {
   legacy_prod_deploy_principal_set      = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_prod_deploy/${var.github_repository_id}"
   legacy_terraform_principal_set        = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_terraform/${var.github_repository_id}"
 
-  preview_deploy_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-cloud'"
+  preview_deploy_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-cloud'"
   preview_operator_workflow_condition = join(" || ", [
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-operations'",
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/cleanup-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.environment) && assertion.environment == 'preview-operations'",
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/reconcile-previews.yml@' + assertion.job_workflow_sha && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/cleanup-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/reconcile-previews.yml@' + assertion.job_workflow_sha && (assertion.event_name == 'push' || assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && assertion.environment == 'preview-operations'",
   ])
-  preview_publish_workflow_condition    = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-publish'"
-  production_workflow_condition         = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
-  production_publish_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production-publish'"
-  terraform_workflow_condition          = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/infrastructure.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  preview_publish_workflow_condition    = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-publish'"
+  production_workflow_condition         = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
+  production_publish_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production-publish'"
+  terraform_workflow_condition          = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/infrastructure.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
 
   # Compatibility accepts an immediately previous reviewed workflow ref for
   # each old operational identity, but maps a distinct attribute per path. A
   # token accepted for one legacy workflow therefore cannot impersonate a
   # different service account through an aggregate repository/environment key.
-  legacy_preview_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && (!has(assertion.environment) || assertion.environment == 'preview-cloud')"
+  legacy_preview_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && assertion.actor != 'dependabot[bot]' && (!has(assertion.environment) || assertion.environment == 'preview-cloud')"
   legacy_preview_operator_workflow_condition = join(" || ", [
-    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && has(assertion.actor) && assertion.actor != 'dependabot[bot]' && has(assertion.environment) && assertion.environment == 'preview-operations'",
+    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-operations'",
     "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/cleanup-preview.yml@') && assertion.event_name == 'pull_request' && (!has(assertion.environment) || assertion.environment == 'preview-operations')",
     "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/reconcile-previews.yml@') && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
   ])
@@ -36,13 +36,17 @@ locals {
     for sha in sort(tolist(var.preview_operator_transition_workflow_shas)) : "assertion.job_workflow_sha == '${sha}'"
   ])
   legacy_preview_operator_attribute_condition = "(${local.legacy_preview_operator_workflow_condition}) && (${local.preview_operator_transition_workflow_sha_condition})"
-  legacy_prod_deploy_workflow_condition       = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
-  legacy_terraform_workflow_condition         = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  legacy_prod_deploy_workflow_condition       = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
+  legacy_terraform_workflow_condition         = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
   legacy_workflow_condition = join(" || ", [
     "(${local.legacy_preview_deploy_workflow_condition})",
     "(${local.legacy_preview_operator_workflow_condition})",
     "(${local.legacy_prod_deploy_workflow_condition})",
     "(${local.legacy_terraform_workflow_condition})",
+    # Phase A must accept the new base-controlled pull_request_target paths as
+    # well as the immediately previous pull_request paths.
+    "(${local.preview_deploy_workflow_condition})",
+    "(${local.preview_operator_workflow_condition})",
     # Publisher identities never receive a generic compatibility binding. Even
     # in phase A, only a full-SHA caller can mint their exact mapped attribute.
     "(${local.preview_publish_workflow_condition})",
@@ -57,12 +61,28 @@ locals {
     "assertion.repository_id == '${var.github_repository_id}'",
     "has(assertion.job_workflow_ref)",
     "has(assertion.job_workflow_sha)",
+    "has(assertion.run_attempt)",
+    "assertion.run_attempt == '1'",
     "assertion.runner_environment == 'github-hosted'",
     "(${local.trusted_workflow_sha_condition})",
     "((${local.preview_deploy_workflow_condition}) || (${local.preview_operator_workflow_condition}) || (${local.preview_publish_workflow_condition}) || (${local.production_workflow_condition}) || (${local.production_publish_workflow_condition}) || (${local.terraform_workflow_condition}))",
   ])
-  legacy_provider_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && assertion.runner_environment == 'github-hosted' && (${local.trusted_workflow_sha_condition}) && (${local.legacy_workflow_condition})"
+  legacy_provider_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted' && (${local.trusted_workflow_sha_condition}) && (${local.legacy_workflow_condition})"
   provider_condition        = var.legacy_compatibility_mode ? local.legacy_provider_condition : local.exact_workflow_provider_condition
+
+  github_attribute_mapping = {
+    "attribute.preview_deploy_workflow_sha"   = "(${local.preview_deploy_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.preview_operator_workflow_sha" = "(${local.preview_operator_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.preview_publish_workflow_sha"  = "(${local.preview_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.prod_workflow_sha"             = "(${local.production_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.prod_publish_workflow_sha"     = "(${local.production_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.terraform_workflow_sha"        = "(${local.terraform_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
+    "attribute.legacy_preview_deploy"         = "(${local.legacy_preview_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_prod_deploy"            = "(${local.legacy_prod_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_terraform"              = "(${local.legacy_terraform_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "google.subject"                          = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
+  }
 
   labels = {
     app        = var.app
@@ -77,6 +97,18 @@ locals {
     var.manage_automatic_default_service_account_grants_policy ? toset(["orgpolicy.googleapis.com"]) : toset([]),
   )
 
+}
+
+check "wif_expression_limits" {
+  assert {
+    condition     = length(local.provider_condition) <= 4096
+    error_message = "The rendered workload identity provider condition exceeds Google's 4096-character limit."
+  }
+
+  assert {
+    condition     = alltrue([for expression in values(local.github_attribute_mapping) : length(expression) <= 2048])
+    error_message = "A rendered workload identity attribute mapping expression exceeds Google's 2048-character limit."
+  }
 }
 
 resource "google_project_service" "required" {
@@ -252,20 +284,8 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   display_name                       = "GitHub"
   description                        = "OIDC provider restricted to ${local.github_repo_full_name}."
 
-  attribute_mapping = {
-    "attribute.preview_deploy_workflow_sha"   = "(${local.preview_deploy_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.preview_operator_workflow_sha" = "(${local.preview_operator_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.preview_publish_workflow_sha"  = "(${local.preview_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.prod_workflow_sha"             = "(${local.production_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.prod_publish_workflow_sha"     = "(${local.production_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.terraform_workflow_sha"        = "(${local.terraform_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.legacy_preview_deploy"         = "(${local.legacy_preview_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_prod_deploy"            = "(${local.legacy_prod_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_terraform"              = "(${local.legacy_terraform_workflow_condition}) ? assertion.repository_id : 'denied'"
-    # Numeric IDs survive renames. run_id makes the subject non-reusable across runs.
-    "google.subject" = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
-  }
+  # Numeric IDs survive renames. run_id makes the subject non-reusable across runs.
+  attribute_mapping = local.github_attribute_mapping
 
   attribute_condition = local.provider_condition
 
@@ -346,6 +366,20 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
     "run.operations.get",
     "run.services.get",
     "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "secret_version_metadata_reader" {
+  project     = var.project_id
+  role_id     = "secretVersionMetadataReader"
+  title       = "Secret Version Metadata Reader"
+  description = "Reads secret and version metadata without access to secret payloads."
+  permissions = [
+    "secretmanager.secrets.get",
+    "secretmanager.versions.get",
+    "secretmanager.versions.list",
   ]
 
   depends_on = [google_project_service.required]

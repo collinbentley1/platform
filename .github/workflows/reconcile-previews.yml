@@ -6,11 +6,24 @@ on:
 permissions: {}
 
 jobs:
+  rerun-guard:
+    name: Reject privileged workflow reruns
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
   reconcile:
     name: Reconcile previews
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     if: >-
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main'
     environment: preview-operations
     permissions:
@@ -22,6 +35,12 @@ jobs:
       cancel-in-progress: false
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Resolve trusted application configuration
         id: app
         env:
@@ -109,6 +128,7 @@ jobs:
       - name: Remove traffic tags that do not match an active pull request head
         env:
           GH_TOKEN: ${{ github.token }}
+          PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
           PROJECT_ID: ${{ steps.app.outputs.project_id }}
           REGION: ${{ steps.app.outputs.region }}
           REPOSITORY_ID: ${{ github.event.repository.id }}
@@ -116,14 +136,17 @@ jobs:
           CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
         run: |
           set -euo pipefail
-          if [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]]; then
+          if [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]] ||
+             [[ ! "$PLATFORM_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Refusing invalid preview reconciliation identity." >&2
             exit 1
           fi
           service="${SERVICE_NAME}-preview"
           service_json="$(mktemp)"
           describe_error="$(mktemp)"
-          trap 'rm -f "$service_json" "$describe_error"' EXIT
+          revision_json="$(mktemp)"
+          revision_error="$(mktemp)"
+          trap 'rm -f "$service_json" "$describe_error" "$revision_json" "$revision_error"' EXIT
 
           verify_stable_preview_absent() {
             local pr_number="$1"
@@ -164,22 +187,53 @@ jobs:
                 echo "Could not authoritatively read pull request #$pr_number; preserving $preview_tag." >&2
                 exit 1
               fi
-              state="$(jq -er '.state | select(. == "open" or . == "closed")' <<< "$pr_json")"
-              draft="$(jq -er '.draft | select(type == "boolean") | tostring' <<< "$pr_json")"
-              head_sha="$(jq -er '.head.sha | select(type == "string")' <<< "$pr_json")"
-              if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "Pull request #$pr_number returned an invalid head SHA; preserving $preview_tag." >&2
-                exit 1
-              fi
+              state="$(jq -r 'if (.state == "open" or .state == "closed") then .state else "invalid" end' <<< "$pr_json")"
+              draft="$(jq -r 'if (.draft | type) == "boolean" then (.draft | tostring) else "invalid" end' <<< "$pr_json")"
+              head_sha="$(jq -r 'if (.head.sha | type) == "string" then .head.sha else "" end' <<< "$pr_json")"
+              head_repo_id="$(jq -r 'if (.head.repo.id | type) == "number" then (.head.repo.id | tostring) else "" end' <<< "$pr_json")"
+              head_repo_name="$(jq -r 'if (.head.repo.full_name | type) == "string" then .head.repo.full_name else "" end' <<< "$pr_json")"
+              base_ref="$(jq -r 'if (.base.ref | type) == "string" then .base.ref else "" end' <<< "$pr_json")"
 
-              expected_revision_prefix="${service}-p${pr_number}-${head_sha:0:12}-r"
+              revision_identity_valid=false
+              if [[ "$revision_name" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+                if ! gcloud run revisions describe "$revision_name" \
+                  --project="$PROJECT_ID" \
+                  --region="$REGION" \
+                  --format=json > "$revision_json" 2> "$revision_error"; then
+                  cat "$revision_error" >&2
+                  echo "Could not authoritatively read tagged revision $revision_name; preserving all tags." >&2
+                  exit 1
+                fi
+                if jq -e \
+                  --arg head "$head_sha" \
+                  --arg name "$revision_name" \
+                  --arg pr "$pr_number" \
+                  --arg repository_id "$REPOSITORY_ID" \
+                  --arg workflow_sha "$PLATFORM_WORKFLOW_SHA" '
+                  .metadata.name == $name and
+                  .metadata.labels["git-head-sha"] == $head and
+                  .metadata.labels["github-repository-id"] == $repository_id and
+                  .metadata.labels["github-pr"] == $pr and
+                  (.metadata.labels["github-run-id"] | type == "string" and test("^[0-9]+$")) and
+                  .metadata.labels["github-run-attempt"] == "1" and
+                  .metadata.labels["managed-by"] == "github-actions" and
+                  .metadata.labels.environment == "preview" and
+                  .metadata.labels["platform-workflow-sha"] == $workflow_sha
+                ' "$revision_json" >/dev/null; then
+                  revision_identity_valid=true
+                fi
+              fi
               if [ "$state" = "open" ] && [ "$draft" = "false" ] &&
-                 [[ "$revision_name" == "${expected_revision_prefix}"* ]]; then
+                 [ "$head_repo_id" = "$REPOSITORY_ID" ] &&
+                 [ "$head_repo_name" = "$GITHUB_REPOSITORY" ] &&
+                 [ "$base_ref" = "main" ] &&
+                 [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] &&
+                 [ "$revision_identity_valid" = "true" ]; then
                 echo "Keeping $preview_tag at $revision_name for pull request #$pr_number head $head_sha."
                 continue
               fi
 
-              echo "Removing invalid tag $preview_tag: state=$state draft=$draft head=$head_sha revision=$revision_name."
+              echo "Removing invalid tag $preview_tag: state=$state draft=$draft head=$head_sha head_repo_id=$head_repo_id base=$base_ref revision=$revision_name."
               gcloud run services update-traffic "$service" \
                 --project="$PROJECT_ID" \
                 --region="$REGION" \
@@ -201,7 +255,7 @@ jobs:
           # service, so lack of list access is an expected steady state.
           legacy_json="$(mktemp)"
           list_error="$(mktemp)"
-          trap 'rm -f "$service_json" "$describe_error" "$legacy_json" "$list_error"' EXIT
+          trap 'rm -f "$service_json" "$describe_error" "$revision_json" "$revision_error" "$legacy_json" "$list_error"' EXIT
           if ! gcloud run services list \
             --project="$PROJECT_ID" \
             --region="$REGION" \

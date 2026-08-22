@@ -47,35 +47,75 @@ jobs:
     uses: collinbentley1/platform/.github/workflows/application.yml@0123456789abcdef0123456789abcdef01234567 # v0.5.0
 ```
 
-Preview deploy callers forward exactly five named secret slots and production
-callers forward the same five plus Medlock's `WAITLIST_IDENTITY_KEYSET`; neither
-uses `secrets: inherit`. The reusable deploy contracts explicitly declare only
-those names, and each approved called-job environment supplies and overrides the
-value.
-`DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and the
-least-scope `SOCKET_API_TOKEN` live only in the owner-approved `preview-build` and
-`production-build` environments. Each real preview or production build runs one
-organization-policy scan of the resolved lock before package extraction, then
-removes the Socket credential; Docker and the duplicate application/firewall
-checks use Socket's public policy. The same credential lives in the platform
-repository's owner-approved `dependency-scan` environment for one post-merge
-platform-main scan. Platform pull requests themselves remain secretless because
-they control the trust-root workflow and scanner source.
+Deploy callers forward no secrets and never use `secrets: inherit`. Preview is
+controlled by a default-branch `pull_request_target` caller pinned to the exact
+reviewed platform commit; the ordinary Application and Socket checks remain
+head-bound `pull_request` workflows. The credentialed prefetch job does not
+checkout or evaluate pull-request data. It alone enters
+`dhi-base-prefetch-20260822-098dca9280b3`, whose selected-branch policy permits
+only `main`, and receives the read-public-only
+`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3` secret plus the non-confidential
+`DHI_USERNAME` variable. Preview and production use this same environment and
+the same immutable base-image digests.
+
+Prefetch verifies the exact linux/amd64 DHI children, frozen Docker signatures,
+signed SBOM/provenance/source records, license evidence, and complete OCI blob
+closure before publishing a one-day raw artifact. The untrusted BuildKit job is
+credentialless: no OIDC, packages permission, runtime secret, registry token, or
+host execution of pull-request code. It checks out the exact same-repository PR
+head only inside the bounded build lane and consumes the verified bases as fixed
+local OCI contexts. A fresh credentialless verifier closes and canonicalizes the
+result, runs Syft and Grype in a networkless read-only container sandbox, and
+proves the final runtime layer/config lineage. A separate publisher revalidates
+the canonical graph without extracting its layers before using its exact WIF
+identity. No raw DHI credential or unreviewed OCI archive crosses that boundary.
+The vendored Docker DHI public key is pinned to keyring commit
+`d6b11e0475ac7ddf74687268d16a4201a15e163f` and SHA-256
+`1d02bbccf149283ae6288d96264dcad3fb23ee1911d90324a48eab28e4cb8a5f`;
+the catalog license is pinned to commit
+`140f79eaba13b83e280f6f554f80f9633fae987e` and SHA-256
+`58881e3f5171ed2e98db7a4dbd64c16b9b5dbb2f5cbd9a56e79608a2360ad5f3`.
+
+The resulting runtime is deliberately described as a hybrid: the immutable DHI
+Community Bun image supplies the signed hardened Alpine rootfs and exact layer,
+history, and configuration prefix, while the Dockerfile overlays the separately
+digest-bound Oven Bun 1.4.0+34cbb binary. The final image advertises
+`BUN_VERSION=1.4.0` and immutable OCI base name/digest labels; the DHI signature
+does not attest the overlaid Oven binary. Preview and production are required to
+use byte-identical base contexts and exporter/provenance settings, though their
+application source and final image digest naturally differ.
+
+Each preview revision records the exact 40-hex platform workflow commit. A
+consumer `main` push runs reconciliation immediately (with the hourly schedule
+as a backstop) and removes every preview tag whose revision lacks that commit or
+names an older one. Consequently, a platform-pin change cannot leave an active
+preview on a different DHI contract: even if the corresponding production
+deployment fails, the old preview is made unavailable rather than presented as
+production parity.
+
+Socket scanning is credential-free. The local scanner enforces the public
+policy, and the `Socket Firewall` check additionally requires the exact
+successful checks produced by Socket GitHub App id `156372`. No Socket token or
+`dependency-scan` environment is part of the platform contract.
+
 Application runtime secret names and grants are encoded in this repository's
 immutable numeric-repository-ID map; repository variables and deploy callers
-cannot add or redirect them. Medlock's trusted production deploy reuses the
-current exact version when its keyset fingerprint matches; otherwise it streams
-the approved keyset into a new version of the one declared secret and validates
-the returned positive numeric version. Cloud Run is bound to that exact version.
-Mutable aliases such as `latest` are forbidden, and the payload never enters
-Terraform state or Cloud Run's literal environment configuration.
+cannot add or redirect them. Medlock/Health has no GitHub keyset secret. Its
+trusted production deploy either reuses the exact numeric Secret Manager version
+already bound to Cloud Run or, only when no binding and no enabled version exist,
+generates a new key directly into `waitlist-identity-keyset`. The deploy identity
+can add and inspect version metadata but cannot read payloads; Cloud Run is bound
+to the returned positive numeric version. Mutable aliases such as `latest` are
+forbidden, and the payload never enters GitHub, Terraform state, an image layer,
+or Cloud Run's literal environment configuration.
 Runsetta is deliberately offline, its old secret containers are retained for
 recovery, and its runtime service account has no accessor grant. Critical
 History's `MAPBOX_PUBLIC_TOKEN` is the narrow exception because the app returns
-it to every browser. It is a Mapbox public `pk.*` token, not a confidential
-credential; the owner-approved `preview-cloud` and `production` environments use
-their `MAPBOX_PUBLIC_TOKEN` secret slots only as approval-gated configuration
-channels. Give each value only the required public read scopes. The simplest
+it to every browser. It is a non-default Mapbox public `pk.*` token, not a confidential
+credential; the protected `preview-cloud` and `production` environments expose
+it as the non-confidential `MAPBOX_PUBLIC_TOKEN` variable. Give the value only
+the required public read scopes. Mapbox's default public token is forbidden
+because its scopes and URL restrictions cannot be changed. The simplest
 configuration reuses one value restricted to `https://ycriticalhistory.org`,
 which Mapbox also permits on all subdomains, including every stable
 `https://pr-N.preview.ycriticalhistory.org` origin. A separate preview value may
@@ -85,22 +125,13 @@ Mapbox documents URL restrictions as best-effort abuse controls, not an
 authorization boundary; never grant a browser token confidential scopes. Do not
 enter wildcard syntax. The workflow validates the public format before mapping
 it to the app's runtime name; Mapbox `sk.*` tokens are rejected. Do not use
-`secrets: inherit` or add any caller secret mapping beyond the reviewed contract.
-The Socket token must be admin-visible only, grant only `packages:list`, and be
-rotated and usage-audited on the same schedule as other CI credentials. The
-canonical dependency-free scanner uses the current org-scoped batch endpoint,
-polls fail closed, validates every NDJSON artifact and summary, and refuses locks
-above the reviewed 128-package ceiling before making a request. The pre-token
-contract also rejects git, GitHub, remote-tarball, file, link, and workspace
-resolutions because Bun 1.4 omits those sources from scanner input; every allowed
-direct and transitive resolution must use the npm registry with an exact version
-and sha512 integrity. Scanner diagnostics are bounded and neutralized before
-GitHub parses re-emitted tool output. Runner command parsing is also disabled
-across the complete PR-controlled Docker build action with a random token that
-is never passed into the build. Socket currently
-charges 100 units per batch and this token has 500 units per hour, so protected
-builds must be serialized to at most five scans per window unless Socket raises
-the token quota.
+`secrets: inherit` or add caller secret mappings. The canonical dependency-free
+scanner rejects git, GitHub, remote-tarball, file, link, and workspace
+resolutions; every allowed direct and transitive resolution must use the npm
+registry with an exact version and sha512 integrity. Scanner diagnostics are
+bounded and neutralized before GitHub parses re-emitted output. Runner command
+parsing, Docker build records, summaries, annotations, and implicit GitHub-token
+access are disabled across the complete PR-controlled build action.
 
 Cloud publication and Cloud Run mutation use different protected environments
 and identities. Secretless `production-publish` and `preview-publish` jobs can
@@ -143,11 +174,12 @@ canary; there is no bypass switch or repository-variable preview enablement.
 Preview secrets are authoritatively cleared on every deployment. Apps with
 production data permissions must remain build-only until a preview-only runtime
 service account is provisioned and the platform registry enables cloud preview.
-The untrusted image build has no GitHub OIDC permission. It publishes by digest
-to an isolated GHCR staging package only after its pinned BuildKit daemon is
-destroyed; a separate runner copies the opaque manifest into Artifact Registry.
-The publish runner proves its own environment-specific exact-SHA WIF binding
-before it exchanges for the repository-scoped publisher identity.
+The untrusted image build has no GitHub OIDC or packages permission and produces
+only a one-day raw artifact. A separate verifier canonicalizes the image and a
+separate publisher uploads the independently revalidated inner OCI index to
+Artifact Registry by digest. The publish runner proves its own
+environment-specific exact-SHA WIF binding before it exchanges for the
+repository-scoped publisher identity.
 
 Security-critical project, service, provider, and service-account values are
 resolved from immutable numeric repository IDs inside the reviewed reusable
@@ -197,14 +229,15 @@ Release `0.5.0` only after required checks and adversarial review. Create a
 protected GitHub release tag for discovery, then copy the release commit SHA into
 consumer workflow and Terraform references. Never move an existing release tag.
 Refresh and review `tools/ci/grype-db.json` immediately before the release. After
-platform CI imports and validates it, copy that exact one-line JSON object into
-the `GRYPE_DB_MANIFEST_JSON` environment secret on both owner-approved build
-environments. The manifest is not confidential; the secret context is an
-owner-controlled integrity boundary that repository variables cannot override.
-The snapshot expires after 48 hours, so builds fail closed against stale data. A
-refresh changes both the checked-in manifest and its exact identity assertion in
-`tools/lint.ts`; it must arrive through a reviewed PR, but it does not change the
-WIF-authorized workflow SHA. Never place this value at repository scope.
+platform CI imports and validates it, the credentialless verifier loads only
+that byte-pinned file from the immutable platform policy archive; every
+`GRYPE_DB_MANIFEST_JSON` or `DB_MANIFEST_JSON` override is forbidden. The
+snapshot expires after 48 hours, so builds fail closed against stale data. A
+refresh changes the platform commit and therefore requires a new reviewed
+platform SHA, WIF authorization, and consumer repin. That sub-48-hour rollout
+cadence is a release stop condition, not an acceptable steady-state update
+mechanism; do not release once the snapshot is stale or if the complete repin
+cannot finish inside its validity window.
 
 ```sh
 gh release create v0.5.0 --target <reviewed-commit-sha> --generate-notes

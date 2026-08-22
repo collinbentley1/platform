@@ -4,14 +4,22 @@ on:
   workflow_call:
 
 permissions:
+  checks: read
   contents: read
 
 jobs:
   firewall:
     name: Socket Firewall
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
 
     steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -111,3 +119,45 @@ jobs:
             echo "bun pm scan must not mutate package.json or bun.lock." >&2
             exit 1
           fi
+
+      - name: Require successful Socket GitHub App checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target_sha="$GITHUB_SHA"
+          expected='["Socket Security: Project Report"]'
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            target_sha="$(jq -er '.pull_request.head.sha | select(test("^[0-9a-f]{40}$"))' "$GITHUB_EVENT_PATH")"
+            expected='["Socket Security: Project Report","Socket Security: Pull Request Alerts"]'
+          fi
+          response="$RUNNER_TEMP/socket-check-runs.json"
+          for _ in $(seq 1 60); do
+            curl --fail-with-body --show-error --silent \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --output "$response" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${target_sha}/check-runs?filter=latest&per_page=100"
+            if jq -e --argjson expected "$expected" '
+              .check_runs as $runs
+              | all($expected[] as $name;
+                  ([$runs[] | select(.name == $name and .app.id == 156372)] | length) == 1 and
+                  ([$runs[] | select(.name == $name and .app.id == 156372)][0]
+                    | .status == "completed" and .conclusion == "success"))
+            ' "$response" >/dev/null; then
+              exit 0
+            fi
+            if jq -e --argjson expected "$expected" '
+              any($expected[] as $name;
+                any(.check_runs[];
+                  .name == $name and .app.id == 156372 and
+                  .status == "completed" and .conclusion != "success"))
+            ' "$response" >/dev/null; then
+              echo "A required Socket GitHub App check completed without success." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for the exact Socket GitHub App checks." >&2
+          exit 1

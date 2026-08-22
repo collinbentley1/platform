@@ -13,5 +13,6 @@ jobs:
   firewall:
     name: Socket Firewall
     permissions:
+      checks: read # Verify the exact successful checks from Socket App 156372.
       contents: read
     uses: collinbentley1/platform/.github/workflows/socket-firewall.yml@__PLATFORM_SHA__

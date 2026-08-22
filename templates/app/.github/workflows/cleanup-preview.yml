@@ -1,7 +1,9 @@
 name: Cleanup preview
 
 on:
-  pull_request:
+  pull_request_target:
+    branches:
+      - main
     types:
       - closed
 
@@ -11,4 +13,5 @@ jobs:
   cleanup:
     permissions:
       id-token: write # Exchange only for the exact-SHA preview traffic operator.
+      pull-requests: read # Let the reusable cleanup re-read current lifecycle state.
     uses: collinbentley1/platform/.github/workflows/cleanup-preview.yml@__PLATFORM_SHA__

@@ -116,7 +116,7 @@ variable "runtime_secret_accessor_ids" {
 }
 
 variable "runtime_secret_version_adder_ids" {
-  description = "Declared runtime secret IDs to which the production deploy identity may add immutable versions. Secure default is no access."
+  description = "Declared runtime secret IDs to which the production deploy identity may add immutable versions and read version metadata, but never payloads. Secure default is no access."
   type        = set(string)
   default     = []
 
