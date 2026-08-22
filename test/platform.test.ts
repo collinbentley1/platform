@@ -162,25 +162,119 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("missing bun.lock");
   });
 
-  test("doctor rejects a duplicate effective scanner lock entry", async () => {
-    const app = await scaffold("scanner-lock-substitution");
-    const path = join(app, "bun.lock");
-    const original = await readFile(path, "utf8");
-    const trustedLine = original.match(
-      /^    "@socketsecurity\/bun-security-scanner": \[.*\],$/m,
-    )?.[0];
-    expect(trustedLine).toBeDefined();
-    await writeFile(
-      path,
-      original.replace(
-        trustedLine!,
-        `${trustedLine}\n    "@socketsecurity/bun-security-scanner": ["@socketsecurity/bun-security-scanner@1.1.2", "", {}, "sha512-invalid"],`,
-      ),
+  test("doctor and immutable contract reject local scanner substitution", async () => {
+    const app = await scaffold("scanner-source-substitution");
+    const path = join(app, "tools/socket-security-scanner.ts");
+    await writeFile(path, `${await readFile(path, "utf8")}\nconsole.log(Bun.env.SOCKET_API_TOKEN);\n`);
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(
+      "tools/socket-security-scanner.ts does not exactly match the immutable platform template",
     );
 
-    const result = await run(["doctor", app]);
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain("does not resolve the reviewed Socket scanner integrity");
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "tools/socket-security-scanner.ts must exactly match the immutable platform template",
+    );
+  });
+
+  test("doctor and immutable contract reject the released quota-exhausting scanner", async () => {
+    const app = await scaffold("published-scanner-substitution");
+    const packagePath = join(app, "package.json");
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as {
+      devDependencies: Record<string, string>;
+    };
+    packageJson.devDependencies["@socketsecurity/bun-security-scanner"] = "1.1.2";
+    await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain("uses the quota-exhausting published Socket scanner");
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain("must not use the quota-exhausting published Socket scanner");
+  });
+
+  test("doctor and immutable contract cap one authenticated Socket request", async () => {
+    const app = await scaffold("scanner-package-cap");
+    const lockPath = join(app, "bun.lock");
+    const lock = Bun.JSONC.parse(await readFile(lockPath, "utf8")) as {
+      packages: Record<string, unknown>;
+    };
+    for (let index = Object.keys(lock.packages).length; index < 129; index += 1) {
+      lock.packages[`synthetic-${index}`] = [
+        `synthetic-${index}@1.0.0`,
+        "",
+        {},
+        `sha512-${"A".repeat(86)}==`,
+      ];
+    }
+    await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain("exceeds the reviewed 128-package Socket request limit");
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain("exceeds the reviewed 128-package Socket request limit");
+  });
+
+  test("doctor and immutable contract reject dependency sources Bun omits from scanning", async () => {
+    const app = await scaffold("scanner-source-bypass");
+    const packagePath = join(app, "package.json");
+    const lockPath = join(app, "bun.lock");
+    const originalPackage = await readFile(packagePath, "utf8");
+    const packageJson = JSON.parse(originalPackage) as {
+      dependencies?: Record<string, string>;
+    };
+    packageJson.dependencies = {
+      "safe-looking": "https://registry.npmjs.org/lodahs/-/lodahs-0.0.1-security.tgz",
+    };
+    await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "must use an exact npm registry version or npm alias",
+      );
+    }
+
+    await writeFile(packagePath, originalPackage);
+    const lock = Bun.JSONC.parse(await readFile(lockPath, "utf8")) as {
+      packages: Record<string, unknown>;
+    };
+    lock.packages["safe-looking"] = [
+      "safe-looking@https://registry.npmjs.org/lodahs/-/lodahs-0.0.1-security.tgz",
+      {},
+      `sha512-${"A".repeat(86)}==`,
+    ];
+    await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "must be a sha512-pinned npm registry resolution",
+      );
+    }
+  });
+
+  test("doctor and immutable contract reject unreviewed workspaces", async () => {
+    const app = await scaffold("scanner-workspace-bypass");
+    const packagePath = join(app, "package.json");
+    const packageJson = JSON.parse(await readFile(packagePath, "utf8")) as Record<string, unknown>;
+    packageJson.workspaces = ["packages/*"];
+    await writeFile(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "package.json workspaces are forbidden by the registry-only dependency policy",
+      );
+    }
   });
 
   test("doctor and immutable contract pin the native TypeScript compiler package", async () => {
@@ -191,7 +285,7 @@ describe("platform scaffold and doctor", () => {
       path,
       original.replace(
         "sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==",
-        "sha512-invalid-native-compiler-integrity",
+        `sha512-${"A".repeat(86)}==`,
       ),
     );
 
@@ -514,33 +608,83 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("does not match consumer pin");
   });
 
-  test("protected Socket token reaches the exact scanner version without free-mode fallback", async () => {
-    const authenticated = await loadPinnedScanner("synthetic-regression-token");
-    expect(authenticated.exitCode, authenticated.stderr).toBe(0);
-    expect(authenticated.stdout).not.toContain("Socket Security Scanner free mode");
-
-    const unauthenticated = await loadPinnedScanner();
-    expect(unauthenticated.exitCode, unauthenticated.stderr).toBe(0);
-    expect(unauthenticated.stdout).toContain("Socket Security Scanner free mode");
-
-    for (const workflow of ["application.yml", "socket-firewall.yml"]) {
-      expect(await readFile(join(repoRoot, ".github/workflows", workflow), "utf8")).toContain(
-        "SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}",
-      );
-    }
-    expect(await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8")).toContain(
-      'SOCKET_API_KEY="$(cat /run/secrets/socket_api_token)"',
+  test("Socket credentials are confined to one pre-extraction deploy step", async () => {
+    expect(await readFile(join(repoRoot, "tools/socket-security-scanner.ts"), "utf8")).toBe(
+      await readFile(join(repoRoot, "templates/app/tools/socket-security-scanner.ts"), "utf8"),
     );
+    for (const workflow of ["application.yml", "socket-firewall.yml"]) {
+      const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
+      expect(text).not.toContain("secrets.SOCKET_API_TOKEN");
+      expect(text).not.toContain("environment: dependency-scan");
+      expect(text).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
+      expect(text).toContain("Socket Security Scanner free mode");
+    }
+    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+      const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
+      expect(text.split("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}")).toHaveLength(2);
+      expect(text).toContain(
+        '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
+      );
+      expect(text).not.toContain("socket_api_token=");
+      expect(text.indexOf("Enforce the trusted application and container contract")).toBeLessThan(
+        text.indexOf("Enforce the organization Socket policy before package extraction"),
+      );
+      expect(
+        text.indexOf("Enforce the organization Socket policy before package extraction"),
+      ).toBeLessThan(text.indexOf("Login to Docker Hardened Images"));
+    }
+    const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
+    expect(dockerfile).not.toContain("--mount=type=secret");
+    expect(dockerfile).toContain(
+      "COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts",
+    );
+    expect(dockerfile).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
   });
 
   test("platform pull requests cannot receive the Socket organization token", async () => {
     const workflow = await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8");
-    expect(workflow).toContain("ALLOW_SOCKET_FREE_MODE: ${{ github.event_name != 'push' }}");
     expect(workflow).toContain(
-      "SOCKET_API_KEY: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
+      "SOCKET_API_TOKEN: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
     );
-    expect(workflow).not.toContain("SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}");
+    expect(workflow).not.toContain("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}");
+    expect(workflow).toContain('--config="$GITHUB_WORKSPACE/bunfig.toml" pm scan');
+    expect(workflow).toContain("Platform pull requests must remain credential-free.");
+    expect(workflow).toContain("unset SOCKET_API_TOKEN SOCKET_API_KEY");
     expect(workflow).not.toContain("workflow_dispatch:");
+  });
+
+  test("PR-controlled Docker output cannot issue GitHub runner commands", async () => {
+    for (const [workflowName, buildName] of [
+      ["deploy-preview.yml", "Build untrusted preview image without cloud credentials"],
+      ["deploy-prod.yml", "Build production image without cloud credentials"],
+    ] as const) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      const disable = workflow.indexOf(
+        "Disable workflow commands for untrusted build output",
+      );
+      const build = workflow.indexOf(buildName);
+      const restore = workflow.indexOf(
+        "Restore workflow commands after untrusted build output",
+      );
+      expect(disable).toBeGreaterThan(-1);
+      expect(disable).toBeLessThan(build);
+      expect(build).toBeLessThan(restore);
+      expect(workflow).toContain('token_file="$RUNNER_TEMP/platform-build-command-token"');
+      expect(workflow).toContain("cat /proc/sys/kernel/random/uuid");
+      expect(workflow).toContain("printf '::stop-commands::%s\\n'");
+      expect(workflow.slice(restore, workflow.indexOf("\n      - name:", restore + 1))).toContain(
+        "if: always()",
+      );
+      const actionWindow = workflow.slice(build, restore);
+      expect(actionWindow).toContain(
+        "uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf",
+      );
+      expect(actionWindow).toContain('DOCKER_BUILD_RECORD_UPLOAD: "false"');
+      expect(actionWindow).not.toContain("platform-build-command-token");
+    }
   });
 
   test("Checkov bypasses the action wrapper and accepts only trusted policy mounts", async () => {
@@ -1048,40 +1192,6 @@ async function runVerification(
     [process.execPath, "--no-env-file", "--no-orphans", runner, app],
     {
       cwd: join(repoRoot, "tools/ci"),
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, stdout, stderr };
-}
-
-async function loadPinnedScanner(
-  apiKey?: string,
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const dataHome = await mkdtemp(join(tmpdir(), "platform-socket-test-"));
-  temporaryRoots.push(dataHome);
-  const env = { ...process.env, XDG_DATA_HOME: dataHome };
-  delete env.SOCKET_API_KEY;
-  delete env.SOCKET_API_TOKEN;
-  if (apiKey) {
-    env.SOCKET_API_KEY = apiKey;
-  }
-  const child = Bun.spawn(
-    [
-      process.execPath,
-      "--no-env-file",
-      "--no-orphans",
-      "-e",
-      'await import("./node_modules/@socketsecurity/bun-security-scanner/src/index.ts")',
-    ],
-    {
-      cwd: repoRoot,
-      env,
       stdout: "pipe",
       stderr: "pipe",
     },

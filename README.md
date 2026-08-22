@@ -49,11 +49,13 @@ jobs:
 
 Deploy callers pass no secrets. `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and the
 least-scope `SOCKET_API_TOKEN` live only in the owner-approved `preview-build` and
-`production-build` environments. The same Socket credential lives in the
-owner-approved `dependency-scan` environment used by trusted-main dependency
-checks. Platform pull requests themselves use Socket's secretless policy because
-they control the platform workflow and dependency configuration; the organization
-token is released only after merge on `main`.
+`production-build` environments. Each real preview or production build runs one
+organization-policy scan of the resolved lock before package extraction, then
+removes the Socket credential; Docker and the duplicate application/firewall
+checks use Socket's public policy. The same credential lives in the platform
+repository's owner-approved `dependency-scan` environment for one post-merge
+platform-main scan. Platform pull requests themselves remain secretless because
+they control the trust-root workflow and scanner source.
 Application runtime secret references must be positive numeric Google Secret
 Manager versions encoded in this repository's immutable numeric-repository-ID
 map; repository variables and deploy callers cannot add or redirect them.
@@ -75,7 +77,20 @@ enter wildcard syntax. The workflow validates the public format before mapping
 it to the app's runtime name; Mapbox `sk.*` tokens are rejected. Do not use
 `secrets: inherit` or add secret parameters to deploy callers.
 The Socket token must be admin-visible only, grant only `packages:list`, and be
-rotated and usage-audited on the same schedule as other CI credentials.
+rotated and usage-audited on the same schedule as other CI credentials. The
+canonical dependency-free scanner uses the current org-scoped batch endpoint,
+polls fail closed, validates every NDJSON artifact and summary, and refuses locks
+above the reviewed 128-package ceiling before making a request. The pre-token
+contract also rejects git, GitHub, remote-tarball, file, link, and workspace
+resolutions because Bun 1.4 omits those sources from scanner input; every allowed
+direct and transitive resolution must use the npm registry with an exact version
+and sha512 integrity. Scanner diagnostics are bounded and neutralized before
+GitHub parses re-emitted tool output. Runner command parsing is also disabled
+across the complete PR-controlled Docker build action with a random token that
+is never passed into the build. Socket currently
+charges 100 units per batch and this token has 500 units per hour, so protected
+builds must be serialized to at most five scans per window unless Socket raises
+the token quota.
 
 Cloud publication and Cloud Run mutation use different protected environments
 and identities. Secretless `production-publish` and `preview-publish` jobs can

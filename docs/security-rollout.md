@@ -112,12 +112,15 @@ the recovery object and stop; never rerun from empty state.
 ## Phase A: add the new path
 
 1. Create `preview-build` and `production-build` with only rotated DHI
-   credentials, a least-scope `SOCKET_API_TOKEN`, the exact reviewed
+   credentials, an admin-visible `packages:list`-only `SOCKET_API_TOKEN`, the exact reviewed
    `GRYPE_DB_MANIFEST_JSON` environment secret, and owner approval. The manifest
    is non-confidential, but the secret context prevents repository-variable
    substitution. Create an
-   owner-approved `dependency-scan` environment containing only the same
-   Socket token with admin-only visibility and only the `packages:list` scope.
+   owner-approved `dependency-scan` environment in the platform repository
+   containing only the same Socket token. Consumer verification jobs do not use
+   that environment or credential: the actual preview/production build performs
+   exactly one organization-policy `bun pm scan` before package extraction, and
+   duplicate application/firewall installs plus Docker use the public policy.
    Platform CI must have imported and validated the
    identical `tools/ci/grype-db.json` object first. Never define the manifest or
    these credentials at repository scope. Rotate both protected environment
@@ -142,14 +145,30 @@ the recovery object and stop; never rerun from empty state.
    runtime values.
    Do this before any caller references the new workflow.
    GitHub never releases environment secrets to external-fork or Dependabot
-   pull-request jobs. Those two cases therefore run the pinned Socket scanner in
-   its public free mode after workflow approval; they never receive the org
-   token, DHI credentials, or a cloud preview. Same-repository pull requests and
-   main must fail unless the protected organization token is present.
+   pull-request jobs. They run only the credential-free checks and never receive
+   the org token, DHI credentials, or a cloud preview. Same-repository preview
+   builds and production-main builds fail unless their protected build
+   environment supplies the token. The canonical local scanner is byte-bound to
+   the platform template before release, uses one org-scoped request for at most
+   128 lock entries, checks the free quota endpoint first, polls fail closed, and
+   rejects malformed, duplicate, missing, unresolved, pending, or unexpected
+   results. Bun 1.4 does not submit git, GitHub, remote-tarball, file, link, or
+   workspace resolutions to a security scanner, so the immutable contract and
+   platform-main pre-token boundary must reject every such direct or transitive
+   lock source before claiming complete coverage. Allow only canonical npm
+   registry lock tuples with exact resolved versions and sha512 integrity. At
+   100 quota units per batch and 500 units per hour, serialize the
+   rollout to no more than five protected scans per quota window unless Socket
+   raises the limit; never retry the paid POST automatically.
    Platform pull requests are a separate trust-root case: they always use
    Socket's secretless public policy because the PR controls the workflow and
    dependency configuration. Only the post-merge `main` platform run may enter
-   `dependency-scan` and receive the organization token.
+   `dependency-scan` and receive the organization token. Disable GitHub runner
+   workflow-command parsing across the entire untrusted Docker build action with
+   a fresh random token held only in the runner temporary directory, then restore
+   it in an unconditional next step. This prevents application tests, build code,
+   package diagnostics, and BuildKit relays from forging modern or legacy runner
+   commands or post-action state.
 2. Prepare, but do not merge, consumer PRs that pin every caller and Terraform
    mirror to the reviewed full platform SHA, remove caller-controlled commands
    and cloud inputs, remove production `workflow_dispatch`, remove

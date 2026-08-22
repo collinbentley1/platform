@@ -5,6 +5,8 @@ import { basename, join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
   validateAppScripts,
+  validateRegistryOnlyDependencySpecs,
+  validateRegistryOnlyLock,
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./ci/app-contract";
@@ -32,6 +34,7 @@ const requiredFiles = [
   "tools/format.ts",
   "tools/lint.ts",
   "tools/platform-verify.ts",
+  "tools/socket-security-scanner.ts",
   "infra/terraform/bootstrap/main.tf",
   "infra/terraform/prod/main.tf",
 ];
@@ -58,6 +61,7 @@ const canonicalAppFiles = [
   ".dockerignore",
   "bunfig.toml",
   "tools/platform-verify.ts",
+  "tools/socket-security-scanner.ts",
 ];
 const approvedAdditionalWorkflows: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   // Runsetta's credential-free macOS Swift package check is centralized here so
@@ -141,25 +145,25 @@ async function doctor(repoArgs: string[]): Promise<void> {
       }
     }
 
-    const scanner = "@socketsecurity/bun-security-scanner";
-    const expectedScannerLock = [
-      `${scanner}@1.1.2`,
-      "",
-      {},
-      "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA==",
-    ];
+    const scanner = "./tools/socket-security-scanner.ts";
+    const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
     const lockText = await readText(join(repoPath, "bun.lock"));
     if (lockText) {
       try {
         const lock = Bun.JSONC.parse(lockText) as {
           packages?: Record<string, unknown>;
           patchedDependencies?: unknown;
+          workspaces?: unknown;
         };
         const reviewedLock = Bun.JSONC.parse(
           (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
         ) as { packages?: Record<string, unknown> };
-        if (JSON.stringify(lock.packages?.[scanner]) !== JSON.stringify(expectedScannerLock)) {
-          messages.push("bun.lock does not resolve the reviewed Socket scanner integrity");
+        messages.push(...validateRegistryOnlyLock(lock));
+        if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
+          messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
+        }
+        if (Object.keys(lock.packages ?? {}).length > 128) {
+          messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
         }
         if (Object.hasOwn(lock, "patchedDependencies")) {
           messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
@@ -218,16 +222,31 @@ async function doctor(repoArgs: string[]): Promise<void> {
     if (packageText) {
       try {
         const packageJson = JSON.parse(packageText) as {
+          dependencies?: Record<string, unknown>;
           packageManager?: unknown;
           scripts?: Record<string, unknown>;
           devDependencies?: Record<string, unknown>;
+          optionalDependencies?: Record<string, unknown>;
+          peerDependencies?: Record<string, unknown>;
           patchedDependencies?: unknown;
+          workspaces?: unknown;
         };
         if (packageJson.packageManager !== "bun@1.4.0") {
           messages.push("package.json packageManager must be bun@1.4.0");
         }
         if (packageJson.devDependencies?.typescript !== "7.0.2") {
           messages.push("package.json must pin the reviewed TypeScript version");
+        }
+        messages.push(...validateRegistryOnlyDependencySpecs(packageJson));
+        if (
+          [
+            packageJson.dependencies,
+            packageJson.devDependencies,
+            packageJson.optionalDependencies,
+            packageJson.peerDependencies,
+          ].some((dependencies) => Object.hasOwn(dependencies ?? {}, forbiddenPublishedScanner))
+        ) {
+          messages.push("package.json uses the quota-exhausting published Socket scanner");
         }
         if (Object.hasOwn(packageJson, "patchedDependencies")) {
           messages.push(

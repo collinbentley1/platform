@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { validateTypeScriptLock } from "./ci/app-contract";
+import {
+  validateRegistryOnlyDependencySpecs,
+  validateRegistryOnlyLock,
+  validateTypeScriptLock,
+} from "./ci/app-contract";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -236,8 +240,72 @@ for (const [path, workflow] of [
   requireContains(
     path,
     workflow,
-    "socket_api_token=${{ secrets.SOCKET_API_TOKEN }}",
-    "Container dependency installs must receive only the owner-approved Socket policy credential as a BuildKit secret.",
+    "SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+    "The pre-extraction lock scan must receive the protected Socket organization token.",
+  );
+  requireContains(
+    path,
+    workflow,
+    '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
+    "The protected Socket scan must use the exact checked-out platform policy.",
+  );
+  requireContains(
+    path,
+    workflow,
+    "bun pm scan must not mutate package.json or bun.lock.",
+    "The protected Socket scan must prove it is non-mutating.",
+  );
+  rejectContains(
+    path,
+    workflow,
+    "socket_api_token=",
+    "The Socket organization token must never enter BuildKit or an image layer.",
+  );
+  for (const boundary of [
+    "Disable workflow commands for untrusted build output",
+    "Restore workflow commands after untrusted build output",
+    'token_file="$RUNNER_TEMP/platform-build-command-token"',
+    "cat /proc/sys/kernel/random/uuid",
+    "(umask 077;",
+    "::stop-commands::%s",
+    "if: always()",
+    'unlink "$token_file"',
+    "printf '::%s::\\n'",
+    'DOCKER_BUILD_RECORD_UPLOAD: "false"',
+  ]) {
+    requireContains(
+      path,
+      workflow,
+      boundary,
+      `The untrusted container build is missing the runner-command boundary: ${boundary}`,
+    );
+  }
+  const buildName = path.endsWith("deploy-preview.yml")
+    ? "Build untrusted preview image without cloud credentials"
+    : "Build production image without cloud credentials";
+  requireBefore(
+    path,
+    workflow,
+    "Disable workflow commands for untrusted build output",
+    buildName,
+    "Runner commands must be disabled before PR-controlled Docker output is relayed.",
+  );
+  requireBefore(
+    path,
+    workflow,
+    buildName,
+    "Restore workflow commands after untrusted build output",
+    "Runner commands must remain disabled throughout the PR-controlled Docker build.",
+  );
+  rejectContains(
+    path,
+    sectionBetween(
+      workflow,
+      `      - name: ${buildName}\n`,
+      "      - name: Restore workflow commands after untrusted build output\n",
+    ),
+    "platform-build-command-token",
+    "The random runner-command resume token must not be passed to the container build action.",
   );
 }
 const syftConfig = await read("tools/ci/syft.yaml");
@@ -446,15 +514,29 @@ requireBefore(
   ".github/workflows/deploy-preview.yml",
   deployPreview,
   "Enforce the trusted application and container contract",
+  "Enforce the organization Socket policy before package extraction",
+  "Preview contract validation must finish before the Socket token is exposed.",
+);
+requireBefore(
+  ".github/workflows/deploy-preview.yml",
+  deployPreview,
+  "Enforce the organization Socket policy before package extraction",
   "Login to Docker Hardened Images",
-  "Preview Docker policy must run before registry credentials are exposed.",
+  "Preview Socket policy must finish before registry credentials are exposed.",
 );
 requireBefore(
   ".github/workflows/deploy-prod.yml",
   deployProduction,
   "Enforce the trusted application and container contract",
+  "Enforce the organization Socket policy before package extraction",
+  "Production contract validation must finish before the Socket token is exposed.",
+);
+requireBefore(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "Enforce the organization Socket policy before package extraction",
   "Login to Docker Hardened Images",
-  "Production Docker policy must run before registry credentials are exposed.",
+  "Production Socket policy must finish before registry credentials are exposed.",
 );
 
 for (const workflow of ["application.yml", "socket-firewall.yml", "platform.yml"]) {
@@ -482,15 +564,46 @@ for (const [path, workflow] of [
   [".github/workflows/application.yml", application],
   [".github/workflows/socket-firewall.yml", await read(".github/workflows/socket-firewall.yml")],
 ] as const) {
-  requireContains(path, workflow, "environment: dependency-scan", "Socket organization policy must come from the protected dependency-scan environment.");
-  requireContains(path, workflow, "SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}", "Scanner 1.1.2 must receive the protected organization token through its supported process variable.");
-  requireContains(path, workflow, "Socket Security Scanner free mode", "Socket installs must fail closed if organization policy is unavailable.");
-  requireContains(
+  rejectContains(path, workflow, "environment: dependency-scan", "Duplicate verification jobs must not unlock the paid Socket token.");
+  rejectContains(path, workflow, "secrets.SOCKET_API_TOKEN", "Duplicate verification jobs must remain credential-free.");
+  requireContains(path, workflow, "unset SOCKET_API_TOKEN SOCKET_API_KEY", "Credential-free Socket checks must scrub token aliases.");
+  requireContains(path, workflow, "Socket Security Scanner free mode", "Credential-free Socket checks must prove public-policy execution.");
+  rejectContains(
     path,
     workflow,
-    "github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]'",
-    "Only external-fork and Dependabot pull requests may use Socket's secretless public policy.",
+    "ALLOW_SOCKET_FREE_MODE",
+    "Credential-free verification must not have a branch-dependent secret mode.",
   );
+}
+for (const path of [
+  ".github/workflows/application.yml",
+  ".github/workflows/socket-firewall.yml",
+  ".github/workflows/deploy-preview.yml",
+  ".github/workflows/deploy-prod.yml",
+  ".github/workflows/platform.yml",
+]) {
+  const workflow = await read(path);
+  for (const boundary of [
+    "print_untrusted_output()",
+    "/proc/sys/kernel/random/uuid",
+    "::stop-commands::%s",
+    "printf '::%s::\\n'",
+  ]) {
+    requireContains(
+      path,
+      workflow,
+      boundary,
+      "Captured dependency-tool output must disable GitHub workflow-command parsing while it is re-emitted.",
+    );
+  }
+  for (const variable of ["scan_output", "install_output"]) {
+    rejectContains(
+      path,
+      workflow,
+      `printf '%s\\n' \"$${variable}\"`,
+      "Remote dependency-tool output must not be re-emitted while runner commands are active.",
+    );
+  }
 }
 const platformDependencyWorkflow = await read(".github/workflows/platform.yml");
 requireContains(
@@ -502,19 +615,13 @@ requireContains(
 requireContains(
   ".github/workflows/platform.yml",
   platformDependencyWorkflow,
-  "ALLOW_SOCKET_FREE_MODE: ${{ github.event_name != 'push' }}",
-  "Platform pull requests must use Socket's secretless policy.",
-);
-requireContains(
-  ".github/workflows/platform.yml",
-  platformDependencyWorkflow,
-  "SOCKET_API_KEY: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
+  "SOCKET_API_TOKEN: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}",
   "The Socket organization token must be unavailable to platform pull requests.",
 );
 rejectContains(
   ".github/workflows/platform.yml",
   platformDependencyWorkflow,
-  "SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}",
+  "SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
   "Platform pull requests must never receive the Socket token through an unconditional mapping.",
 );
 rejectContains(
@@ -525,9 +632,16 @@ rejectContains(
 );
 for (const boundary of [
   "PLATFORM_BUN=",
-  "Reject dependency patching before any Socket credential exists",
+  "Reject scanner substitution before any Socket credential exists",
   'Object.hasOwn(packageJson, "patchedDependencies")',
   'Object.hasOwn(lock, "patchedDependencies")',
+  'Object.hasOwn(packageJson, "workspaces")',
+  "must use an exact npm registry version or npm alias",
+  "must be a sha512-pinned npm registry resolution",
+  "bun.lock must contain only the root workspace",
+  'Object.keys(lock.packages ?? {}).length > 128',
+  '--config="$GITHUB_WORKSPACE/bunfig.toml" pm scan',
+  "bun pm scan must not mutate package.json or bun.lock.",
   'tools/ci/verify-platform.ts "$GITHUB_WORKSPACE"',
 ]) {
   requireContains(
@@ -586,7 +700,9 @@ const appPolicy = await read("tools/ci/enforce-app-contract.ts");
 for (const boundary of [
   "canonicalFiles",
   "Bun.JSONC.parse",
-  "bun.lock does not resolve the reviewed Socket scanner integrity",
+  "bun.lock must not resolve the quota-exhausting published Socket scanner",
+  "bun.lock exceeds the reviewed",
+  '"tools/socket-security-scanner.ts"',
   "must exactly match the immutable platform template",
   'name !== ".env.example"',
   "validateAppScripts",
@@ -594,6 +710,8 @@ for (const boundary of [
   "isForbiddenTerraformArtifact",
   "trusted-repository-id",
   "validateTypeScriptLock",
+  "validateRegistryOnlyDependencySpecs",
+  "validateRegistryOnlyLock",
   "package.json patchedDependencies are forbidden",
   "bun.lock patchedDependencies are forbidden",
   "tools/platform-verify.ts",
@@ -619,6 +737,10 @@ for (const boundary of [
   "# BEGIN platform-managed Terraform safety rules",
   "@typescript/typescript-",
   "bun.lock does not resolve the reviewed TypeScript integrity for ${name}",
+  "package.json workspaces are forbidden by the registry-only dependency policy",
+  "must use an exact npm registry version or npm alias",
+  "must be a sha512-pinned npm registry resolution",
+  "bun.lock must contain only the root workspace",
 ]) {
   requireContains(
     "tools/ci/app-contract.ts",
@@ -745,15 +867,63 @@ for (const boundary of [
   "telemetry = false",
   "minimumReleaseAge = 604800",
   'registry = "https://registry.npmjs.org"',
-  'scanner = "@socketsecurity/bun-security-scanner"',
+  'scanner = "./tools/socket-security-scanner.ts"',
 ]) {
   requireContains("bunfig.toml", platformBunfig, boundary, `The platform Bun policy is missing boundary: ${boundary}`);
 }
 requireContains(
   "tools/ci/bunfig.toml",
   trustedCiBunfig,
-  'scanner = "@socketsecurity/bun-security-scanner"',
-  "Trusted Bun execution must pin the Socket scanner.",
+  'scanner = "./tools/socket-security-scanner.ts"',
+  "Trusted Bun execution must use the canonical local Socket scanner.",
+);
+const socketScanner = await read("tools/socket-security-scanner.ts");
+const templateSocketScanner = await read("templates/app/tools/socket-security-scanner.ts");
+if (socketScanner !== templateSocketScanner) {
+  failures.push(
+    "templates/app/tools/socket-security-scanner.ts: scanner must byte-match the reviewed platform implementation.",
+  );
+}
+for (const boundary of [
+  'const socketOrganization = "collinbentley1"',
+  'const authenticatedPackageLimit = 128',
+  'const authenticatedBatchCost = 100',
+  "const maxAlertsPerArtifact = 256",
+  '`${socketApiBase}/quota`',
+  '/orgs/${encodeURIComponent(socketOrganization)}/purl?',
+  'alerts: "true"',
+  'actions: "error,warn"',
+  'poll: "true"',
+  'purlErrors: "true"',
+  'summary: "true"',
+  'redirect: "error"',
+  'parsed._type === "purlError"',
+  'parsed._type === "summary"',
+  'rawAlert.action !== "error" && rawAlert.action !== "warn"',
+  "/^[A-Za-z][A-Za-z0-9_-]{0,127}$/",
+  'rawAlert.type === "pendingScan"',
+  'rawAlert.type === "notFound"',
+  '.replaceAll("::", ": :")',
+  '.replaceAll("##[", "# #[")',
+]) {
+  requireContains(
+    "tools/socket-security-scanner.ts",
+    socketScanner,
+    boundary,
+    `The local Socket scanner is missing fail-closed boundary: ${boundary}`,
+  );
+}
+rejectContains(
+  "tools/socket-security-scanner.ts",
+  socketScanner,
+  "SOCKET_API_KEY",
+  "The local Socket scanner must accept only the canonical least-scope token variable.",
+);
+rejectContains(
+  "tools/socket-security-scanner.ts",
+  socketScanner,
+  "Promise.all(flights)",
+  "The local scanner must not reintroduce the released scanner's shared-array race.",
 );
 
 const socketFirewall = await read(".github/workflows/socket-firewall.yml");
@@ -967,16 +1137,38 @@ const bunfig = await read("templates/app/bunfig.toml");
 const templateLock = await read("templates/app/bun.lock");
 const platformLock = await read("bun.lock");
 const platformPackage = JSON.parse(await read("package.json")) as Record<string, unknown>;
-const parsedTemplateLock = Bun.JSONC.parse(templateLock) as { packages?: Record<string, unknown> };
+const parsedTemplateLock = Bun.JSONC.parse(templateLock) as {
+  packages?: Record<string, unknown>;
+  workspaces?: unknown;
+};
 const parsedPlatformLock = Bun.JSONC.parse(platformLock) as {
   packages?: Record<string, unknown>;
   patchedDependencies?: unknown;
+  workspaces?: unknown;
 };
+for (const failure of validateRegistryOnlyDependencySpecs(platformPackage)) {
+  failures.push(`package.json: ${failure}`);
+}
+for (const failure of validateRegistryOnlyLock(parsedPlatformLock)) {
+  failures.push(`bun.lock: ${failure}`);
+}
+for (const failure of validateRegistryOnlyLock(parsedTemplateLock)) {
+  failures.push(`templates/app/bun.lock: ${failure}`);
+}
 if (Object.hasOwn(platformPackage, "patchedDependencies")) {
   failures.push("package.json: patchedDependencies are forbidden for trusted CI dependencies.");
 }
+if ((await read("package.json")).includes("@socketsecurity/bun-security-scanner")) {
+  failures.push("package.json: the quota-exhausting published Socket scanner is forbidden.");
+}
 if (Object.hasOwn(parsedPlatformLock, "patchedDependencies")) {
   failures.push("bun.lock: patchedDependencies are forbidden for trusted CI dependencies.");
+}
+if (Object.hasOwn(parsedPlatformLock.packages ?? {}, "@socketsecurity/bun-security-scanner")) {
+  failures.push("bun.lock: the quota-exhausting published Socket scanner is forbidden.");
+}
+if (Object.keys(parsedPlatformLock.packages ?? {}).length > 128) {
+  failures.push("bun.lock: exceeds the reviewed 128-package Socket request limit.");
 }
 for (const failure of validateTypeScriptLock(
   parsedPlatformLock.packages,
@@ -998,11 +1190,11 @@ for (const boundary of ["env = false", "telemetry = false", "minimumReleaseAge =
     `The scaffold Bun policy is missing boundary: ${boundary}`,
   );
 }
-requireContains(
+rejectContains(
   "templates/app/bun.lock",
   templateLock,
-  '"@socketsecurity/bun-security-scanner@1.1.2", "", {}, "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA=="',
-  "The scaffold lockfile must retain the reviewed Socket scanner integrity.",
+  "@socketsecurity/bun-security-scanner",
+  "The scaffold lockfile must not include the quota-exhausting published Socket scanner.",
 );
 requireContains(
   "templates/app/bun.lock",
@@ -1021,17 +1213,23 @@ rejectContains("templates/app/Dockerfile", dockerfile, "apt-get", "Container bui
 rejectContains("templates/app/Dockerfile", dockerfile, "curl ", "Container builds must not download executable build inputs over the network.");
 requireContains("templates/app/Dockerfile", dockerfile, "--ignore-scripts", "Docker dependency installs must disable lifecycle scripts.");
 requireContains("templates/app/Dockerfile", dockerfile, "--no-env-file", "Docker dependency installs must disable environment-file loading.");
-requireContains(
+rejectContains(
   "templates/app/Dockerfile",
   dockerfile,
   "--mount=type=secret,id=socket_api_token,required=true",
-  "Docker dependency installs must receive the Socket organization key as an ephemeral required secret mount.",
+  "Docker dependency installs must never receive the Socket organization token.",
 );
 requireContains(
   "templates/app/Dockerfile",
   dockerfile,
   "Socket Security Scanner free mode",
-  "Docker dependency installs must fail closed if Socket falls back to free mode.",
+  "Docker dependency installs must prove the scanner ran without credentials.",
+);
+requireContains(
+  "templates/app/Dockerfile",
+  dockerfile,
+  "COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts",
+  "Docker dependency installs must receive the reviewed local scanner before package extraction.",
 );
 requireContains(
   "templates/app/Dockerfile",

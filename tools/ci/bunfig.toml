@@ -6,4 +6,4 @@ exact = true
 registry = "https://registry.npmjs.org"
 
 [install.security]
-scanner = "@socketsecurity/bun-security-scanner"
+scanner = "./tools/socket-security-scanner.ts"
