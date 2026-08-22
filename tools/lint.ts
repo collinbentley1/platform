@@ -538,6 +538,7 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
     "Prove exact preview publisher workflow-SHA WIF trust",
   ],
 ] as const) {
+  const stagingKind = path === ".github/workflows/deploy-preview.yml" ? "preview" : "production";
   const publish = sectionBetween(workflow, "  publish:\n", "\n  attest:\n");
   const deploy =
     path === ".github/workflows/deploy-preview.yml"
@@ -547,6 +548,111 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
   requireContains(path, publish, publisherAccount, "Image publication must use the dedicated publisher service account.");
   requireContains(path, publish, publisherCanary, "Each publisher claim must have an independent no-role canary exchange.");
   rejectContains(path, publish, deployAccount, "An image publisher job must not authenticate the Cloud Run operator.");
+  for (const packageIdentity of [
+    `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
+    `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
+  ]) {
+    requireContains(
+      path,
+      workflow,
+      packageIdentity,
+      "Each staging image must use a run-and-attempt-unique GHCR package and tag.",
+    );
+  }
+  rejectContains(
+    path,
+    workflow,
+    `-${stagingKind}-staging:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
+    "A shared staging package permits cross-run manifest-version races.",
+  );
+  const copy = sectionBetween(
+    publish,
+    "      - name: Copy the opaque image by digest\n",
+    "\n      - name: Verify registry credentials were retired\n",
+  );
+  const credentialVerification = sectionFrom(
+    publish,
+    "      - name: Verify registry credentials were retired\n",
+  );
+  const cleanup = sectionBetween(
+    workflow,
+    "  cleanup-staging:\n",
+    "\n  attest:\n",
+  );
+  for (const needle of [
+    "set -euo pipefail",
+    'docker_config="$RUNNER_TEMP/platform-publisher-docker"',
+    'trap retire_registry_credentials EXIT',
+    'export DOCKER_CONFIG="$docker_config"',
+    'rm -f -- "$docker_config/config.json"',
+    '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"',
+    'remote_digest="$("$crane" digest "$REMOTE_IMAGE")"',
+    'if [ "$remote_digest" != "$STAGING_DIGEST" ]',
+    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
+  ]) {
+    requireContains(path, copy, needle, `Verified registry copy transaction is missing: ${needle}`);
+  }
+  requireBefore(
+    path,
+    copy,
+    '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"',
+    'remote_digest="$("$crane" digest "$REMOTE_IMAGE")"',
+    "The registry digest must be read only after the opaque copy completes.",
+  );
+  requireBefore(
+    path,
+    copy,
+    'if [ "$remote_digest" != "$STAGING_DIGEST" ]',
+    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
+    "The publisher must reject a changed digest before exporting it.",
+  );
+  rejectContains(path, copy, "continue-on-error", "The verified registry copy transaction must fail closed.");
+  rejectContains(path, copy, "|| true", "The verified registry copy transaction must not suppress failures.");
+  rejectContains(path, publish, '"$crane" delete', "GHCR does not support distribution-spec manifest deletion.");
+  for (const needle of [
+    "set -euo pipefail",
+    'credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"',
+    '[ -e "$credential_file" ] || [ -L "$credential_file" ]',
+  ]) {
+    requireContains(path, credentialVerification, needle, `Registry credential retirement proof is missing: ${needle}`);
+  }
+  for (const needle of [
+    "needs:\n      - build\n      - publish",
+    "if: always() && needs.publish.result == 'success'",
+    "timeout-minutes: 5",
+    "permissions:\n      packages: write",
+    "continue-on-error: true",
+    "timeout-minutes: 2",
+    `package="platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}"`,
+    'tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+    '[[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]',
+    '[[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]',
+    'for candidate_root in user "users/${owner}"; do',
+    '/${candidate_root}/packages/container/${package}/versions?state=active&per_page=100',
+    '.name == $digest',
+    '.metadata.package_type == "container"',
+    '.metadata.container.tags == [$tag]',
+    'if length == 1 then .[0] else error("expected one isolated staging version") end',
+    '[[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]',
+    '/packages/container/${package}/versions/${version_id}',
+    "X-GitHub-Api-Version: 2022-11-28",
+  ]) {
+    requireContains(path, cleanup, needle, `Staging package cleanup is missing: ${needle}`);
+  }
+  rejectContains(path, cleanup, "AR_ACCESS_TOKEN", "Post-copy staging cleanup must not retain Artifact Registry credentials.");
+  rejectContains(path, cleanup, "DOCKER_CONFIG", "Post-copy staging cleanup must run outside the publisher credential directory.");
+  rejectContains(path, cleanup, "id-token", "Post-copy staging cleanup must not be able to mint cloud credentials.");
+  rejectContains(path, cleanup, "environment:", "Post-copy staging cleanup must not enter a protected cloud environment.");
+  rejectContains(path, cleanup, "--paginate", "Post-copy staging cleanup must bound GitHub package enumeration.");
+  rejectContains(path, cleanup, '"$crane" copy', "Post-copy staging cleanup must not recopy the image.");
+  rejectContains(path, cleanup, "|| true", "Staging package cleanup must use explicit fallback branches.");
+  requireBefore(
+    path,
+    workflow,
+    'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
+    "  cleanup-staging:",
+    "Best-effort staging cleanup must occur only after a verified copy exports its digest.",
+  );
   requireContains(path, deploy, deployAccount, "Cloud Run mutation must use the dedicated deploy/operator service account.");
   rejectContains(path, deploy, publisherAccount, "A Cloud Run deploy job must not authenticate the Artifact Registry publisher.");
 }

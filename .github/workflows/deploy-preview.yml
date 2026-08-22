@@ -46,14 +46,14 @@ jobs:
         run: |
           set -euo pipefail
           repository="${GITHUB_REPOSITORY#*/}"
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           if [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] || [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
             echo "Unexpected repository identity." >&2
             exit 1
           fi
           {
             echo "local_image=platform-preview:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "staging_image=ghcr.io/${owner}/platform-${repository}-preview-staging:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "staging_image=ghcr.io/${owner}/platform-${repository}-preview-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout pull request
@@ -482,7 +482,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # Exchange only for the exact-SHA preview image-copy identity.
-      packages: write # Read and delete the isolated GHCR staging image.
+      packages: read # Read only the digest-addressed isolated GHCR staging image.
     outputs:
       image-digest: ${{ steps.copy.outputs.digest }}
       image-name: ${{ steps.app.outputs.image_name }}
@@ -514,7 +514,7 @@ jobs:
             echo "project_id=$project_id"
             echo "image_name=$image_name"
             echo "remote_image=${image_name}:pr-${PR_NUMBER}-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "staging_image=ghcr.io/${source_owner}/platform-${source_repository}-preview-staging:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "staging_image=ghcr.io/${source_owner}/platform-${source_repository}-preview-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "publisher_service_account=gha-preview-publish@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
@@ -567,6 +567,17 @@ jobs:
         run: |
           set -euo pipefail
           crane="$RUNNER_TEMP/platform-tools/crane"
+          docker_config="$RUNNER_TEMP/platform-publisher-docker"
+          if [ -z "$RUNNER_TEMP" ] || [ -e "$docker_config" ] || [ -L "$docker_config" ]; then
+            echo "Refusing an unsafe registry credential directory." >&2
+            exit 1
+          fi
+          install -d -m 0700 "$docker_config"
+          retire_registry_credentials() {
+            rm -f -- "$docker_config/config.json"
+          }
+          trap retire_registry_credentials EXIT
+          export DOCKER_CONFIG="$docker_config"
           if [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Invalid staging digest." >&2
             exit 1
@@ -580,7 +591,91 @@ jobs:
             exit 1
           fi
           echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"
-          "$crane" delete "${STAGING_IMAGE}@${STAGING_DIGEST}"
+
+      - name: Verify registry credentials were retired
+        run: |
+          set -euo pipefail
+          credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"
+          if [ -e "$credential_file" ] || [ -L "$credential_file" ]; then
+            echo "Registry credentials survived the verified copy step." >&2
+            exit 1
+          fi
+
+  cleanup-staging:
+    name: Retire copied GitHub staging package version
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - publish
+    if: always() && needs.publish.result == 'success'
+    timeout-minutes: 5
+    permissions:
+      packages: write # Delete only the uniquely matched isolated GHCR staging version.
+
+    steps:
+      - name: Delete the unique exact staging package version
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGING_DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          repository="${GITHUB_REPOSITORY#*/}"
+          package="platform-${repository}-preview-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+             [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
+             [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] ||
+             [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
+             [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::warning::Refusing malformed isolated staging package cleanup."
+            exit 1
+          fi
+
+          versions="$RUNNER_TEMP/staging-package-versions.json"
+          version_id=""
+          package_api_root=""
+          for candidate_root in user "users/${owner}"; do
+            if gh api \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "/${candidate_root}/packages/container/${package}/versions?state=active&per_page=100" \
+              > "$versions"; then
+              candidate_id=""
+              if candidate_id="$(jq -er --arg digest "$STAGING_DIGEST" --arg tag "$tag" '
+                [
+                    .[]
+                    | select(
+                        .name == $digest and
+                        .metadata.package_type == "container" and
+                        .metadata.container.tags == [$tag] and
+                        (.id | type) == "number" and
+                        .id > 0 and
+                        (.id | floor) == .id
+                      )
+                    | .id
+                  ]
+                | if length == 1 then .[0] else error("expected one isolated staging version") end
+              ' "$versions" 2>/dev/null)" && [[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]; then
+                version_id="$candidate_id"
+                package_api_root="$candidate_root"
+                break
+              fi
+            fi
+          done
+          if [[ ! "$version_id" =~ ^[1-9][0-9]*$ ]] || [ -z "$package_api_root" ]; then
+            echo "::warning::GitHub staging package cleanup found no unique exact version."
+            exit 1
+          fi
+          if ! gh api --method DELETE \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "/${package_api_root}/packages/container/${package}/versions/${version_id}"; then
+            echo "::warning::GitHub staging package cleanup failed after the verified registry copy."
+            exit 1
+          fi
 
   attest:
     name: Attest preview image and SBOM

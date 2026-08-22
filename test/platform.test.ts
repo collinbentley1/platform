@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -1326,6 +1326,281 @@ describe("platform scaffold and doctor", () => {
     expect(bootstrap).not.toContain(
       'member             = "serviceAccount:${google_service_account.preview_operator.email}"',
     );
+  });
+
+  test("verified registry copies are isolated from exact-version staging cleanup", async () => {
+    const copyRuns: string[] = [];
+    const cleanupRuns: string[] = [];
+    const occurrences = (value: string, needle: string) => value.split(needle).length - 1;
+    for (const [workflowName, stagingKind] of [
+      ["deploy-prod.yml", "production"],
+      ["deploy-preview.yml", "preview"],
+    ] as const) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      const runTag = "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}";
+      expect(workflow).toContain(
+        `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      );
+      expect(workflow).toContain(
+        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      );
+      expect(workflow).not.toContain(`-${stagingKind}-staging:${runTag}`);
+      const parsed = Bun.YAML.parse(workflow) as {
+        jobs: Record<string, Record<string, unknown>>;
+      };
+      const publish = parsed.jobs.publish;
+      const publishSteps = publish.steps as Array<Record<string, unknown>>;
+      const copyIndex = publishSteps.findIndex(
+        (step) => step.name === "Copy the opaque image by digest",
+      );
+      const verifyIndex = publishSteps.findIndex(
+        (step) => step.name === "Verify registry credentials were retired",
+      );
+      const authIndex = publishSteps.findIndex((step) => step.id === "auth");
+      expect(copyIndex).toBe(authIndex + 1);
+      expect(verifyIndex).toBe(copyIndex + 1);
+      expect(verifyIndex).toBe(publishSteps.length - 1);
+      expect(publish.permissions).toEqual({
+        contents: "read",
+        "id-token": "write",
+        packages: "read",
+      });
+
+      const copy = publishSteps[copyIndex];
+      expect(Object.keys(copy).sort()).toEqual(["env", "id", "name", "run"]);
+      expect(copy.id).toBe("copy");
+      expect(copy.env).toEqual({
+        AR_ACCESS_TOKEN: "${{ steps.auth.outputs.access_token }}",
+        GH_TOKEN: "${{ github.token }}",
+        REMOTE_IMAGE: "${{ steps.app.outputs.remote_image }}",
+        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
+        STAGING_IMAGE: "${{ steps.app.outputs.staging_image }}",
+      });
+      const copyRun = copy.run as string;
+      copyRuns.push(copyRun);
+      expect(copyRun.startsWith("set -euo pipefail\n")).toBe(true);
+      expect(occurrences(copyRun, '"$crane" auth login')).toBe(2);
+      expect(
+        occurrences(copyRun, '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"'),
+      ).toBe(1);
+      expect(occurrences(copyRun, '"$crane" digest "$REMOTE_IMAGE"')).toBe(1);
+      expect(occurrences(copyRun, 'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"')).toBe(1);
+      expect(copyRun).toContain('docker_config="$RUNNER_TEMP/platform-publisher-docker"');
+      expect(copyRun).toContain('trap retire_registry_credentials EXIT');
+      expect(copyRun).toContain('export DOCKER_CONFIG="$docker_config"');
+      expect(copyRun).toContain('rm -f -- "$docker_config/config.json"');
+      expect(copyRun.indexOf('"$crane" copy')).toBeLessThan(
+        copyRun.indexOf('remote_digest="$("$crane" digest'),
+      );
+      expect(copyRun.indexOf('if [ "$remote_digest" != "$STAGING_DIGEST" ]')).toBeLessThan(
+        copyRun.indexOf('echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"'),
+      );
+      expect(copyRun).not.toContain("|| true");
+
+      const verify = publishSteps[verifyIndex];
+      expect(Object.keys(verify).sort()).toEqual(["name", "run"]);
+      expect(verify.run).toBe(
+        "set -euo pipefail\n" +
+          'credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"\n' +
+          'if [ -e "$credential_file" ] || [ -L "$credential_file" ]; then\n' +
+          '  echo "Registry credentials survived the verified copy step." >&2\n' +
+          "  exit 1\n" +
+          "fi\n",
+      );
+
+      const cleanup = parsed.jobs["cleanup-staging"];
+      expect(Object.keys(cleanup).sort()).toEqual([
+        "if",
+        "name",
+        "needs",
+        "permissions",
+        "runs-on",
+        "steps",
+        "timeout-minutes",
+      ]);
+      expect(cleanup.needs).toEqual(["build", "publish"]);
+      expect(cleanup.if).toBe("always() && needs.publish.result == 'success'");
+      expect(cleanup["timeout-minutes"]).toBe(5);
+      expect(cleanup.permissions).toEqual({ packages: "write" });
+      const cleanupSteps = cleanup.steps as Array<Record<string, unknown>>;
+      expect(cleanupSteps).toHaveLength(1);
+      const cleanupStep = cleanupSteps[0];
+      expect(Object.keys(cleanupStep).sort()).toEqual([
+        "continue-on-error",
+        "env",
+        "name",
+        "run",
+        "timeout-minutes",
+      ]);
+      expect(cleanupStep["continue-on-error"]).toBe(true);
+      expect(cleanupStep["timeout-minutes"]).toBe(2);
+      expect(cleanupStep.env).toEqual({
+        GH_TOKEN: "${{ github.token }}",
+        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
+      });
+      const cleanupRun = cleanupStep.run as string;
+      cleanupRuns.push(cleanupRun);
+      expect(cleanupRun.startsWith("set -euo pipefail\n")).toBe(true);
+      expect(cleanupRun).toContain(
+        `package="platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}"`,
+      );
+      expect(cleanupRun).not.toContain("--paginate");
+      expect(cleanupRun).not.toContain("AR_ACCESS_TOKEN");
+      expect(cleanupRun).not.toContain("DOCKER_CONFIG");
+      expect(cleanupRun).not.toContain("steps.auth");
+      expect(cleanupRun).not.toContain("us-east4-docker.pkg.dev");
+      expect(occurrences(cleanupRun, "gh api")).toBe(2);
+      expect(occurrences(cleanupRun, "gh api --method DELETE")).toBe(1);
+      expect(
+        occurrences(cleanupRun, '/packages/container/${package}/versions/${version_id}'),
+      ).toBe(1);
+      expect(occurrences(cleanupRun, "versions?state=active&per_page=100")).toBe(1);
+      expect(cleanupRun).not.toContain("|| true");
+    }
+
+    expect(copyRuns[0]).toBe(copyRuns[1]);
+    expect(cleanupRuns[0].replace("production-staging-", "KIND-staging-")).toBe(
+      cleanupRuns[1].replace("preview-staging-", "KIND-staging-"),
+    );
+
+    const digest = `sha256:${"a".repeat(64)}`;
+    const tag = "run-123-1";
+    const exact = {
+      id: 123,
+      metadata: { container: { tags: [tag] }, package_type: "container" },
+      name: digest,
+    };
+    const fixtures = [
+      { versions: [exact], valid: true },
+      { versions: [{ ...exact, name: `sha256:${"b".repeat(64)}` }], valid: false },
+      {
+        versions: [{ ...exact, metadata: { ...exact.metadata, container: { tags: ["wrong"] } } }],
+        valid: false,
+      },
+      {
+        versions: [
+          { ...exact, metadata: { ...exact.metadata, container: { tags: [tag, "other"] } } },
+        ],
+        valid: false,
+      },
+      { versions: [{ ...exact, metadata: { ...exact.metadata, package_type: "npm" } }], valid: false },
+      { versions: [{ id: 123, name: digest }], valid: false },
+      { versions: [exact, { ...exact, id: 124 }], valid: false },
+      { versions: [{ ...exact, id: "123" }], valid: false },
+      { versions: [{ ...exact, id: 123.5 }], valid: false },
+      { versions: [{ ...exact, id: 0 }], valid: false },
+      { versions: [{ ...exact, id: -1 }], valid: false },
+      { versions: [{ ...exact, id: null }], valid: false },
+      { versions: [{ ...exact, id: true }], valid: false },
+    ];
+    for (const cleanupRun of cleanupRuns) {
+      const match = cleanupRun.match(
+        /jq -er --arg digest "\$STAGING_DIGEST" --arg tag "\$tag" '\n([\s\S]*?)\n\s+' "\$versions" 2>\/dev\/null/,
+      );
+      expect(match).not.toBeNull();
+      const predicate = match?.[1] ?? "";
+      for (const fixture of fixtures) {
+        const child = Bun.spawn(
+          ["jq", "-er", "--arg", "digest", digest, "--arg", "tag", tag, predicate],
+          {
+            stdin: new Blob([JSON.stringify(fixture.versions)]),
+            stdout: "ignore",
+            stderr: "ignore",
+          },
+        );
+        expect((await child.exited) === 0).toBe(fixture.valid);
+      }
+    }
+
+    const harnessRoot = await mkdtemp(join(tmpdir(), "platform-ghcr-cleanup-"));
+    temporaryRoots.push(harnessRoot);
+    const fakeBin = join(harnessRoot, "bin");
+    await mkdir(fakeBin);
+    const fakeGh = join(fakeBin, "gh");
+    await writeFile(
+      fakeGh,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        '[ "$1" = "api" ]',
+        "shift",
+        'delete_request="0"',
+        'previous=""',
+        'endpoint=""',
+        'for argument in "$@"; do',
+        '  if [ "$previous" = "--method" ] && [ "$argument" = "DELETE" ]; then',
+        '    delete_request="1"',
+        "  fi",
+        '  previous="$argument"',
+        '  endpoint="$argument"',
+        "done",
+        'if [ "$delete_request" = "1" ]; then',
+        '  printf \'%s\\n\' "$endpoint" >> "$FAKE_GH_CAPTURE"',
+        "  exit 0",
+        "fi",
+        'case "$endpoint" in',
+        '  /user/packages/*) [ "${FAKE_GH_FAIL_USER:-0}" != "1" ] || exit 1 ;;',
+        "esac",
+        'cat "$FAKE_GH_FIXTURE"',
+        "",
+      ].join("\n"),
+    );
+    await chmod(fakeGh, 0o755);
+
+    const functionalFixtures = [
+      { versions: [exact], expectedId: 123, failUser: false },
+      { versions: [{ ...exact, id: 987654321 }], expectedId: 987654321, failUser: true },
+      ...fixtures.filter((fixture) => !fixture.valid).map((fixture) => ({
+        versions: fixture.versions,
+        expectedId: null,
+        failUser: false,
+      })),
+    ];
+    for (const [runIndex, cleanupRun] of cleanupRuns.entries()) {
+      const stagingKind = runIndex === 0 ? "production" : "preview";
+      for (const [fixtureIndex, fixture] of functionalFixtures.entries()) {
+        const runnerTemp = join(harnessRoot, `runner-${runIndex}-${fixtureIndex}`);
+        await mkdir(runnerTemp);
+        const fixturePath = join(runnerTemp, "fixture.json");
+        const capturePath = join(runnerTemp, "delete.txt");
+        await writeFile(fixturePath, JSON.stringify(fixture.versions));
+        const child = Bun.spawn(["/bin/bash", "-c", cleanupRun], {
+          env: {
+            FAKE_GH_CAPTURE: capturePath,
+            FAKE_GH_FAIL_USER: fixture.failUser ? "1" : "0",
+            FAKE_GH_FIXTURE: fixturePath,
+            GH_TOKEN: "test-token",
+            GITHUB_REPOSITORY: "collinbentley1/cdbentley",
+            GITHUB_REPOSITORY_OWNER: "collinbentley1",
+            GITHUB_RUN_ATTEMPT: "1",
+            GITHUB_RUN_ID: "123",
+            PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            RUNNER_TEMP: runnerTemp,
+            STAGING_DIGEST: digest,
+          },
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        const exitCode = await child.exited;
+        const stderr = await new Response(child.stderr).text();
+        const deletes = (await Bun.file(capturePath).exists())
+          ? (await Bun.file(capturePath).text()).trim().split("\n").filter(Boolean)
+          : [];
+        if (fixture.expectedId === null) {
+          expect(exitCode).not.toBe(0);
+          expect(deletes).toEqual([]);
+        } else {
+          const apiRoot = fixture.failUser ? "/users/collinbentley1" : "/user";
+          expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+          expect(deletes).toEqual([
+            `${apiRoot}/packages/container/platform-cdbentley-${stagingKind}-staging-123-1/versions/${fixture.expectedId}`,
+          ]);
+        }
+      }
+    }
   });
 
   test("image policy blocks an unfixable High vulnerability", async () => {
