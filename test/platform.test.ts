@@ -769,6 +769,30 @@ describe("platform scaffold and doctor", () => {
     expect(infrastructure).toContain("--skip-path '(^|/)work(/|$)'");
     expect(infrastructure).not.toContain("--skip-path work");
     expect(infrastructure).not.toContain('uses: docker://ghcr.io/bridgecrewio/checkov@');
+    expect(infrastructure).toContain("Terraform policy search failed closed.");
+    expect(infrastructure).toContain("Terraform module search failed closed for $root.");
+    expect(infrastructure).toContain("Platform reference search failed closed.");
+    expect(infrastructure).toContain("Checkov suppression search failed closed.");
+    expect(infrastructure).not.toMatch(/grep -R/);
+  });
+
+  test("hosted-runner workflows do not depend on ambient ripgrep", async () => {
+    for (const workflowName of [
+      "application.yml",
+      "socket-firewall.yml",
+      "infrastructure.yml",
+      "deploy-prod.yml",
+      "deploy-preview.yml",
+      "cleanup-preview.yml",
+      "reconcile-previews.yml",
+      "platform.yml",
+    ]) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      expect(workflow).not.toMatch(/\brg\b/);
+    }
   });
 
   test("SBOM attest jobs consume the exact uploaded artifact and verify its content", async () => {
