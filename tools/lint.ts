@@ -29,6 +29,11 @@ for (const workflow of platformWorkflows) {
   const path = `.github/workflows/${workflow}`;
   const text = await read(path);
   checkActionPins(path, text, false);
+  if (/\brg\b/.test(text)) {
+    failures.push(
+      `${path}: Hosted-runner workflows must use baseline grep instead of assuming ambient ripgrep.`,
+    );
+  }
   rejectContains(
     path,
     text,

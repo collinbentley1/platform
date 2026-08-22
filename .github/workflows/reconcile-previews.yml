@@ -188,7 +188,7 @@ jobs:
               verify_stable_preview_absent "$pr_number" "$preview_tag"
             done < <(jq -r '.status.traffic[]? | select(.tag != null) | [.tag, (.revisionName // "")] | @tsv' "$service_json")
           else
-            if rg -qi 'not[ _-]?found|could not be found|404' "$describe_error"; then
+            if grep -Eqi 'not[ _-]?found|could not be found|404' "$describe_error"; then
               echo "Shared preview service $service does not exist yet."
             else
               cat "$describe_error" >&2
@@ -206,7 +206,7 @@ jobs:
             --project="$PROJECT_ID" \
             --region="$REGION" \
             --format=json > "$legacy_json" 2> "$list_error"; then
-            if rg -qi 'permission.denied|permission denied|forbidden|403' "$list_error"; then
+            if grep -Eqi 'permission.denied|permission denied|forbidden|403' "$list_error"; then
               echo "Project-wide service listing is unavailable; scoped preview IAM is active."
               exit 0
             fi

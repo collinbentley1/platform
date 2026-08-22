@@ -155,7 +155,7 @@ jobs:
             --region="$REGION" \
             --project="$PROJECT_ID" \
             --format=json > "$service_json" 2> "$describe_error"; then
-            if rg -qi 'not[ _-]?found|could not be found|404' "$describe_error"; then
+            if grep -Eqi 'not[ _-]?found|could not be found|404' "$describe_error"; then
               echo "Preview service $preview_service does not exist; nothing to invalidate."
               verify_stable_preview_absent
               exit 0
