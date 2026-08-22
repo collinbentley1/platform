@@ -1,6 +1,100 @@
 export const expectedVerifyScript =
   "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci";
 
+const dependencyGroups = [
+  "dependencies",
+  "devDependencies",
+  "optionalDependencies",
+  "peerDependencies",
+] as const;
+const exactSemanticVersion =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const npmPackageName = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+const sha512Integrity = /^sha512-[A-Za-z0-9+/]{86}==$/;
+
+type DependencyManifest = Partial<Record<(typeof dependencyGroups)[number], unknown>> & {
+  readonly workspaces?: unknown;
+};
+
+type BunTextLock = {
+  readonly packages?: unknown;
+  readonly workspaces?: unknown;
+};
+
+/**
+ * Bun 1.4 only submits npm-registry resolutions to its security scanner. Keep
+ * every declared dependency on an exact registry version so git, GitHub,
+ * tarball, file, link, workspace, tag, range, and npm-alias specs cannot bypass
+ * the organization policy.
+ */
+export function validateRegistryOnlyDependencySpecs(manifest: DependencyManifest): string[] {
+  const failures: string[] = [];
+
+  if (Object.hasOwn(manifest, "workspaces")) {
+    failures.push("package.json workspaces are forbidden by the registry-only dependency policy");
+  }
+
+  for (const group of dependencyGroups) {
+    const dependencies = manifest[group];
+    if (dependencies === undefined) {
+      continue;
+    }
+    if (!isRecord(dependencies)) {
+      failures.push(`package.json ${group} must be an object`);
+      continue;
+    }
+    for (const [name, specifier] of Object.entries(dependencies)) {
+      if (!npmPackageName.test(name) || typeof specifier !== "string" || !isRegistrySpecifier(specifier)) {
+        failures.push(
+          `package.json ${group}.${name} must use an exact npm registry version or npm alias`,
+        );
+      }
+    }
+  }
+
+  return failures;
+}
+
+/**
+ * Treat the frozen text lock as hostile input. A registry package has Bun's
+ * four-field shape, an exact name/version resolution, the default registry
+ * marker, and sha512 integrity. Other source tags use a different shape and
+ * are deliberately rejected before the protected scanner credential exists.
+ */
+export function validateRegistryOnlyLock(lock: BunTextLock): string[] {
+  const failures: string[] = [];
+  if (!isRecord(lock.workspaces) || Object.keys(lock.workspaces).length !== 1 || !("" in lock.workspaces)) {
+    failures.push("bun.lock must contain only the root workspace");
+  }
+  if (!isRecord(lock.packages)) {
+    return [...failures, "bun.lock packages must be an object"];
+  }
+
+  for (const [key, entry] of Object.entries(lock.packages)) {
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 4 ||
+      typeof entry[0] !== "string" ||
+      entry[1] !== "" ||
+      !isRecord(entry[2]) ||
+      typeof entry[3] !== "string" ||
+      !sha512Integrity.test(entry[3])
+    ) {
+      failures.push(`bun.lock package ${key} must be a sha512-pinned npm registry resolution`);
+      continue;
+    }
+
+    const separator = entry[0].lastIndexOf("@");
+    const name = entry[0].slice(0, separator);
+    const version = entry[0].slice(separator + 1);
+    if (separator < 1 || !npmPackageName.test(name) || !exactSemanticVersion.test(version)) {
+      failures.push(`bun.lock package ${key} must resolve to an exact npm registry package version`);
+    }
+  }
+
+  return failures;
+}
+
 const expectedScripts: Readonly<Record<string, string>> = {
   verify: expectedVerifyScript,
   "verify:ci": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build",
@@ -126,5 +220,25 @@ export function isForbiddenTerraformArtifact(relativePath: string): boolean {
     /\.tflock(?:\..+)?$/.test(name) ||
     /\.tfvars(?:\..+)?$/.test(name) ||
     /(?:^|_)override\.tf(?:\.json)?$/.test(name)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRegistrySpecifier(value: string): boolean {
+  if (exactSemanticVersion.test(value)) {
+    return true;
+  }
+  if (!value.startsWith("npm:")) {
+    return false;
+  }
+  const resolution = value.slice("npm:".length);
+  const separator = resolution.lastIndexOf("@");
+  return (
+    separator > 0 &&
+    npmPackageName.test(resolution.slice(0, separator)) &&
+    exactSemanticVersion.test(resolution.slice(separator + 1))
   );
 }

@@ -3,22 +3,20 @@ import { join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
   validateAppScripts,
+  validateRegistryOnlyDependencySpecs,
+  validateRegistryOnlyLock,
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./app-contract";
 
-const scanner = "@socketsecurity/bun-security-scanner";
-const expectedScannerLock = [
-  `${scanner}@1.1.2`,
-  "",
-  {},
-  "sha512-TdsAg6SMolubyZ6HfIjLWlANfHvhV6i7pdWof4OQ33zPEwXJm2ilA755levHMR618MKq22+06Ag8efiVKowxqA==",
-];
+const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
+const maximumReviewedPackages = 128;
 const canonicalFiles = [
   "Dockerfile",
   ".dockerignore",
   "bunfig.toml",
   "tools/platform-verify.ts",
+  "tools/socket-security-scanner.ts",
 ];
 const requiredFiles = [
   ...canonicalFiles,
@@ -65,10 +63,14 @@ for (const file of canonicalFiles) {
 }
 
 const packageJson = JSON.parse(await readFile(join(appRoot, "package.json"), "utf8")) as {
+  dependencies?: Record<string, unknown>;
   packageManager?: unknown;
   scripts?: Record<string, unknown>;
   devDependencies?: Record<string, unknown>;
+  optionalDependencies?: Record<string, unknown>;
+  peerDependencies?: Record<string, unknown>;
   patchedDependencies?: unknown;
+  workspaces?: unknown;
 };
 const platformConfig = JSON.parse(
   await readFile(join(appRoot, ".platform/config.json"), "utf8"),
@@ -81,8 +83,19 @@ if (platformConfig.githubRepositoryId !== trustedRepositoryId) {
 if (packageJson.packageManager !== "bun@1.4.0") {
   throw new Error("package.json packageManager must be bun@1.4.0.");
 }
-if (packageJson.devDependencies?.[scanner] !== "1.1.2") {
-  throw new Error("package.json must pin the reviewed Socket scanner version.");
+const registryDependencyFailures = validateRegistryOnlyDependencySpecs(packageJson);
+if (registryDependencyFailures.length > 0) {
+  throw new Error(registryDependencyFailures.join("\n"));
+}
+if (
+  [
+    packageJson.dependencies,
+    packageJson.devDependencies,
+    packageJson.optionalDependencies,
+    packageJson.peerDependencies,
+  ].some((dependencies) => Object.hasOwn(dependencies ?? {}, forbiddenPublishedScanner))
+) {
+  throw new Error("package.json must not use the quota-exhausting published Socket scanner.");
 }
 if (packageJson.devDependencies?.typescript !== "7.0.2") {
   throw new Error("package.json must pin the reviewed TypeScript version.");
@@ -105,12 +118,22 @@ if (gitignoreFailures.length > 0) {
 const lock = Bun.JSONC.parse(await readFile(join(appRoot, "bun.lock"), "utf8")) as {
   packages?: Record<string, unknown>;
   patchedDependencies?: unknown;
+  workspaces?: unknown;
 };
 const reviewedLock = Bun.JSONC.parse(
   await readFile(join(templateRoot, "bun.lock"), "utf8"),
 ) as { packages?: Record<string, unknown> };
-if (JSON.stringify(lock.packages?.[scanner]) !== JSON.stringify(expectedScannerLock)) {
-  throw new Error("bun.lock does not resolve the reviewed Socket scanner integrity.");
+const registryLockFailures = validateRegistryOnlyLock(lock);
+if (registryLockFailures.length > 0) {
+  throw new Error(registryLockFailures.join("\n"));
+}
+if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
+  throw new Error("bun.lock must not resolve the quota-exhausting published Socket scanner.");
+}
+if (Object.keys(lock.packages ?? {}).length > maximumReviewedPackages) {
+  throw new Error(
+    `bun.lock exceeds the reviewed ${maximumReviewedPackages}-package Socket request limit.`,
+  );
 }
 if (Object.hasOwn(lock, "patchedDependencies")) {
   throw new Error("bun.lock patchedDependencies are forbidden for trusted CI dependencies.");

@@ -10,7 +10,6 @@ jobs:
   firewall:
     name: Socket Firewall
     runs-on: ubuntu-24.04
-    environment: dependency-scan
 
     steps:
       - name: Checkout
@@ -77,25 +76,37 @@ jobs:
               "${{ github.event.repository.id }}"
           )
 
-      - name: Run Bun install with Socket scanner
-        env:
-          ALLOW_SOCKET_FREE_MODE: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') }}
-          # Scanner 1.1.2 still consumes the legacy process variable. The
-          # protected GitHub secret keeps Socket's current token naming.
-          SOCKET_API_KEY: ${{ secrets.SOCKET_API_TOKEN }}
+      - name: Scan the resolved lock with the public Socket policy
         run: |
           set -euo pipefail
-          if [[ -z "$SOCKET_API_KEY" && "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
-            echo "The Socket organization token is required outside an external-fork or Dependabot pull request." >&2
+          print_untrusted_output() {
+            local stop_marker
+            stop_marker="$(cat /proc/sys/kernel/random/uuid)"
+            printf '::stop-commands::%s\n' "$stop_marker"
+            printf '%s\n' "$1"
+            printf '::%s::\n' "$stop_marker"
+          }
+          if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
+            echo "Committed node_modules content is forbidden before the Socket scan." >&2
             exit 1
           fi
+          before="$(sha256sum package.json bun.lock)"
+          unset SOCKET_API_TOKEN SOCKET_API_KEY
           unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
-          if ! install_output="$(bun --no-env-file --no-orphans install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org 2>&1)"; then
-            printf '%s\n' "$install_output"
+          if ! scan_output="$(bun --no-env-file --config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan 2>&1)"; then
+            print_untrusted_output "$scan_output"
             exit 1
           fi
-          printf '%s\n' "$install_output"
-          if grep -Fq 'Socket Security Scanner free mode' <<< "$install_output" && [[ "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
-            echo "Socket must enforce the owner-approved organization policy." >&2
+          print_untrusted_output "$scan_output"
+          if ! grep -Fq 'Socket Security Scanner free mode' <<< "$scan_output"; then
+            echo "The standalone Socket check must remain credential-free." >&2
+            exit 1
+          fi
+          if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
+            echo "bun pm scan must not create node_modules." >&2
+            exit 1
+          fi
+          if [[ "$(sha256sum package.json bun.lock)" != "$before" ]]; then
+            echo "bun pm scan must not mutate package.json or bun.lock." >&2
             exit 1
           fi

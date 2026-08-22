@@ -46,45 +46,149 @@ jobs:
           echo "PLATFORM_BUN=$destination/bun-linux-x64/bun" >> "$GITHUB_ENV"
           "$destination/bun-linux-x64/bun" -e 'if (Bun.version !== "1.4.0") process.exit(1)'
 
-      - name: Reject dependency patching before any Socket credential exists
+      - name: Reject scanner substitution before any Socket credential exists
         env:
+          BUNFIG_PATH: ${{ github.workspace }}/bunfig.toml
           LOCK_PATH: ${{ github.workspace }}/bun.lock
           PACKAGE_PATH: ${{ github.workspace }}/package.json
+          SCANNER_PATH: ${{ github.workspace }}/tools/socket-security-scanner.ts
         run: |
           set -euo pipefail
+          for trusted_file in "$BUNFIG_PATH" "$LOCK_PATH" "$PACKAGE_PATH" "$SCANNER_PATH"; do
+            if [ ! -f "$trusted_file" ] || [ -L "$trusted_file" ] || [ "$(realpath -e -- "$trusted_file")" != "$trusted_file" ]; then
+              echo "Trusted dependency policy files must be canonical regular files." >&2
+              exit 1
+            fi
+          done
           (
             cd "$RUNNER_TEMP"
             "$PLATFORM_BUN" --no-env-file --no-orphans -e '
               const packageJson = JSON.parse(await Bun.file(Bun.env.PACKAGE_PATH).text());
               const lock = Bun.JSONC.parse(await Bun.file(Bun.env.LOCK_PATH).text());
+              const groups = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+              const exactVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+              const packageName = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+              const integrity = /^sha512-[A-Za-z0-9+/]{86}==$/;
+              const isRecord = value => typeof value === "object" && value !== null && !Array.isArray(value);
+              const isRegistrySpecifier = value => {
+                if (typeof value !== "string") return false;
+                if (exactVersion.test(value)) return true;
+                if (!value.startsWith("npm:")) return false;
+                const resolution = value.slice(4);
+                const separator = resolution.lastIndexOf("@");
+                return separator > 0 && packageName.test(resolution.slice(0, separator)) && exactVersion.test(resolution.slice(separator + 1));
+              };
               if (Object.hasOwn(packageJson, "patchedDependencies") || Object.hasOwn(lock, "patchedDependencies")) {
                 throw new Error("Bun patchedDependencies are forbidden for trusted CI dependencies.");
+              }
+              if (Object.hasOwn(packageJson, "workspaces")) {
+                throw new Error("package.json workspaces are forbidden by the registry-only dependency policy.");
+              }
+              for (const group of groups) {
+                const dependencies = packageJson[group];
+                if (dependencies === undefined) continue;
+                if (!isRecord(dependencies)) throw new Error("package.json " + group + " must be an object.");
+                for (const [name, specifier] of Object.entries(dependencies)) {
+                  if (!packageName.test(name) || !isRegistrySpecifier(specifier)) {
+                    throw new Error("package.json " + group + "." + name + " must use an exact npm registry version or npm alias.");
+                  }
+                }
+              }
+              if (!isRecord(lock.workspaces) || Object.keys(lock.workspaces).length !== 1 || !("" in lock.workspaces)) {
+                throw new Error("bun.lock must contain only the root workspace.");
+              }
+              if (!isRecord(lock.packages)) throw new Error("bun.lock packages must be an object.");
+              for (const [key, entry] of Object.entries(lock.packages)) {
+                if (!Array.isArray(entry) || entry.length !== 4 || typeof entry[0] !== "string" || entry[1] !== "" || !isRecord(entry[2]) || typeof entry[3] !== "string" || !integrity.test(entry[3])) {
+                  throw new Error("bun.lock package " + key + " must be a sha512-pinned npm registry resolution.");
+                }
+                const separator = entry[0].lastIndexOf("@");
+                if (separator < 1 || !packageName.test(entry[0].slice(0, separator)) || !exactVersion.test(entry[0].slice(separator + 1))) {
+                  throw new Error("bun.lock package " + key + " must resolve to an exact npm registry package version.");
+                }
+              }
+              const publishedScanner = "@socketsecurity/bun-security-scanner";
+              for (const group of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+                if (Object.hasOwn(packageJson[group] ?? {}, publishedScanner)) {
+                  throw new Error("The quota-exhausting published Socket scanner is forbidden.");
+                }
+              }
+              if (Object.hasOwn(lock.packages ?? {}, publishedScanner)) {
+                throw new Error("The quota-exhausting published Socket scanner is forbidden in bun.lock.");
+              }
+              if (Object.keys(lock.packages ?? {}).length > 128) {
+                throw new Error("bun.lock exceeds the reviewed 128-package Socket request limit.");
               }
             '
           )
 
-      - name: Install dependencies
+      - name: Scan the resolved lock with Socket
         env:
-          ALLOW_SOCKET_FREE_MODE: ${{ github.event_name != 'push' }}
-          SOCKET_API_KEY: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}
+          SOCKET_API_TOKEN: ${{ github.event_name == 'push' && secrets.SOCKET_API_TOKEN || '' }}
         run: |
           set -euo pipefail
+          print_untrusted_output() {
+            local stop_marker
+            stop_marker="$(cat /proc/sys/kernel/random/uuid)"
+            printf '::stop-commands::%s\n' "$stop_marker"
+            printf '%s\n' "$1"
+            printf '::%s::\n' "$stop_marker"
+          }
           if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
             echo "Committed node_modules content is forbidden before the Socket credential is released." >&2
             exit 1
           fi
-          if [[ -z "$SOCKET_API_KEY" && "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
-            echo "The Socket organization token is required outside an external-fork or Dependabot pull request." >&2
+          if [[ "${{ github.event_name }}" == "push" && -z "$SOCKET_API_TOKEN" ]]; then
+            echo "The Socket organization token is required on protected main." >&2
             exit 1
           fi
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            unset SOCKET_API_TOKEN
+          fi
+          unset SOCKET_API_KEY
+          unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
+          before="$(sha256sum package.json bun.lock)"
+          if ! scan_output="$("$PLATFORM_BUN" --no-env-file --config="$GITHUB_WORKSPACE/bunfig.toml" pm scan 2>&1)"; then
+            print_untrusted_output "$scan_output"
+            exit 1
+          fi
+          print_untrusted_output "$scan_output"
+          if [[ "${{ github.event_name }}" == "push" ]] && grep -Fq 'Socket Security Scanner free mode' <<< "$scan_output"; then
+            echo "Protected main must enforce the organization Socket policy." >&2
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" != "push" ]] && ! grep -Fq 'Socket Security Scanner free mode' <<< "$scan_output"; then
+            echo "Platform pull requests must remain credential-free." >&2
+            exit 1
+          fi
+          if find . -name node_modules -not -path './.git/*' -print -quit | grep -q .; then
+            echo "bun pm scan must not create node_modules." >&2
+            exit 1
+          fi
+          if [[ "$(sha256sum package.json bun.lock)" != "$before" ]]; then
+            echo "bun pm scan must not mutate package.json or bun.lock." >&2
+            exit 1
+          fi
+
+      - name: Install dependencies without a Socket credential
+        run: |
+          set -euo pipefail
+          print_untrusted_output() {
+            local stop_marker
+            stop_marker="$(cat /proc/sys/kernel/random/uuid)"
+            printf '::stop-commands::%s\n' "$stop_marker"
+            printf '%s\n' "$1"
+            printf '::%s::\n' "$stop_marker"
+          }
+          unset SOCKET_API_TOKEN SOCKET_API_KEY
           unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY
           if ! install_output="$(bun --no-env-file --no-orphans install --frozen-lockfile --ignore-scripts --registry=https://registry.npmjs.org 2>&1)"; then
-            printf '%s\n' "$install_output"
+            print_untrusted_output "$install_output"
             exit 1
           fi
-          printf '%s\n' "$install_output"
-          if grep -Fq 'Socket Security Scanner free mode' <<< "$install_output" && [[ "$ALLOW_SOCKET_FREE_MODE" != "true" ]]; then
-            echo "Socket must enforce the owner-approved organization policy." >&2
+          print_untrusted_output "$install_output"
+          if ! grep -Fq 'Socket Security Scanner free mode' <<< "$install_output"; then
+            echo "Dependency installation must remain credential-free." >&2
             exit 1
           fi
 

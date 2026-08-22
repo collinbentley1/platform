@@ -62,8 +62,10 @@ commit SHA. Deploy callers pass no secrets and must never use `secrets: inherit`
 The `preview-build` and `production-build` environments contain only the DHI
 registry credentials, an admin-visible `packages:list`-only Socket policy token,
 and the reviewed, non-confidential Grype database manifest stored as an
-environment secret for integrity. The owner-approved `dependency-scan`
-environment contains only the Socket key. Runtime secrets stay in `production`.
+environment secret for integrity. Only the platform repository's owner-approved
+`dependency-scan` environment contains the same Socket token for trusted-main
+verification; consumer duplicate checks remain credential-free. Runtime secrets
+stay in `production`.
 The secretless `production-publish` and `preview-publish` environments are
 separate approval and OIDC claim boundaries. Their publisher identities have
 Writer on only the matching Artifact Registry repository, no Cloud Run role,
@@ -82,10 +84,28 @@ Production environments accept only protected `main`. `preview-publish` and
 `preview-cloud` require owner approval before an untrusted image can cross first
 the service-scoped preview repository and then the no-data preview runtime
 boundary.
-External-fork and Dependabot pull requests never receive environment secrets;
-their required dependency checks use Socket's secretless public mode and cannot
-build or deploy a cloud preview. Organization policy is mandatory for
-same-repository pull requests and `main`.
+External-fork and Dependabot pull requests never receive environment secrets and
+cannot build or deploy a cloud preview. All application/firewall verification and
+Docker dependency installs use Socket's public mode. Organization policy is
+mandatory exactly once before package extraction in every same-repository preview
+build and production-main build. The canonical dependency-free scanner is an
+immutable app-contract file, rejects more than 128 lock packages before any
+request, uses the org-scoped batch endpoint, and validates complete fail-closed
+NDJSON results. Because Bun 1.4 omits git, GitHub, remote-tarball, file, link,
+and workspace resolutions from its scanner payload, the pre-token contract
+forbids those sources in both direct specifications and transitive lock entries.
+Every allowed lock entry must be a canonical exact-version npm resolution with
+sha512 integrity; exact `npm:` aliases are allowed only when their resolved lock
+entry satisfies that same registry shape. Remote alert text is length/control
+bounded and captured dependency-tool output is re-emitted only while GitHub
+workflow-command parsing is disabled with a fresh random marker. The token never
+enters BuildKit or an image layer. The same parser boundary spans the complete
+Docker build action because pull-request tests and build code can write arbitrary
+stdout from inside BuildKit. Its random resume token stays in a mode-0600 runner
+temporary file that is neither an action input nor a build argument/secret, and
+an unconditional following step restores command parsing even when the build
+fails. Docker's default build-record artifact upload is disabled; the explicitly
+identified, content-digested SBOM remains the build job's only artifact.
 
 ## Runtime Configuration
 
