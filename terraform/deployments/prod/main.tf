@@ -27,6 +27,7 @@ locals {
       container_env                     = {}
       runtime_secret_ids                = []
       runtime_secret_accessor_ids       = []
+      runtime_secret_version_adder_ids  = []
       firestore_database                = null
       bootstrap_runtime_service_account = "cloud-run-bootstrap@cdbentley.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@cdbentley.iam.gserviceaccount.com"
@@ -60,6 +61,7 @@ locals {
       # runtime may not read their payloads until reviewed numeric versions are
       # encoded in the platform deployment policy.
       runtime_secret_accessor_ids       = []
+      runtime_secret_version_adder_ids  = []
       firestore_database                = null
       bootstrap_runtime_service_account = "cloud-run-bootstrap@runsetta.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@runsetta.iam.gserviceaccount.com"
@@ -86,8 +88,15 @@ locals {
         MEDLOCK_VERSION  = "0.2.0"
         WAITLIST_BACKEND = "firestore"
       }
-      runtime_secret_ids          = []
-      runtime_secret_accessor_ids = []
+      runtime_secret_ids = [
+        "waitlist-identity-keyset",
+      ]
+      runtime_secret_accessor_ids = [
+        "waitlist-identity-keyset",
+      ]
+      runtime_secret_version_adder_ids = [
+        "waitlist-identity-keyset",
+      ]
       firestore_database = {
         name                         = "(default)"
         location_id                  = "nam5"
@@ -114,6 +123,7 @@ locals {
       container_env                     = {}
       runtime_secret_ids                = []
       runtime_secret_accessor_ids       = []
+      runtime_secret_version_adder_ids  = []
       firestore_database                = null
       bootstrap_runtime_service_account = "cloud-run-bootstrap@critical-history-16823277.iam.gserviceaccount.com"
       runtime_service_account           = "cloud-run-runtime@critical-history-16823277.iam.gserviceaccount.com"
@@ -172,5 +182,6 @@ module "site" {
   container_env                           = local.deployment.container_env
   runtime_secret_ids                      = local.deployment.runtime_secret_ids
   runtime_secret_accessor_ids             = local.deployment.runtime_secret_accessor_ids
+  runtime_secret_version_adder_ids        = local.deployment.runtime_secret_version_adder_ids
   firestore_database                      = local.deployment.firestore_database
 }

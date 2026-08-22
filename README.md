@@ -47,9 +47,11 @@ jobs:
     uses: collinbentley1/platform/.github/workflows/application.yml@0123456789abcdef0123456789abcdef01234567 # v0.5.0
 ```
 
-Deploy callers forward exactly five named secret slots and never use
-`secrets: inherit`. The reusable deploy contracts explicitly declare only those
-names; each approved called-job environment supplies and overrides the value.
+Preview deploy callers forward exactly five named secret slots and production
+callers forward the same five plus Medlock's `WAITLIST_IDENTITY_KEYSET`; neither
+uses `secrets: inherit`. The reusable deploy contracts explicitly declare only
+those names, and each approved called-job environment supplies and overrides the
+value.
 `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and the
 least-scope `SOCKET_API_TOKEN` live only in the owner-approved `preview-build` and
 `production-build` environments. Each real preview or production build runs one
@@ -59,9 +61,14 @@ checks use Socket's public policy. The same credential lives in the platform
 repository's owner-approved `dependency-scan` environment for one post-merge
 platform-main scan. Platform pull requests themselves remain secretless because
 they control the trust-root workflow and scanner source.
-Application runtime secret references must be positive numeric Google Secret
-Manager versions encoded in this repository's immutable numeric-repository-ID
-map; repository variables and deploy callers cannot add or redirect them.
+Application runtime secret names and grants are encoded in this repository's
+immutable numeric-repository-ID map; repository variables and deploy callers
+cannot add or redirect them. Medlock's trusted production deploy reuses the
+current exact version when its keyset fingerprint matches; otherwise it streams
+the approved keyset into a new version of the one declared secret and validates
+the returned positive numeric version. Cloud Run is bound to that exact version.
+Mutable aliases such as `latest` are forbidden, and the payload never enters
+Terraform state or Cloud Run's literal environment configuration.
 Runsetta is deliberately offline, its old secret containers are retained for
 recovery, and its runtime service account has no accessor grant. Critical
 History's `MAPBOX_PUBLIC_TOKEN` is the narrow exception because the app returns
@@ -78,7 +85,7 @@ Mapbox documents URL restrictions as best-effort abuse controls, not an
 authorization boundary; never grant a browser token confidential scopes. Do not
 enter wildcard syntax. The workflow validates the public format before mapping
 it to the app's runtime name; Mapbox `sk.*` tokens are rejected. Do not use
-`secrets: inherit` or add any caller secret mapping beyond the five reviewed names.
+`secrets: inherit` or add any caller secret mapping beyond the reviewed contract.
 The Socket token must be admin-visible only, grant only `packages:list`, and be
 rotated and usage-audited on the same schedule as other CI credentials. The
 canonical dependency-free scanner uses the current org-scoped batch endpoint,
@@ -102,7 +109,10 @@ Writer on exactly one Artifact Registry repository and no Cloud Run or runtime
 `actAs` access. `production` and `preview-cloud` use separate deploy identities
 with the service-scoped Cloud Run role, `actAs` on only the matching runtime,
 and Reader on only the matching image repository, as Cloud Run requires; they
-cannot upload or delete artifacts. `preview-operations` uses
+cannot upload or delete artifacts. Medlock's production deploy identity alone
+also has Secret Version Adder on exactly `waitlist-identity-keyset`; it cannot
+read, list, disable, or destroy versions, and every other deploy identity has no
+secret grant. `preview-operations` uses
 the existing `gha-preview-deploy` identity through the distinct
 `attribute.preview_operator_workflow_sha` WIF path. Cloud Run revalidates the
 service identity and image during `gcloud run services update-traffic`, so the

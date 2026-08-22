@@ -68,7 +68,7 @@ variable "preview_ingress" {
 }
 
 variable "prod_deploy_service_account_email" {
-  description = "Production deploy service account email; receives service update, exact runtime actAs, and exact-repository Artifact Registry Reader only."
+  description = "Production deploy service account email; receives service update, exact runtime actAs, exact-repository Artifact Registry Reader, and only declared exact-secret version-add grants."
   type        = string
 }
 
@@ -112,6 +112,17 @@ variable "runtime_secret_accessor_ids" {
   validation {
     condition     = length(setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)) == 0
     error_message = "runtime_secret_accessor_ids must be a subset of runtime_secret_ids."
+  }
+}
+
+variable "runtime_secret_version_adder_ids" {
+  description = "Declared runtime secret IDs to which the production deploy identity may add immutable versions. Secure default is no access."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = length(setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)) == 0
+    error_message = "runtime_secret_version_adder_ids must be a subset of runtime_secret_ids."
   }
 }
 

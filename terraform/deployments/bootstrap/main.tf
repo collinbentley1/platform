@@ -140,6 +140,7 @@ locals {
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
         "run.googleapis.com",
+        "secretmanager.googleapis.com",
         "serviceusage.googleapis.com",
         "storage.googleapis.com",
         "sts.googleapis.com",

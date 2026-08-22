@@ -20,7 +20,7 @@ function visit(
   references: SecretContextReference[],
 ): void {
   if (typeof value === "string") {
-    if (secretContextToken.test(value)) {
+    if (containsSecretContextReference(value)) {
       references.push({ job: jobFor(path), path: path.join("."), value });
     }
     return;
@@ -40,11 +40,55 @@ function visit(
   }
 
   for (const [key, item] of Object.entries(value)) {
-    if (secretContextToken.test(key)) {
+    if (/^secrets$/i.test(key) || containsSecretContextReference(key)) {
       references.push({ job: jobFor(path), path: [...path, `<key:${key}>`].join("."), value: key });
     }
     visit(item, [...path, key], nestedAncestors, references);
   }
+}
+
+function containsSecretContextReference(value: string): boolean {
+  let offset = 0;
+  while (offset < value.length) {
+    const start = value.indexOf("${{", offset);
+    if (start < 0) {
+      return false;
+    }
+
+    let quote: "'" | '"' | undefined;
+    let index = start + 3;
+    for (; index < value.length - 1; index += 1) {
+      const character = value[index];
+      if (quote) {
+        if (character === quote) {
+          if (quote === "'" && value[index + 1] === "'") {
+            index += 1;
+          } else {
+            quote = undefined;
+          }
+        } else if (quote === '"' && character === "\\") {
+          index += 1;
+        }
+        continue;
+      }
+      if (character === "'" || character === '"') {
+        quote = character;
+        continue;
+      }
+      if (character === "}" && value[index + 1] === "}") {
+        const expression = value.slice(start, index + 2);
+        if (secretContextToken.test(expression)) {
+          return true;
+        }
+        offset = index + 2;
+        break;
+      }
+    }
+    if (index >= value.length - 1) {
+      return secretContextToken.test(value.slice(start));
+    }
+  }
+  return false;
 }
 
 function jobFor(path: Array<number | string>): string | null {

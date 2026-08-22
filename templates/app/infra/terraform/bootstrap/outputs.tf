@@ -19,7 +19,7 @@ output "terraform_service_account_email" {
 }
 
 output "prod_deploy_service_account_email" {
-  description = "Cloud Run deploy service account with read-only access to the exact production image repository."
+  description = "Cloud Run deploy service account with read-only access to the exact production image repository and only declared exact-secret version-add grants."
   value       = module.bootstrap.prod_deploy_service_account_email
 }
 

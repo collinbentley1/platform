@@ -24,4 +24,5 @@ module "site" {
   preview_publisher_service_account_email = var.preview_publisher_service_account_email
   runtime_secret_ids                      = var.runtime_secret_ids
   runtime_secret_accessor_ids             = var.runtime_secret_accessor_ids
+  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids
 }

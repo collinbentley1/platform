@@ -98,10 +98,11 @@ variable "preview_operator_transition_workflow_shas" {
 
   validation {
     condition = (
+      length(var.preview_operator_transition_workflow_shas) <= 1 &&
       alltrue([for sha in var.preview_operator_transition_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))]) &&
       length(setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)) == 0
     )
-    error_message = "preview_operator_transition_workflow_shas must contain only trusted full lowercase commit SHAs."
+    error_message = "preview_operator_transition_workflow_shas must contain at most one trusted full lowercase commit SHA."
   }
 }
 
@@ -158,7 +159,7 @@ variable "terraform_service_account_description" {
 variable "prod_deploy_service_account_description" {
   description = "Description for the production deploy service account."
   type        = string
-  default     = "Updates only the pre-created production Cloud Run service and reads its exact image repository from protected main."
+  default     = "Updates only the pre-created production Cloud Run service, reads its exact image repository, and may add versions only to platform-declared exact secrets from protected main."
 }
 
 variable "prod_publisher_service_account_description" {

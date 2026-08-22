@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, cp, lstat, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
@@ -10,6 +10,7 @@ import {
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./ci/app-contract";
+import { validateTerraformMirrorContract } from "./ci/terraform-mirror-contract";
 
 type PlatformConfig = {
   readonly name?: string;
@@ -36,7 +37,21 @@ const requiredFiles = [
   "tools/platform-verify.ts",
   "tools/socket-security-scanner.ts",
   "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
   "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
+  "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
+  "infra/terraform/prod/.terraform.lock.hcl",
+];
+const requiredDirectories = [
+  "infra",
+  "infra/terraform",
+  "infra/terraform/bootstrap",
+  "infra/terraform/prod",
 ];
 const workflowFiles = [
   "application.yml",
@@ -62,7 +77,21 @@ const canonicalAppFiles = [
   "bunfig.toml",
   "tools/platform-verify.ts",
   "tools/socket-security-scanner.ts",
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/prod/.terraform.lock.hcl",
 ];
+const allowedTerraformMirrorFiles = new Set([
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
+  "infra/terraform/prod/.terraform.lock.hcl",
+  "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
+  "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
+]);
 const approvedAdditionalWorkflows: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   // Runsetta's credential-free macOS Swift package check is centralized here so
   // a consumer PR cannot add or alter an executable workflow without a platform review.
@@ -103,10 +132,16 @@ switch (command) {
 async function doctor(repoArgs: string[]): Promise<void> {
   const repos = repoArgs.length > 0 ? repoArgs : ["."];
   const expectedWorkflowSha = Bun.env.PLATFORM_WORKFLOW_SHA;
+  const trustedRepositoryId = Bun.env.TRUSTED_GITHUB_REPOSITORY_ID;
   let failures = 0;
 
   if (expectedWorkflowSha !== undefined && !isFullCommitSha(expectedWorkflowSha)) {
     throw new Error("PLATFORM_WORKFLOW_SHA must be a full lowercase commit SHA when provided.");
+  }
+  if (trustedRepositoryId !== undefined && !/^[1-9][0-9]*$/.test(trustedRepositoryId)) {
+    throw new Error(
+      "TRUSTED_GITHUB_REPOSITORY_ID must be a positive numeric ID when provided.",
+    );
   }
 
   for (const repo of repos) {
@@ -114,9 +149,27 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const repoName = basename(repoPath);
     const messages: string[] = [];
 
+    for (const directory of requiredDirectories) {
+      const metadata = await lstat(join(repoPath, directory)).catch((error: unknown) => {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      });
+      if (!metadata) {
+        messages.push(`missing ${directory}`);
+      } else if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        messages.push(`${directory} must be a real, non-symbolic-link directory`);
+      }
+    }
+
     for (const file of requiredFiles) {
-      if (!(await exists(join(repoPath, file)))) {
+      const metadata = await lstat(join(repoPath, file)).catch((error: unknown) => {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      });
+      if (!metadata) {
         messages.push(`missing ${file}`);
+      } else if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        messages.push(`${file} must be a regular, non-symbolic-link file`);
       }
     }
 
@@ -148,34 +201,38 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const scanner = "./tools/socket-security-scanner.ts";
     const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
     const lockText = await readText(join(repoPath, "bun.lock"));
-    if (lockText) {
-      try {
-        const lock = Bun.JSONC.parse(lockText) as {
-          packages?: Record<string, unknown>;
-          patchedDependencies?: unknown;
-          workspaces?: unknown;
-        };
-        const reviewedLock = Bun.JSONC.parse(
-          (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
-        ) as { packages?: Record<string, unknown> };
-        messages.push(...validateRegistryOnlyLock(lock));
-        if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
-          messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
-        }
-        if (Object.keys(lock.packages ?? {}).length > 128) {
-          messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
-        }
-        if (Object.hasOwn(lock, "patchedDependencies")) {
-          messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
-        }
-        messages.push(...validateTypeScriptLock(lock.packages, reviewedLock.packages));
-      } catch {
+    if (lockText !== undefined) {
+      if (lockText.trim().length === 0) {
         messages.push("bun.lock is not valid JSONC");
+      } else {
+        try {
+          const lock = Bun.JSONC.parse(lockText) as {
+            packages?: Record<string, unknown>;
+            patchedDependencies?: unknown;
+            workspaces?: unknown;
+          };
+          const reviewedLock = Bun.JSONC.parse(
+            (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
+          ) as { packages?: Record<string, unknown> };
+          messages.push(...validateRegistryOnlyLock(lock));
+          if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
+            messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
+          }
+          if (Object.keys(lock.packages ?? {}).length > 128) {
+            messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
+          }
+          if (Object.hasOwn(lock, "patchedDependencies")) {
+            messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
+          }
+          messages.push(...validateTypeScriptLock(lock.packages, reviewedLock.packages));
+        } catch {
+          messages.push("bun.lock is not valid JSONC");
+        }
       }
     }
 
     const bunfigText = await readText(join(repoPath, "bunfig.toml"));
-    if (bunfigText) {
+    if (bunfigText !== undefined) {
       try {
         const bunfig = Bun.TOML.parse(bunfigText) as {
           install?: {
@@ -216,10 +273,72 @@ async function doctor(repoArgs: string[]): Promise<void> {
       if (!config.githubRepositoryId || !/^[1-9][0-9]*$/.test(config.githubRepositoryId)) {
         messages.push(".platform/config.json githubRepositoryId must be a positive numeric ID");
       }
+      if (
+        trustedRepositoryId !== undefined &&
+        config.githubRepositoryId !== trustedRepositoryId
+      ) {
+        messages.push(
+          ".platform/config.json githubRepositoryId must match the immutable GitHub event repository ID",
+        );
+      }
+    }
+
+    if (config?.projectId && (trustedRepositoryId ?? config.githubRepositoryId)) {
+      const [
+        bootstrapMain,
+        bootstrapOutputs,
+        bootstrapVariables,
+        bootstrapVersions,
+        productionMain,
+        productionOutputs,
+        productionVariables,
+        productionVersions,
+      ] = await Promise.all([
+        readText(join(repoPath, "infra/terraform/bootstrap/main.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/outputs.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/variables.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/versions.tf")),
+        readText(join(repoPath, "infra/terraform/prod/main.tf")),
+        readText(join(repoPath, "infra/terraform/prod/outputs.tf")),
+        readText(join(repoPath, "infra/terraform/prod/variables.tf")),
+        readText(join(repoPath, "infra/terraform/prod/versions.tf")),
+      ]);
+      if (
+        bootstrapMain !== undefined &&
+        bootstrapOutputs !== undefined &&
+        bootstrapVariables !== undefined &&
+        bootstrapVersions !== undefined &&
+        productionMain !== undefined &&
+        productionOutputs !== undefined &&
+        productionVariables !== undefined &&
+        productionVersions !== undefined
+      ) {
+        messages.push(
+          ...validateTerraformMirrorContract(
+            {
+              expectedPlatformSha: expectedWorkflowSha,
+              githubRepositoryId: trustedRepositoryId ?? config.githubRepositoryId!,
+              name: config.name,
+              projectId: config.projectId,
+              serviceName: config.serviceName,
+            },
+            {
+              bootstrapMain,
+              bootstrapOutputs,
+              bootstrapVariables,
+              bootstrapVersions,
+              productionMain,
+              productionOutputs,
+              productionVariables,
+              productionVersions,
+            },
+          ),
+        );
+      }
     }
 
     const packageText = await readText(join(repoPath, "package.json"));
-    if (packageText) {
+    if (packageText !== undefined) {
       try {
         const packageJson = JSON.parse(packageText) as {
           dependencies?: Record<string, unknown>;
@@ -269,6 +388,9 @@ async function doctor(repoArgs: string[]): Promise<void> {
     for (const path of await trackedFiles(repoPath)) {
       if (isForbiddenTerraformArtifact(path)) {
         messages.push(`forbidden committed Terraform state/config artifact ${path}`);
+      }
+      if (isAdditionalTerraformMirrorFile(path)) {
+        messages.push(`unreviewed additional Terraform mirror file ${path}`);
       }
     }
 
@@ -402,7 +524,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
     }
 
     const bootstrapText = await readText(join(repoPath, "infra/terraform/bootstrap/main.tf"));
-    if (bootstrapText) {
+    if (bootstrapText !== undefined) {
       let uniqueTrustedRefs: Set<string> | undefined;
       const trustedBlock = bootstrapText.match(
         /^\s*trusted_platform_workflow_shas\s*=\s*\[([^\]]*)\]/m,
@@ -425,18 +547,16 @@ async function doctor(repoArgs: string[]): Promise<void> {
           }
         }
         uniqueTrustedRefs = new Set(trustedRefs);
-        if (
-          invalidLine ||
-          trustedRefs.length !== uniqueTrustedRefs.size ||
-          trustedRefs.length < 1 ||
-          trustedRefs.length > 2
-        ) {
+        if (invalidLine || trustedRefs.length !== 1 || uniqueTrustedRefs.size !== 1) {
           messages.push(
-            "trusted_platform_workflow_shas must contain one or two unique full commit SHAs",
+            "trusted_platform_workflow_shas must contain exactly one full commit SHA",
           );
         }
-        if (platformRef !== "unknown" && !uniqueTrustedRefs.has(platformRef)) {
-          messages.push("trusted_platform_workflow_shas must include the active platform SHA");
+        if (
+          platformRef !== "unknown" &&
+          (trustedRefs.length !== 1 || trustedRefs[0] !== platformRef)
+        ) {
+          messages.push("trusted_platform_workflow_shas must contain only the active platform SHA");
         }
         for (const ref of uniqueTrustedRefs) {
           if (forbiddenPreMigrationWorkflowShas.has(ref)) {
@@ -489,9 +609,9 @@ async function doctor(repoArgs: string[]): Promise<void> {
           "preview_operations_active_workflow_shas must contain the active platform SHA",
         );
       }
-      if (transitionOperatorRefs && transitionOperatorRefs.size > 1) {
+      if (transitionOperatorRefs && transitionOperatorRefs.size !== 0) {
         messages.push(
-          "preview_operator_transition_workflow_shas may contain at most one immediately previous SHA",
+          "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
         );
       }
       if (activeOperatorRefs && transitionOperatorRefs) {
@@ -507,11 +627,6 @@ async function doctor(repoArgs: string[]): Promise<void> {
           ) {
             messages.push(
               "preview operator active and transition workflow SHA sets must exactly partition trusted_platform_workflow_shas",
-            );
-          }
-          if (uniqueTrustedRefs.size === 1 && transitionOperatorRefs.size !== 0) {
-            messages.push(
-              "preview_operator_transition_workflow_shas must be empty at steady state",
             );
           }
         }
@@ -654,6 +769,21 @@ function isNotFound(error: unknown): boolean {
 
 function isFullCommitSha(value: string): boolean {
   return /^[0-9a-f]{40}$/.test(value);
+}
+
+function isAdditionalTerraformMirrorFile(path: string): boolean {
+  return isTerraformMirrorPath(path) && !allowedTerraformMirrorFiles.has(path);
+}
+
+function isTerraformMirrorPath(path: string): boolean {
+  return (
+    path === "infra" ||
+    path === "infra/terraform" ||
+    path === "infra/terraform/bootstrap" ||
+    path === "infra/terraform/prod" ||
+    path.startsWith("infra/terraform/bootstrap/") ||
+    path.startsWith("infra/terraform/prod/")
+  );
 }
 
 function escapeRegExp(value: string): string {

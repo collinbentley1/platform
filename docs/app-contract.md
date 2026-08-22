@@ -58,24 +58,30 @@ the pinned TypeScript entrypoint by its exact installed path. The package script
 are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
-commit SHA. Deploy callers forward exactly the five reviewed secret names and
-must never use `secrets: inherit`. The reusable deploy contracts declare only
-those names; the protected called-job environment supplies and overrides each
-value after approval, and callers cannot redirect them.
+commit SHA. Deploy callers forward only the reviewed five-name preview or
+six-name production secret contract and must never use `secrets: inherit`. The
+reusable deploy contracts declare only those names; the protected called-job
+environment supplies and overrides each value after approval, and callers
+cannot redirect them.
 The `preview-build` and `production-build` environments contain only the DHI
 registry credentials, an admin-visible `packages:list`-only Socket policy token,
 and the reviewed, non-confidential Grype database manifest stored as an
 environment secret for integrity. Only the platform repository's owner-approved
 `dependency-scan` environment contains the same Socket token for trusted-main
-verification; consumer duplicate checks remain credential-free. Runtime secrets
-stay in `production`.
+verification; consumer duplicate checks remain credential-free. Medlock alone
+receives its rotatable waitlist-cookie signing keyset in `production`; its
+trusted preview deploy generates a revision-local key without a stored preview
+credential. Other confidential runtime values stay in `production`.
 The secretless `production-publish` and `preview-publish` environments are
 separate approval and OIDC claim boundaries. Their publisher identities have
 Writer on only the matching Artifact Registry repository, no Cloud Run role,
 and no runtime-service-account `actAs`. The `production` and `preview-cloud`
 deploy identities can update only the pre-created matching Cloud Run service,
 `actAs` only as its matching runtime, and read only its exact image repository;
-they cannot upload or delete registry artifacts. The `preview-operations`
+they cannot upload or delete registry artifacts. Medlock's production deployer
+alone may add a version to exactly `waitlist-identity-keyset`; it cannot read,
+list, disable, or destroy versions, and all other deployers have zero Secret
+Manager grants. The `preview-operations`
 workflows authenticate `gha-preview-deploy` through the distinct
 `attribute.preview_operator_workflow_sha` claim path. Cloud Run revalidates the
 attached service identity and image during `update-traffic`, so the API-minimum
@@ -128,12 +134,17 @@ Product-specific runtime configuration is an immutable numeric-repository-ID map
 in the reviewed platform workflow and Terraform root. Repository variables cannot
 add environment values, Secret Manager mappings, or enable cloud deployment.
 Pull request code is never executed on the runner after Google authentication,
-and preview deployments use an identity with no production data access. A future
-runtime secret mapping must name a positive numeric Secret Manager version in
-platform code; mutable aliases such as `latest` are forbidden. Declaring a secret
-container does not grant its payload to a runtime: `runtime_secret_accessor_ids`
-defaults to empty and must be a subset of the retained containers. Runsetta stays
-offline with no runtime accessor grants until reviewed versions are encoded.
+and preview deployments use an identity with no production data access. Runtime
+secret mappings must use positive numeric Secret Manager versions; mutable aliases
+such as `latest` are forbidden. Medlock's secret name and both least-privilege
+grants are fixed in the repository-ID map. Its trusted production deploy adds a
+version over standard input only when the current keyset fingerprint differs,
+validates the returned resource name, and passes only that numeric version
+reference to Cloud Run. An unchanged keyset reuses the existing exact version.
+Declaring a secret container grants no payload access: both `runtime_secret_accessor_ids` and
+`runtime_secret_version_adder_ids` default to empty and must be subsets of the
+retained containers. Runsetta stays offline with no runtime accessor or version-
+adder grants.
 
 The sole client-token exception is Critical History's `MAPBOX_PUBLIC_TOKEN`.
 Because every browser receives it, this is public configuration rather than a

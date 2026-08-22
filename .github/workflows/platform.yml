@@ -303,7 +303,10 @@ jobs:
           done
 
       - name: Test protected bootstrap input validation
-        run: terraform -chdir=terraform/deployments/bootstrap test -no-color
+        run: |
+          terraform -chdir=terraform/deployments/bootstrap test -no-color
+          terraform -chdir=terraform/modules/bootstrap init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=terraform/modules/bootstrap test -no-color
 
       - name: Test stable preview-domain selection
         run: terraform -chdir=terraform/deployments/exposure test -no-color
