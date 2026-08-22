@@ -101,17 +101,6 @@ resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader
   member     = "serviceAccount:${var.preview_deploy_service_account_email}"
 }
 
-# Removing a Cloud Run traffic tag makes the service reconcile the referenced
-# revision. Grant only the one permission observed to be required, on only the
-# preview repository; the operator gets no repository metadata/listing access.
-resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader" {
-  project    = var.project_id
-  location   = google_artifact_registry_repository.preview.location
-  repository = google_artifact_registry_repository.preview.repository_id
-  role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"
-  member     = "serviceAccount:${var.preview_operator_service_account_email}"
-}
-
 moved {
   from = google_artifact_registry_repository_iam_member.prod_deploy_writer
   to   = google_artifact_registry_repository_iam_member.prod_publisher_writer
@@ -353,14 +342,6 @@ resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {
   name     = google_cloud_run_v2_service.preview.name
   role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
   member   = "serviceAccount:${var.preview_deploy_service_account_email}"
-}
-
-resource "google_cloud_run_v2_service_iam_member" "preview_operator" {
-  project  = var.project_id
-  location = google_cloud_run_v2_service.preview.location
-  name     = google_cloud_run_v2_service.preview.name
-  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
-  member   = "serviceAccount:${var.preview_operator_service_account_email}"
 }
 
 removed {

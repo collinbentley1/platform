@@ -1120,7 +1120,7 @@ jobs:
       needs.deploy.outputs.lifecycle-keep != 'true'
     environment: preview-operations
     permissions:
-      id-token: write # Exchange only for the service-scoped preview traffic operator.
+      id-token: write # Exchange only for the exact-SHA preview-operations path.
     concurrency:
       group: preview-cloud-${{ github.event.repository.id }}
       queue: max
@@ -1145,7 +1145,7 @@ jobs:
             echo "region=us-east4"
             echo "preview_service=${service_name}-preview"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
-            echo "operator_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
+            echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
@@ -1184,12 +1184,12 @@ jobs:
           create_credentials_file: false
           export_environment_variables: false
 
-      - name: Authenticate preview traffic operator
+      - name: Authenticate trusted preview deployer for stale-tag invalidation
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
-          service_account: ${{ steps.app.outputs.operator_service_account }}
+          service_account: ${{ steps.app.outputs.deploy_service_account }}
 
       - name: Remove a tag deployed after its pull request changed
         env:

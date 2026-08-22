@@ -71,6 +71,12 @@ locals {
     var.active_workflow_sha,
     var.transition_workflow_sha,
   ]))
+  preview_operations_active_workflow_shas = toset([
+    var.active_workflow_sha,
+  ])
+  preview_operator_transition_workflow_shas = toset(compact([
+    var.transition_workflow_sha,
+  ]))
 
   deployments = {
     "1255553151" = {
@@ -180,18 +186,20 @@ provider "google" {
 module "bootstrap" {
   source = "../../modules/bootstrap"
 
-  app                            = local.deployment.app
-  project_id                     = local.deployment.project_id
-  region                         = local.deployment.region
-  state_bucket_name              = local.deployment.state_bucket_name
-  bootstrap_state_bucket_name    = local.deployment.bootstrap_state_bucket_name
-  state_bucket_location          = local.deployment.state_bucket_location
-  github_owner                   = "collinbentley1"
-  github_repo                    = local.deployment.github_repo
-  github_owner_id                = "16823277"
-  github_repository_id           = local.deployment.github_repository_id
-  trusted_platform_workflow_shas = local.trusted_workflow_shas
-  legacy_compatibility_mode      = var.legacy_compatibility_mode
+  app                                       = local.deployment.app
+  project_id                                = local.deployment.project_id
+  region                                    = local.deployment.region
+  state_bucket_name                         = local.deployment.state_bucket_name
+  bootstrap_state_bucket_name               = local.deployment.bootstrap_state_bucket_name
+  state_bucket_location                     = local.deployment.state_bucket_location
+  github_owner                              = "collinbentley1"
+  github_repo                               = local.deployment.github_repo
+  github_owner_id                           = "16823277"
+  github_repository_id                      = local.deployment.github_repository_id
+  trusted_platform_workflow_shas            = local.trusted_workflow_shas
+  preview_operations_active_workflow_shas   = local.preview_operations_active_workflow_shas
+  preview_operator_transition_workflow_shas = local.preview_operator_transition_workflow_shas
+  legacy_compatibility_mode                 = var.legacy_compatibility_mode
   # These four personal projects have no organization parent. Google permits
   # Organization Policy Administrator only at organization scope and marks the
   # write permissions unsupported in project custom roles. The authoritative

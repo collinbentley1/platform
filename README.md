@@ -103,11 +103,23 @@ Writer on exactly one Artifact Registry repository and no Cloud Run or runtime
 with the service-scoped Cloud Run role, `actAs` on only the matching runtime,
 and Reader on only the matching image repository, as Cloud Run requires; they
 cannot upload or delete artifacts. `preview-operations` uses
-`gha-preview-operator`, which has only service-scoped Cloud Run get/update and
-operation-read permissions plus `downloadArtifacts` on only the preview image
-repository, with no registry listing, publishing, deletion, or runtime `actAs`
-grant. Protect both publish environments before pinning a consumer to this
-workflow.
+the existing `gha-preview-deploy` identity through the distinct
+`attribute.preview_operator_workflow_sha` WIF path. Cloud Run revalidates the
+service identity and image during `gcloud run services update-traffic`, so the
+API-minimum traffic operation requires the same service-scoped update,
+preview-runtime `actAs`, and exact-preview-repository Reader permissions as a
+deployment. Those coarse permissions could deploy a preview revision, so their
+containment is the exact reviewed cleanup/reconcile workflow SHA,
+`preview-operations` environment/event claims, immutable numeric-repository-ID
+project/service map, fixed CLI arguments, and the absence of PR checkout or
+PR-controlled code after authentication. No credential reaches the untrusted PR
+build. `gha-preview-operator` is transition-only: the immediately previous SHA
+may retain its old binding during repin, while the active SHA binds the distinct
+operator-workflow attribute only to `gha-preview-deploy`; the transition set and
+legacy fallback are empty at steady state. The retired operator receives no
+steady-state Cloud Run, registry, runtime `actAs`, project, secret, state, data,
+or production access. Protect both publish environments before pinning a
+consumer to this workflow.
 
 ## Runtime Configuration
 

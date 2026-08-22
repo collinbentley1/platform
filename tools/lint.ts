@@ -726,8 +726,8 @@ requireContains(
 requireContains(
   ".github/workflows/deploy-preview.yml",
   previewInvalidation,
-  "gha-preview-operator@",
-  "Stale-preview invalidation must authenticate the traffic-only operator.",
+  "gha-preview-deploy@",
+  "Stale-preview invalidation must authenticate the existing preview deploy identity.",
 );
 for (const boundary of [
   "deployed-revision: ${{ steps.deploy.outputs.revision }}",
@@ -744,8 +744,14 @@ for (const boundary of [
 rejectContains(
   ".github/workflows/deploy-preview.yml",
   previewInvalidation,
-  "gha-preview-deploy@",
-  "Stale-preview invalidation must not authenticate the preview deployer.",
+  "gha-preview-operator@",
+  "Active stale-preview invalidation must not authenticate the retired preview operator.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewInvalidation,
+  "actions/checkout@",
+  "Privileged stale-preview invalidation must not checkout or execute PR-controlled code.",
 );
 for (const needle of [
   "verify_stable_preview_absent",
@@ -762,9 +768,15 @@ for (const needle of [
 for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
   const path = `.github/workflows/${workflowName}`;
   const workflow = await read(path);
-  requireContains(path, workflow, "gha-preview-operator@", "Preview traffic operations must use the dedicated operator.");
-  rejectContains(path, workflow, "gha-preview-deploy@", "Preview traffic operations must not authenticate the deploy identity.");
+  requireContains(path, workflow, "gha-preview-deploy@", "Preview traffic operations must authenticate the existing preview deploy identity.");
+  rejectContains(path, workflow, "gha-preview-operator@", "Active preview traffic operations must not authenticate the retired operator identity.");
   rejectContains(path, workflow, "gha-preview-publish@", "Preview traffic operations must not authenticate the publisher identity.");
+  rejectContains(
+    path,
+    workflow,
+    "actions/checkout@",
+    "Privileged preview traffic operations must not checkout or execute repository code.",
+  );
   requireContains(
     path,
     workflow,
@@ -777,6 +789,32 @@ for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
     sectionFrom(workflow, "verify_stable_preview_absent()"),
     "--location",
     "Stable preview teardown probes must not follow redirects.",
+  );
+}
+const cleanupPreview = await read(".github/workflows/cleanup-preview.yml");
+for (const boundary of [
+  "github.event.pull_request.head.repo.full_name == github.repository",
+  "PR_NUMBER: ${{ github.event.pull_request.number }}",
+  'preview_tag="pr-${PR_NUMBER}"',
+]) {
+  requireContains(
+    ".github/workflows/cleanup-preview.yml",
+    cleanupPreview,
+    boundary,
+    `Preview cleanup must derive its exact target from the trusted event: ${boundary}`,
+  );
+}
+const reconcilePreviews = await read(".github/workflows/reconcile-previews.yml");
+for (const boundary of [
+  "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
+  "github.ref == 'refs/heads/main'",
+  'gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}"',
+]) {
+  requireContains(
+    ".github/workflows/reconcile-previews.yml",
+    reconcilePreviews,
+    boundary,
+    `Preview reconciliation must derive its decisions from trusted default-branch state: ${boundary}`,
   );
 }
 requireBefore(
@@ -1593,7 +1631,7 @@ const moduleVariables = await read("terraform/modules/cloud-run-service/variable
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
 if (
   createHash("sha256").update(moduleMain).digest("hex") !==
-  "79f919267d1f29cfdee8bcc93a254ec089c890b65f860a029aad15cae3f2e4b8"
+  "ba3a42664087637d024128134e610694a9cb7c19487656de063c2361121daebb"
 ) {
   failures.push(
     "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
@@ -1875,31 +1913,6 @@ for (const [readerResource, readerVariable, repositoryResource] of [
     "Deploy identities must not receive Artifact Registry upload or delete permissions.",
   );
 }
-const previewOperatorRegistry = sectionBetween(
-  moduleMain,
-  'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader"',
-  "\n}\n",
-);
-for (const needle of [
-  'role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
-  'member     = "serviceAccount:${var.preview_operator_service_account_email}"',
-  "repository = google_artifact_registry_repository.preview.repository_id",
-]) {
-  requireContains(
-    "terraform/modules/cloud-run-service/main.tf",
-    previewOperatorRegistry,
-    needle,
-    `The preview operator's one-permission repository grant is missing: ${needle}`,
-  );
-}
-for (const forbidden of ["roles/artifactregistry.reader", "roles/artifactregistry.writer"]) {
-  rejectContains(
-    "terraform/modules/cloud-run-service/main.tf",
-    previewOperatorRegistry,
-    forbidden,
-    "The preview operator must use only the downloadArtifacts custom role.",
-  );
-}
 const repositoryIamMembers = [
   ...allServiceModuleTerraform.matchAll(
     /resource\s+"google_artifact_registry_repository_iam_member"\s+"([^"]+)"/g,
@@ -1909,7 +1922,6 @@ const repositoryIamMembers = [
   .sort();
 const approvedRepositoryIamMembers = [
   "preview_deploy_reader",
-  "preview_operator_image_downloader",
   "preview_publisher_writer",
   "prod_deploy_reader",
   "prod_publisher_writer",
@@ -1938,12 +1950,10 @@ const allIamResources = [
   .sort();
 const approvedIamResources = [
   "google_artifact_registry_repository_iam_member.preview_deploy_reader",
-  "google_artifact_registry_repository_iam_member.preview_operator_image_downloader",
   "google_artifact_registry_repository_iam_member.preview_publisher_writer",
   "google_artifact_registry_repository_iam_member.prod_deploy_reader",
   "google_artifact_registry_repository_iam_member.prod_publisher_writer",
   "google_cloud_run_v2_service_iam_member.preview_deploy",
-  "google_cloud_run_v2_service_iam_member.preview_operator",
   "google_cloud_run_v2_service_iam_member.prod_deploy",
   "google_secret_manager_secret_iam_member.runtime_accessor",
 ].sort();
@@ -1990,15 +2000,6 @@ const exactIamBlocks = [
     "}",
   ].join("\n"),
   [
-    'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader" {',
-    "  project    = var.project_id",
-    "  location   = google_artifact_registry_repository.preview.location",
-    "  repository = google_artifact_registry_repository.preview.repository_id",
-    '  role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
-    '  member     = "serviceAccount:${var.preview_operator_service_account_email}"',
-    "}",
-  ].join("\n"),
-  [
     'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
     "  for_each = var.runtime_secret_accessor_ids",
     "",
@@ -2026,15 +2027,6 @@ const exactIamBlocks = [
     '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
     "}",
   ].join("\n"),
-  [
-    'resource "google_cloud_run_v2_service_iam_member" "preview_operator" {',
-    "  project  = var.project_id",
-    "  location = google_cloud_run_v2_service.preview.location",
-    "  name     = google_cloud_run_v2_service.preview.name",
-    '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
-    '  member   = "serviceAccount:${var.preview_operator_service_account_email}"',
-    "}",
-  ].join("\n"),
 ];
 for (const exactIamBlock of exactIamBlocks) {
   if (moduleMain.split(exactIamBlock).length - 1 !== 1) {
@@ -2043,20 +2035,9 @@ for (const exactIamBlock of exactIamBlocks) {
     );
   }
 }
-const registryIam = sectionBetween(
-  moduleMain,
-  'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
-  'resource "google_secret_manager_secret" "runtime"',
-);
-if (registryIam.split("preview_operator_service_account_email").length - 1 !== 1) {
-  failures.push(
-    "terraform/modules/cloud-run-service/main.tf: The preview operator needs exactly one repository-scoped downloadArtifacts grant for traffic-tag reconciliation.",
-  );
-}
 for (const [resource, identity, service] of [
   ["prod_deploy", "prod_deploy_service_account_email", "site"],
   ["preview_deploy", "preview_deploy_service_account_email", "preview"],
-  ["preview_operator", "preview_operator_service_account_email", "preview"],
 ] as const) {
   const serviceGrant = sectionBetween(
     moduleMain,
@@ -2092,11 +2073,17 @@ for (const needle of [
     `The runtime-only secret grant is missing: ${needle}`,
   );
 }
-if (allServiceModuleTerraform.split("preview_operator_service_account_email").length - 1 !== 3) {
+if (allServiceModuleTerraform.split("preview_operator_service_account_email").length - 1 !== 1) {
   failures.push(
-    "terraform/modules/cloud-run-service/main.tf: The preview operator must appear only in its exact-repository downloadArtifacts and exact-service traffic grants.",
+    "terraform/modules/cloud-run-service: The deprecated preview operator input must remain declared exactly once and receive no IAM grant.",
   );
 }
+rejectContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  moduleMain,
+  "preview_operator_service_account_email",
+  "The retired preview operator must receive no Cloud Run or Artifact Registry grant.",
+);
 for (const publisherVariable of [
   "prod_publisher_service_account_email",
   "preview_publisher_service_account_email",
@@ -2113,7 +2100,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "92845129ede0a6f6836a69c5bda8f6f17556c504118af6857ac01411d655dac0"
+  "42b12bb7f5eda9ac0f2131660e54d44fed4174db8a7e4735c48c0f3b995ab7f1"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2138,6 +2125,7 @@ const approvedBootstrapIamResources = [
   "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
   "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
   "google_service_account_iam_member.preview_deploy_wif_repo",
+  "google_service_account_iam_member.preview_deploy_wif_preview_operations_workflow_sha",
   "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
   "google_service_account_iam_member.preview_operator_wif_repo",
   "google_service_account_iam_member.preview_operator_wif_workflow_sha",
@@ -2218,8 +2206,8 @@ const expectedPreviewTrafficImageDownloaderRole = [
   'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
   "  project     = var.project_id",
   '  role_id     = "previewTrafficImageDownloader"',
-  '  title       = "Preview Traffic Image Downloader"',
-  '  description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+  '  title       = "Legacy Preview Traffic Image Downloader"',
+  '  description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
   "  permissions = [",
   '    "artifactregistry.repositories.downloadArtifacts",',
   "  ]",
@@ -2239,7 +2227,7 @@ if (
 }
 for (const needle of [
   'role_id     = "previewTrafficImageDownloader"',
-  'description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+  'description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
   '"artifactregistry.repositories.downloadArtifacts",',
 ]) {
   requireContains(
@@ -2279,20 +2267,20 @@ if (
 requireContains(
   "terraform/modules/bootstrap/variables.tf",
   bootstrapVariables,
-  "downloads artifacts only from its preview repository; cannot publish or act as a runtime identity.",
-  "The preview operator service-account description must disclose its exact repository download grant.",
+  "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants.",
+  "The retired preview operator description must disclose its transition-only boundary.",
 );
 requireContains(
   "README.md",
   readme,
-  "operation-read permissions plus `downloadArtifacts` on only the preview image",
-  "The identity overview must disclose the preview operator's one-permission registry grant.",
+  "active SHA binds the distinct",
+  "The identity overview must disclose the active and transition preview-operations split.",
 );
 requireContains(
   "docs/security-rollout.md",
   securityRollout,
-  "preview traffic-reconciliation operator with exact environment/workflow-SHA WIF",
-  "The rollout guide must not describe the preview operator as traffic-only.",
+  "active/new SHA's distinct preview-operator workflow attribute",
+  "The rollout guide must disclose the active and transition preview-operations split.",
 );
 for (const outputPath of [
   "terraform/modules/bootstrap/outputs.tf",
@@ -2302,8 +2290,41 @@ for (const outputPath of [
   requireContains(
     outputPath,
     await read(outputPath),
-    "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository.",
-    "The preview operator output must disclose its one-permission registry grant.",
+    "Retired transition-only preview operator service account; receives no steady-state operational grants.",
+    "The preview operator output must disclose its retired transition-only status.",
+  );
+}
+const activePreviewOperationsShas = sectionBetween(
+  bootstrapVariables,
+  'variable "preview_operations_active_workflow_shas"',
+  "\n}\n",
+);
+for (const boundary of [
+  "length(var.preview_operations_active_workflow_shas) > 0",
+  "setintersection(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas)",
+  "setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas",
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/variables.tf",
+    activePreviewOperationsShas,
+    boundary,
+    `Active preview-operations SHA partition validation is missing: ${boundary}`,
+  );
+}
+const transitionPreviewOperatorShas = sectionBetween(
+  bootstrapVariables,
+  'variable "preview_operator_transition_workflow_shas"',
+  "\n}\n",
+);
+for (const boundary of [
+  "default     = []",
+  "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/variables.tf",
+    transitionPreviewOperatorShas,
+    boundary,
+    `Transition preview-operator SHA validation is missing: ${boundary}`,
   );
 }
 requireContains(
@@ -2370,6 +2391,7 @@ for (const boundary of [
   '"attribute.legacy_terraform"',
   'resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha"',
   'resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha"',
+  'resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"',
   'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
   'resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha"',
   'resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha"',
@@ -2391,10 +2413,27 @@ for (const forbiddenMapping of ['"attribute.environment"', '"attribute.repositor
     `Compatibility WIF must not expose aggregate cross-identity mapping ${forbiddenMapping}.`,
   );
 }
+for (const boundary of [
+  'preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false"',
+  "for sha in sort(tolist(var.preview_operator_transition_workflow_shas))",
+  '"attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : \'denied\'"',
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    boundary,
+    `Retired preview-operator compatibility trust must be restricted to the declared transition SHA set: ${boundary}`,
+  );
+}
 for (const [binding, serviceAccount, attribute] of [
   ["prod_deploy_wif_workflow_sha", "prod_deploy", "prod_workflow_sha"],
   ["prod_publisher_wif_workflow_sha", "prod_publisher", "prod_publish_workflow_sha"],
   ["preview_deploy_wif_workflow_sha", "preview_deploy", "preview_deploy_workflow_sha"],
+  [
+    "preview_deploy_wif_preview_operations_workflow_sha",
+    "preview_deploy",
+    "preview_operator_workflow_sha",
+  ],
   ["preview_operator_wif_workflow_sha", "preview_operator", "preview_operator_workflow_sha"],
   ["preview_publisher_wif_workflow_sha", "preview_publisher", "preview_publish_workflow_sha"],
   ["terraform_wif_workflow_sha", "terraform", "terraform_workflow_sha"],
@@ -2415,6 +2454,24 @@ for (const [binding, serviceAccount, attribute] of [
     block,
     `/attribute.${attribute}/`,
     `Exact WIF binding ${binding} must use only ${attribute}.`,
+  );
+}
+for (const [binding, forEach] of [
+  [
+    "preview_deploy_wif_preview_operations_workflow_sha",
+    "var.preview_operations_active_workflow_shas",
+  ],
+  ["preview_operator_wif_workflow_sha", "var.preview_operator_transition_workflow_shas"],
+] as const) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    sectionBetween(
+      bootstrapMain,
+      `resource "google_service_account_iam_member" "${binding}"`,
+      "\n}\n",
+    ),
+    `for_each = ${forEach}`,
+    `Preview-operations WIF binding ${binding} must use only ${forEach}.`,
   );
 }
 for (const [binding, serviceAccount, principal] of [
@@ -2488,6 +2545,17 @@ requireContains(
   "manage_automatic_default_service_account_grants_policy = false",
   "The four registered standalone projects must not request organization-only authority.",
 );
+for (const boundary of [
+  "preview_operations_active_workflow_shas   = local.preview_operations_active_workflow_shas",
+  "preview_operator_transition_workflow_shas = local.preview_operator_transition_workflow_shas",
+]) {
+  requireContains(
+    "terraform/deployments/bootstrap/main.tf",
+    bootstrapDeployment,
+    boundary,
+    `The protected bootstrap root is missing the exact preview-operations transition partition: ${boundary}`,
+  );
+}
 const templateBootstrapMain = await read("templates/app/infra/terraform/bootstrap/main.tf");
 const templateBootstrapVariables = await read("templates/app/infra/terraform/bootstrap/variables.tf");
 requireContains(
@@ -2496,6 +2564,17 @@ requireContains(
   "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
   "Generic scaffolds must require an explicit organization-policy capability decision.",
 );
+for (const boundary of [
+  "preview_operations_active_workflow_shas = [",
+  "preview_operator_transition_workflow_shas              = []",
+]) {
+  requireContains(
+    "templates/app/infra/terraform/bootstrap/main.tf",
+    templateBootstrapMain,
+    boundary,
+    `Generic scaffolds must render the steady-state preview-operations partition: ${boundary}`,
+  );
+}
 requireContains(
   "templates/app/infra/terraform/bootstrap/variables.tf",
   templateBootstrapVariables,

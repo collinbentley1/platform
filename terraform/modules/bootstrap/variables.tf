@@ -76,6 +76,35 @@ variable "trusted_platform_workflow_shas" {
   }
 }
 
+variable "preview_operations_active_workflow_shas" {
+  description = "Nonempty reviewed platform commit set whose preview-operations workflows exchange through the preview deploy service account. Must be disjoint from the transition set and together exactly partition trusted_platform_workflow_shas."
+  type        = set(string)
+
+  validation {
+    condition = (
+      length(var.preview_operations_active_workflow_shas) > 0 &&
+      alltrue([for sha in var.preview_operations_active_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))]) &&
+      length(setintersection(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas)) == 0 &&
+      setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas
+    )
+    error_message = "preview_operations_active_workflow_shas must be nonempty, contain full lowercase commit SHAs, be disjoint from the transition set, and together exactly partition trusted_platform_workflow_shas."
+  }
+}
+
+variable "preview_operator_transition_workflow_shas" {
+  description = "Immediately previous reviewed platform commit set temporarily allowed to exchange preview-operations tokens through the retired preview operator identity. Empty at steady state."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition = (
+      alltrue([for sha in var.preview_operator_transition_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))]) &&
+      length(setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)) == 0
+    )
+    error_message = "preview_operator_transition_workflow_shas must contain only trusted full lowercase commit SHAs."
+  }
+}
+
 variable "legacy_compatibility_mode" {
   description = "Temporarily retain only constrained repository/environment Workload Identity User bindings during a verified exact-SHA migration. Broad project roles, Token Creator, and cross-boundary actAs grants are always removed. Must be false at steady state."
   type        = bool
@@ -147,7 +176,7 @@ variable "preview_deploy_service_account_description" {
 variable "preview_operator_service_account_description" {
   description = "Description for the preview traffic operator service account."
   type        = string
-  default     = "Reads and updates traffic only on the pre-created shared preview Cloud Run service and downloads artifacts only from its preview repository; cannot publish or act as a runtime identity."
+  default     = "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants."
 }
 
 variable "preview_publisher_service_account_description" {

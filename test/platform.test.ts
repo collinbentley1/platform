@@ -33,9 +33,12 @@ describe("platform scaffold and doctor", () => {
       projectId: "secure-app",
       serviceName: "secure-app",
     });
-    expect(await readFile(join(app, "infra/terraform/bootstrap/main.tf"), "utf8")).toContain(
+    const bootstrap = await readFile(join(app, "infra/terraform/bootstrap/main.tf"), "utf8");
+    expect(bootstrap).toContain(
       "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
     );
+    expect(bootstrap).toContain("preview_operations_active_workflow_shas = [");
+    expect(bootstrap).toContain("preview_operator_transition_workflow_shas");
     expect(await readFile(join(app, "infra/terraform/bootstrap/variables.tf"), "utf8")).toContain(
       'variable "manage_automatic_default_service_account_grants_policy"',
     );
@@ -652,7 +655,14 @@ describe("platform scaffold and doctor", () => {
     const path = join(app, "infra/terraform/bootstrap/main.tf");
     const original = await readFile(path, "utf8");
     const safePrior = "b".repeat(40);
-    await writeFile(path, original.replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${safePrior}",`));
+    const withTransition = (transition: string) =>
+      original
+        .replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${transition}",`)
+        .replace(
+          /preview_operator_transition_workflow_shas\s*=\s*\[\]/,
+          `preview_operator_transition_workflow_shas = [\n    "${transition}",\n  ]`,
+        );
+    await writeFile(path, withTransition(safePrior));
     expect((await run(["doctor", app])).exitCode).toBe(0);
 
     for (const vulnerable of [
@@ -667,7 +677,7 @@ describe("platform scaffold and doctor", () => {
     ]) {
       await writeFile(
         path,
-        original.replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${vulnerable}",`),
+        withTransition(vulnerable),
       );
       const result = await run(["doctor", app]);
       expect(result.exitCode).not.toBe(0);
@@ -1102,8 +1112,10 @@ describe("platform scaffold and doctor", () => {
     expect(caller).toContain("needs: invalidate");
     expect(cleanup).toContain("github.event.action == 'synchronize'");
     expect(cleanup).toContain("github.event.action == 'converted_to_draft'");
-    expect(cleanup).toContain("gha-preview-operator@");
-    expect(cleanup).not.toContain("gha-preview-deploy@");
+    expect(cleanup).toContain("gha-preview-deploy@");
+    expect(cleanup).not.toContain("gha-preview-operator@");
+    expect(cleanup).not.toContain("actions/checkout@");
+    expect(cleanup).toContain("PR_NUMBER: ${{ github.event.pull_request.number }}");
     expect(cleanup).toContain("verify_stable_preview_absent");
     expect(cleanup).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain('--revision-suffix="$revision_suffix"');
@@ -1119,7 +1131,9 @@ describe("platform scaffold and doctor", () => {
     );
     expect(deploy).toContain("  invalidate:\n");
     const invalidation = deploy.slice(deploy.indexOf("  invalidate:\n"));
-    expect(invalidation).toContain("gha-preview-operator@");
+    expect(invalidation).toContain("gha-preview-deploy@");
+    expect(invalidation).not.toContain("gha-preview-operator@");
+    expect(invalidation).not.toContain("actions/checkout@");
     expect(invalidation).toContain("verify_stable_preview_absent");
     expect(invalidation).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain("deployed-revision: ${{ steps.deploy.outputs.revision }}");
@@ -1181,8 +1195,9 @@ describe("platform scaffold and doctor", () => {
     expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
     expect(reconcile).toContain("expected_revision_prefix");
     expect(reconcile).toContain("head_sha:0:12");
-    expect(reconcile).toContain("gha-preview-operator@");
-    expect(reconcile).not.toContain("gha-preview-deploy@");
+    expect(reconcile).toContain("gha-preview-deploy@");
+    expect(reconcile).not.toContain("gha-preview-operator@");
+    expect(reconcile).not.toContain("actions/checkout@");
     expect(reconcile).toContain("verify_stable_preview_absent");
     expect(reconcile).toContain('[ "$status" = "404" ]');
   });
@@ -1327,7 +1342,7 @@ describe("platform scaffold and doctor", () => {
     const serviceModule = serviceModuleFiles[0]!;
     const allServiceModuleTerraform = serviceModuleFiles.join("\n");
     expect(createHash("sha256").update(serviceModule).digest("hex")).toBe(
-      "79f919267d1f29cfdee8bcc93a254ec089c890b65f860a029aad15cae3f2e4b8",
+      "ba3a42664087637d024128134e610694a9cb7c19487656de063c2361121daebb",
     );
     const productionServiceStart = serviceModule.indexOf(
       'resource "google_cloud_run_v2_service" "site"',
@@ -1395,24 +1410,6 @@ describe("platform scaffold and doctor", () => {
       );
       expect(block).not.toContain("roles/artifactregistry.writer");
     }
-    const operatorRegistryStart = serviceModule.indexOf(
-      'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader"',
-    );
-    const operatorRegistry = serviceModule.slice(
-      operatorRegistryStart,
-      serviceModule.indexOf("\n}\n", operatorRegistryStart) + 3,
-    );
-    expect(operatorRegistry).toContain(
-      'role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
-    );
-    expect(operatorRegistry).toContain(
-      'member     = "serviceAccount:${var.preview_operator_service_account_email}"',
-    );
-    expect(operatorRegistry).toContain(
-      "repository = google_artifact_registry_repository.preview.repository_id",
-    );
-    expect(operatorRegistry).not.toContain("roles/artifactregistry.reader");
-    expect(operatorRegistry).not.toContain("roles/artifactregistry.writer");
     const repositoryIamMembers = [
       ...allServiceModuleTerraform.matchAll(
         /resource\s+"google_artifact_registry_repository_iam_member"\s+"([^"]+)"/g,
@@ -1423,7 +1420,6 @@ describe("platform scaffold and doctor", () => {
     expect(repositoryIamMembers).toEqual(
       [
         "preview_deploy_reader",
-        "preview_operator_image_downloader",
         "preview_publisher_writer",
         "prod_deploy_reader",
         "prod_publisher_writer",
@@ -1445,12 +1441,10 @@ describe("platform scaffold and doctor", () => {
     expect(allIamResources).toEqual(
       [
         "google_artifact_registry_repository_iam_member.preview_deploy_reader",
-        "google_artifact_registry_repository_iam_member.preview_operator_image_downloader",
         "google_artifact_registry_repository_iam_member.preview_publisher_writer",
         "google_artifact_registry_repository_iam_member.prod_deploy_reader",
         "google_artifact_registry_repository_iam_member.prod_publisher_writer",
         "google_cloud_run_v2_service_iam_member.preview_deploy",
-        "google_cloud_run_v2_service_iam_member.preview_operator",
         "google_cloud_run_v2_service_iam_member.prod_deploy",
         "google_secret_manager_secret_iam_member.runtime_accessor",
       ].sort(),
@@ -1493,15 +1487,6 @@ describe("platform scaffold and doctor", () => {
         "}",
       ].join("\n"),
       [
-        'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader" {',
-        "  project    = var.project_id",
-        "  location   = google_artifact_registry_repository.preview.location",
-        "  repository = google_artifact_registry_repository.preview.repository_id",
-        '  role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
-        '  member     = "serviceAccount:${var.preview_operator_service_account_email}"',
-        "}",
-      ].join("\n"),
-      [
         'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
         "  for_each = var.runtime_secret_accessor_ids",
         "",
@@ -1529,47 +1514,26 @@ describe("platform scaffold and doctor", () => {
         '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
         "}",
       ].join("\n"),
-      [
-        'resource "google_cloud_run_v2_service_iam_member" "preview_operator" {',
-        "  project  = var.project_id",
-        "  location = google_cloud_run_v2_service.preview.location",
-        "  name     = google_cloud_run_v2_service.preview.name",
-        '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
-        '  member   = "serviceAccount:${var.preview_operator_service_account_email}"',
-        "}",
-      ].join("\n"),
     ];
     for (const exactIamBlock of exactIamBlocks) {
       expect(serviceModule.split(exactIamBlock)).toHaveLength(2);
     }
-    const registryIam = serviceModule.slice(
-      serviceModule.indexOf(
-        'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
-      ),
-      serviceModule.indexOf('resource "google_secret_manager_secret" "runtime"'),
-    );
-    expect(registryIam.split("preview_operator_service_account_email")).toHaveLength(2);
-    const operatorServiceStart = serviceModule.indexOf(
-      'resource "google_cloud_run_v2_service_iam_member" "preview_operator"',
-    );
-    const operatorService = serviceModule.slice(
-      operatorServiceStart,
-      serviceModule.indexOf("\n}\n", operatorServiceStart) + 3,
-    );
-    expect(operatorService).toContain(
-      'role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
-    );
-    expect(operatorService).toContain(
-      'member   = "serviceAccount:${var.preview_operator_service_account_email}"',
-    );
+    expect(serviceModule).not.toContain("preview_operator_service_account_email");
     expect(allServiceModuleTerraform.split("preview_operator_service_account_email")).toHaveLength(
-      4,
+      2,
+    );
+    expect(
+      await readFile(
+        join(repoRoot, "terraform/modules/cloud-run-service/variables.tf"),
+        "utf8",
+      ),
+    ).toContain(
+      "Deprecated transition-only preview operator email retained for input compatibility; this module intentionally grants it no IAM role.",
     );
 
     for (const [resource, identity, service] of [
       ["prod_deploy", "prod_deploy_service_account_email", "site"],
       ["preview_deploy", "preview_deploy_service_account_email", "preview"],
-      ["preview_operator", "preview_operator_service_account_email", "preview"],
     ] as const) {
       const start = serviceModule.indexOf(
         `resource "google_cloud_run_v2_service_iam_member" "${resource}"`,
@@ -1598,14 +1562,14 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "92845129ede0a6f6836a69c5bda8f6f17556c504118af6857ac01411d655dac0",
+      "42b12bb7f5eda9ac0f2131660e54d44fed4174db8a7e4735c48c0f3b995ab7f1",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
       "  project     = var.project_id",
       '  role_id     = "previewTrafficImageDownloader"',
-      '  title       = "Preview Traffic Image Downloader"',
-      '  description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+      '  title       = "Legacy Preview Traffic Image Downloader"',
+      '  description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
       "  permissions = [",
       '    "artifactregistry.repositories.downloadArtifacts",',
       "  ]",
@@ -1640,6 +1604,7 @@ describe("platform scaffold and doctor", () => {
         "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
         "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
         "google_service_account_iam_member.preview_deploy_wif_repo",
+        "google_service_account_iam_member.preview_deploy_wif_preview_operations_workflow_sha",
         "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
         "google_service_account_iam_member.preview_operator_wif_repo",
         "google_service_account_iam_member.preview_operator_wif_workflow_sha",
@@ -1702,7 +1667,7 @@ describe("platform scaffold and doctor", () => {
     );
     expect(imageRole).toContain('role_id     = "previewTrafficImageDownloader"');
     expect(imageRole).toContain(
-      'description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+      'description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
     );
     expect(imageRole).toContain(
       '"artifactregistry.repositories.downloadArtifacts",',
@@ -1718,10 +1683,10 @@ describe("platform scaffold and doctor", () => {
     expect(
       await readFile(join(repoRoot, "terraform/modules/bootstrap/variables.tf"), "utf8"),
     ).toContain(
-      'downloads artifacts only from its preview repository; cannot publish or act as a runtime identity.',
+      "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants.",
     );
     expect(await readFile(join(repoRoot, "README.md"), "utf8")).toContain(
-      "operation-read permissions plus `downloadArtifacts` on only the preview image",
+      "active SHA binds the distinct",
     );
     expect(bootstrap).not.toMatch(/^\s*module\s+"/m);
     for (const outputPath of [
@@ -1730,9 +1695,53 @@ describe("platform scaffold and doctor", () => {
       "templates/app/infra/terraform/bootstrap/outputs.tf",
     ]) {
       expect(await readFile(join(repoRoot, outputPath), "utf8")).toContain(
-        "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository.",
+        "Retired transition-only preview operator service account; receives no steady-state operational grants.",
       );
     }
+    const activeOperationsBindingStart = bootstrap.indexOf(
+      'resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"',
+    );
+    const activeOperationsBinding = bootstrap.slice(
+      activeOperationsBindingStart,
+      bootstrap.indexOf("\n}\n", activeOperationsBindingStart) + 3,
+    );
+    expect(activeOperationsBinding).toContain(
+      "for_each = var.preview_operations_active_workflow_shas",
+    );
+    expect(activeOperationsBinding).toContain(
+      "service_account_id = google_service_account.preview_deploy.name",
+    );
+    expect(activeOperationsBinding).toContain("/attribute.preview_operator_workflow_sha/");
+    const transitionOperatorBindingStart = bootstrap.indexOf(
+      'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
+    );
+    const transitionOperatorBinding = bootstrap.slice(
+      transitionOperatorBindingStart,
+      bootstrap.indexOf("\n}\n", transitionOperatorBindingStart) + 3,
+    );
+    expect(transitionOperatorBinding).toContain(
+      "for_each = var.preview_operator_transition_workflow_shas",
+    );
+    expect(transitionOperatorBinding).toContain(
+      "service_account_id = google_service_account.preview_operator.name",
+    );
+    expect(transitionOperatorBinding).toContain("/attribute.preview_operator_workflow_sha/");
+    expect(bootstrap).toContain(
+      'preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false"',
+    );
+    expect(bootstrap).toContain(
+      '"attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : \'denied\'"',
+    );
+    const bootstrapVariables = await readFile(
+      join(repoRoot, "terraform/modules/bootstrap/variables.tf"),
+      "utf8",
+    );
+    expect(bootstrapVariables).toContain(
+      "setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas",
+    );
+    expect(bootstrapVariables).toContain(
+      "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
+    );
     for (const attribute of [
       "attribute.prod_publish_workflow_sha",
       "attribute.preview_publish_workflow_sha",

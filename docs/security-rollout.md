@@ -197,10 +197,13 @@ the recovery object and stop; never rerun from empty state.
    code with cloud credentials, so a full-SHA rollback would recover that path.
    This first apply must remove every project-wide routine/deployer role,
    all Token Creator grants, routine-Terraform runtime `actAs`, and preview
-   `actAs` on the production runtime. It creates the two publisher identities
-   and the preview traffic-reconciliation operator with exact environment/workflow-SHA WIF
-   bindings; neither publisher gets a generic fallback. Compatibility mode
-   retains only path-specific Workload Identity User fallbacks for Terraform,
+   `actAs` on the production runtime. It creates the two publisher identities;
+   neither publisher gets a generic fallback. The active/new SHA's distinct preview-operator workflow attribute
+   binds to `gha-preview-deploy`, while only an explicitly declared transition
+   SHA retains the old `gha-preview-operator` binding during repin. With the
+   empty initial transition set, the retired
+   operator has no workflow binding. Compatibility mode retains only
+   path-specific Workload Identity User fallbacks for Terraform,
    production deploy, preview deploy, and preview traffic operations, so tokens
    admitted on one path cannot impersonate another identity. Old workflows stop
    authenticating at this point.
@@ -251,11 +254,18 @@ the recovery object and stop; never rerun from empty state.
    repository-scoped Writer member to move from the deploy identity to its
    publisher identity and add only repository-scoped Reader to the matching
    deploy identity. No upload/delete-capable registry grant may remain on a
-   deploy or operator identity. The preview operator must have only the
-   `previewTrafficImageDownloader` custom role on the exact preview repository
-   (one `artifactregistry.repositories.downloadArtifacts` permission, required
-   to reconcile traffic tags), with no production-repository or runtime `actAs`
-   grant. Require the subsequent exposure plan to remain empty. For a
+   deploy identity. Remove the preview operator's exact-service Cloud Run and
+   exact-repository download grants during production convergence. Cloud Run
+   revalidates the attached service identity and image during `update-traffic`,
+   so the API-minimum traffic operation uses `gha-preview-deploy`'s existing
+   exact-service update, preview-runtime `actAs`, and exact-preview-repository
+   Reader grants. Those permissions are also sufficient to deploy a preview
+   revision; contain that irreducible API capability with the distinct
+   preview-operator workflow attribute, exact workflow-SHA WIF, protected
+   `preview-operations` environment/event claims, immutable project/service
+   selection, fixed CLI arguments, and no PR checkout or PR-controlled code
+   after authentication. No credential may reach PR-controlled code.
+   Require the subsequent exposure plan to remain empty. For a
    fresh app, apply production first and exposure second. The current Critical
    History service already completed this baseline migration with public preview
    ingress. For its follow-on stable namespace, do not apply the new production
@@ -303,15 +313,22 @@ the recovery object and stop; never rerun from empty state.
     external-principal, public, group, domain, inherited, or custom grant that
     could mint its tokens.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
-    `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish` and require the expected
-    identity-specific `attribute.*_workflow_sha/<new-sha>` Workload Identity User
-    binding on each. Prove both publisher accounts have only one exact
+    `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
+    the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload
+    Identity User binding on every active identity and no active-SHA binding on
+    the retired operator. Prove both publisher accounts have only one exact
     repository-level Artifact Registry Writer grant, both deploy accounts have
     only Reader on their exact image repository, both publishers have zero Cloud
-    Run and runtime `actAs` grants, and the preview operator has only the
-    `previewTrafficImageDownloader` custom role on the exact preview repository
-    and zero runtime `actAs` grants. The canary alone cannot prove each operational
-    binding.
+    Run and runtime `actAs` grants. Prove the active/new SHA's
+    `attribute.preview_operator_workflow_sha` principalSet targets only
+    `gha-preview-deploy`; only the declared transition SHA may target
+    `gha-preview-operator`, and both the transition set and legacy fallback must
+    be empty at steady state. Prove the retired operator has zero Cloud Run,
+    registry, runtime `actAs`, project, secret, state, data, and production
+    grants. Audit the exact cleanup/reconcile workflow SHA, environment/event
+    claims, immutable project/service map, fixed CLI arguments, and absence of PR
+    checkout or PR-controlled execution after authentication. The canary alone
+    cannot prove each operational binding.
 
 ### Stable-preview rollback boundary
 
