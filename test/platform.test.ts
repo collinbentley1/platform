@@ -1122,6 +1122,60 @@ describe("platform scaffold and doctor", () => {
     expect(invalidation).toContain("verify_stable_preview_absent");
     expect(invalidation).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain("deployed-revision: ${{ steps.deploy.outputs.revision }}");
+    expect(deploy).toContain(
+      'gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body',
+    );
+    expect(deploy).not.toContain('gh pr comment "$PR_NUMBER" --body');
+    const parsedPreview = Bun.YAML.parse(deploy) as {
+      jobs: { deploy: { steps: Array<Record<string, unknown>> } };
+    };
+    const commentStep = parsedPreview.jobs.deploy.steps.find(
+      (step) => step.name === "Comment preview URL",
+    );
+    expect(commentStep).toBeDefined();
+    const commentRun = commentStep?.run as string;
+    const commentRoot = await mkdtemp(join(tmpdir(), "platform-preview-comment-"));
+    temporaryRoots.push(commentRoot);
+    const commentBin = join(commentRoot, "bin");
+    await mkdir(commentBin);
+    const commentCapture = join(commentRoot, "arguments.txt");
+    const fakeCommentGh = join(commentBin, "gh");
+    await writeFile(
+      fakeCommentGh,
+      ["#!/bin/sh", "set -eu", "printf '%s\\n' \"$@\" > \"$FAKE_GH_CAPTURE\"", ""].join(
+        "\n",
+      ),
+    );
+    await chmod(fakeCommentGh, 0o755);
+    const commentChild = Bun.spawn(["/bin/bash", "-c", commentRun], {
+      cwd: commentRoot,
+      env: {
+        EXPECTED_HEAD_SHA: "a".repeat(40),
+        FAKE_GH_CAPTURE: commentCapture,
+        GH_TOKEN: "test-token",
+        GITHUB_REPOSITORY: "collinbentley1/cdbentley",
+        PATH: `${commentBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+        PREVIEW_REVISION: "cdbentley-preview-p31-test",
+        PREVIEW_URL: "https://pr-31.example.test",
+        PR_NUMBER: "31",
+      },
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [commentExit, commentStderr] = await Promise.all([
+      commentChild.exited,
+      new Response(commentChild.stderr).text(),
+    ]);
+    expect({ commentExit, commentStderr }).toEqual({ commentExit: 0, commentStderr: "" });
+    expect((await readFile(commentCapture, "utf8")).trim().split("\n")).toEqual([
+      "pr",
+      "comment",
+      "31",
+      "--repo",
+      "collinbentley1/cdbentley",
+      "--body",
+      `Preview for commit ${"a".repeat(40)} deployed at https://pr-31.example.test (revision cdbentley-preview-p31-test).`,
+    ]);
     expect(invalidation).toContain("EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}");
     expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
     expect(reconcile).toContain("expected_revision_prefix");
@@ -1328,7 +1382,7 @@ describe("platform scaffold and doctor", () => {
     );
   });
 
-  test("verified registry copies are isolated from exact-version staging cleanup", async () => {
+  test("verified registry copies are isolated from exact-package staging cleanup", async () => {
     const copyRuns: string[] = [];
     const cleanupRuns: string[] = [];
     const occurrences = (value: string, needle: string) => value.split(needle).length - 1;
@@ -1429,13 +1483,11 @@ describe("platform scaffold and doctor", () => {
       expect(cleanupSteps).toHaveLength(1);
       const cleanupStep = cleanupSteps[0];
       expect(Object.keys(cleanupStep).sort()).toEqual([
-        "continue-on-error",
         "env",
         "name",
         "run",
         "timeout-minutes",
       ]);
-      expect(cleanupStep["continue-on-error"]).toBe(true);
       expect(cleanupStep["timeout-minutes"]).toBe(2);
       expect(cleanupStep.env).toEqual({
         GH_TOKEN: "${{ github.token }}",
@@ -1454,10 +1506,10 @@ describe("platform scaffold and doctor", () => {
       expect(cleanupRun).not.toContain("us-east4-docker.pkg.dev");
       expect(occurrences(cleanupRun, "gh api")).toBe(2);
       expect(occurrences(cleanupRun, "gh api --method DELETE")).toBe(1);
-      expect(
-        occurrences(cleanupRun, '/packages/container/${package}/versions/${version_id}'),
-      ).toBe(1);
+      expect(occurrences(cleanupRun, '/packages/container/${package}"')).toBe(1);
+      expect(cleanupRun).not.toContain('/versions/${version_id}');
       expect(occurrences(cleanupRun, "versions?state=active&per_page=100")).toBe(1);
+      expect(cleanupRun).not.toContain("continue-on-error");
       expect(cleanupRun).not.toContain("|| true");
     }
 
@@ -1475,6 +1527,8 @@ describe("platform scaffold and doctor", () => {
     };
     const fixtures = [
       { versions: [exact], valid: true },
+      { versions: null, valid: false },
+      { versions: {}, valid: false },
       { versions: [{ ...exact, name: `sha256:${"b".repeat(64)}` }], valid: false },
       {
         versions: [{ ...exact, metadata: { ...exact.metadata, container: { tags: ["wrong"] } } }],
@@ -1489,6 +1543,10 @@ describe("platform scaffold and doctor", () => {
       { versions: [{ ...exact, metadata: { ...exact.metadata, package_type: "npm" } }], valid: false },
       { versions: [{ id: 123, name: digest }], valid: false },
       { versions: [exact, { ...exact, id: 124 }], valid: false },
+      {
+        versions: [exact, { ...exact, id: 124, name: `sha256:${"b".repeat(64)}` }],
+        valid: false,
+      },
       { versions: [{ ...exact, id: "123" }], valid: false },
       { versions: [{ ...exact, id: 123.5 }], valid: false },
       { versions: [{ ...exact, id: 0 }], valid: false },
@@ -1538,6 +1596,11 @@ describe("platform scaffold and doctor", () => {
         '  endpoint="$argument"',
         "done",
         'if [ "$delete_request" = "1" ]; then',
+        '  case "$endpoint" in',
+        '    */versions/*) exit 64 ;;',
+        '    */packages/container/platform-*) ;;',
+        '    *) exit 65 ;;',
+        '  esac',
         '  printf \'%s\\n\' "$endpoint" >> "$FAKE_GH_CAPTURE"',
         "  exit 0",
         "fi",
@@ -1596,7 +1659,7 @@ describe("platform scaffold and doctor", () => {
           const apiRoot = fixture.failUser ? "/users/collinbentley1" : "/user";
           expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
           expect(deletes).toEqual([
-            `${apiRoot}/packages/container/platform-cdbentley-${stagingKind}-staging-123-1/versions/${fixture.expectedId}`,
+            `${apiRoot}/packages/container/platform-cdbentley-${stagingKind}-staging-123-1`,
           ]);
         }
       }

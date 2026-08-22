@@ -564,7 +564,7 @@ jobs:
           fi
 
   cleanup-staging:
-    name: Retire copied GitHub staging package version
+    name: Retire copied GitHub staging package
     runs-on: ubuntu-24.04
     needs:
       - build
@@ -572,11 +572,10 @@ jobs:
     if: always() && needs.publish.result == 'success'
     timeout-minutes: 5
     permissions:
-      packages: write # Delete only the uniquely matched isolated GHCR staging version.
+      packages: write # Delete only the verified run-and-attempt-unique GHCR staging package.
 
     steps:
-      - name: Delete the unique exact staging package version
-        continue-on-error: true
+      - name: Delete the verified isolated staging package
         timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
@@ -607,19 +606,17 @@ jobs:
               > "$versions"; then
               candidate_id=""
               if candidate_id="$(jq -er --arg digest "$STAGING_DIGEST" --arg tag "$tag" '
-                [
-                    .[]
-                    | select(
-                        .name == $digest and
-                        .metadata.package_type == "container" and
-                        .metadata.container.tags == [$tag] and
-                        (.id | type) == "number" and
-                        .id > 0 and
-                        (.id | floor) == .id
-                      )
-                    | .id
-                  ]
-                | if length == 1 then .[0] else error("expected one isolated staging version") end
+                if type == "array" and
+                   length == 1 and
+                   .[0].name == $digest and
+                   .[0].metadata.package_type == "container" and
+                   .[0].metadata.container.tags == [$tag] and
+                   (.[0].id | type) == "number" and
+                   .[0].id > 0 and
+                   (.[0].id | floor) == .[0].id
+                then .[0].id
+                else error("expected one exact isolated staging version")
+                end
               ' "$versions" 2>/dev/null)" && [[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]; then
                 version_id="$candidate_id"
                 package_api_root="$candidate_root"
@@ -634,7 +631,7 @@ jobs:
           if ! gh api --method DELETE \
             --header 'Accept: application/vnd.github+json' \
             --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "/${package_api_root}/packages/container/${package}/versions/${version_id}"; then
+            "/${package_api_root}/packages/container/${package}"; then
             echo "::warning::GitHub staging package cleanup failed after the verified registry copy."
             exit 1
           fi

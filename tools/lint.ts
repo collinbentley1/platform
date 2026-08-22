@@ -621,7 +621,6 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
     "if: always() && needs.publish.result == 'success'",
     "timeout-minutes: 5",
     "permissions:\n      packages: write",
-    "continue-on-error: true",
     "timeout-minutes: 2",
     `package="platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}"`,
     'tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
@@ -632,9 +631,11 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
     '.name == $digest',
     '.metadata.package_type == "container"',
     '.metadata.container.tags == [$tag]',
-    'if length == 1 then .[0] else error("expected one isolated staging version") end',
+    'if type == "array" and',
+    'length == 1 and',
+    'else error("expected one exact isolated staging version")',
     '[[ "$candidate_id" =~ ^[1-9][0-9]*$ ]]',
-    '/packages/container/${package}/versions/${version_id}',
+    '/packages/container/${package}',
     "X-GitHub-Api-Version: 2022-11-28",
   ]) {
     requireContains(path, cleanup, needle, `Staging package cleanup is missing: ${needle}`);
@@ -645,18 +646,32 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
   rejectContains(path, cleanup, "environment:", "Post-copy staging cleanup must not enter a protected cloud environment.");
   rejectContains(path, cleanup, "--paginate", "Post-copy staging cleanup must bound GitHub package enumeration.");
   rejectContains(path, cleanup, '"$crane" copy', "Post-copy staging cleanup must not recopy the image.");
+  rejectContains(path, cleanup, "continue-on-error", "Staging package cleanup failures must remain visible.");
   rejectContains(path, cleanup, "|| true", "Staging package cleanup must use explicit fallback branches.");
   requireBefore(
     path,
     workflow,
     'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"',
     "  cleanup-staging:",
-    "Best-effort staging cleanup must occur only after a verified copy exports its digest.",
+    "Staging cleanup must occur only after a verified copy exports its digest.",
   );
   requireContains(path, deploy, deployAccount, "Cloud Run mutation must use the dedicated deploy/operator service account.");
   rejectContains(path, deploy, publisherAccount, "A Cloud Run deploy job must not authenticate the Artifact Registry publisher.");
 }
 const previewInvalidation = sectionFrom(deployPreview, "  invalidate:\n");
+const previewDeploy = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
+requireContains(
+  ".github/workflows/deploy-preview.yml",
+  previewDeploy,
+  'gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body',
+  "Preview comments must identify the repository when the deploy job has no checkout.",
+);
+rejectContains(
+  ".github/workflows/deploy-preview.yml",
+  previewDeploy,
+  'gh pr comment "$PR_NUMBER" --body',
+  "Preview comments must not rely on a local Git repository.",
+);
 const previewPublishCanary = sectionBetween(deployPreview, "  publish-canary:\n", "\n  publish:\n");
 requireContains(
   ".github/workflows/deploy-preview.yml",
