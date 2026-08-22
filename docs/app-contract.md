@@ -58,7 +58,10 @@ the pinned TypeScript entrypoint by its exact installed path. The package script
 are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
-commit SHA. Deploy callers pass no secrets and must never use `secrets: inherit`.
+commit SHA. Deploy callers forward exactly the five reviewed secret names and
+must never use `secrets: inherit`. The reusable deploy contracts declare only
+those names; the protected called-job environment supplies and overrides each
+value after approval, and callers cannot redirect them.
 The `preview-build` and `production-build` environments contain only the DHI
 registry credentials, an admin-visible `packages:list`-only Socket policy token,
 and the reviewed, non-confidential Grype database manifest stored as an

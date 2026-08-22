@@ -5,6 +5,10 @@ import {
   validateRegistryOnlyLock,
   validateTypeScriptLock,
 } from "./ci/app-contract";
+import {
+  type SecretContextReference,
+  semanticSecretContextReferences,
+} from "./ci/workflow-secret-contract";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -18,6 +22,62 @@ const reusableWorkflows = [
   "reconcile-previews.yml",
 ];
 const platformWorkflows = [...reusableWorkflows, "platform.yml"];
+const declaredEnvironmentSecrets = [
+  "DHI_ACCESS_TOKEN",
+  "DHI_USERNAME",
+  "GRYPE_DB_MANIFEST_JSON",
+  "MAPBOX_PUBLIC_TOKEN",
+  "SOCKET_API_TOKEN",
+];
+const expectedEnvironmentSecretDeclarations = [
+  "    secrets:",
+  "      DHI_ACCESS_TOKEN:",
+  "        required: true",
+  "      DHI_USERNAME:",
+  "        required: true",
+  "      GRYPE_DB_MANIFEST_JSON:",
+  "        required: true",
+  "      MAPBOX_PUBLIC_TOKEN:",
+  "        required: false",
+  "      SOCKET_API_TOKEN:",
+  "        required: true",
+].join("\n");
+const expectedCallerSecretMap = [
+  "    secrets:",
+  "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
+  "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
+  "      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+  "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+].join("\n");
+const expectedReusableSecretContextReferences: SecretContextReference[] = [
+  { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
+  {
+    job: "build",
+    path: "jobs.build.steps.7.env.SOCKET_API_TOKEN",
+    value: "${{ secrets.SOCKET_API_TOKEN }}",
+  },
+  {
+    job: "build",
+    path: "jobs.build.steps.9.with.username",
+    value: "${{ secrets.DHI_USERNAME }}",
+  },
+  {
+    job: "build",
+    path: "jobs.build.steps.9.with.password",
+    value: "${{ secrets.DHI_ACCESS_TOKEN }}",
+  },
+  {
+    job: "build",
+    path: "jobs.build.steps.17.env.DB_MANIFEST_JSON",
+    value: "${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+  },
+  {
+    job: "deploy",
+    path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
+    value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  },
+];
 
 for (const workflow of reusableWorkflows) {
   const path = `.github/workflows/${workflow}`;
@@ -62,6 +122,18 @@ requireContains(
 );
 
 const deployPreview = await read(".github/workflows/deploy-preview.yml");
+
+for (const [path, workflow] of [
+  [".github/workflows/deploy-preview.yml", deployPreview],
+  [".github/workflows/deploy-prod.yml", deployProd],
+] as const) {
+  const workflowCall = sectionBetween(workflow, "  workflow_call:\n", "\npermissions:");
+  const declarationBlock = sectionFrom(workflowCall, "    secrets:\n").trimEnd();
+  if (declarationBlock !== expectedEnvironmentSecretDeclarations) {
+    failures.push(`${path}: workflow_call secrets must exactly match the reviewed five-name contract.`);
+  }
+}
+
 rejectContains(
   ".github/workflows/deploy-preview.yml",
   deployPreview,
@@ -114,6 +186,46 @@ for (const needle of [
   );
 }
 const previewDeployJob = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
+for (const [path, workflow, buildJob, deployJob] of [
+  [
+    ".github/workflows/deploy-preview.yml",
+    deployPreview,
+    sectionBetween(deployPreview, "  build:\n", "\n  canary:\n"),
+    previewDeployJob,
+  ],
+  [
+    ".github/workflows/deploy-prod.yml",
+    deployProd,
+    sectionBetween(deployProd, "  build:\n", "\n  canary:\n"),
+    sectionFrom(deployProd, "  deploy:\n"),
+  ],
+] as const) {
+  let references: SecretContextReference[];
+  try {
+    references = semanticSecretContextReferences(workflow);
+  } catch (error) {
+    failures.push(`${path}: semantic YAML inspection failed: ${String(error)}`);
+    references = [];
+  }
+  if (JSON.stringify(references) !== JSON.stringify(expectedReusableSecretContextReferences)) {
+    failures.push(`${path}: decoded secret-context references must exactly match the reviewed job paths.`);
+  }
+  for (const secret of [
+    "DHI_ACCESS_TOKEN",
+    "DHI_USERNAME",
+    "GRYPE_DB_MANIFEST_JSON",
+    "SOCKET_API_TOKEN",
+  ]) {
+    const reference = `\${{ secrets.${secret} }}`;
+    if (workflow.split(reference).length !== 2 || !buildJob.includes(reference)) {
+      failures.push(`${path}: ${secret} must be referenced exactly once and only by the build job.`);
+    }
+  }
+  const mapboxReference = "${{ secrets.MAPBOX_PUBLIC_TOKEN }}";
+  if (workflow.split(mapboxReference).length !== 2 || !deployJob.includes(mapboxReference)) {
+    failures.push(`${path}: MAPBOX_PUBLIC_TOKEN must be referenced exactly once and only by the deploy job.`);
+  }
+}
 for (const needle of [
   'stable_preview_domain="preview.ycriticalhistory.org"',
   'preview_ingress="internal-and-cloud-load-balancing"',
@@ -1159,6 +1271,15 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
   requireContains(path, text, "@__PLATFORM_SHA__", "Template workflows must use the scaffolded platform SHA.");
   rejectContains(path, text, "secrets: inherit", "Template workflows must pass only named secrets.");
   checkActionPins(path, text, true);
+}
+
+for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+  const path = `templates/app/.github/workflows/${workflow}`;
+  const text = await read(path);
+  const secretMap = sectionFrom(text, "    secrets:\n").trimEnd();
+  if (secretMap !== expectedCallerSecretMap) {
+    failures.push(`${path}: deploy caller secret map must exactly match the reviewed five-name contract.`);
+  }
 }
 
 const dockerfile = await read("templates/app/Dockerfile");

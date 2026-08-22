@@ -2,6 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  type SecretContextReference,
+  semanticSecretContextReferences,
+} from "../tools/ci/workflow-secret-contract";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const cli = join(repoRoot, "tools/platform.ts");
@@ -174,6 +178,43 @@ describe("platform scaffold and doctor", () => {
     const result = await run(["doctor", app]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("uses secrets: inherit");
+  });
+
+  test("doctor rejects missing, redirected, or additional deploy secret mappings", async () => {
+    const mutations = [
+      [
+        "missing-deploy-secret",
+        (workflow: string) =>
+          workflow.replace("      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}\n", ""),
+      ],
+      [
+        "redirected-deploy-secret",
+        (workflow: string) =>
+          workflow.replace(
+            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
+            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_USERNAME }}",
+          ),
+      ],
+      [
+        "additional-deploy-secret",
+        (workflow: string) =>
+          workflow.replace(
+            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}\n" +
+              "      UNREVIEWED_TOKEN: ${{ secrets.UNREVIEWED_TOKEN }}",
+          ),
+      ],
+    ] as const;
+
+    for (const [name, mutate] of mutations) {
+      const app = await scaffold(name);
+      const path = join(app, ".github/workflows/deploy-preview.yml");
+      await writeFile(path, mutate(await readFile(path, "utf8")));
+
+      const result = await run(["doctor", app]);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("must exactly match the rendered platform caller template");
+    }
   });
 
   test("doctor rejects caller-controlled Checkov configuration symlinks", async () => {
@@ -653,6 +694,92 @@ describe("platform scaffold and doctor", () => {
     }
     for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
+      const expectedSecretContextReferences: SecretContextReference[] = [
+        { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
+        {
+          job: "build",
+          path: "jobs.build.steps.7.env.SOCKET_API_TOKEN",
+          value: "${{ secrets.SOCKET_API_TOKEN }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.9.with.username",
+          value: "${{ secrets.DHI_USERNAME }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.9.with.password",
+          value: "${{ secrets.DHI_ACCESS_TOKEN }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.17.env.DB_MANIFEST_JSON",
+          value: "${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+        },
+        {
+          job: "deploy",
+          path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
+          value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+        },
+      ];
+      expect(semanticSecretContextReferences(text)).toEqual(expectedSecretContextReferences);
+      for (const hostileScalar of [
+        "${{ secrets.socket_api_token }}",
+        "${{ secrets['socket_api_token'] }}",
+        "${{ format('{0}', secrets.DHI_ACCESS_TOKEN) }}",
+        "${{ toJSON(secrets) }}",
+        "\"${{ \\u0073ecrets.socket_api_token }}\"",
+        "\"${{ \\x73ecrets.socket_api_token }}\"",
+      ]) {
+        const mutated = text.replace(
+          "  canary:\n",
+          `  canary:\n    env:\n      HOSTILE_SECRET_REFERENCE: ${hostileScalar}\n`,
+        );
+        expect(semanticSecretContextReferences(mutated)).not.toEqual(
+          expectedSecretContextReferences,
+        );
+      }
+      const anchoredEnvironment = text
+        .replace(
+          "        env:\n          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+          "        env: &platform_secret_env\n" +
+            "          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+        )
+        .replace("  canary:\n", "  canary:\n    env: *platform_secret_env\n");
+      expect(semanticSecretContextReferences(anchoredEnvironment)).not.toEqual(
+        expectedSecretContextReferences,
+      );
+      let anchoredStep = text.replace(
+        "      - name: Enforce the organization Socket policy before package extraction",
+        "      - &platform_secret_step\n" +
+          "        name: Enforce the organization Socket policy before package extraction",
+      );
+      const canaryStart = anchoredStep.indexOf("\n  canary:\n");
+      const canarySteps = anchoredStep.indexOf("    steps:\n", canaryStart);
+      const canaryStepsBody = canarySteps + "    steps:\n".length;
+      anchoredStep =
+        anchoredStep.slice(0, canaryStepsBody) +
+        "      - *platform_secret_step\n" +
+        anchoredStep.slice(canaryStepsBody);
+      expect(semanticSecretContextReferences(anchoredStep)).not.toEqual(
+        expectedSecretContextReferences,
+      );
+      const workflowCall = text.slice(0, text.indexOf("\npermissions:"));
+      expect(workflowCall.slice(workflowCall.indexOf("    secrets:\n")).trimEnd()).toBe(
+        [
+          "    secrets:",
+          "      DHI_ACCESS_TOKEN:",
+          "        required: true",
+          "      DHI_USERNAME:",
+          "        required: true",
+          "      GRYPE_DB_MANIFEST_JSON:",
+          "        required: true",
+          "      MAPBOX_PUBLIC_TOKEN:",
+          "        required: false",
+          "      SOCKET_API_TOKEN:",
+          "        required: true",
+        ].join("\n"),
+      );
       expect(text.split("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}")).toHaveLength(2);
       expect(text).toContain(
         '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
@@ -664,6 +791,43 @@ describe("platform scaffold and doctor", () => {
       expect(
         text.indexOf("Enforce the organization Socket policy before package extraction"),
       ).toBeLessThan(text.indexOf("Login to Docker Hardened Images"));
+      const buildJob = text.slice(text.indexOf("  build:\n"), text.indexOf("\n  canary:\n"));
+      const deployStart = text.indexOf("  deploy:\n");
+      const deployEnd =
+        workflow === "deploy-preview.yml" ? text.indexOf("\n  invalidate:\n") : text.length;
+      const deployJob = text.slice(deployStart, deployEnd);
+      for (const secret of [
+        "DHI_ACCESS_TOKEN",
+        "DHI_USERNAME",
+        "GRYPE_DB_MANIFEST_JSON",
+        "SOCKET_API_TOKEN",
+      ]) {
+        const reference = `\${{ secrets.${secret} }}`;
+        expect(text.split(reference)).toHaveLength(2);
+        expect(buildJob).toContain(reference);
+        expect(deployJob).not.toContain(reference);
+      }
+      const mapboxReference = "${{ secrets.MAPBOX_PUBLIC_TOKEN }}";
+      expect(text.split(mapboxReference)).toHaveLength(2);
+      expect(deployJob).toContain(mapboxReference);
+      expect(buildJob).not.toContain(mapboxReference);
+    }
+    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+      const caller = await readFile(
+        join(repoRoot, "templates/app/.github/workflows", workflow),
+        "utf8",
+      );
+      const secretMap = caller.slice(caller.indexOf("    secrets:\n")).trimEnd();
+      expect(secretMap).toBe(
+        [
+          "    secrets:",
+          "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
+          "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
+          "      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+          "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+          "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+        ].join("\n"),
+      );
     }
     const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
     expect(dockerfile).not.toContain("--mount=type=secret");

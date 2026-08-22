@@ -2,6 +2,20 @@ name: Deploy production
 
 on:
   workflow_call:
+    # Cross-repository reusable workflows expose only declared and forwarded secret
+    # names. Callers forward exactly these names without inheriting broader scope;
+    # the approved job environments below supply and override their values.
+    secrets:
+      DHI_ACCESS_TOKEN:
+        required: true
+      DHI_USERNAME:
+        required: true
+      GRYPE_DB_MANIFEST_JSON:
+        required: true
+      MAPBOX_PUBLIC_TOKEN:
+        required: false
+      SOCKET_API_TOKEN:
+        required: true
 
 permissions: {}
 

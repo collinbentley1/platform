@@ -144,6 +144,11 @@ the recovery object and stop; never rerun from empty state.
    unsupported wildcard syntax. All other deploy environments remain free of
    runtime values.
    Do this before any caller references the new workflow.
+   The reusable deploy contracts must explicitly declare each secret name they
+   consume, and callers must forward exactly those names without using
+   `secrets: inherit`; the protected called-job environment then supplies and
+   overrides the value. Otherwise cross-repository `workflow_call` jobs receive
+   empty secret values.
    GitHub never releases environment secrets to external-fork or Dependabot
    pull-request jobs. They run only the credential-free checks and never receive
    the org token, DHI credentials, or a cloud preview. Same-repository preview

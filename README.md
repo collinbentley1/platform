@@ -47,7 +47,10 @@ jobs:
     uses: collinbentley1/platform/.github/workflows/application.yml@0123456789abcdef0123456789abcdef01234567 # v0.5.0
 ```
 
-Deploy callers pass no secrets. `DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and the
+Deploy callers forward exactly five named secret slots and never use
+`secrets: inherit`. The reusable deploy contracts explicitly declare only those
+names; each approved called-job environment supplies and overrides the value.
+`DHI_USERNAME`, `DHI_ACCESS_TOKEN`, and the
 least-scope `SOCKET_API_TOKEN` live only in the owner-approved `preview-build` and
 `production-build` environments. Each real preview or production build runs one
 organization-policy scan of the resolved lock before package extraction, then
@@ -75,7 +78,7 @@ Mapbox documents URL restrictions as best-effort abuse controls, not an
 authorization boundary; never grant a browser token confidential scopes. Do not
 enter wildcard syntax. The workflow validates the public format before mapping
 it to the app's runtime name; Mapbox `sk.*` tokens are rejected. Do not use
-`secrets: inherit` or add secret parameters to deploy callers.
+`secrets: inherit` or add any caller secret mapping beyond the five reviewed names.
 The Socket token must be admin-visible only, grant only `packages:list`, and be
 rotated and usage-audited on the same schedule as other CI credentials. The
 canonical dependency-free scanner uses the current org-scoped batch endpoint,
