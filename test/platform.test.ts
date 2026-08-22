@@ -1170,10 +1170,17 @@ describe("platform scaffold and doctor", () => {
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
-  test("Socket check gating accepts one exact app-owned success and rejects drift", async () => {
-    const workflow = Bun.YAML.parse(
-      await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8"),
-    ) as { jobs: { verify: { steps: Array<Record<string, unknown>> } } };
+  test("Socket check gating binds success to the current pull request and commit", async () => {
+    const workflowSource = await readFile(
+      join(repoRoot, ".github/workflows/platform.yml"),
+      "utf8",
+    );
+    expect(workflowSource).toContain(
+      "types:\n      - edited\n      - opened\n      - reopened\n      - synchronize",
+    );
+    const workflow = Bun.YAML.parse(workflowSource) as {
+      jobs: { verify: { steps: Array<Record<string, unknown>> } };
+    };
     const gate = workflow.jobs.verify.steps.find(
       (step) => step.name === "Require successful Socket GitHub App checks",
     );
@@ -1185,13 +1192,33 @@ describe("platform scaffold and doctor", () => {
     await mkdir(bin);
     const fixture = join(root, "check-runs.json");
     const event = join(root, "event.json");
+    const curlArguments = join(root, "curl-arguments.txt");
+    const repositoryId = 1_255_856_466;
+    const pullRequestNumber = 16;
     const head = "a".repeat(40);
-    await writeFile(event, JSON.stringify({ pull_request: { head: { sha: head } } }));
+    const base = "b".repeat(40);
+    const merge = "c".repeat(40);
+    const updatedAt = "2026-08-22T22:43:02Z";
+    const pullRequestEvent = {
+      action: "synchronize",
+      number: pullRequestNumber,
+      pull_request: {
+        base: { repo: { id: repositoryId }, sha: base },
+        head: { repo: { id: repositoryId }, sha: head },
+        updated_at: updatedAt,
+      },
+      repository: { id: repositoryId },
+    };
     await writeFile(
       join(bin, "curl"),
       [
         "#!/bin/sh",
         "set -eu",
+        'printf \'%s\\n\' "$@" > "$FAKE_CURL_ARGUMENTS"',
+        'grep -Fx -- "Authorization: Bearer test-token" "$FAKE_CURL_ARGUMENTS" >/dev/null',
+        'grep -Fx -- "Accept: application/vnd.github+json" "$FAKE_CURL_ARGUMENTS" >/dev/null',
+        'grep -Fx -- "X-GitHub-Api-Version: 2022-11-28" "$FAKE_CURL_ARGUMENTS" >/dev/null',
+        'grep -Fx -- "$EXPECTED_SOCKET_URL" "$FAKE_CURL_ARGUMENTS" >/dev/null',
         'output=""',
         'while [ "$#" -gt 0 ]; do',
         '  if [ "$1" = "--output" ]; then shift; output="$1"; fi',
@@ -1203,31 +1230,71 @@ describe("platform scaffold and doctor", () => {
       ].join("\n"),
     );
     await writeFile(join(bin, "seq"), "#!/bin/sh\nprintf '1\\n'\n");
-    await writeFile(join(bin, "sleep"), "#!/bin/sh\nexit 88\n");
+    await writeFile(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
     await Promise.all(["curl", "seq", "sleep"].map((name) => chmod(join(bin, name), 0o755)));
 
-    const exactCheck = (name: string, conclusion = "success", appId = 156372) => ({
-      app: { id: appId },
-      conclusion,
+    const pullRequestAssociation = (
+      number = pullRequestNumber,
+      associatedBase = base,
+      headRepositoryId = repositoryId,
+    ) => ({
+      base: { repo: { id: repositoryId }, sha: associatedBase },
+      head: { repo: { id: headRepositoryId }, sha: head },
+      number,
+    });
+    const exactCheck = (name: string, overrides: Record<string, unknown> = {}) => ({
+      app: { id: 156372 },
+      completed_at: "2026-08-22T22:43:05Z",
+      conclusion: "success",
+      head_sha: head,
       name,
+      output: {
+        title:
+          name === "Socket Security: Pull Request Alerts"
+            ? `Pull Request #${pullRequestNumber} Alerts: Skipped`
+            : "Project Report: Success",
+      },
+      pull_requests: [pullRequestAssociation()],
+      started_at: "2026-08-22T22:43:03Z",
       status: "completed",
+      ...overrides,
     });
     const successes = [
       exactCheck("Socket Security: Project Report"),
       exactCheck("Socket Security: Pull Request Alerts"),
     ];
-    const execute = async (checkRuns: Array<Record<string, unknown>>) => {
-      await writeFile(fixture, JSON.stringify({ check_runs: checkRuns }));
+    const execute = async ({
+      checkRuns,
+      eventDocument = pullRequestEvent,
+      eventName = "pull_request",
+      expectedTargetSha = head,
+      githubSha = merge,
+      totalCount = checkRuns.length,
+    }: {
+      checkRuns: Array<Record<string, unknown>>;
+      eventDocument?: Record<string, unknown>;
+      eventName?: string;
+      expectedTargetSha?: string;
+      githubSha?: string;
+      totalCount?: number;
+    }) => {
+      await writeFile(
+        fixture,
+        JSON.stringify({ check_runs: checkRuns, total_count: totalCount }),
+      );
+      await writeFile(event, JSON.stringify(eventDocument));
       const child = Bun.spawn(
         ["/bin/bash", "--noprofile", "--norc", "-c", `set -euo pipefail\n${gate?.run as string}`],
         {
           cwd: root,
           env: {
+            EXPECTED_SOCKET_URL: `https://api.github.com/repos/collinbentley1/platform/commits/${expectedTargetSha}/check-runs?filter=latest&per_page=100&app_id=156372`,
+            FAKE_CURL_ARGUMENTS: curlArguments,
             GH_TOKEN: "test-token",
-            GITHUB_EVENT_NAME: "pull_request",
+            GITHUB_EVENT_NAME: eventName,
             GITHUB_EVENT_PATH: event,
             GITHUB_REPOSITORY: "collinbentley1/platform",
-            GITHUB_SHA: head,
+            GITHUB_SHA: githubSha,
             PATH: `${bin}:/usr/bin:/bin`,
             RUNNER_TEMP: root,
             SOCKET_CHECK_FIXTURE: fixture,
@@ -1242,16 +1309,142 @@ describe("platform scaffold and doctor", () => {
       ]);
       return { exitCode, stderr };
     };
+    const expectTimeout = async (
+      checkRuns: Array<Record<string, unknown>>,
+      options: Omit<Parameters<typeof execute>[0], "checkRuns"> = {},
+    ) => {
+      const result = await execute({ checkRuns, ...options });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("Timed out waiting for the exact Socket GitHub App checks");
+    };
 
-    expect(await execute(successes)).toEqual({ exitCode: 0, stderr: "" });
-    const failed = await execute([
-      exactCheck("Socket Security: Project Report", "failure"),
-      successes[1],
-    ]);
+    expect(await execute({ checkRuns: successes })).toEqual({ exitCode: 0, stderr: "" });
+    const failed = await execute({
+      checkRuns: [
+        exactCheck("Socket Security: Project Report", { conclusion: "failure" }),
+        successes[1],
+      ],
+    });
     expect(failed.exitCode).toBe(1);
     expect(failed.stderr).toContain("completed without success");
-    expect((await execute([...successes, successes[0]])).exitCode).not.toBe(0);
-    expect((await execute([successes[0], exactCheck("Socket Security: Pull Request Alerts", "success", 1)])).exitCode).not.toBe(0);
+
+    await expectTimeout([...successes, successes[0]]);
+    await expectTimeout([successes[0]]);
+    await expectTimeout([
+      successes[0],
+      exactCheck("Socket Security: Pull Request Alerts", {
+        completed_at: null,
+        conclusion: null,
+        status: "in_progress",
+      }),
+    ]);
+    await expectTimeout(successes.map((check) => ({ ...check, app: { id: 1 } })));
+    expect(
+      await execute({
+        checkRuns: [
+          ...successes,
+          exactCheck("Socket Security: Pull Request Alerts", { app: { id: 1 } }),
+        ],
+      }),
+    ).toEqual({ exitCode: 0, stderr: "" });
+
+    const neutral = await execute({
+      checkRuns: [
+        successes[0],
+        exactCheck("Socket Security: Pull Request Alerts", { conclusion: "neutral" }),
+      ],
+    });
+    expect(neutral.exitCode).toBe(1);
+    expect(neutral.stderr).toContain("completed without success");
+
+    await expectTimeout(
+      successes.map((check) => ({
+        ...check,
+        completed_at: "2026-08-22T22:42:59Z",
+        started_at: "2026-08-22T22:42:58Z",
+      })),
+    );
+    await expectTimeout(
+      successes.map((check) => ({
+        ...check,
+        pull_requests: [pullRequestAssociation(pullRequestNumber + 1)],
+      })),
+    );
+    await expectTimeout(
+      successes.map((check) => ({
+        ...check,
+        pull_requests: [pullRequestAssociation(pullRequestNumber, "d".repeat(40))],
+      })),
+    );
+    await expectTimeout(successes.map((check) => ({ ...check, head_sha: "d".repeat(40) })));
+    await expectTimeout(successes, { totalCount: 101 });
+
+    const titleEditEvent = {
+      ...pullRequestEvent,
+      action: "edited",
+      changes: { title: { from: "old title" } },
+      pull_request: { ...pullRequestEvent.pull_request, updated_at: "2026-08-22T22:50:00Z" },
+    };
+    expect(
+      await execute({ checkRuns: successes, eventDocument: titleEditEvent }),
+    ).toEqual({ exitCode: 0, stderr: "" });
+    await expectTimeout(successes, {
+      eventDocument: {
+        ...titleEditEvent,
+        changes: { base: { ref: { from: "staging" } } },
+      },
+    });
+
+    const forkRepositoryId = 9_999;
+    const forkEvent = {
+      ...pullRequestEvent,
+      pull_request: {
+        ...pullRequestEvent.pull_request,
+        head: { repo: { id: forkRepositoryId }, sha: head },
+      },
+    };
+    const forkSuccesses = successes.map((check) => ({ ...check, pull_requests: [] }));
+    expect(
+      await execute({ checkRuns: forkSuccesses, eventDocument: forkEvent }),
+    ).toEqual({ exitCode: 0, stderr: "" });
+    await expectTimeout(
+      forkSuccesses.map((check) =>
+        check.name === "Socket Security: Pull Request Alerts"
+          ? { ...check, output: { title: "Pull Request #17 Alerts: Skipped" } }
+          : check,
+      ),
+      { eventDocument: forkEvent },
+    );
+
+    const pushSha = "e".repeat(40);
+    const pushOptions = {
+      eventDocument: { repository: { id: repositoryId } },
+      eventName: "push",
+      expectedTargetSha: pushSha,
+      githubSha: pushSha,
+    };
+    const pushCheck = exactCheck("Socket Security: Project Report", {
+      head_sha: pushSha,
+      pull_requests: [],
+    });
+    expect(
+      await execute({
+        checkRuns: [pushCheck],
+        ...pushOptions,
+      }),
+    ).toEqual({ exitCode: 0, stderr: "" });
+    await expectTimeout([{ ...pushCheck, completed_at: null, started_at: null }], pushOptions);
+    await expectTimeout([{ ...pushCheck, started_at: null }], pushOptions);
+    await expectTimeout(
+      [
+        {
+          ...pushCheck,
+          completed_at: "2026-08-22T22:43:02Z",
+          started_at: "2026-08-22T22:43:03Z",
+        },
+      ],
+      pushOptions,
+    );
   });
 
   test("executable workflow secret contexts reject pre-epoch credential names", async () => {
@@ -1536,6 +1729,126 @@ describe("platform scaffold and doctor", () => {
         "utf8",
       );
       expect(workflow).not.toMatch(/\brg\b/);
+    }
+  });
+
+  test("raw artifact basenames exactly match every downstream metadata check", async () => {
+    const uploadAction =
+      "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+    const helper = await readFile(
+      join(repoRoot, "tools/ci/container-artifact-contract.sh"),
+      "utf8",
+    );
+    const prefetchHelper = helper.slice(
+      helper.indexOf("prefetch() {\n"),
+      helper.indexOf("\nverify_base() {\n"),
+    );
+    const promoteHelper = helper.slice(
+      helper.indexOf("promote_image() {\n"),
+      helper.indexOf("\nvalidate_promoted() {\n"),
+    );
+    expect(prefetchHelper).toContain(
+      'local artifact="$RUNNER_TEMP/platform-${kind}-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar"',
+    );
+    expect(prefetchHelper).toContain('echo "artifact=$artifact" >> "$GITHUB_OUTPUT"');
+    expect(promoteHelper).toContain(
+      'local artifact="$RUNNER_TEMP/platform-${kind}-promoted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar"',
+    );
+    expect(promoteHelper).toContain('echo "artifact=$artifact" >> "$GITHUB_OUTPUT"');
+
+    for (const [workflowName, kind] of [
+      ["deploy-preview.yml", "preview"],
+      ["deploy-prod.yml", "production"],
+    ] as const) {
+      const source = await readFile(join(repoRoot, ".github/workflows", workflowName), "utf8");
+      const workflow = Bun.YAML.parse(source) as {
+        jobs: Record<
+          string,
+          {
+            steps?: Array<{
+              env?: Record<string, unknown>;
+              id?: string;
+              run?: string;
+              uses?: string;
+              with?: Record<string, unknown>;
+            }>;
+          }
+        >;
+      };
+      const uploads = Object.entries(workflow.jobs).flatMap(([jobName, job]) =>
+        (job.steps ?? [])
+          .filter(
+            (step) =>
+              typeof step.uses === "string" &&
+              step.uses.startsWith("actions/upload-artifact@"),
+          )
+          .map((step) => ({ jobName, step })),
+      );
+
+      expect(uploads).toHaveLength(3);
+      expect(uploads.map(({ jobName }) => jobName).sort()).toEqual([
+        "build",
+        "prefetch-bases",
+        "verify-image",
+      ]);
+      const expectedPaths: Record<string, string> = {
+        build: "${{ runner.temp }}/platform-image.oci.tar",
+        "prefetch-bases": "${{ steps.bundle.outputs.artifact }}",
+        "verify-image": "${{ steps.promote.outputs.artifact }}",
+      };
+      for (const { jobName, step } of uploads) {
+        expect(step.uses, `${workflowName}/${jobName} upload action drifted`).toBe(
+          uploadAction,
+        );
+        expect(step.id, `${workflowName}/${jobName} must expose the exact artifact id`).toBe(
+          "upload",
+        );
+        expect(step.with?.archive, `${workflowName}/${jobName} must remain raw`).toBe(false);
+        expect(
+          step.with?.name,
+          `${workflowName}/${jobName} must not pretend raw-mode name overrides are authoritative`,
+        ).toBeUndefined();
+        expect(step.with?.path, `${workflowName}/${jobName} upload path drifted`).toBe(
+          expectedPaths[jobName],
+        );
+      }
+
+      for (const [jobName, stepId, operation] of [
+        ["prefetch-bases", "bundle", "prefetch"],
+        ["verify-image", "promote", "promote"],
+      ] as const) {
+        const producers = (workflow.jobs[jobName]?.steps ?? []).filter(
+          (step) => step.id === stepId,
+        );
+        expect(producers).toHaveLength(1);
+        expect(producers[0]?.env?.ARTIFACT_KIND).toBe(kind);
+        expect(producers[0]?.run).toContain(`container-artifact-contract.sh\" ${operation}`);
+      }
+
+      const baseName = `platform-${kind}-bases-\${GITHUB_RUN_ID}-\${GITHUB_RUN_ATTEMPT}.tar`;
+      const promotedName = `platform-${kind}-promoted-\${GITHUB_RUN_ID}-\${GITHUB_RUN_ATTEMPT}.tar`;
+      expect(new Set([baseName, "platform-image.oci.tar", promotedName]).size).toBe(3);
+      const baseCheck =
+        `verify_artifact "$BASE_ARTIFACT_ID" "$BASE_ARTIFACT_DIGEST" "${baseName}"`;
+      const builtCheck =
+        'verify_artifact "$BUILT_ARTIFACT_ID" "$BUILT_ARTIFACT_DIGEST" platform-image.oci.tar';
+      const promotedCheck =
+        `verify_artifact "$ARTIFACT_ID" "$ARTIFACT_DIGEST" "${promotedName}"`;
+      const verifyImage = source.slice(
+        source.indexOf("  verify-image:\n"),
+        source.indexOf("\n  canary:\n"),
+      );
+      const publish = source.slice(
+        source.indexOf("  publish:\n"),
+        source.indexOf("\n  attest:\n"),
+      );
+      expect(verifyImage).toContain(baseCheck);
+      expect(verifyImage).toContain(builtCheck);
+      expect(publish).toContain(baseCheck);
+      expect(publish).toContain(promotedCheck);
+      expect(source.split(baseCheck)).toHaveLength(3);
+      expect(source.split(builtCheck)).toHaveLength(2);
+      expect(source.split(promotedCheck)).toHaveLength(2);
     }
   });
 
