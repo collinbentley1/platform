@@ -1414,6 +1414,25 @@ checkDockerPins("templates/app/Dockerfile", dockerfile);
 
 const readme = await read("README.md");
 requireContains("README.md", readme, "0.5.0", "README should document the current release.");
+const securityRollout = await read("docs/security-rollout.md");
+for (const boundary of [
+  "The WIF predecessor `P` is not a recovery root.",
+  "separate recovery root `R` from `S`",
+  "transition exact WIF trust from `{P, S}` to `{S, R}`",
+]) {
+  requireContains(
+    "docs/security-rollout.md",
+    securityRollout,
+    boundary,
+    `Stable-preview rollback documentation is missing boundary: ${boundary}`,
+  );
+}
+rejectContains(
+  "docs/security-rollout.md",
+  securityRollout,
+  "with the exact reviewed `P` production root",
+  "The WIF predecessor must never be presented as a public-ingress recovery root.",
+);
 const templateServer = await read("templates/app/src/server.ts");
 requireContains(
   "templates/app/src/server.ts",

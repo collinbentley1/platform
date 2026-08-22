@@ -315,14 +315,25 @@ the recovery object and stop; never rerun from empty state.
   before the first new-SHA Critical preview changes ingress, stop with consumer
   Actions disabled and preview ingress still `all`. Leave the protected edge
   resources dormant for diagnosis; do not destroy or partially unwind them.
-- If the first live-tag proof fails after ingress becomes restricted, retain
-  both `S` and the live-read predecessor `P` workflow-SHA WIF bindings. Restore
-  the Critical preview service to public ingress with the exact reviewed `P`
-  production root, or use a separately reviewed hotfix, and prove the generated
-  raw URL healthy before any repin or retry.
-- Never apply the predecessor exposure root after the stable frontend exists,
-  and never remove DNS as the first recovery step; that older exposure root
-  does not own the new protected edge resources.
+- The WIF predecessor `P` is not a recovery root. It exists only to keep the
+  immediately previous workflows authenticating during the rollout; never
+  assume that `P`, or any other historical platform root, restores public
+  preview ingress or preserves the current edge resources.
+- If the first live-tag proof fails after ingress becomes restricted, disable
+  Actions in every consumer and wait for every old run to finish. Prepare a
+  separate recovery root `R` from `S` that changes only the immutable Critical
+  preview ingress map and production preview-ingress value back to public
+  ingress while retaining the current exposure resources. Review fresh
+  bootstrap, production, and exposure plans from live state: the recovery plans
+  must contain no deletion or replacement of DNS, certificate, load balancer,
+  NEG, or URL-map resources. Only after no `P` workflow can run may the protected
+  bootstrap transition exact WIF trust from `{P, S}` to `{S, R}`. Run the exact
+  `R` recovery pipeline, prove the generated raw URL healthy, and keep DNS and
+  the dormant protected frontend in place for diagnosis.
+- Never apply `P` or an older exposure root as ingress recovery, and never
+  remove DNS as the first recovery step. If a reviewed `R` cannot meet every
+  precondition above, leave Actions disabled and stop instead of improvising a
+  third trusted SHA or a direct cloud mutation.
 - Remove the old workflow-SHA WIF trust only after the new-SHA production,
   Terraform, stable preview, cleanup, and reconciliation operations all pass.
 
