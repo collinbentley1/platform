@@ -548,16 +548,32 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
   requireContains(path, publish, publisherAccount, "Image publication must use the dedicated publisher service account.");
   requireContains(path, publish, publisherCanary, "Each publisher claim must have an independent no-role canary exchange.");
   rejectContains(path, publish, deployAccount, "An image publisher job must not authenticate the Cloud Run operator.");
-  for (const packageIdentity of [
+  requireContains(
+    path,
+    workflow,
     `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
-    `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:run-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
+    "The build must create a run-and-attempt-unique GHCR package and tag.",
+  );
+  requireContains(
+    path,
+    workflow,
+    'staging-image: ${{ steps.metadata.outputs.staging_image }}',
+    "The build must export its exact staging image identity.",
+  );
+  rejectContains(
+    path,
+    publish,
+    `staging_image=ghcr.io/${"${source_owner}"}/platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}`,
+    "A rerun must not reconstruct the producer attempt from the current attempt.",
+  );
+  for (const needle of [
+    'BUILD_STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}',
+    `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*):run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)`,
+    '[[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]]',
+    '[[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]',
+    'echo "staging_image=$BUILD_STAGING_IMAGE"',
   ]) {
-    requireContains(
-      path,
-      workflow,
-      packageIdentity,
-      "Each staging image must use a run-and-attempt-unique GHCR package and tag.",
-    );
+    requireContains(path, publish, needle, `Publisher staging identity handoff is missing: ${needle}`);
   }
   rejectContains(
     path,
@@ -622,10 +638,13 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
     "timeout-minutes: 5",
     "permissions:\n      packages: write",
     "timeout-minutes: 2",
-    `package="platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}"`,
-    'tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+    'STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}',
+    `staging_pattern="^ghcr\\\\.io/${"${owner}"}/(platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)):(run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*))$"`,
+    '[[ ! "$STAGING_IMAGE" =~ $staging_pattern ]]',
+    '[[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]',
+    'package="${BASH_REMATCH[1]}"',
+    'tag="${BASH_REMATCH[3]}"',
     '[[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]',
-    '[[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]',
     'for candidate_root in user "users/${owner}"; do',
     '/${candidate_root}/packages/container/${package}/versions?state=active&per_page=100',
     '.name == $digest',
@@ -648,6 +667,12 @@ for (const [path, workflow, publishEnvironment, publisherAccount, deployAccount,
   rejectContains(path, cleanup, '"$crane" copy', "Post-copy staging cleanup must not recopy the image.");
   rejectContains(path, cleanup, "continue-on-error", "Staging package cleanup failures must remain visible.");
   rejectContains(path, cleanup, "|| true", "Staging package cleanup must use explicit fallback branches.");
+  rejectContains(
+    path,
+    cleanup,
+    'package="platform-${repository}',
+    "Cleanup must use the producer-exported package rather than the current rerun attempt.",
+  );
   requireBefore(
     path,
     workflow,

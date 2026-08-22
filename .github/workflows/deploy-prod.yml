@@ -33,6 +33,7 @@ jobs:
       digest: ${{ steps.publish.outputs.digest }}
       sbom-artifact-id: ${{ steps.upload_sbom.outputs.artifact-id }}
       sbom-content-digest: ${{ steps.sbom_digest.outputs.digest }}
+      staging-image: ${{ steps.metadata.outputs.staging_image }}
 
     steps:
       - name: Resolve fixed build metadata
@@ -455,6 +456,7 @@ jobs:
       - name: Resolve trusted application configuration
         id: app
         env:
+          BUILD_STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}
           REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
@@ -472,11 +474,21 @@ jobs:
             echo "Unexpected repository identity." >&2
             exit 1
           fi
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Unexpected workflow run identity." >&2
+            exit 1
+          fi
+          staging_pattern="^ghcr\\.io/${source_owner}/platform-${source_repository}-production-staging-${GITHUB_RUN_ID}-([1-9][0-9]*):run-${GITHUB_RUN_ID}-([1-9][0-9]*)$"
+          if [[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]] ||
+             [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]; then
+            echo "Invalid inherited production staging image identity." >&2
+            exit 1
+          fi
           {
             echo "project_id=$project_id"
             echo "image_name=$image_name"
             echo "remote_image=${image_name}:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "staging_image=ghcr.io/${source_owner}/platform-${source_repository}-production-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "staging_image=$BUILD_STAGING_IMAGE"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "publisher_service_account=gha-prod-publish@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
@@ -580,20 +592,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           STAGING_DIGEST: ${{ needs.build.outputs.digest }}
+          STAGING_IMAGE: ${{ needs.build.outputs.staging-image }}
         run: |
           set -euo pipefail
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           repository="${GITHUB_REPOSITORY#*/}"
-          package="platform-${repository}-production-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          tag="run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if [[ ! "$owner" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
              [[ ! "$repository" =~ ^[a-z0-9][a-z0-9-]*$ ]] ||
              [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]] ||
-             [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
              [[ ! "$STAGING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::warning::Refusing malformed isolated staging package cleanup."
             exit 1
           fi
+          staging_pattern="^ghcr\\.io/${owner}/(platform-${repository}-production-staging-${GITHUB_RUN_ID}-([1-9][0-9]*)):(run-${GITHUB_RUN_ID}-([1-9][0-9]*))$"
+          if [[ ! "$STAGING_IMAGE" =~ $staging_pattern ]] ||
+             [[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]; then
+            echo "::warning::Refusing an invalid inherited staging image identity."
+            exit 1
+          fi
+          package="${BASH_REMATCH[1]}"
+          tag="${BASH_REMATCH[3]}"
 
           versions="$RUNNER_TEMP/staging-package-versions.json"
           version_id=""

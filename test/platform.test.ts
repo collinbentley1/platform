@@ -1398,15 +1398,34 @@ describe("platform scaffold and doctor", () => {
       expect(workflow).toContain(
         `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
       );
-      expect(workflow).toContain(
+      expect(workflow).not.toContain(
         `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
       );
       expect(workflow).not.toContain(`-${stagingKind}-staging:${runTag}`);
       const parsed = Bun.YAML.parse(workflow) as {
         jobs: Record<string, Record<string, unknown>>;
       };
+      const build = parsed.jobs.build;
+      expect(build.outputs).toEqual({
+        digest: "${{ steps.publish.outputs.digest }}",
+        "sbom-artifact-id": "${{ steps.upload_sbom.outputs.artifact-id }}",
+        "sbom-content-digest": "${{ steps.sbom_digest.outputs.digest }}",
+        "staging-image": "${{ steps.metadata.outputs.staging_image }}",
+      });
       const publish = parsed.jobs.publish;
       const publishSteps = publish.steps as Array<Record<string, unknown>>;
+      const app = publishSteps.find((step) => step.name === "Resolve trusted application configuration");
+      expect(app).toBeDefined();
+      expect((app?.env as Record<string, string>).BUILD_STAGING_IMAGE).toBe(
+        "${{ needs.build.outputs.staging-image }}",
+      );
+      const appRun = app?.run as string;
+      expect(appRun).toContain(
+        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*):run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)`,
+      );
+      expect(appRun).toContain('[[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]]');
+      expect(appRun).toContain('[[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]');
+      expect(appRun).toContain('echo "staging_image=$BUILD_STAGING_IMAGE"');
       const copyIndex = publishSteps.findIndex(
         (step) => step.name === "Copy the opaque image by digest",
       );
@@ -1492,13 +1511,19 @@ describe("platform scaffold and doctor", () => {
       expect(cleanupStep.env).toEqual({
         GH_TOKEN: "${{ github.token }}",
         STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
+        STAGING_IMAGE: "${{ needs.build.outputs.staging-image }}",
       });
       const cleanupRun = cleanupStep.run as string;
       cleanupRuns.push(cleanupRun);
       expect(cleanupRun.startsWith("set -euo pipefail\n")).toBe(true);
       expect(cleanupRun).toContain(
-        `package="platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}"`,
+        `(platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)):(run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*))`,
       );
+      expect(cleanupRun).toContain('[[ ! "$STAGING_IMAGE" =~ $staging_pattern ]]');
+      expect(cleanupRun).toContain('[[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]');
+      expect(cleanupRun).toContain('package="${BASH_REMATCH[1]}"');
+      expect(cleanupRun).toContain('tag="${BASH_REMATCH[3]}"');
+      expect(cleanupRun).not.toContain('package="platform-${repository}');
       expect(cleanupRun).not.toContain("--paginate");
       expect(cleanupRun).not.toContain("AR_ACCESS_TOKEN");
       expect(cleanupRun).not.toContain("DOCKER_CONFIG");
@@ -1638,11 +1663,12 @@ describe("platform scaffold and doctor", () => {
             GH_TOKEN: "test-token",
             GITHUB_REPOSITORY: "collinbentley1/cdbentley",
             GITHUB_REPOSITORY_OWNER: "collinbentley1",
-            GITHUB_RUN_ATTEMPT: "1",
+            GITHUB_RUN_ATTEMPT: "2",
             GITHUB_RUN_ID: "123",
             PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
             RUNNER_TEMP: runnerTemp,
             STAGING_DIGEST: digest,
+            STAGING_IMAGE: `ghcr.io/collinbentley1/platform-cdbentley-${stagingKind}-staging-123-1:run-123-1`,
           },
           stdout: "ignore",
           stderr: "pipe",
