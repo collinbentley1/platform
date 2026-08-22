@@ -1072,6 +1072,12 @@ for (const workflow of ["application.yml", "socket-firewall.yml", "deploy-previe
   requireContains(
     path,
     text,
+    '"${{ github.event.repository.id }}" \\\n              "${{ job.workflow_sha }}"',
+    "Immutable app policy must bind Terraform mirrors to the resolved reusable workflow SHA.",
+  );
+  requireContains(
+    path,
+    text,
     "--no-env-file --no-orphans",
     "Trusted Bun commands must disable env files and kill descendants.",
   );

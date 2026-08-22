@@ -18,6 +18,8 @@ const canonicalFiles = [
   "bunfig.toml",
   "tools/platform-verify.ts",
   "tools/socket-security-scanner.ts",
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/prod/.terraform.lock.hcl",
 ];
 const requiredFiles = [
   ...canonicalFiles,
@@ -31,10 +33,26 @@ const requiredFiles = [
   "tools/lint.ts",
   "infra/terraform/bootstrap/main.tf",
   "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
   "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
   "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
 ];
 const ignoredWalkPaths = new Set([".git", "_platform_policy"]);
+const allowedTerraformMirrorFiles = new Set([
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
+  "infra/terraform/prod/.terraform.lock.hcl",
+  "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
+  "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
+]);
 const forbiddenSyftConfigs = new Set([
   ".syft",
   ".syft.yaml",
@@ -43,10 +61,17 @@ const forbiddenSyftConfigs = new Set([
   ".syft/config.yml",
 ]);
 
-const [appArg, templateArg, trustedRepositoryId] = Bun.argv.slice(2);
-if (!appArg || !templateArg || !trustedRepositoryId || !/^[1-9][0-9]*$/.test(trustedRepositoryId)) {
+const [appArg, templateArg, trustedRepositoryId, expectedPlatformSha] = Bun.argv.slice(2);
+if (
+  !appArg ||
+  !templateArg ||
+  !trustedRepositoryId ||
+  !/^[1-9][0-9]*$/.test(trustedRepositoryId) ||
+  !expectedPlatformSha ||
+  !/^[0-9a-f]{40}$/.test(expectedPlatformSha)
+) {
   throw new Error(
-    "Usage: enforce-app-contract.ts <application-root> <platform-template-root> <trusted-repository-id>",
+    "Usage: enforce-app-contract.ts <application-root> <platform-template-root> <trusted-repository-id> <expected-platform-sha>",
   );
 }
 
@@ -94,20 +119,43 @@ const typedPlatformConfig = platformConfig as {
 if (!typedPlatformConfig.projectId) {
   throw new Error(".platform/config.json projectId is required by the Terraform mirror contract.");
 }
-const [bootstrapMain, bootstrapOutputs, productionMain, productionVariables] = await Promise.all([
+const [
+  bootstrapMain,
+  bootstrapOutputs,
+  bootstrapVariables,
+  bootstrapVersions,
+  productionMain,
+  productionOutputs,
+  productionVariables,
+  productionVersions,
+] = await Promise.all([
   readFile(join(appRoot, "infra/terraform/bootstrap/main.tf"), "utf8"),
   readFile(join(appRoot, "infra/terraform/bootstrap/outputs.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/bootstrap/variables.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/bootstrap/versions.tf"), "utf8"),
   readFile(join(appRoot, "infra/terraform/prod/main.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/prod/outputs.tf"), "utf8"),
   readFile(join(appRoot, "infra/terraform/prod/variables.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/prod/versions.tf"), "utf8"),
 ]);
 const terraformMirrorFailures = validateTerraformMirrorContract(
   {
+    expectedPlatformSha,
     githubRepositoryId: trustedRepositoryId,
     name: typedPlatformConfig.name,
     projectId: typedPlatformConfig.projectId,
     serviceName: typedPlatformConfig.serviceName,
   },
-  { bootstrapMain, bootstrapOutputs, productionMain, productionVariables },
+  {
+    bootstrapMain,
+    bootstrapOutputs,
+    bootstrapVariables,
+    bootstrapVersions,
+    productionMain,
+    productionOutputs,
+    productionVariables,
+    productionVersions,
+  },
 );
 if (terraformMirrorFailures.length > 0) {
   throw new Error(terraformMirrorFailures.join("\n"));
@@ -181,6 +229,9 @@ for await (const file of walk(appRoot)) {
   if (isForbiddenTerraformArtifact(relativeFile)) {
     throw new Error(`Forbidden Terraform state/config artifact: ${relativeFile}`);
   }
+  if (isAdditionalTerraformMirrorFile(relativeFile)) {
+    throw new Error(`Unreviewed additional Terraform mirror file: ${relativeFile}`);
+  }
   if (
     name === ".npmrc" ||
     name === "npmrc" ||
@@ -212,6 +263,9 @@ async function* walk(directory: string): AsyncGenerator<string> {
       throw new Error(`Forbidden Terraform state/config artifact: ${relativePath}`);
     }
     if (entry.isSymbolicLink()) {
+      if (isTerraformMirrorPath(relativePath)) {
+        throw new Error(`Terraform mirror entries must not be symbolic links: ${relativePath}`);
+      }
       if (
         entry.name === ".npmrc" ||
         entry.name === "npmrc" ||
@@ -233,4 +287,12 @@ async function* walk(directory: string): AsyncGenerator<string> {
       yield path;
     }
   }
+}
+
+function isTerraformMirrorPath(path: string): boolean {
+  return path.startsWith("infra/terraform/bootstrap/") || path.startsWith("infra/terraform/prod/");
+}
+
+function isAdditionalTerraformMirrorFile(path: string): boolean {
+  return isTerraformMirrorPath(path) && !allowedTerraformMirrorFiles.has(path);
 }

@@ -167,6 +167,165 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("uses non-immutable platform ref main");
   });
 
+  test("doctor and immutable contract bind module sources inside the unique module block", async () => {
+    const app = await scaffold("module-source-decoy");
+    const path = join(app, "infra/terraform/prod/main.tf");
+    const original = await readFile(path, "utf8");
+    await writeFile(
+      path,
+      original.replace(
+        `github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=${platformSha}`,
+        `github.com/attacker/platform//terraform/modules/cloud-run-service?ref=${platformSha}`,
+      ) +
+        `\nlocals {\n  source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=${platformSha}"\n}\n`,
+    );
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "module must contain exactly one top-level canonical cloud-run-service source",
+      );
+    }
+  });
+
+  test("Terraform mirror main files reject resources outside the reviewed module", async () => {
+    const app = await scaffold("extra-terraform-resource");
+    const path = join(app, "infra/terraform/prod/main.tf");
+    await writeFile(
+      path,
+      `${await readFile(path, "utf8")}\nresource "google_project_iam_member" "rogue" {\n  project = var.project_id\n  role = "roles/owner"\n  member = "user:attacker@example.com"\n}\n`,
+    );
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "main.tf must contain only the exact reviewed repository-specific platform module",
+      );
+    }
+  });
+
+  test("bootstrap identity passthroughs cannot be replaced beside comment decoys", async () => {
+    const app = await scaffold("bootstrap-identity-drift");
+    const path = join(app, "infra/terraform/bootstrap/main.tf");
+    const original = await readFile(path, "utf8");
+    await writeFile(
+      path,
+      original.replace(
+        "  github_repository_id        = var.github_repository_id",
+        [
+          '  github_repository_id = "999999999"',
+          "  # github_repository_id = var.github_repository_id",
+        ].join("\n"),
+      ),
+    );
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "module bootstrap must exactly match the reviewed repository-specific platform contract",
+      );
+    }
+  });
+
+  test("security-critical Terraform variable defaults are exact", async () => {
+    const app = await scaffold("terraform-variable-drift");
+    const path = join(app, "infra/terraform/prod/variables.tf");
+    const original = await readFile(path, "utf8");
+    await writeFile(
+      path,
+      replaceAfterMarker(
+        original,
+        'variable "runtime_service_account_email"',
+        '  default     = "cloud-run-runtime@terraform-variable-drift.iam.gserviceaccount.com"',
+        [
+          '  default = "attacker@other-project.iam.gserviceaccount.com"',
+          '  # default = "cloud-run-runtime@terraform-variable-drift.iam.gserviceaccount.com"',
+        ].join("\n"),
+      ),
+    );
+
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(
+        "infra/terraform/prod/variables.tf must exactly match the reviewed repository-specific mirror contract",
+      );
+    }
+  });
+
+  test("an empty Terraform mirror file cannot skip validation of the remaining files", async () => {
+    const app = await scaffold("empty-mirror-file");
+    await writeFile(join(app, "infra/terraform/bootstrap/outputs.tf"), "");
+    const variablesPath = join(app, "infra/terraform/prod/variables.tf");
+    const variables = await readFile(variablesPath, "utf8");
+    await writeFile(
+      variablesPath,
+      replaceAfterMarker(
+        variables,
+        'variable "runtime_service_account_email"',
+        '  default     = "cloud-run-runtime@empty-mirror-file.iam.gserviceaccount.com"',
+        '  default     = "attacker@other-project.iam.gserviceaccount.com"',
+      ),
+    );
+
+    const result = await run(["doctor", app]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain(
+      "infra/terraform/bootstrap/outputs.tf must exactly match the reviewed repository-specific mirror contract",
+    );
+    expect(result.stderr).toContain(
+      "infra/terraform/prod/variables.tf must exactly match the reviewed repository-specific mirror contract",
+    );
+  });
+
+  test("Terraform roots reject extra configuration and provider-lock drift", async () => {
+    const extraApp = await scaffold("extra-terraform-config");
+    await writeFile(
+      join(extraApp, "infra/terraform/prod/rogue.tf"),
+      'resource "google_project_iam_member" "rogue" {}\n',
+    );
+    for (const result of [await run(["doctor", extraApp]), await runContract(extraApp)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr.toLowerCase()).toContain("unreviewed additional terraform mirror file");
+    }
+
+    const autoVariablesApp = await scaffold("terraform-auto-variables");
+    await writeFile(
+      join(autoVariablesApp, "infra/terraform/bootstrap/attacker.auto.tfvars"),
+      'github_repository_id = "999999999"\n',
+    );
+    for (const result of [
+      await run(["doctor", autoVariablesApp]),
+      await runContract(autoVariablesApp),
+    ]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("Terraform state/config artifact");
+    }
+
+    const lockApp = await scaffold("terraform-lock-drift");
+    const lockPath = join(lockApp, "infra/terraform/prod/.terraform.lock.hcl");
+    await writeFile(lockPath, `${await readFile(lockPath, "utf8")}\n# unreviewed checksum\n`);
+    for (const result of [await run(["doctor", lockApp]), await runContract(lockApp)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("exactly match the immutable platform template");
+    }
+
+    const symlinkApp = await scaffold("terraform-lock-symlink");
+    const symlinkPath = join(symlinkApp, "infra/terraform/prod/.terraform.lock.hcl");
+    await rm(symlinkPath);
+    await symlink("../bootstrap/.terraform.lock.hcl", symlinkPath);
+    for (const result of [await run(["doctor", symlinkApp]), await runContract(symlinkApp)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("must be a regular, non-symbolic-link file");
+    }
+  });
+
+  test("immutable contract binds Terraform mirrors to the resolved reusable workflow SHA", async () => {
+    const app = await scaffold("immutable-workflow-sha");
+    const result = await runContract(app, "123456789", "b".repeat(40));
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("module source must match the active reusable workflow SHA");
+  });
+
   test("doctor rejects Terraform passthrough drift hidden behind line and block comments", async () => {
     const app = await scaffold("terraform-comment-decoys");
     const path = join(app, "infra/terraform/prod/main.tf");
@@ -181,6 +340,20 @@ describe("platform scaffold and doctor", () => {
         .replace(
           "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
           "  /* runtime_secret_version_adder_ids = var.runtime_secret_version_adder_ids */",
+        )
+        .replace(
+          "  runtime_secret_ids                      = var.runtime_secret_ids",
+          [
+            '  runtime_secret_ids = ["attacker-controlled-secret"]',
+            "  # runtime_secret_ids = var.runtime_secret_ids",
+          ].join("\n"),
+        )
+        .replace(
+          "  runtime_secret_accessor_ids             = var.runtime_secret_accessor_ids",
+          [
+            "  runtime_secret_accessor_ids = var.runtime_secret_ids",
+            "  /* runtime_secret_accessor_ids = var.runtime_secret_accessor_ids */",
+          ].join("\n"),
         ),
     );
 
@@ -191,6 +364,12 @@ describe("platform scaffold and doctor", () => {
       );
       expect(result.stderr).toContain(
         "module site must pass runtime_secret_version_adder_ids = var.runtime_secret_version_adder_ids exactly once",
+      );
+      expect(result.stderr).toContain(
+        "module site must pass runtime_secret_ids = var.runtime_secret_ids exactly once",
+      );
+      expect(result.stderr).toContain(
+        "module site must pass runtime_secret_accessor_ids = var.runtime_secret_accessor_ids exactly once",
       );
     }
   });
@@ -256,59 +435,9 @@ describe("platform scaffold and doctor", () => {
   });
 
   test("doctor accepts the exact Medlock secret contract and rejects one added ID", async () => {
-    const app = await scaffold("medlock-contract");
-    await setPlatformIdentity(app, {
-      githubRepositoryId: "1025243085",
-      name: "medlock",
-      projectId: "medlock-1025243085",
-      serviceName: "medlock",
-    });
-
+    const app = await scaffold("medlock");
+    await configureReviewedMedlock(app);
     const variablesPath = join(app, "infra/terraform/prod/variables.tf");
-    let variables = (await readFile(variablesPath, "utf8")).replaceAll(
-      "medlock-contract.iam.gserviceaccount.com",
-      "medlock-1025243085.iam.gserviceaccount.com",
-    );
-    const waitlistDefault = '  default = [\n    "waitlist-identity-keyset",\n  ]';
-    for (const variable of [
-      "runtime_secret_ids",
-      "runtime_secret_accessor_ids",
-      "runtime_secret_version_adder_ids",
-    ]) {
-      variables = replaceAfterMarker(
-        variables,
-        'variable "' + variable + '"',
-        "  default     = []",
-        waitlistDefault,
-      );
-    }
-    await writeFile(variablesPath, variables);
-
-    const bootstrapPath = join(app, "infra/terraform/bootstrap/main.tf");
-    const bootstrap = await readFile(bootstrapPath, "utf8");
-    await writeFile(
-      bootstrapPath,
-      bootstrap.replace(
-        "  legacy_compatibility_mode",
-        [
-          "  required_services = [",
-          '    "artifactregistry.googleapis.com",',
-          '    "cloudresourcemanager.googleapis.com",',
-          '    "firestore.googleapis.com",',
-          '    "iam.googleapis.com",',
-          '    "iamcredentials.googleapis.com",',
-          '    "orgpolicy.googleapis.com",',
-          '    "run.googleapis.com",',
-          '    "secretmanager.googleapis.com",',
-          '    "serviceusage.googleapis.com",',
-          '    "storage.googleapis.com",',
-          '    "sts.googleapis.com",',
-          "  ]",
-          "  legacy_compatibility_mode",
-        ].join("\n"),
-      ),
-    );
-
     const env = { TRUSTED_GITHUB_REPOSITORY_ID: "1025243085" };
     expect((await run(["doctor", app], env)).exitCode).toBe(0);
     expect((await runContract(app, "1025243085")).exitCode).toBe(0);
@@ -428,6 +557,17 @@ describe("platform scaffold and doctor", () => {
     const result = await run(["doctor", app]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("missing bun.lock");
+  });
+
+  test("empty required package manifests cannot skip doctor policy", async () => {
+    const app = await scaffold("empty-package-manifests");
+    await writeFile(join(app, "package.json"), "");
+    await writeFile(join(app, "bun.lock"), "");
+
+    const result = await run(["doctor", app]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("package.json is not valid JSON");
+    expect(result.stderr).toContain("bun.lock packages must be an object");
   });
 
   test("doctor and immutable contract reject local scanner substitution", async () => {
@@ -2561,6 +2701,139 @@ async function setPlatformIdentity(
   await writeFile(path, JSON.stringify(config, null, 2) + "\n");
 }
 
+async function configureReviewedMedlock(app: string): Promise<void> {
+  await setPlatformIdentity(app, {
+    githubRepositoryId: "1025243085",
+    name: "medlock",
+    projectId: "medlock-1025243085",
+    serviceName: "medlock",
+  });
+
+  const productionMainPath = join(app, "infra/terraform/prod/main.tf");
+  let productionMain = await readFile(productionMainPath, "utf8");
+  productionMain = productionMain
+    .replace('artifact_registry_description           = "Container images for medlock."', 'artifact_registry_description           = "Container images for Medlock."')
+    .replace(
+      "  preview_publisher_service_account_email = var.preview_publisher_service_account_email",
+      [
+        "  preview_publisher_service_account_email = var.preview_publisher_service_account_email",
+        "  container_env = {",
+        '    ALLOWED_HOSTS    = "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app"',
+        '    ALLOWED_ORIGINS  = "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app"',
+        '    CANONICAL_HOST   = "medlock.ai"',
+        '    LEGACY_HOSTS     = "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app"',
+        '    MEDLOCK_VERSION  = "0.2.0"',
+        '    WAITLIST_BACKEND = "firestore"',
+        "  }",
+      ].join("\n"),
+    )
+    .replace(
+      "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+      [
+        "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+        "  firestore_database = {",
+        '    name                         = "(default)"',
+        '    location_id                  = "nam5"',
+        '    runtime_collection_env_name  = "FIRESTORE_COLLECTION"',
+        '    runtime_collection_env_value = "waitlist"',
+        "  }",
+      ].join("\n"),
+    );
+  await writeFile(productionMainPath, productionMain);
+
+  const productionVariablesPath = join(app, "infra/terraform/prod/variables.tf");
+  let productionVariables = await readFile(productionVariablesPath, "utf8");
+  productionVariables = replaceAfterMarker(
+    productionVariables,
+    'variable "project_id"',
+    '  default     = "medlock"',
+    '  default     = "medlock-1025243085"',
+  ).replaceAll(
+    "@medlock.iam.gserviceaccount.com",
+    "@medlock-1025243085.iam.gserviceaccount.com",
+  );
+  const waitlistDefault = '  default = [\n    "waitlist-identity-keyset",\n  ]';
+  for (const variable of [
+    "runtime_secret_ids",
+    "runtime_secret_accessor_ids",
+    "runtime_secret_version_adder_ids",
+  ]) {
+    productionVariables = replaceAfterMarker(
+      productionVariables,
+      'variable "' + variable + '"',
+      "  default     = []",
+      waitlistDefault,
+    );
+  }
+  await writeFile(productionVariablesPath, productionVariables);
+
+  const bootstrapMainPath = join(app, "infra/terraform/bootstrap/main.tf");
+  let bootstrapMain = await readFile(bootstrapMainPath, "utf8");
+  bootstrapMain = bootstrapMain
+    .replace(
+      "  legacy_compatibility_mode",
+      [
+        "  required_services = [",
+        '    "artifactregistry.googleapis.com",',
+        '    "cloudresourcemanager.googleapis.com",',
+        '    "firestore.googleapis.com",',
+        '    "iam.googleapis.com",',
+        '    "iamcredentials.googleapis.com",',
+        '    "orgpolicy.googleapis.com",',
+        '    "run.googleapis.com",',
+        '    "secretmanager.googleapis.com",',
+        '    "serviceusage.googleapis.com",',
+        '    "storage.googleapis.com",',
+        '    "sts.googleapis.com",',
+        "  ]",
+        "  runtime_project_roles = [",
+        '    "roles/datastore.user",',
+        "  ]",
+        "  legacy_compatibility_mode",
+      ].join("\n"),
+    )
+    .replace(
+      '"Runtime identity for the medlock Cloud Run services."',
+      '"Runtime identity for the Medlock Cloud Run services."',
+    );
+  await writeFile(bootstrapMainPath, bootstrapMain);
+
+  const bootstrapVariablesPath = join(app, "infra/terraform/bootstrap/variables.tf");
+  let bootstrapVariables = await readFile(bootstrapVariablesPath, "utf8");
+  bootstrapVariables = replaceAfterMarker(
+    bootstrapVariables,
+    'variable "project_id"',
+    '  default     = "medlock"',
+    '  default     = "medlock-1025243085"',
+  )
+    .replaceAll('"medlock-tfstate"', '"medlock-tfstate-1025243085"')
+    .replaceAll('"medlock-tfstate-bootstrap"', '"medlock-tfstate-1025243085-bootstrap"');
+  bootstrapVariables = replaceAfterMarker(
+    bootstrapVariables,
+    'variable "github_repo"',
+    '  default     = "medlock"',
+    '  default     = "healthmcp"',
+  );
+  bootstrapVariables = replaceAfterMarker(
+    bootstrapVariables,
+    'variable "github_repository_id"',
+    '  default     = "123456789"',
+    '  default     = "1025243085"',
+  );
+  await writeFile(bootstrapVariablesPath, bootstrapVariables);
+
+  for (const relativePath of [
+    "infra/terraform/bootstrap/versions.tf",
+    "infra/terraform/prod/versions.tf",
+  ]) {
+    const path = join(app, relativePath);
+    const versions = (await readFile(path, "utf8"))
+      .replaceAll('"medlock-tfstate"', '"medlock-tfstate-1025243085"')
+      .replaceAll('"medlock-tfstate-bootstrap"', '"medlock-tfstate-1025243085-bootstrap"');
+    await writeFile(path, versions);
+  }
+}
+
 function replaceAfterMarker(
   source: string,
   marker: string,
@@ -2578,6 +2851,7 @@ function replaceAfterMarker(
 async function runContract(
   app: string,
   repositoryId = "123456789",
+  expectedPlatformSha = platformSha,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const contract = join(repoRoot, "tools/ci/enforce-app-contract.ts");
   const template = join(repoRoot, "templates/app");
@@ -2590,6 +2864,7 @@ async function runContract(
       app,
       template,
       repositoryId,
+      expectedPlatformSha,
     ],
     {
       cwd: join(repoRoot, "tools/ci"),

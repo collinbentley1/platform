@@ -118,7 +118,8 @@ jobs:
             bun --no-env-file --no-orphans ./enforce-app-contract.ts \
               "$GITHUB_WORKSPACE" \
               "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
-              "${{ github.event.repository.id }}"
+              "${{ github.event.repository.id }}" \
+              "${{ job.workflow_sha }}"
           )
 
       - name: Enforce the organization Socket policy before package extraction

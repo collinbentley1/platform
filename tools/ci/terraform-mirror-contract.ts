@@ -1,4 +1,5 @@
 export type TerraformMirrorIdentity = {
+  readonly expectedPlatformSha?: string | undefined;
   readonly githubRepositoryId: string;
   readonly name?: string | undefined;
   readonly projectId: string;
@@ -8,24 +9,43 @@ export type TerraformMirrorIdentity = {
 export type TerraformMirrorSources = {
   readonly bootstrapMain: string;
   readonly bootstrapOutputs: string;
+  readonly bootstrapVariables: string;
+  readonly bootstrapVersions: string;
   readonly productionMain: string;
+  readonly productionOutputs: string;
   readonly productionVariables: string;
+  readonly productionVersions: string;
 };
 
 type ReviewedTerraformContract = {
+  readonly artifactRegistryDescription?: string;
+  readonly artifactRegistryRepositoryId?: string;
+  readonly containerEnv?: readonly (readonly [string, string])[];
+  readonly firestoreDatabase?: readonly (readonly [string, string])[];
+  readonly githubRepo?: string;
   readonly name?: string;
   readonly previewIngress: "INGRESS_TRAFFIC_ALL" | "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER";
   readonly projectId?: string;
   readonly requiredServicesOverride: readonly string[] | null;
+  readonly runtimeDescription?: string;
+  readonly runtimeProjectRolesOverride: readonly string[] | null;
   readonly runtimeSecretAccessorIds: readonly string[];
   readonly runtimeSecretIds: readonly string[];
   readonly runtimeSecretVersionAdderIds: readonly string[];
   readonly serviceName?: string;
+  readonly stateBucketName?: string;
+};
+
+type WorkflowShaPartitions = {
+  readonly active: readonly string[];
+  readonly transition: readonly string[];
+  readonly trusted: readonly string[];
 };
 
 const defaultContract: ReviewedTerraformContract = {
   previewIngress: "INGRESS_TRAFFIC_ALL",
   requiredServicesOverride: null,
+  runtimeProjectRolesOverride: null,
   runtimeSecretAccessorIds: [],
   runtimeSecretIds: [],
   runtimeSecretVersionAdderIds: [],
@@ -34,11 +54,41 @@ const defaultContract: ReviewedTerraformContract = {
 const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
   "1255553151": {
     ...defaultContract,
+    artifactRegistryDescription: "Container images for the cdbentley personal site.",
+    artifactRegistryRepositoryId: "site",
+    githubRepo: "cdbentley",
     name: "cdbentley",
     projectId: "cdbentley",
     serviceName: "cdbentley",
+    stateBucketName: "cdbentley-tfstate-882468538648",
   },
   "1025243085": {
+    artifactRegistryDescription: "Container images for Medlock.",
+    artifactRegistryRepositoryId: "site",
+    containerEnv: [
+      [
+        "ALLOWED_HOSTS",
+        "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app",
+      ],
+      [
+        "ALLOWED_ORIGINS",
+        "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app",
+      ],
+      ["CANONICAL_HOST", "medlock.ai"],
+      [
+        "LEGACY_HOSTS",
+        "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app",
+      ],
+      ["MEDLOCK_VERSION", "0.2.0"],
+      ["WAITLIST_BACKEND", "firestore"],
+    ],
+    firestoreDatabase: [
+      ["name", "(default)"],
+      ["location_id", "nam5"],
+      ["runtime_collection_env_name", "FIRESTORE_COLLECTION"],
+      ["runtime_collection_env_value", "waitlist"],
+    ],
+    githubRepo: "healthmcp",
     name: "medlock",
     previewIngress: "INGRESS_TRAFFIC_ALL",
     projectId: "medlock-1025243085",
@@ -56,11 +106,22 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       "sts.googleapis.com",
     ],
     runtimeSecretAccessorIds: ["waitlist-identity-keyset"],
+    runtimeDescription: "Runtime identity for the Medlock Cloud Run services.",
     runtimeSecretIds: ["waitlist-identity-keyset"],
     runtimeSecretVersionAdderIds: ["waitlist-identity-keyset"],
+    runtimeProjectRolesOverride: ["roles/datastore.user"],
     serviceName: "medlock",
+    stateBucketName: "medlock-tfstate-1025243085",
   },
   "711292980": {
+    artifactRegistryDescription: "Container images for the Runsetta API.",
+    artifactRegistryRepositoryId: "api",
+    containerEnv: [
+      ["RUNSETTA_OFFLINE", "1"],
+      ["RUNSETTA_TTS_MODEL", "gpt-4o-mini-tts"],
+      ["RUNSETTA_TTS_VOICE", "marin"],
+    ],
+    githubRepo: "runsetta",
     name: "runsetta",
     previewIngress: "INGRESS_TRAFFIC_ALL",
     projectId: "runsetta",
@@ -76,6 +137,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       "sts.googleapis.com",
     ],
     runtimeSecretAccessorIds: [],
+    runtimeDescription: "Runtime identity for the Runsetta Cloud Run services.",
     runtimeSecretIds: [
       "openai-api-key",
       "spotify-client-id",
@@ -83,14 +145,20 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       "spotify-redirect-uri",
     ],
     runtimeSecretVersionAdderIds: [],
+    runtimeProjectRolesOverride: null,
     serviceName: "runsetta",
+    stateBucketName: "runsetta-tfstate-601124730704",
   },
   "280932482": {
     ...defaultContract,
+    artifactRegistryDescription: "Container images for the Critical History Map.",
+    artifactRegistryRepositoryId: "site",
+    githubRepo: "critical-history",
     name: "critical-history",
     previewIngress: "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
     projectId: "critical-history-16823277",
     serviceName: "critical-history",
+    stateBucketName: "critical-history-tfstate-422714632513",
   },
 };
 
@@ -98,6 +166,16 @@ const previewOperatorVariableDescription =
   "Deprecated transition-only preview operator email retained for input compatibility; receives no IAM grant.";
 const previewOperatorOutputDescription =
   "Retired transition-only preview operator service account; receives no steady-state operational grants.";
+const forbiddenPreMigrationWorkflowShas = new Set([
+  "734d0cd02187f88c6e91263f127dc3f4c0709feb",
+  "1378a3e81a5e74c71f2adfd5548b430bb008490e",
+  "37bd4b1beea8802ec85c38d69ea08d5992c75a50",
+  "42435a3c4c5c063a342765ef7c85047224217fe2",
+  "7f01d9f008a7757df12f13ac8fa0f261600cf21a",
+  "4f032955477c26b942fdd4f1b01f5272380390ea",
+  "92c73184bc527388b5e10ccb5e4f0222a84e68b5",
+  "33ab9b9a5f3d8a0553372980c22540cad001f776",
+]);
 
 export function validateTerraformMirrorContract(
   identity: TerraformMirrorIdentity,
@@ -105,6 +183,19 @@ export function validateTerraformMirrorContract(
 ): string[] {
   const failures: string[] = [];
   const contract = reviewedContracts[identity.githubRepositoryId] ?? defaultContract;
+
+  if (!identity.name) {
+    failures.push(".platform/config.json name is required by the Terraform mirror contract");
+  }
+  if (!identity.serviceName) {
+    failures.push(".platform/config.json serviceName is required by the Terraform mirror contract");
+  }
+  if (
+    identity.expectedPlatformSha !== undefined &&
+    !/^[0-9a-f]{40}$/.test(identity.expectedPlatformSha)
+  ) {
+    failures.push("expected platform workflow SHA must be one full lowercase commit SHA");
+  }
 
   if (contract.name !== undefined && identity.name !== contract.name) {
     failures.push(
@@ -129,10 +220,30 @@ export function validateTerraformMirrorContract(
       sources.bootstrapOutputs,
       failures,
     ),
+    bootstrapVariables: parseDocument(
+      "infra/terraform/bootstrap/variables.tf",
+      sources.bootstrapVariables,
+      failures,
+    ),
+    bootstrapVersions: parseDocument(
+      "infra/terraform/bootstrap/versions.tf",
+      sources.bootstrapVersions,
+      failures,
+    ),
     productionMain: parseDocument("infra/terraform/prod/main.tf", sources.productionMain, failures),
+    productionOutputs: parseDocument(
+      "infra/terraform/prod/outputs.tf",
+      sources.productionOutputs,
+      failures,
+    ),
     productionVariables: parseDocument(
       "infra/terraform/prod/variables.tf",
       sources.productionVariables,
+      failures,
+    ),
+    productionVersions: parseDocument(
+      "infra/terraform/prod/versions.tf",
+      sources.productionVersions,
       failures,
     ),
   };
@@ -144,6 +255,14 @@ export function validateTerraformMirrorContract(
     "infra/terraform/prod/main.tf",
     failures,
   );
+  const productionPlatformSha = productionModule
+    ? requirePlatformModuleSource(
+        productionModule,
+        "cloud-run-service",
+        "infra/terraform/prod/main.tf",
+        failures,
+      )
+    : undefined;
   if (productionModule) {
     requireExactTopLevelAttribute(
       productionModule,
@@ -159,6 +278,46 @@ export function validateTerraformMirrorContract(
       "infra/terraform/prod/main.tf module site must pass runtime_secret_version_adder_ids = var.runtime_secret_version_adder_ids exactly once",
       failures,
     );
+    requireExactTopLevelAttribute(
+      productionModule,
+      "runtime_secret_ids",
+      "var.runtime_secret_ids",
+      "infra/terraform/prod/main.tf module site must pass runtime_secret_ids = var.runtime_secret_ids exactly once",
+      failures,
+    );
+    requireExactTopLevelAttribute(
+      productionModule,
+      "runtime_secret_accessor_ids",
+      "var.runtime_secret_accessor_ids",
+      "infra/terraform/prod/main.tf module site must pass runtime_secret_accessor_ids = var.runtime_secret_accessor_ids exactly once",
+      failures,
+    );
+    if (
+      productionPlatformSha &&
+      identity.expectedPlatformSha !== undefined &&
+      productionPlatformSha !== identity.expectedPlatformSha
+    ) {
+      failures.push(
+        "infra/terraform/prod/main.tf module source must match the active reusable workflow SHA",
+      );
+    }
+    if (productionPlatformSha && identity.name && identity.serviceName) {
+      const expectedProductionModule = renderProductionModule(
+        identity,
+        contract,
+        productionPlatformSha,
+      );
+      if (compactHcl(productionModule) !== compactHcl(expectedProductionModule)) {
+        failures.push(
+          "infra/terraform/prod/main.tf module site must exactly match the reviewed repository-specific platform contract",
+        );
+      }
+      if (compactHcl(parsed.productionMain) !== compactHcl(expectedProductionModule)) {
+        failures.push(
+          "infra/terraform/prod/main.tf must contain only the exact reviewed repository-specific platform module",
+        );
+      }
+    }
   }
 
   requireCanonicalNamedBlock(
@@ -220,6 +379,30 @@ export function validateTerraformMirrorContract(
     "infra/terraform/bootstrap/main.tf",
     failures,
   );
+  const bootstrapPlatformSha = bootstrapModule
+    ? requirePlatformModuleSource(
+        bootstrapModule,
+        "bootstrap",
+        "infra/terraform/bootstrap/main.tf",
+        failures,
+      )
+    : undefined;
+  if (
+    productionPlatformSha &&
+    bootstrapPlatformSha &&
+    productionPlatformSha !== bootstrapPlatformSha
+  ) {
+    failures.push("bootstrap and production module sources must use the same platform SHA");
+  }
+  if (
+    bootstrapPlatformSha &&
+    identity.expectedPlatformSha !== undefined &&
+    bootstrapPlatformSha !== identity.expectedPlatformSha
+  ) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf module source must match the active reusable workflow SHA",
+    );
+  }
   if (bootstrapModule) {
     const requiredServices = topLevelAttributeValues(bootstrapModule, "required_services");
     if (contract.requiredServicesOverride === null) {
@@ -234,6 +417,87 @@ export function validateTerraformMirrorContract(
         failures.push(
           "infra/terraform/bootstrap/main.tf required_services must match the reviewed repository-specific API set",
         );
+      }
+    }
+
+    const runtimeProjectRoles = topLevelAttributeValues(
+      bootstrapModule,
+      "runtime_project_roles",
+    );
+    if (contract.runtimeProjectRolesOverride === null) {
+      if (runtimeProjectRoles.length !== 0) {
+        failures.push(
+          "infra/terraform/bootstrap/main.tf must rely on the reviewed empty runtime_project_roles default for this repository",
+        );
+      }
+    } else {
+      const expected = compactHcl(renderStringList(contract.runtimeProjectRolesOverride));
+      if (runtimeProjectRoles.length !== 1 || compactHcl(runtimeProjectRoles[0] ?? "") !== expected) {
+        failures.push(
+          "infra/terraform/bootstrap/main.tf runtime_project_roles must match the reviewed repository-specific role set",
+        );
+      }
+    }
+
+    if (bootstrapPlatformSha && identity.name) {
+      const partitions = validateWorkflowShaPartitions(
+        bootstrapModule,
+        bootstrapPlatformSha,
+        failures,
+      );
+      if (partitions) {
+        const expectedBootstrapModule = renderBootstrapModule(
+          identity,
+          contract,
+          bootstrapPlatformSha,
+          partitions,
+        );
+        if (compactHcl(bootstrapModule) !== compactHcl(expectedBootstrapModule)) {
+          failures.push(
+            "infra/terraform/bootstrap/main.tf module bootstrap must exactly match the reviewed repository-specific platform contract",
+          );
+        }
+        if (compactHcl(parsed.bootstrapMain) !== compactHcl(expectedBootstrapModule)) {
+          failures.push(
+            "infra/terraform/bootstrap/main.tf must contain only the exact reviewed repository-specific platform module",
+          );
+        }
+      }
+    }
+  }
+
+  if (identity.name && identity.serviceName) {
+    const exactFiles = [
+      [
+        "infra/terraform/bootstrap/variables.tf",
+        parsed.bootstrapVariables,
+        renderBootstrapVariables(identity, contract),
+      ],
+      [
+        "infra/terraform/bootstrap/outputs.tf",
+        parsed.bootstrapOutputs,
+        renderBootstrapOutputs(),
+      ],
+      [
+        "infra/terraform/bootstrap/versions.tf",
+        parsed.bootstrapVersions,
+        renderBootstrapVersions(identity, contract),
+      ],
+      [
+        "infra/terraform/prod/variables.tf",
+        parsed.productionVariables,
+        renderProductionVariables(identity, contract),
+      ],
+      ["infra/terraform/prod/outputs.tf", parsed.productionOutputs, renderProductionOutputs()],
+      [
+        "infra/terraform/prod/versions.tf",
+        parsed.productionVersions,
+        renderProductionVersions(identity, contract),
+      ],
+    ] as const;
+    for (const [path, actual, expected] of exactFiles) {
+      if (compactHcl(actual) !== compactHcl(expected)) {
+        failures.push(`${path} must exactly match the reviewed repository-specific mirror contract`);
       }
     }
   }
@@ -508,6 +772,595 @@ function compactHcl(source: string): string {
     }
   }
   return result;
+}
+
+function requirePlatformModuleSource(
+  block: string,
+  moduleName: "bootstrap" | "cloud-run-service",
+  path: string,
+  failures: string[],
+): string | undefined {
+  const values = topLevelAttributeValues(block, "source");
+  const pattern = new RegExp(
+    '^"github\\.com/collinbentley1/platform//terraform/modules/' +
+      escapeRegExp(moduleName) +
+      '\\?ref=([0-9a-f]{40})"$',
+  );
+  const match = values.length === 1 ? compactHcl(values[0] ?? "").match(pattern) : null;
+  if (!match) {
+    failures.push(
+      `${path} module must contain exactly one top-level canonical ${moduleName} source pinned to a full lowercase platform commit SHA`,
+    );
+    return undefined;
+  }
+
+  const sha = match[1]!;
+  if (forbiddenPreMigrationWorkflowShas.has(sha)) {
+    failures.push(`${path} module source must not restore a retired pre-migration platform SHA`);
+  }
+  return sha;
+}
+
+function validateWorkflowShaPartitions(
+  block: string,
+  platformSha: string,
+  failures: string[],
+): WorkflowShaPartitions | undefined {
+  const trusted = requireStringListAttribute(
+    block,
+    "trusted_platform_workflow_shas",
+    failures,
+  );
+  const active = requireStringListAttribute(
+    block,
+    "preview_operations_active_workflow_shas",
+    failures,
+  );
+  const transition = requireStringListAttribute(
+    block,
+    "preview_operator_transition_workflow_shas",
+    failures,
+  );
+  if (!trusted || !active || !transition) return undefined;
+
+  for (const [name, values] of [
+    ["trusted_platform_workflow_shas", trusted],
+    ["preview_operations_active_workflow_shas", active],
+    ["preview_operator_transition_workflow_shas", transition],
+  ] as const) {
+    if (values.some((value) => !/^[0-9a-f]{40}$/.test(value))) {
+      failures.push(`infra/terraform/bootstrap/main.tf ${name} must contain only full lowercase commit SHAs`);
+    }
+    if (new Set(values).size !== values.length) {
+      failures.push(`infra/terraform/bootstrap/main.tf ${name} must not contain duplicate SHAs`);
+    }
+    if (values.some((value) => forbiddenPreMigrationWorkflowShas.has(value))) {
+      failures.push(`infra/terraform/bootstrap/main.tf ${name} must not restore a retired pre-migration SHA`);
+    }
+  }
+
+  if (trusted.length < 1 || trusted.length > 2) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf trusted_platform_workflow_shas must contain one steady-state SHA or exactly two migration SHAs",
+    );
+  }
+  if (active.length !== 1 || active[0] !== platformSha) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf preview_operations_active_workflow_shas must contain only the module platform SHA",
+    );
+  }
+  if (transition.length > 1) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf preview_operator_transition_workflow_shas may contain at most one migration SHA",
+    );
+  }
+  if (!trusted.includes(platformSha)) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf trusted_platform_workflow_shas must include the module platform SHA",
+    );
+  }
+
+  const partition = [...active, ...transition];
+  if (
+    new Set(partition).size !== partition.length ||
+    !sameStringSet(partition, trusted)
+  ) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf active and transition workflow SHAs must be disjoint and exactly partition trusted_platform_workflow_shas",
+    );
+  }
+
+  return { active, transition, trusted };
+}
+
+function requireStringListAttribute(
+  block: string,
+  name: string,
+  failures: string[],
+): string[] | undefined {
+  const values = topLevelAttributeValues(block, name);
+  if (values.length !== 1) {
+    failures.push(
+      `infra/terraform/bootstrap/main.tf module bootstrap must define ${name} exactly once at top level`,
+    );
+    return undefined;
+  }
+  const parsed = parseStringListExpression(values[0] ?? "");
+  if (!parsed) {
+    failures.push(
+      `infra/terraform/bootstrap/main.tf ${name} must be a literal list of quoted strings`,
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
+function parseStringListExpression(expression: string): string[] | undefined {
+  const values: string[] = [];
+  let index = 0;
+  const skipWhitespace = (): void => {
+    while (/\s/.test(expression[index] ?? "")) index += 1;
+  };
+
+  skipWhitespace();
+  if (expression[index] !== "[") return undefined;
+  index += 1;
+  skipWhitespace();
+  if (expression[index] === "]") {
+    index += 1;
+    skipWhitespace();
+    return index === expression.length ? values : undefined;
+  }
+
+  while (index < expression.length) {
+    if (expression[index] !== '"') return undefined;
+    const start = index;
+    index += 1;
+    let escaped = false;
+    while (index < expression.length) {
+      const character = expression[index]!;
+      index += 1;
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        break;
+      }
+    }
+    if (expression[index - 1] !== '"' || escaped) return undefined;
+    try {
+      const parsed = JSON.parse(expression.slice(start, index));
+      if (typeof parsed !== "string") return undefined;
+      values.push(parsed);
+    } catch {
+      return undefined;
+    }
+
+    skipWhitespace();
+    if (expression[index] === "]") {
+      index += 1;
+      skipWhitespace();
+      return index === expression.length ? values : undefined;
+    }
+    if (expression[index] !== ",") return undefined;
+    index += 1;
+    skipWhitespace();
+    if (expression[index] === "]") {
+      index += 1;
+      skipWhitespace();
+      return index === expression.length ? values : undefined;
+    }
+  }
+  return undefined;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
+}
+
+function renderProductionModule(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+  platformSha: string,
+): string {
+  const lines = [
+    'module "site" {',
+    `source = "github.com/collinbentley1/platform//terraform/modules/cloud-run-service?ref=${platformSha}"`,
+    "providers = {",
+    "google = google",
+    "google.no_attribution = google.no_attribution",
+    "}",
+    `app = ${JSON.stringify(identity.name)}`,
+    "project_id = var.project_id",
+    "region = var.region",
+    "service_name = var.service_name",
+    "artifact_registry_repository_id = var.artifact_registry_repository_id",
+  ];
+  lines.push(
+    `artifact_registry_description = ${JSON.stringify(
+      contract.artifactRegistryDescription ?? `Container images for ${identity.name}.`,
+    )}`,
+  );
+  lines.push(
+    "bootstrap_image = var.bootstrap_image",
+    "bootstrap_runtime_service_account_email = var.bootstrap_runtime_service_account_email",
+    "runtime_service_account_email = var.runtime_service_account_email",
+    "preview_runtime_service_account_email = var.preview_runtime_service_account_email",
+    "preview_ingress = var.preview_ingress",
+    "prod_deploy_service_account_email = var.prod_deploy_service_account_email",
+    "prod_publisher_service_account_email = var.prod_publisher_service_account_email",
+    "preview_deploy_service_account_email = var.preview_deploy_service_account_email",
+    "preview_operator_service_account_email = var.preview_operator_service_account_email",
+    "preview_publisher_service_account_email = var.preview_publisher_service_account_email",
+  );
+  if (contract.containerEnv !== undefined) {
+    lines.push(...renderStringMap("container_env", contract.containerEnv));
+  }
+  lines.push(
+    "runtime_secret_ids = var.runtime_secret_ids",
+    "runtime_secret_accessor_ids = var.runtime_secret_accessor_ids",
+    "runtime_secret_version_adder_ids = var.runtime_secret_version_adder_ids",
+  );
+  if (contract.firestoreDatabase !== undefined) {
+    lines.push(...renderStringMap("firestore_database", contract.firestoreDatabase));
+  }
+  lines.push("}");
+  return lines.join("\n");
+}
+
+function renderBootstrapModule(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+  platformSha: string,
+  partitions: WorkflowShaPartitions,
+): string {
+  const lines = [
+    'module "bootstrap" {',
+    `source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=${platformSha}"`,
+    `app = ${JSON.stringify(identity.name)}`,
+    "project_id = var.project_id",
+    "region = var.region",
+    "state_bucket_name = var.state_bucket_name",
+    "bootstrap_state_bucket_name = var.bootstrap_state_bucket_name",
+    "state_bucket_location = var.state_bucket_location",
+    "github_owner = var.github_owner",
+    "github_repo = var.github_repo",
+    "github_owner_id = var.github_owner_id",
+    "github_repository_id = var.github_repository_id",
+    "trusted_platform_workflow_shas = " + renderStringList(partitions.trusted),
+    "preview_operations_active_workflow_shas = " + renderStringList(partitions.active),
+    "preview_operator_transition_workflow_shas = " + renderStringList(partitions.transition),
+  ];
+  if (contract.requiredServicesOverride !== null) {
+    lines.push("required_services = " + renderStringList(contract.requiredServicesOverride));
+  }
+  if (contract.runtimeProjectRolesOverride !== null) {
+    lines.push("runtime_project_roles = " + renderStringList(contract.runtimeProjectRolesOverride));
+  }
+  lines.push(
+    "legacy_compatibility_mode = false",
+    "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
+    `runtime_description = ${JSON.stringify(
+      contract.runtimeDescription ??
+        `Runtime identity for the ${identity.name ?? "application"} Cloud Run services.`,
+    )}`,
+    "}",
+  );
+  return lines.join("\n");
+}
+
+function renderStringMap(
+  name: string,
+  entries: readonly (readonly [string, string])[],
+): string[] {
+  return [
+    `${name} = {`,
+    ...entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+    "}",
+  ];
+}
+
+function renderProductionVariables(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+): string {
+  const projectId = identity.projectId;
+  const blocks = [
+    simpleVariable("project_id", "Google Cloud project ID.", "string", JSON.stringify(projectId)),
+    simpleVariable("region", "Primary Google Cloud region.", "string", '"us-east4"'),
+    simpleVariable(
+      "service_name",
+      "Production Cloud Run service name.",
+      "string",
+      JSON.stringify(identity.serviceName),
+    ),
+    simpleVariable(
+      "artifact_registry_repository_id",
+      "Artifact Registry Docker repository ID.",
+      "string",
+      JSON.stringify(contract.artifactRegistryRepositoryId ?? "site"),
+    ),
+    simpleVariable(
+      "bootstrap_image",
+      "Digest-pinned initial public image used before the application container exists.",
+      "string",
+      '"us-docker.pkg.dev/cloudrun/container/hello@sha256:9a0e9a5c7a19281e7617991d2fc61809de4973e6e75a10b2f07df3719ffda33c"',
+    ),
+    simpleVariable(
+      "bootstrap_runtime_service_account_email",
+      "No-role service account used only by the initial bootstrap image.",
+      "string",
+      JSON.stringify(`cloud-run-bootstrap@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
+      "runtime_service_account_email",
+      "Cloud Run runtime service account email.",
+      "string",
+      JSON.stringify(`cloud-run-runtime@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
+      "preview_runtime_service_account_email",
+      "No-data Cloud Run preview runtime service account email.",
+      "string",
+      JSON.stringify(`cloud-run-preview@${projectId}.iam.gserviceaccount.com`),
+    ),
+    previewIngressVariable(contract.previewIngress),
+    simpleVariable(
+      "prod_deploy_service_account_email",
+      "Production deploy service account email with exact-repository read access and only declared exact-secret version-add grants.",
+      "string",
+      JSON.stringify(`gha-prod-deploy@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
+      "prod_publisher_service_account_email",
+      "Artifact Registry-only production publisher service account email.",
+      "string",
+      JSON.stringify(`gha-prod-publish@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
+      "preview_deploy_service_account_email",
+      "Preview deploy service account email with exact-repository read access.",
+      "string",
+      JSON.stringify(`gha-preview-deploy@${projectId}.iam.gserviceaccount.com`),
+    ),
+    previewOperatorVariable(projectId),
+    simpleVariable(
+      "preview_publisher_service_account_email",
+      "Artifact Registry-only preview publisher service account email.",
+      "string",
+      JSON.stringify(`gha-preview-publish@${projectId}.iam.gserviceaccount.com`),
+    ),
+    secretSetVariable("runtime_secret_ids", contract.runtimeSecretIds),
+    secretSetVariable("runtime_secret_accessor_ids", contract.runtimeSecretAccessorIds),
+    secretSetVariable(
+      "runtime_secret_version_adder_ids",
+      contract.runtimeSecretVersionAdderIds,
+    ),
+  ];
+  return blocks.join("\n\n");
+}
+
+function renderBootstrapVariables(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+): string {
+  const stateBucketName = contract.stateBucketName ?? `${identity.name}-tfstate`;
+  const githubRepo = contract.githubRepo ?? identity.name;
+  return [
+    simpleVariable(
+      "project_id",
+      "Google Cloud project ID.",
+      "string",
+      JSON.stringify(identity.projectId),
+    ),
+    simpleVariable("region", "Primary Google Cloud region.", "string", '"us-east4"'),
+    simpleVariable(
+      "state_bucket_name",
+      "Globally unique Cloud Storage bucket for routine production Terraform state.",
+      "string",
+      JSON.stringify(stateBucketName),
+    ),
+    [
+      'variable "bootstrap_state_bucket_name" {',
+      'description = "Globally unique, separately protected bucket for privileged bootstrap Terraform state."',
+      "type = string",
+      `default = ${JSON.stringify(`${stateBucketName}-bootstrap`)}`,
+      "validation {",
+      "condition = var.bootstrap_state_bucket_name != var.state_bucket_name",
+      'error_message = "bootstrap_state_bucket_name must be distinct from the routine production state bucket."',
+      "}",
+      "}",
+    ].join("\n"),
+    simpleVariable(
+      "state_bucket_location",
+      "Cloud Storage location for Terraform state.",
+      "string",
+      '"US-EAST4"',
+    ),
+    simpleVariable("github_owner", "GitHub repository owner.", "string", '"collinbentley1"'),
+    simpleVariable(
+      "github_repo",
+      "GitHub repository name.",
+      "string",
+      JSON.stringify(githubRepo),
+    ),
+    numericIdVariable("github_owner_id", "Immutable numeric GitHub owner ID.", "16823277"),
+    numericIdVariable(
+      "github_repository_id",
+      "Immutable numeric GitHub repository ID.",
+      identity.githubRepositoryId,
+    ),
+    simpleVariable(
+      "manage_automatic_default_service_account_grants_policy",
+      "Explicit protected-pipeline decision: true only when the project has an organization parent and the bootstrap identity has organization-level policy authority; false only for a reviewed standalone-project exception.",
+      "bool",
+    ),
+  ].join("\n\n");
+}
+
+function simpleVariable(
+  name: string,
+  description: string,
+  type: string,
+  defaultExpression?: string,
+): string {
+  const lines = [
+    `variable ${JSON.stringify(name)} {`,
+    `description = ${JSON.stringify(description)}`,
+    `type = ${type}`,
+  ];
+  if (defaultExpression !== undefined) lines.push(`default = ${defaultExpression}`);
+  lines.push("}");
+  return lines.join("\n");
+}
+
+function numericIdVariable(name: string, description: string, value: string): string {
+  return [
+    `variable ${JSON.stringify(name)} {`,
+    `description = ${JSON.stringify(description)}`,
+    "type = string",
+    `default = ${JSON.stringify(value)}`,
+    "validation {",
+    `condition = can(regex("^[1-9][0-9]*$", var.${name}))`,
+    `error_message = ${JSON.stringify(`${name} must be a positive decimal ID.`)}`,
+    "}",
+    "}",
+  ].join("\n");
+}
+
+function renderBootstrapOutputs(): string {
+  return [
+    outputBlock(
+      "state_bucket_name",
+      "Routine production Terraform state bucket.",
+      "module.bootstrap.state_bucket_name",
+    ),
+    outputBlock(
+      "bootstrap_state_bucket_name",
+      "Separately protected privileged bootstrap Terraform state bucket.",
+      "module.bootstrap.bootstrap_state_bucket_name",
+    ),
+    outputBlock(
+      "workload_identity_provider",
+      "Full Workload Identity Provider resource name for GitHub Actions.",
+      "module.bootstrap.workload_identity_provider",
+    ),
+    outputBlock(
+      "terraform_service_account_email",
+      "Metadata-only service account used by the immutable Terraform convergence workflow.",
+      "module.bootstrap.terraform_service_account_email",
+    ),
+    outputBlock(
+      "prod_deploy_service_account_email",
+      "Cloud Run deploy service account with read-only access to the exact production image repository and only declared exact-secret version-add grants.",
+      "module.bootstrap.prod_deploy_service_account_email",
+    ),
+    outputBlock(
+      "prod_publisher_service_account_email",
+      "Artifact Registry-only service account used by the production publish job.",
+      "module.bootstrap.prod_publisher_service_account_email",
+    ),
+    outputBlock(
+      "preview_deploy_service_account_email",
+      "Cloud Run deploy service account with read-only access to the exact preview image repository.",
+      "module.bootstrap.preview_deploy_service_account_email",
+    ),
+    previewOperatorOutput(),
+    outputBlock(
+      "preview_publisher_service_account_email",
+      "Artifact Registry-only service account used by the preview publish job.",
+      "module.bootstrap.preview_publisher_service_account_email",
+    ),
+    outputBlock(
+      "runtime_service_account_email",
+      "Cloud Run runtime service account.",
+      "module.bootstrap.runtime_service_account_email",
+    ),
+  ].join("\n\n");
+}
+
+function renderProductionOutputs(): string {
+  return [
+    outputBlock(
+      "artifact_registry_repository",
+      "Artifact Registry Docker repository.",
+      "module.site.artifact_registry_repository",
+    ),
+    outputBlock(
+      "cloud_run_service_name",
+      "Production Cloud Run service name.",
+      "module.site.cloud_run_service_name",
+    ),
+    outputBlock(
+      "cloud_run_service_uri",
+      "Production Cloud Run service URL.",
+      "module.site.cloud_run_service_uri",
+    ),
+  ].join("\n\n");
+}
+
+function outputBlock(name: string, description: string, value: string): string {
+  return [
+    `output ${JSON.stringify(name)} {`,
+    `description = ${JSON.stringify(description)}`,
+    `value = ${value}`,
+    "}",
+  ].join("\n");
+}
+
+function renderBootstrapVersions(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+): string {
+  return renderVersions(identity, contract, true);
+}
+
+function renderProductionVersions(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+): string {
+  return renderVersions(identity, contract, false);
+}
+
+function renderVersions(
+  identity: TerraformMirrorIdentity,
+  contract: ReviewedTerraformContract,
+  bootstrap: boolean,
+): string {
+  const stateBucketName = contract.stateBucketName ?? `${identity.name}-tfstate`;
+  const lines = [
+    "terraform {",
+    'required_version = "~> 1.14.0"',
+    'backend "gcs" {',
+    `bucket = ${JSON.stringify(bootstrap ? `${stateBucketName}-bootstrap` : stateBucketName)}`,
+    `prefix = ${JSON.stringify(`${identity.name}/${bootstrap ? "bootstrap" : "prod"}`)}`,
+    "}",
+    "required_providers {",
+    "google = {",
+    'source = "hashicorp/google"',
+    'version = "= 7.45.0"',
+    "}",
+    "}",
+    "}",
+    'provider "google" {',
+    "project = var.project_id",
+    "region = var.region",
+    "}",
+  ];
+  if (!bootstrap) {
+    lines.push(
+      'provider "google" {',
+      'alias = "no_attribution"',
+      "project = var.project_id",
+      "region = var.region",
+      "add_terraform_attribution_label = false",
+      "}",
+    );
+  }
+  return lines.join("\n");
 }
 
 function previewIngressVariable(expected: string): string {

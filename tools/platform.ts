@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { access, cp, lstat, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
@@ -38,8 +38,14 @@ const requiredFiles = [
   "tools/socket-security-scanner.ts",
   "infra/terraform/bootstrap/main.tf",
   "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
   "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
   "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
+  "infra/terraform/prod/.terraform.lock.hcl",
 ];
 const workflowFiles = [
   "application.yml",
@@ -65,7 +71,21 @@ const canonicalAppFiles = [
   "bunfig.toml",
   "tools/platform-verify.ts",
   "tools/socket-security-scanner.ts",
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/prod/.terraform.lock.hcl",
 ];
+const allowedTerraformMirrorFiles = new Set([
+  "infra/terraform/bootstrap/.terraform.lock.hcl",
+  "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/bootstrap/variables.tf",
+  "infra/terraform/bootstrap/versions.tf",
+  "infra/terraform/prod/.terraform.lock.hcl",
+  "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/outputs.tf",
+  "infra/terraform/prod/variables.tf",
+  "infra/terraform/prod/versions.tf",
+]);
 const approvedAdditionalWorkflows: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   // Runsetta's credential-free macOS Swift package check is centralized here so
   // a consumer PR cannot add or alter an executable workflow without a platform review.
@@ -124,8 +144,14 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const messages: string[] = [];
 
     for (const file of requiredFiles) {
-      if (!(await exists(join(repoPath, file)))) {
+      const metadata = await lstat(join(repoPath, file)).catch((error: unknown) => {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      });
+      if (!metadata) {
         messages.push(`missing ${file}`);
+      } else if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        messages.push(`${file} must be a regular, non-symbolic-link file`);
       }
     }
 
@@ -157,7 +183,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const scanner = "./tools/socket-security-scanner.ts";
     const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
     const lockText = await readText(join(repoPath, "bun.lock"));
-    if (lockText) {
+    if (lockText !== undefined) {
       try {
         const lock = Bun.JSONC.parse(lockText) as {
           packages?: Record<string, unknown>;
@@ -184,7 +210,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
     }
 
     const bunfigText = await readText(join(repoPath, "bunfig.toml"));
-    if (bunfigText) {
+    if (bunfigText !== undefined) {
       try {
         const bunfig = Bun.TOML.parse(bunfigText) as {
           install?: {
@@ -236,30 +262,61 @@ async function doctor(repoArgs: string[]): Promise<void> {
     }
 
     if (config?.projectId && (trustedRepositoryId ?? config.githubRepositoryId)) {
-      const [bootstrapMain, bootstrapOutputs, productionMain, productionVariables] =
-        await Promise.all([
-          readText(join(repoPath, "infra/terraform/bootstrap/main.tf")),
-          readText(join(repoPath, "infra/terraform/bootstrap/outputs.tf")),
-          readText(join(repoPath, "infra/terraform/prod/main.tf")),
-          readText(join(repoPath, "infra/terraform/prod/variables.tf")),
-        ]);
-      if (bootstrapMain && bootstrapOutputs && productionMain && productionVariables) {
+      const [
+        bootstrapMain,
+        bootstrapOutputs,
+        bootstrapVariables,
+        bootstrapVersions,
+        productionMain,
+        productionOutputs,
+        productionVariables,
+        productionVersions,
+      ] = await Promise.all([
+        readText(join(repoPath, "infra/terraform/bootstrap/main.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/outputs.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/variables.tf")),
+        readText(join(repoPath, "infra/terraform/bootstrap/versions.tf")),
+        readText(join(repoPath, "infra/terraform/prod/main.tf")),
+        readText(join(repoPath, "infra/terraform/prod/outputs.tf")),
+        readText(join(repoPath, "infra/terraform/prod/variables.tf")),
+        readText(join(repoPath, "infra/terraform/prod/versions.tf")),
+      ]);
+      if (
+        bootstrapMain !== undefined &&
+        bootstrapOutputs !== undefined &&
+        bootstrapVariables !== undefined &&
+        bootstrapVersions !== undefined &&
+        productionMain !== undefined &&
+        productionOutputs !== undefined &&
+        productionVariables !== undefined &&
+        productionVersions !== undefined
+      ) {
         messages.push(
           ...validateTerraformMirrorContract(
             {
+              expectedPlatformSha: expectedWorkflowSha,
               githubRepositoryId: trustedRepositoryId ?? config.githubRepositoryId!,
               name: config.name,
               projectId: config.projectId,
               serviceName: config.serviceName,
             },
-            { bootstrapMain, bootstrapOutputs, productionMain, productionVariables },
+            {
+              bootstrapMain,
+              bootstrapOutputs,
+              bootstrapVariables,
+              bootstrapVersions,
+              productionMain,
+              productionOutputs,
+              productionVariables,
+              productionVersions,
+            },
           ),
         );
       }
     }
 
     const packageText = await readText(join(repoPath, "package.json"));
-    if (packageText) {
+    if (packageText !== undefined) {
       try {
         const packageJson = JSON.parse(packageText) as {
           dependencies?: Record<string, unknown>;
@@ -309,6 +366,9 @@ async function doctor(repoArgs: string[]): Promise<void> {
     for (const path of await trackedFiles(repoPath)) {
       if (isForbiddenTerraformArtifact(path)) {
         messages.push(`forbidden committed Terraform state/config artifact ${path}`);
+      }
+      if (isAdditionalTerraformMirrorFile(path)) {
+        messages.push(`unreviewed additional Terraform mirror file ${path}`);
       }
     }
 
@@ -442,7 +502,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
     }
 
     const bootstrapText = await readText(join(repoPath, "infra/terraform/bootstrap/main.tf"));
-    if (bootstrapText) {
+    if (bootstrapText !== undefined) {
       let uniqueTrustedRefs: Set<string> | undefined;
       const trustedBlock = bootstrapText.match(
         /^\s*trusted_platform_workflow_shas\s*=\s*\[([^\]]*)\]/m,
@@ -694,6 +754,13 @@ function isNotFound(error: unknown): boolean {
 
 function isFullCommitSha(value: string): boolean {
   return /^[0-9a-f]{40}$/.test(value);
+}
+
+function isAdditionalTerraformMirrorFile(path: string): boolean {
+  return (
+    (path.startsWith("infra/terraform/bootstrap/") || path.startsWith("infra/terraform/prod/")) &&
+    !allowedTerraformMirrorFiles.has(path)
+  );
 }
 
 function escapeRegExp(value: string): string {
