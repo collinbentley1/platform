@@ -18,9 +18,8 @@ locals {
     },
   )
 
-  preview_repository_id            = "${var.artifact_registry_repository_id}-preview"
-  preview_service_name             = "${var.service_name}-preview"
-  cloud_run_revision_deployer_role = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
+  preview_repository_id = "${var.artifact_registry_repository_id}-preview"
+  preview_service_name  = "${var.service_name}-preview"
 }
 
 resource "google_artifact_registry_repository" "site" {
@@ -100,6 +99,17 @@ resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader
   repository = google_artifact_registry_repository.preview.repository_id
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${var.preview_deploy_service_account_email}"
+}
+
+# Removing a Cloud Run traffic tag makes the service reconcile the referenced
+# revision. Grant only the one permission observed to be required, on only the
+# preview repository; the operator gets no repository metadata/listing access.
+resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.preview.location
+  repository = google_artifact_registry_repository.preview.repository_id
+  role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"
+  member     = "serviceAccount:${var.preview_operator_service_account_email}"
 }
 
 moved {
@@ -262,7 +272,7 @@ resource "google_cloud_run_v2_service_iam_member" "prod_deploy" {
   project  = var.project_id
   location = google_cloud_run_v2_service.site.location
   name     = google_cloud_run_v2_service.site.name
-  role     = local.cloud_run_revision_deployer_role
+  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
   member   = "serviceAccount:${var.prod_deploy_service_account_email}"
 }
 
@@ -338,7 +348,7 @@ resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {
   project  = var.project_id
   location = google_cloud_run_v2_service.preview.location
   name     = google_cloud_run_v2_service.preview.name
-  role     = local.cloud_run_revision_deployer_role
+  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
   member   = "serviceAccount:${var.preview_deploy_service_account_email}"
 }
 
@@ -346,7 +356,7 @@ resource "google_cloud_run_v2_service_iam_member" "preview_operator" {
   project  = var.project_id
   location = google_cloud_run_v2_service.preview.location
   name     = google_cloud_run_v2_service.preview.name
-  role     = local.cloud_run_revision_deployer_role
+  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
   member   = "serviceAccount:${var.preview_operator_service_account_email}"
 }
 

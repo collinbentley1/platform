@@ -198,7 +198,7 @@ the recovery object and stop; never rerun from empty state.
    This first apply must remove every project-wide routine/deployer role,
    all Token Creator grants, routine-Terraform runtime `actAs`, and preview
    `actAs` on the production runtime. It creates the two publisher identities
-   and the traffic-only preview operator with exact environment/workflow-SHA WIF
+   and the preview traffic-reconciliation operator with exact environment/workflow-SHA WIF
    bindings; neither publisher gets a generic fallback. Compatibility mode
    retains only path-specific Workload Identity User fallbacks for Terraform,
    production deploy, preview deploy, and preview traffic operations, so tokens
@@ -251,8 +251,11 @@ the recovery object and stop; never rerun from empty state.
    repository-scoped Writer member to move from the deploy identity to its
    publisher identity and add only repository-scoped Reader to the matching
    deploy identity. No upload/delete-capable registry grant may remain on a
-   deploy identity, and the preview operator must have no registry or runtime
-   `actAs` grant. Require the subsequent exposure plan to remain empty. For a
+   deploy or operator identity. The preview operator must have only the
+   `previewTrafficImageDownloader` custom role on the exact preview repository
+   (one `artifactregistry.repositories.downloadArtifacts` permission, required
+   to reconcile traffic tags), with no production-repository or runtime `actAs`
+   grant. Require the subsequent exposure plan to remain empty. For a
    fresh app, apply production first and exposure second. The current Critical
    History service already completed this baseline migration with public preview
    ingress. For its follow-on stable namespace, do not apply the new production
@@ -305,9 +308,10 @@ the recovery object and stop; never rerun from empty state.
     binding on each. Prove both publisher accounts have only one exact
     repository-level Artifact Registry Writer grant, both deploy accounts have
     only Reader on their exact image repository, both publishers have zero Cloud
-    Run and runtime `actAs` grants, and the preview operator has zero Artifact
-    Registry and runtime `actAs` grants. The canary alone cannot prove each
-    operational binding.
+    Run and runtime `actAs` grants, and the preview operator has only the
+    `previewTrafficImageDownloader` custom role on the exact preview repository
+    and zero runtime `actAs` grants. The canary alone cannot prove each operational
+    binding.
 
 ### Stable-preview rollback boundary
 

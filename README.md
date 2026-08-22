@@ -104,8 +104,10 @@ with the service-scoped Cloud Run role, `actAs` on only the matching runtime,
 and Reader on only the matching image repository, as Cloud Run requires; they
 cannot upload or delete artifacts. `preview-operations` uses
 `gha-preview-operator`, which has only service-scoped Cloud Run get/update and
-operation-read permissions, with no registry or runtime `actAs` grant. Protect
-both publish environments before pinning a consumer to this workflow.
+operation-read permissions plus `downloadArtifacts` on only the preview image
+repository, with no registry listing, publishing, deletion, or runtime `actAs`
+grant. Protect both publish environments before pinning a consumer to this
+workflow.
 
 ## Runtime Configuration
 

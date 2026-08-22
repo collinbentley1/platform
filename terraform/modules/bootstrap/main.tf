@@ -347,6 +347,18 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {
+  project     = var.project_id
+  role_id     = "previewTrafficImageDownloader"
+  title       = "Preview Traffic Image Downloader"
+  description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."
+  permissions = [
+    "artifactregistry.repositories.downloadArtifacts",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_project_iam_custom_role" "terraform_convergence_reader" {
   project     = var.project_id
   role_id     = "terraformConvergenceReader"

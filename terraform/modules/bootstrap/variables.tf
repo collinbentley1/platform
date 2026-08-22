@@ -147,7 +147,7 @@ variable "preview_deploy_service_account_description" {
 variable "preview_operator_service_account_description" {
   description = "Description for the preview traffic operator service account."
   type        = string
-  default     = "Reads and updates traffic only on the pre-created shared preview Cloud Run service; cannot publish, deploy a runtime identity, or read images."
+  default     = "Reads and updates traffic only on the pre-created shared preview Cloud Run service and downloads artifacts only from its preview repository; cannot publish or act as a runtime identity."
 }
 
 variable "preview_publisher_service_account_description" {

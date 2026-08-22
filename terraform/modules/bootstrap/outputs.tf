@@ -34,7 +34,7 @@ output "preview_deploy_service_account_email" {
 }
 
 output "preview_operator_service_account_email" {
-  description = "Cloud Run traffic-only service account used by preview cleanup and reconciliation jobs."
+  description = "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository."
   value       = google_service_account.preview_operator.email
 }
 
@@ -51,6 +51,11 @@ output "exact_wif_canary_service_account_email" {
 output "cloud_run_revision_deployer_role" {
   description = "Custom role for updating pre-created Cloud Run services without delete access."
   value       = google_project_iam_custom_role.cloud_run_revision_deployer.name
+}
+
+output "preview_traffic_image_downloader_role" {
+  description = "Single-permission custom role used to reconcile preview traffic tags."
+  value       = google_project_iam_custom_role.preview_traffic_image_downloader.name
 }
 
 output "terraform_convergence_reader_role" {

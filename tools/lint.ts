@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
   validateRegistryOnlyDependencySpecs,
@@ -1590,6 +1591,50 @@ requireContains(
 const moduleMain = await read("terraform/modules/cloud-run-service/main.tf");
 const moduleVariables = await read("terraform/modules/cloud-run-service/variables.tf");
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
+if (
+  createHash("sha256").update(moduleMain).digest("hex") !==
+  "df1530df67f74814fd8444459ff776fa4dc30d9688162900e6abe37287e0e2e8"
+) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
+  );
+}
+const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.tf"];
+for (const moduleName of ["cloud-run-service", "bootstrap"]) {
+  const moduleDirectory = join(root, "terraform/modules", moduleName);
+  const terraformFiles = (await readdir(moduleDirectory)).sort();
+  if (JSON.stringify(terraformFiles) !== JSON.stringify(approvedModuleFiles)) {
+    failures.push(
+      `terraform/modules/${moduleName}: Terraform files must be exactly ${approvedModuleFiles.join(", ")}; found ${terraformFiles.join(", ")}.`,
+    );
+  }
+  for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
+    const content = await readFile(join(moduleDirectory, name), "utf8");
+    if (/^\s*(?:resource|data|module|locals|provider)\s+(?:"|\{)/m.test(content)) {
+      failures.push(
+        `terraform/modules/${moduleName}/${name}: Executable Terraform blocks belong only in the reviewed main.tf.`,
+      );
+    }
+  }
+}
+const allServiceModuleTerraform = (
+  await Promise.all(
+    approvedModuleFiles.map((name) => read(`terraform/modules/cloud-run-service/${name}`)),
+  )
+).join("\n");
+for (const [path, content] of [
+  ["terraform/modules/cloud-run-service/main.tf", moduleMain],
+  ["terraform/modules/bootstrap/main.tf", await read("terraform/modules/bootstrap/main.tf")],
+] as const) {
+  if (/^\s*module\s+"/m.test(content)) {
+    failures.push(`${path}: Trusted Terraform modules must not delegate to child modules.`);
+  }
+  if (/<<|\/\*|^\s*\/\//m.test(content)) {
+    failures.push(
+      `${path}: Trusted Terraform module entrypoints must not use heredocs or block-style comments that can disguise structural delimiters.`,
+    );
+  }
+}
 requireContains(
   "terraform/modules/cloud-run-service/versions.tf",
   moduleVersions,
@@ -1758,9 +1803,9 @@ for (const [publisherResource, publisherVariable, formerDeployResource] of [
     "Deploy/operator identities must not retain Artifact Registry Writer resources.",
   );
 }
-for (const [readerResource, deployVariable] of [
-  ["prod_deploy_reader", "prod_deploy_service_account_email"],
-  ["preview_deploy_reader", "preview_deploy_service_account_email"],
+for (const [readerResource, readerVariable, repositoryResource] of [
+  ["prod_deploy_reader", "prod_deploy_service_account_email", "site"],
+  ["preview_deploy_reader", "preview_deploy_service_account_email", "preview"],
 ] as const) {
   const reader = sectionBetween(
     moduleMain,
@@ -1776,8 +1821,14 @@ for (const [readerResource, deployVariable] of [
   requireContains(
     "terraform/modules/cloud-run-service/main.tf",
     reader,
-    `member     = "serviceAccount:${"${var."}${deployVariable}}"`,
+    `member     = "serviceAccount:${"${var."}${readerVariable}}"`,
     "Artifact Registry Reader must belong only to the matching deploy identity.",
+  );
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    reader,
+    `repository = google_artifact_registry_repository.${repositoryResource}.repository_id`,
+    "Artifact Registry Reader must remain scoped to the matching image repository.",
   );
   rejectContains(
     "terraform/modules/cloud-run-service/main.tf",
@@ -1786,16 +1837,228 @@ for (const [readerResource, deployVariable] of [
     "Deploy identities must not receive Artifact Registry upload or delete permissions.",
   );
 }
-rejectContains(
-  "terraform/modules/cloud-run-service/main.tf",
-  sectionBetween(
-    moduleMain,
-    'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
-    'resource "google_secret_manager_secret" "runtime"',
-  ),
-  "preview_operator_service_account_email",
-  "Preview traffic operators must have zero Artifact Registry access.",
+const previewOperatorRegistry = sectionBetween(
+  moduleMain,
+  'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader"',
+  "\n}\n",
 );
+for (const needle of [
+  'role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
+  'member     = "serviceAccount:${var.preview_operator_service_account_email}"',
+  "repository = google_artifact_registry_repository.preview.repository_id",
+]) {
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    previewOperatorRegistry,
+    needle,
+    `The preview operator's one-permission repository grant is missing: ${needle}`,
+  );
+}
+for (const forbidden of ["roles/artifactregistry.reader", "roles/artifactregistry.writer"]) {
+  rejectContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    previewOperatorRegistry,
+    forbidden,
+    "The preview operator must use only the downloadArtifacts custom role.",
+  );
+}
+const repositoryIamMembers = [
+  ...allServiceModuleTerraform.matchAll(
+    /resource\s+"google_artifact_registry_repository_iam_member"\s+"([^"]+)"/g,
+  ),
+]
+  .map((match) => match[1])
+  .sort();
+const approvedRepositoryIamMembers = [
+  "preview_deploy_reader",
+  "preview_operator_image_downloader",
+  "preview_publisher_writer",
+  "prod_deploy_reader",
+  "prod_publisher_writer",
+].sort();
+if (JSON.stringify(repositoryIamMembers) !== JSON.stringify(approvedRepositoryIamMembers)) {
+  failures.push(
+    `terraform/modules/cloud-run-service/main.tf: Repository IAM resources must be exactly ${approvedRepositoryIamMembers.join(", ")}; found ${repositoryIamMembers.join(", ")}.`,
+  );
+}
+for (const forbiddenResource of [
+  /resource\s+"google_artifact_registry_repository_iam_(?:binding|policy)"/,
+  /resource\s+"google_project_iam_(?:member|binding|policy)"/,
+]) {
+  if (forbiddenResource.test(allServiceModuleTerraform)) {
+    failures.push(
+      `terraform/modules/cloud-run-service/main.tf: ${forbiddenResource.source} is forbidden; IAM must remain in the enumerated exact-resource grants.`,
+    );
+  }
+}
+const allIamResources = [
+  ...allServiceModuleTerraform.matchAll(
+    /resource\s+"(google_[^"]+_iam_(?:member|binding|policy))"\s+"([^"]+)"/g,
+  ),
+]
+  .map((match) => `${match[1]}.${match[2]}`)
+  .sort();
+const approvedIamResources = [
+  "google_artifact_registry_repository_iam_member.preview_deploy_reader",
+  "google_artifact_registry_repository_iam_member.preview_operator_image_downloader",
+  "google_artifact_registry_repository_iam_member.preview_publisher_writer",
+  "google_artifact_registry_repository_iam_member.prod_deploy_reader",
+  "google_artifact_registry_repository_iam_member.prod_publisher_writer",
+  "google_cloud_run_v2_service_iam_member.preview_deploy",
+  "google_cloud_run_v2_service_iam_member.preview_operator",
+  "google_cloud_run_v2_service_iam_member.prod_deploy",
+  "google_secret_manager_secret_iam_member.runtime_accessor",
+].sort();
+if (JSON.stringify(allIamResources) !== JSON.stringify(approvedIamResources)) {
+  failures.push(
+    `terraform/modules/cloud-run-service: IAM resources must be exactly ${approvedIamResources.join(", ")}; found ${allIamResources.join(", ")}.`,
+  );
+}
+const exactIamBlocks = [
+  [
+    'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.site.location",
+    "  repository = google_artifact_registry_repository.site.repository_id",
+    '  role       = "roles/artifactregistry.writer"',
+    '  member     = "serviceAccount:${var.prod_publisher_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "preview_publisher_writer" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.preview.location",
+    "  repository = google_artifact_registry_repository.preview.repository_id",
+    '  role       = "roles/artifactregistry.writer"',
+    '  member     = "serviceAccount:${var.preview_publisher_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "prod_deploy_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.site.location",
+    "  repository = google_artifact_registry_repository.site.repository_id",
+    '  role       = "roles/artifactregistry.reader"',
+    '  member     = "serviceAccount:${var.prod_deploy_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.preview.location",
+    "  repository = google_artifact_registry_repository.preview.repository_id",
+    '  role       = "roles/artifactregistry.reader"',
+    '  member     = "serviceAccount:${var.preview_deploy_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "preview_operator_image_downloader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.preview.location",
+    "  repository = google_artifact_registry_repository.preview.repository_id",
+    '  role       = "projects/${var.project_id}/roles/previewTrafficImageDownloader"',
+    '  member     = "serviceAccount:${var.preview_operator_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
+    "  for_each = var.runtime_secret_accessor_ids",
+    "",
+    "  project   = var.project_id",
+    "  secret_id = google_secret_manager_secret.runtime[each.value].secret_id",
+    '  role      = "roles/secretmanager.secretAccessor"',
+    '  member    = "serviceAccount:${var.runtime_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "prod_deploy" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.site.location",
+    "  name     = google_cloud_run_v2_service.site.name",
+    '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+    '  member   = "serviceAccount:${var.prod_deploy_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.preview.location",
+    "  name     = google_cloud_run_v2_service.preview.name",
+    '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+    '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "preview_operator" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.preview.location",
+    "  name     = google_cloud_run_v2_service.preview.name",
+    '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+    '  member   = "serviceAccount:${var.preview_operator_service_account_email}"',
+    "}",
+  ].join("\n"),
+];
+for (const exactIamBlock of exactIamBlocks) {
+  if (moduleMain.split(exactIamBlock).length - 1 !== 1) {
+    failures.push(
+      `terraform/modules/cloud-run-service/main.tf: IAM block must match its exact canonical contract: ${exactIamBlock.split("\n")[0]}`,
+    );
+  }
+}
+const registryIam = sectionBetween(
+  moduleMain,
+  'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
+  'resource "google_secret_manager_secret" "runtime"',
+);
+if (registryIam.split("preview_operator_service_account_email").length - 1 !== 1) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: The preview operator needs exactly one repository-scoped downloadArtifacts grant for traffic-tag reconciliation.",
+  );
+}
+for (const [resource, identity, service] of [
+  ["prod_deploy", "prod_deploy_service_account_email", "site"],
+  ["preview_deploy", "preview_deploy_service_account_email", "preview"],
+  ["preview_operator", "preview_operator_service_account_email", "preview"],
+] as const) {
+  const serviceGrant = sectionBetween(
+    moduleMain,
+    `resource "google_cloud_run_v2_service_iam_member" "${resource}"`,
+    "\n}\n",
+  );
+  for (const needle of [
+    'role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+    `member   = "serviceAccount:${"${var."}${identity}}"`,
+    `name     = google_cloud_run_v2_service.${service}.name`,
+  ]) {
+    requireContains(
+      "terraform/modules/cloud-run-service/main.tf",
+      serviceGrant,
+      needle,
+      `The exact ${resource} service grant is missing: ${needle}`,
+    );
+  }
+}
+const runtimeAccessor = sectionBetween(
+  moduleMain,
+  'resource "google_secret_manager_secret_iam_member" "runtime_accessor"',
+  "\n}\n",
+);
+for (const needle of [
+  'role      = "roles/secretmanager.secretAccessor"',
+  'member    = "serviceAccount:${var.runtime_service_account_email}"',
+]) {
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    runtimeAccessor,
+    needle,
+    `The runtime-only secret grant is missing: ${needle}`,
+  );
+}
+if (allServiceModuleTerraform.split("preview_operator_service_account_email").length - 1 !== 3) {
+  failures.push(
+    "terraform/modules/cloud-run-service/main.tf: The preview operator must appear only in its exact-repository downloadArtifacts and exact-service traffic grants.",
+  );
+}
 for (const publisherVariable of [
   "prod_publisher_service_account_email",
   "preview_publisher_service_account_email",
@@ -1810,6 +2073,201 @@ for (const publisherVariable of [
 
 const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
+if (
+  createHash("sha256").update(bootstrapMain).digest("hex") !==
+  "92845129ede0a6f6836a69c5bda8f6f17556c504118af6857ac01411d655dac0"
+) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
+  );
+}
+const bootstrapIamResources = [
+  ...bootstrapMain.matchAll(
+    /^resource\s+"(google_[^"]+_iam_(?:member|binding|policy))"\s+"([^"]+)"/gm,
+  ),
+]
+  .map((match) => `${match[1]}.${match[2]}`)
+  .sort();
+const approvedBootstrapIamResources = [
+  "google_project_iam_binding.editor_absent",
+  "google_project_iam_member.runtime_project_roles",
+  "google_project_iam_member.terraform_convergence_reader",
+  "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
+  "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
+  "google_service_account_iam_member.canary_wif_preview_publish_workflow_sha",
+  "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
+  "google_service_account_iam_member.canary_wif_prod_workflow_sha",
+  "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
+  "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
+  "google_service_account_iam_member.preview_deploy_wif_repo",
+  "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
+  "google_service_account_iam_member.preview_operator_wif_repo",
+  "google_service_account_iam_member.preview_operator_wif_workflow_sha",
+  "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
+  "google_service_account_iam_member.prod_deploy_uses_runtime",
+  "google_service_account_iam_member.prod_deploy_wif_prod_env",
+  "google_service_account_iam_member.prod_deploy_wif_workflow_sha",
+  "google_service_account_iam_member.prod_publisher_wif_workflow_sha",
+  "google_service_account_iam_member.terraform_wif_prod_env",
+  "google_service_account_iam_member.terraform_wif_workflow_sha",
+  "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
+  "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
+  "google_storage_bucket_iam_binding.terraform_state_no_legacy_access",
+  "google_storage_bucket_iam_member.terraform_state_access_logs_writer",
+  "google_storage_bucket_iam_member.terraform_state_reader",
+].sort();
+if (
+  JSON.stringify(bootstrapIamResources) !== JSON.stringify(approvedBootstrapIamResources)
+) {
+  failures.push(
+    `terraform/modules/bootstrap/main.tf: IAM resources must be exactly ${approvedBootstrapIamResources.join(", ")}; found ${bootstrapIamResources.join(", ")}.`,
+  );
+}
+for (const exactProjectIamBlock of [
+  [
+    'resource "google_project_iam_member" "terraform_convergence_reader" {',
+    "  project = var.project_id",
+    "  role    = google_project_iam_custom_role.terraform_convergence_reader.name",
+    '  member  = "serviceAccount:${google_service_account.terraform.email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_project_iam_member" "runtime_project_roles" {',
+    "  for_each = var.runtime_project_roles",
+    "",
+    "  project = var.project_id",
+    "  role    = each.value",
+    '  member  = "serviceAccount:${google_service_account.runtime.email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_project_iam_binding" "editor_absent" {',
+    "  #checkov:skip=CKV_GCP_49:An authoritative empty binding removes impersonation-capable basic-role members; it grants no principal access.",
+    "  #checkov:skip=CKV_GCP_117:An authoritative empty Editor binding removes the basic role and prevents drift; it grants no principal access.",
+    "  project = var.project_id",
+    '  role    = "roles/editor"',
+    "  members = []",
+    "",
+    "  depends_on = [google_project_service.required]",
+    "}",
+  ].join("\n"),
+]) {
+  if (bootstrapMain.split(exactProjectIamBlock).length - 1 !== 1) {
+    failures.push(
+      `terraform/modules/bootstrap/main.tf: Project IAM block must match its exact canonical contract: ${exactProjectIamBlock.split("\n")[0]}`,
+    );
+  }
+}
+if (/roles\/artifactregistry\.(?:admin|reader|writer)/.test(bootstrapMain)) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: Bootstrap must not grant predefined Artifact Registry roles.",
+  );
+}
+if (
+  /google_service_account\.preview_operator\.(?:email|member)/.test(bootstrapMain) ||
+  bootstrapMain.includes("serviceAccount:gha-preview-operator@")
+) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: The preview operator must not receive direct project, registry, state, secret, or runtime grants.",
+  );
+}
+const previewTrafficImageDownloaderRole = sectionBetween(
+  bootstrapMain,
+  'resource "google_project_iam_custom_role" "preview_traffic_image_downloader"',
+  "\n}\n",
+);
+const expectedPreviewTrafficImageDownloaderRole = [
+  'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
+  "  project     = var.project_id",
+  '  role_id     = "previewTrafficImageDownloader"',
+  '  title       = "Preview Traffic Image Downloader"',
+  '  description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+  "  permissions = [",
+  '    "artifactregistry.repositories.downloadArtifacts",',
+  "  ]",
+  "",
+  "  depends_on = [google_project_service.required]",
+  "}",
+].join("\n");
+if (
+  bootstrapMain.split(expectedPreviewTrafficImageDownloaderRole).length - 1 !== 1 ||
+  [...bootstrapMain.matchAll(
+    /^resource\s+"google_project_iam_custom_role"\s+"preview_traffic_image_downloader"\s*\{/gm,
+  )].length !== 1
+) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: previewTrafficImageDownloader must match its one exact canonical resource block.",
+  );
+}
+for (const needle of [
+  'role_id     = "previewTrafficImageDownloader"',
+  'description = "Permits artifact downloads from the preview repository solely for Cloud Run traffic-tag reconciliation."',
+  '"artifactregistry.repositories.downloadArtifacts",',
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    previewTrafficImageDownloaderRole,
+    needle,
+    `The preview traffic image downloader role is missing: ${needle}`,
+  );
+}
+rejectContains(
+  "terraform/modules/bootstrap/main.tf",
+  previewTrafficImageDownloaderRole,
+  "ignore_changes",
+  "The one-permission preview role must converge out-of-band permission drift.",
+);
+const previewTrafficPermissions = [
+  ...previewTrafficImageDownloaderRole.matchAll(/"([a-z]+\.[A-Za-z]+\.[A-Za-z]+)",/g),
+].map((match) => match[1]);
+if (
+  previewTrafficImageDownloaderRole.split("permissions =").length - 1 !== 1 ||
+  !/permissions\s*=\s*\[\s*"artifactregistry\.repositories\.downloadArtifacts",?\s*\]/.test(
+    previewTrafficImageDownloaderRole,
+  )
+) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: previewTrafficImageDownloader permissions must be one literal singleton list.",
+  );
+}
+if (
+  JSON.stringify(previewTrafficPermissions) !==
+  JSON.stringify(["artifactregistry.repositories.downloadArtifacts"])
+) {
+  failures.push(
+    `terraform/modules/bootstrap/main.tf: previewTrafficImageDownloader must contain exactly artifactregistry.repositories.downloadArtifacts; found ${previewTrafficPermissions.join(", ")}.`,
+  );
+}
+requireContains(
+  "terraform/modules/bootstrap/variables.tf",
+  bootstrapVariables,
+  "downloads artifacts only from its preview repository; cannot publish or act as a runtime identity.",
+  "The preview operator service-account description must disclose its exact repository download grant.",
+);
+requireContains(
+  "README.md",
+  readme,
+  "operation-read permissions plus `downloadArtifacts` on only the preview image",
+  "The identity overview must disclose the preview operator's one-permission registry grant.",
+);
+requireContains(
+  "docs/security-rollout.md",
+  securityRollout,
+  "preview traffic-reconciliation operator with exact environment/workflow-SHA WIF",
+  "The rollout guide must not describe the preview operator as traffic-only.",
+);
+for (const outputPath of [
+  "terraform/modules/bootstrap/outputs.tf",
+  "terraform/deployments/bootstrap/outputs.tf",
+  "templates/app/infra/terraform/bootstrap/outputs.tf",
+]) {
+  requireContains(
+    outputPath,
+    await read(outputPath),
+    "Preview traffic-reconciliation service account with downloadArtifacts-only access to the exact preview repository.",
+    "The preview operator output must disclose its one-permission registry grant.",
+  );
+}
 requireContains(
   "terraform/modules/bootstrap/variables.tf",
   bootstrapVariables,

@@ -83,7 +83,7 @@ variable "preview_deploy_service_account_email" {
 }
 
 variable "preview_operator_service_account_email" {
-  description = "Preview traffic operator service account email; receives service update only, with no Artifact Registry or runtime actAs grant."
+  description = "Preview traffic operator service account email; receives service update plus downloadArtifacts-only access to the exact preview image repository, with no runtime actAs grant."
   type        = string
 }
 
