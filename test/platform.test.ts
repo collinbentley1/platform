@@ -567,7 +567,7 @@ describe("platform scaffold and doctor", () => {
     const result = await run(["doctor", app]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("package.json is not valid JSON");
-    expect(result.stderr).toContain("bun.lock packages must be an object");
+    expect(result.stderr).toContain("bun.lock is not valid JSONC");
   });
 
   test("doctor and immutable contract reject local scanner substitution", async () => {

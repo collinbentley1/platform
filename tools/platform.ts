@@ -184,28 +184,32 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
     const lockText = await readText(join(repoPath, "bun.lock"));
     if (lockText !== undefined) {
-      try {
-        const lock = Bun.JSONC.parse(lockText) as {
-          packages?: Record<string, unknown>;
-          patchedDependencies?: unknown;
-          workspaces?: unknown;
-        };
-        const reviewedLock = Bun.JSONC.parse(
-          (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
-        ) as { packages?: Record<string, unknown> };
-        messages.push(...validateRegistryOnlyLock(lock));
-        if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
-          messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
-        }
-        if (Object.keys(lock.packages ?? {}).length > 128) {
-          messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
-        }
-        if (Object.hasOwn(lock, "patchedDependencies")) {
-          messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
-        }
-        messages.push(...validateTypeScriptLock(lock.packages, reviewedLock.packages));
-      } catch {
+      if (lockText.trim().length === 0) {
         messages.push("bun.lock is not valid JSONC");
+      } else {
+        try {
+          const lock = Bun.JSONC.parse(lockText) as {
+            packages?: Record<string, unknown>;
+            patchedDependencies?: unknown;
+            workspaces?: unknown;
+          };
+          const reviewedLock = Bun.JSONC.parse(
+            (await readText(join(root, "templates/app/bun.lock"))) ?? "{}",
+          ) as { packages?: Record<string, unknown> };
+          messages.push(...validateRegistryOnlyLock(lock));
+          if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
+            messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
+          }
+          if (Object.keys(lock.packages ?? {}).length > 128) {
+            messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
+          }
+          if (Object.hasOwn(lock, "patchedDependencies")) {
+            messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
+          }
+          messages.push(...validateTypeScriptLock(lock.packages, reviewedLock.packages));
+        } catch {
+          messages.push("bun.lock is not valid JSONC");
+        }
       }
     }
 
