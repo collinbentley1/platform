@@ -839,9 +839,9 @@ function validateWorkflowShaPartitions(
     }
   }
 
-  if (trusted.length < 1 || trusted.length > 2) {
+  if (trusted.length !== 1 || trusted[0] !== platformSha) {
     failures.push(
-      "infra/terraform/bootstrap/main.tf trusted_platform_workflow_shas must contain one steady-state SHA or exactly two migration SHAs",
+      "infra/terraform/bootstrap/main.tf consumer mirror trusted_platform_workflow_shas must contain only the module platform SHA",
     );
   }
   if (active.length !== 1 || active[0] !== platformSha) {
@@ -849,14 +849,9 @@ function validateWorkflowShaPartitions(
       "infra/terraform/bootstrap/main.tf preview_operations_active_workflow_shas must contain only the module platform SHA",
     );
   }
-  if (transition.length > 1) {
+  if (transition.length !== 0) {
     failures.push(
-      "infra/terraform/bootstrap/main.tf preview_operator_transition_workflow_shas may contain at most one migration SHA",
-    );
-  }
-  if (!trusted.includes(platformSha)) {
-    failures.push(
-      "infra/terraform/bootstrap/main.tf trusted_platform_workflow_shas must include the module platform SHA",
+      "infra/terraform/bootstrap/main.tf preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
     );
   }
 

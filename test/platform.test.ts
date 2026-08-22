@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -981,11 +981,10 @@ describe("platform scaffold and doctor", () => {
     );
   });
 
-  test("doctor permits one safe transition SHA but rejects pre-migration trust", async () => {
-    const app = await scaffold("safe-transition");
+  test("doctor and immutable contract reject every consumer transition SHA", async () => {
+    const app = await scaffold("consumer-transition");
     const path = join(app, "infra/terraform/bootstrap/main.tf");
     const original = await readFile(path, "utf8");
-    const safePrior = "b".repeat(40);
     const withTransition = (transition: string) =>
       original
         .replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${transition}",`)
@@ -993,8 +992,25 @@ describe("platform scaffold and doctor", () => {
           /preview_operator_transition_workflow_shas\s*=\s*\[\]/,
           `preview_operator_transition_workflow_shas = [\n    "${transition}",\n  ]`,
         );
-    await writeFile(path, withTransition(safePrior));
-    expect((await run(["doctor", app])).exitCode).toBe(0);
+
+    await writeFile(path, withTransition("b".repeat(40)));
+    const doctor = await run(["doctor", app]);
+    expect(doctor.exitCode).not.toBe(0);
+    expect(doctor.stderr).toContain(
+      "trusted_platform_workflow_shas must contain exactly one full commit SHA",
+    );
+    expect(doctor.stderr).toContain(
+      "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
+    );
+
+    const contract = await runContract(app);
+    expect(contract.exitCode).not.toBe(0);
+    expect(contract.stderr).toContain(
+      "consumer mirror trusted_platform_workflow_shas must contain only the module platform SHA",
+    );
+    expect(contract.stderr).toContain(
+      "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
+    );
 
     for (const vulnerable of [
       "734d0cd02187f88c6e91263f127dc3f4c0709feb",
@@ -1010,9 +1026,40 @@ describe("platform scaffold and doctor", () => {
         path,
         withTransition(vulnerable),
       );
-      const result = await run(["doctor", app]);
-      expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain("vulnerable pre-migration SHA");
+      for (const result of [await run(["doctor", app]), await runContract(app)]) {
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain("pre-migration SHA");
+      }
+    }
+  });
+
+  test("doctor and immutable contract reject symlinked Terraform ancestor directories", async () => {
+    for (const [index, ancestor] of [
+      "infra",
+      "infra/terraform",
+      "infra/terraform/bootstrap",
+      "infra/terraform/prod",
+    ].entries()) {
+      const app = await scaffold(`terraform-ancestor-symlink-${index}`);
+      const original = join(app, ancestor);
+      const mirror = join(app, `mirror-${index}`);
+      await cp(original, mirror, { recursive: true });
+      const rogue =
+        index === 0
+          ? join(mirror, "terraform/prod/rogue.tf")
+          : index === 1
+            ? join(mirror, "prod/rogue.tf")
+            : join(mirror, "rogue.tf");
+      await writeFile(rogue, "resource \"null_resource\" \"rogue\" {}\n");
+      await rm(original, { recursive: true });
+      await symlink(mirror, original);
+
+      for (const result of [await run(["doctor", app]), await runContract(app)]) {
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          `${ancestor} must be a real, non-symbolic-link directory`,
+        );
+      }
     }
   });
 

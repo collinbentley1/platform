@@ -40,6 +40,12 @@ const requiredFiles = [
   "infra/terraform/prod/variables.tf",
   "infra/terraform/prod/versions.tf",
 ];
+const requiredDirectories = [
+  "infra",
+  "infra/terraform",
+  "infra/terraform/bootstrap",
+  "infra/terraform/prod",
+];
 const ignoredWalkPaths = new Set([".git", "_platform_policy"]);
 const allowedTerraformMirrorFiles = new Set([
   "infra/terraform/bootstrap/.terraform.lock.hcl",
@@ -77,6 +83,10 @@ if (
 
 const appRoot = await realpath(resolve(appArg));
 const templateRoot = await realpath(resolve(templateArg));
+
+for (const directory of requiredDirectories) {
+  await requireRegularDirectory(join(appRoot, directory), directory);
+}
 
 for (const file of requiredFiles) {
   await requireRegularFile(join(appRoot, file), file);
@@ -252,6 +262,13 @@ async function requireRegularFile(path: string, label: string): Promise<void> {
   }
 }
 
+async function requireRegularDirectory(path: string, label: string): Promise<void> {
+  const metadata = await lstat(path).catch(() => undefined);
+  if (!metadata?.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a real, non-symbolic-link directory.`);
+  }
+}
+
 async function* walk(directory: string): AsyncGenerator<string> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
@@ -290,7 +307,14 @@ async function* walk(directory: string): AsyncGenerator<string> {
 }
 
 function isTerraformMirrorPath(path: string): boolean {
-  return path.startsWith("infra/terraform/bootstrap/") || path.startsWith("infra/terraform/prod/");
+  return (
+    path === "infra" ||
+    path === "infra/terraform" ||
+    path === "infra/terraform/bootstrap" ||
+    path === "infra/terraform/prod" ||
+    path.startsWith("infra/terraform/bootstrap/") ||
+    path.startsWith("infra/terraform/prod/")
+  );
 }
 
 function isAdditionalTerraformMirrorFile(path: string): boolean {

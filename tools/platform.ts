@@ -47,6 +47,12 @@ const requiredFiles = [
   "infra/terraform/prod/versions.tf",
   "infra/terraform/prod/.terraform.lock.hcl",
 ];
+const requiredDirectories = [
+  "infra",
+  "infra/terraform",
+  "infra/terraform/bootstrap",
+  "infra/terraform/prod",
+];
 const workflowFiles = [
   "application.yml",
   "socket-firewall.yml",
@@ -142,6 +148,18 @@ async function doctor(repoArgs: string[]): Promise<void> {
     const repoPath = resolve(repo);
     const repoName = basename(repoPath);
     const messages: string[] = [];
+
+    for (const directory of requiredDirectories) {
+      const metadata = await lstat(join(repoPath, directory)).catch((error: unknown) => {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      });
+      if (!metadata) {
+        messages.push(`missing ${directory}`);
+      } else if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        messages.push(`${directory} must be a real, non-symbolic-link directory`);
+      }
+    }
 
     for (const file of requiredFiles) {
       const metadata = await lstat(join(repoPath, file)).catch((error: unknown) => {
@@ -529,18 +547,16 @@ async function doctor(repoArgs: string[]): Promise<void> {
           }
         }
         uniqueTrustedRefs = new Set(trustedRefs);
-        if (
-          invalidLine ||
-          trustedRefs.length !== uniqueTrustedRefs.size ||
-          trustedRefs.length < 1 ||
-          trustedRefs.length > 2
-        ) {
+        if (invalidLine || trustedRefs.length !== 1 || uniqueTrustedRefs.size !== 1) {
           messages.push(
-            "trusted_platform_workflow_shas must contain one or two unique full commit SHAs",
+            "trusted_platform_workflow_shas must contain exactly one full commit SHA",
           );
         }
-        if (platformRef !== "unknown" && !uniqueTrustedRefs.has(platformRef)) {
-          messages.push("trusted_platform_workflow_shas must include the active platform SHA");
+        if (
+          platformRef !== "unknown" &&
+          (trustedRefs.length !== 1 || trustedRefs[0] !== platformRef)
+        ) {
+          messages.push("trusted_platform_workflow_shas must contain only the active platform SHA");
         }
         for (const ref of uniqueTrustedRefs) {
           if (forbiddenPreMigrationWorkflowShas.has(ref)) {
@@ -593,9 +609,9 @@ async function doctor(repoArgs: string[]): Promise<void> {
           "preview_operations_active_workflow_shas must contain the active platform SHA",
         );
       }
-      if (transitionOperatorRefs && transitionOperatorRefs.size > 1) {
+      if (transitionOperatorRefs && transitionOperatorRefs.size !== 0) {
         messages.push(
-          "preview_operator_transition_workflow_shas may contain at most one immediately previous SHA",
+          "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
         );
       }
       if (activeOperatorRefs && transitionOperatorRefs) {
@@ -611,11 +627,6 @@ async function doctor(repoArgs: string[]): Promise<void> {
           ) {
             messages.push(
               "preview operator active and transition workflow SHA sets must exactly partition trusted_platform_workflow_shas",
-            );
-          }
-          if (uniqueTrustedRefs.size === 1 && transitionOperatorRefs.size !== 0) {
-            messages.push(
-              "preview_operator_transition_workflow_shas must be empty at steady state",
             );
           }
         }
@@ -761,9 +772,17 @@ function isFullCommitSha(value: string): boolean {
 }
 
 function isAdditionalTerraformMirrorFile(path: string): boolean {
+  return isTerraformMirrorPath(path) && !allowedTerraformMirrorFiles.has(path);
+}
+
+function isTerraformMirrorPath(path: string): boolean {
   return (
-    (path.startsWith("infra/terraform/bootstrap/") || path.startsWith("infra/terraform/prod/")) &&
-    !allowedTerraformMirrorFiles.has(path)
+    path === "infra" ||
+    path === "infra/terraform" ||
+    path === "infra/terraform/bootstrap" ||
+    path === "infra/terraform/prod" ||
+    path.startsWith("infra/terraform/bootstrap/") ||
+    path.startsWith("infra/terraform/prod/")
   );
 }
 
