@@ -3147,6 +3147,10 @@ describe("platform scaffold and doctor", () => {
       join(repoRoot, "terraform/deployments/bootstrap/main.tf"),
       "utf8",
     );
+    const mirrorContract = await readFile(
+      join(repoRoot, "tools/ci/terraform-mirror-contract.ts"),
+      "utf8",
+    );
     expect(moduleMain).toContain("for_each = var.runtime_secret_accessor_ids");
     expect(moduleMain).toContain("for_each = var.runtime_secret_version_adder_ids");
     expect(moduleVariables).toContain("setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)");
@@ -3185,6 +3189,27 @@ describe("platform scaffold and doctor", () => {
       bootstrapDeployment.indexOf('    "280932482" = {'),
     );
     expect(medlockBootstrap).toContain('"secretmanager.googleapis.com"');
+    expect(medlockBootstrap).not.toContain('"orgpolicy.googleapis.com"');
+    const criticalBootstrap = bootstrapDeployment.slice(
+      bootstrapDeployment.indexOf('    "280932482" = {'),
+      bootstrapDeployment.indexOf("\n  }\n\n  deployment", bootstrapDeployment.indexOf('    "280932482" = {')),
+    );
+    const medlockMirror = mirrorContract.slice(
+      mirrorContract.indexOf('  "1025243085": {'),
+      mirrorContract.indexOf('  "711292980": {'),
+    );
+    const criticalMirror = mirrorContract.slice(
+      mirrorContract.indexOf('  "280932482": {'),
+      mirrorContract.indexOf("\n};", mirrorContract.indexOf('  "280932482": {')),
+    );
+    const serviceSet = (source: string) =>
+      [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)]
+        .map((match) => match[1]!)
+        .toSorted();
+    expect(serviceSet(medlockMirror)).toEqual(serviceSet(medlockBootstrap));
+    expect(serviceSet(criticalMirror)).toEqual(serviceSet(criticalBootstrap));
+    expect(criticalMirror).toContain('"certificatemanager.googleapis.com"');
+    expect(criticalMirror).toContain('"compute.googleapis.com"');
   });
 
   test("production state can relinquish legacy domain mappings without provider loss", async () => {
@@ -3311,7 +3336,6 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    "firestore.googleapis.com",',
         '    "iam.googleapis.com",',
         '    "iamcredentials.googleapis.com",',
-        '    "orgpolicy.googleapis.com",',
         '    "run.googleapis.com",',
         '    "secretmanager.googleapis.com",',
         '    "serviceusage.googleapis.com",',
