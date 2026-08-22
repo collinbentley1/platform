@@ -830,6 +830,18 @@ describe("platform scaffold and doctor", () => {
       );
     }
     const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
+    expect(dockerfile).toContain(
+      "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
+    );
+    expect(dockerfile).toContain(
+      "dhi.io/bun:1-alpine-dev@sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8",
+    );
+    expect(dockerfile).toContain(
+      "dhi.io/bun:1-alpine@sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3",
+    );
+    expect(dockerfile).not.toContain("dhi.io/bun:1-dev@");
+    expect(dockerfile).not.toContain("dhi.io/bun:1@");
+    expect(dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676")).toHaveLength(3);
     expect(dockerfile).not.toContain("--mount=type=secret");
     expect(dockerfile).toContain(
       "COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts",

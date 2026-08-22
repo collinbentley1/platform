@@ -204,15 +204,17 @@ the recovery object and stop; never rerun from empty state.
    production deploy, preview deploy, and preview traffic operations, so tokens
    admitted on one path cannot impersonate another identity. Old workflows stop
    authenticating at this point.
-   The current stable-preview follow-on starts after that Phase-A migration:
-   `95ad7531492cba2891ec6d02fa2d821955cd36bc` is already active and every
-   prepared consumer head pins it. For a new stable-preview workflow SHA `S`, do
-   not repeat the empty-transition form above. Before repinning any consumer,
-   apply all four protected bootstrap roots with `active_workflow_sha = S`,
-   `transition_workflow_sha =
-   "95ad7531492cba2891ec6d02fa2d821955cd36bc"`, and
-   `legacy_compatibility_mode = true`. Retain both exact SHA bindings until all
-   new-SHA canaries and operations pass. The final Phase-B apply is
+   Every later stable-preview follow-on starts by reading all four live
+   bootstrap states and the prepared consumer heads. Call the exact workflow
+   SHA that every consumer currently pins `P`; do not infer `P` from this
+   document, a branch name, or a mutable tag. Require all four projects to have
+   the same active `P`, and prove that no consumer still runs any existing
+   transition SHA. For a new reviewed workflow SHA `S`, do not repeat the
+   empty-transition form above. Before repinning any consumer, apply all four
+   protected bootstrap roots with `active_workflow_sha = S`,
+   `transition_workflow_sha = P`, and `legacy_compatibility_mode = true`.
+   Retain both exact SHA bindings until all new-SHA canaries and operations
+   pass. The final Phase-B apply is
    `active_workflow_sha = S`, an empty transition, and
    `legacy_compatibility_mode = false`.
 4. Confirm the first bootstrap plan removes the four direct default Compute
@@ -314,14 +316,13 @@ the recovery object and stop; never rerun from empty state.
   Actions disabled and preview ingress still `all`. Leave the protected edge
   resources dormant for diagnosis; do not destroy or partially unwind them.
 - If the first live-tag proof fails after ingress becomes restricted, retain
-  both the new and `95ad7531492cba2891ec6d02fa2d821955cd36bc` workflow-SHA WIF
-  bindings. Restore the Critical preview service to public ingress with the
-  exact reviewed `95ad7531492cba2891ec6d02fa2d821955cd36bc` production root, or
-  use a separately reviewed hotfix, and prove the generated raw URL healthy
-  before any repin or retry.
-- Never apply the `95ad7531492cba2891ec6d02fa2d821955cd36bc` exposure root after
-  the stable frontend exists, and never remove DNS as the first recovery step;
-  that older exposure root does not own the new protected edge resources.
+  both `S` and the live-read predecessor `P` workflow-SHA WIF bindings. Restore
+  the Critical preview service to public ingress with the exact reviewed `P`
+  production root, or use a separately reviewed hotfix, and prove the generated
+  raw URL healthy before any repin or retry.
+- Never apply the predecessor exposure root after the stable frontend exists,
+  and never remove DNS as the first recovery step; that older exposure root
+  does not own the new protected edge resources.
 - Remove the old workflow-SHA WIF trust only after the new-SHA production,
   Terraform, stable preview, cleanup, and reconciliation operations all pass.
 

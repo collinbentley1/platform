@@ -1356,9 +1356,14 @@ rejectContains("templates/app/Dockerfile", dockerfile, "curl -fsSL https://bun.c
 requireContains(
   "templates/app/Dockerfile",
   dockerfile,
-  "oven/bun:1.4.0@sha256:5ff609364c049b54eb0ff560ec96319729a972078ef2c755d758f0c6ef89c2d6",
+  "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
   "The exact Bun binary source image must be digest pinned.",
 );
+if (dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676").length !== 3) {
+  failures.push(
+    "templates/app/Dockerfile: both executable stages must verify the exact Bun revision.",
+  );
+}
 rejectContains("templates/app/Dockerfile", dockerfile, "apt-get", "Container builds must not execute mutable package-manager downloads.");
 rejectContains("templates/app/Dockerfile", dockerfile, "curl ", "Container builds must not download executable build inputs over the network.");
 requireContains("templates/app/Dockerfile", dockerfile, "--ignore-scripts", "Docker dependency installs must disable lifecycle scripts.");
@@ -1390,13 +1395,13 @@ requireContains(
 requireContains(
   "templates/app/Dockerfile",
   dockerfile,
-  "dhi.io/bun:1-dev@sha256:8a1c66b0e289dd86f9ebfb24abd273f653bde4cfd18c8284d9bebba81ebeeaac",
+  "dhi.io/bun:1-alpine-dev@sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8",
   "The reviewed zero-High/Critical build base image must stay digest pinned.",
 );
 requireContains(
   "templates/app/Dockerfile",
   dockerfile,
-  "dhi.io/bun:1@sha256:7d31a1b2907df08fe257212331bd0f8e661595870c60285860fcc60abd394473",
+  "dhi.io/bun:1-alpine@sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3",
   "The reviewed zero-vulnerability runtime base image must stay digest pinned.",
 );
 rejectContains(
