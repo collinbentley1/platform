@@ -61,9 +61,9 @@ jobs:
             echo "JSON Terraform roots are outside the reviewed platform contract." >&2
             exit 1
           fi
-          if grep -rInE \
-            '^[[:space:]]*(resource|data)[[:space:]]+"|provisioner[[:space:]]+"(local-exec|remote-exec)"|(^|[^[:alnum:]_])external([^[:alnum:]_]|$)' \
-            infra/terraform; then
+          if grep -raE \
+            '(^|[^[:alnum:]_])(resource|data)[[:space:]]+"|provisioner[[:space:]]+"(local-exec|remote-exec)"|(^|[^[:alnum:]_])external([^[:alnum:]_]|$)' \
+            infra/terraform >/dev/null; then
             echo "Consumer roots may configure only the reviewed platform modules; direct resources and executable provisioners are forbidden." >&2
             exit 1
           else
@@ -80,12 +80,14 @@ jobs:
             local module_path="$3"
             local expected_sha="${4:-}"
             local main="$root/main.tf"
-            local declarations
             local declaration_count
             local sources
             local source_count
 
-            if declarations="$(grep -rInE --include='*.tf' '^[[:space:]]*module[[:space:]]+"' "$root")"; then
+            if declaration_count="$(
+              grep -rahcE --include='*.tf' '(^|[^[:alnum:]_])module[[:space:]]+"' "$root" |
+                awk '{ count += $1 } END { print count + 0 }'
+            )"; then
               :
             else
               search_status="$?"
@@ -94,7 +96,6 @@ jobs:
                 exit 1
               fi
             fi
-            declaration_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "$declarations")"
             if [ "$declaration_count" -ne 1 ] || \
                ! grep -En "^[[:space:]]*module[[:space:]]+\"${module_name}\"[[:space:]]*\\{" "$main" >/dev/null; then
               echo "$root must contain exactly the reviewed ${module_name} module." >&2
@@ -119,7 +120,10 @@ jobs:
           platform_sha="$(validate_root infra/terraform/bootstrap bootstrap terraform/modules/bootstrap)"
           validate_root infra/terraform/prod site terraform/modules/cloud-run-service "$platform_sha" >/dev/null
 
-          if platform_refs="$(grep -rInE 'collinbentley1/platform|github\.com/[^"[:space:]]+/platform' infra/terraform)"; then
+          if platform_ref_count="$(
+            grep -rahcE 'collinbentley1/platform|github\.com/[^"[:space:]]+/platform' infra/terraform |
+              awk '{ count += $1 } END { print count + 0 }'
+          )"; then
             :
           else
             search_status="$?"
@@ -128,10 +132,8 @@ jobs:
               exit 1
             fi
           fi
-          platform_ref_count="$(awk 'NF { count += 1 } END { print count + 0 }' <<< "$platform_refs")"
           if [ "$platform_ref_count" -ne 2 ]; then
             echo "Unexpected or missing platform source reference." >&2
-            printf '%s\n' "$platform_refs" >&2
             exit 1
           fi
 
@@ -213,7 +215,7 @@ jobs:
             echo "Caller-controlled Checkov configuration is forbidden." >&2
             exit 1
           fi
-          if grep -rInEI --exclude-dir=.git '#[[:space:]]*checkov:skip' .; then
+          if grep -raE --exclude-dir=.git '#[[:space:]]*checkov:skip' . >/dev/null; then
             echo "Inline Checkov suppressions are not accepted in any scanned caller file." >&2
             exit 1
           else

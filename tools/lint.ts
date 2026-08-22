@@ -34,6 +34,11 @@ for (const workflow of platformWorkflows) {
       `${path}: Hosted-runner workflows must use baseline grep instead of assuming ambient ripgrep.`,
     );
   }
+  if (/\bgrep\s+-[A-Za-z]*I/.test(text) || text.includes("--binary-files=without-match")) {
+    failures.push(
+      `${path}: Security searches must force binary-classified files to text instead of skipping them with grep -I.`,
+    );
+  }
   rejectContains(
     path,
     text,
@@ -946,6 +951,25 @@ rejectContains(
 );
 
 const infrastructure = await read(".github/workflows/infrastructure.yml");
+for (const boundary of [
+  "infra/terraform >/dev/null; then",
+  "grep -rahcE --include='*.tf'",
+  "grep -rahcE 'collinbentley1/platform",
+  "' . >/dev/null; then",
+]) {
+  requireContains(
+    ".github/workflows/infrastructure.yml",
+    infrastructure,
+    boundary,
+    `Infrastructure policy search must suppress attacker-controlled match output: ${boundary}`,
+  );
+}
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  'printf \'%s\\n\' "$platform_refs"',
+  "Infrastructure validation must never replay attacker-controlled grep output to the runner command channel.",
+);
 requireContains(
   ".github/workflows/infrastructure.yml",
   infrastructure,

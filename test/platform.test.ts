@@ -774,6 +774,78 @@ describe("platform scaffold and doctor", () => {
     expect(infrastructure).toContain("Platform reference search failed closed.");
     expect(infrastructure).toContain("Checkov suppression search failed closed.");
     expect(infrastructure).not.toMatch(/grep -R/);
+    expect(infrastructure).not.toMatch(/\bgrep\s+-[A-Za-z]*I/);
+    expect(infrastructure).not.toContain("--binary-files=without-match");
+    expect(infrastructure.match(/grep -raE/g)).toHaveLength(2);
+    expect(infrastructure.match(/grep -rahcE/g)).toHaveLength(2);
+    expect(infrastructure).toContain("(^|[^[:alnum:]_])(resource|data)[[:space:]]+");
+    expect(infrastructure).toContain("(^|[^[:alnum:]_])module[[:space:]]+");
+    expect(infrastructure).toContain("infra/terraform >/dev/null; then");
+    expect(infrastructure).toContain("' . >/dev/null; then");
+    expect(infrastructure).not.toContain('printf \'%s\\n\' "$platform_refs"');
+  });
+
+  test("security searches reject NUL-bearing and comment-prefixed HCL policy text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "platform-grep-text-test-"));
+    temporaryRoots.push(root);
+    const terraformRoot = join(root, "infra", "terraform");
+    const bootstrapRoot = join(terraformRoot, "bootstrap");
+    await mkdir(bootstrapRoot, { recursive: true });
+
+    await writeFile(
+      join(bootstrapRoot, "safe\n::warning title=Injected::untrusted filename\ntail.tf"),
+      Buffer.from(
+        '# binary-classification probe \0 remains inside this comment\n/* same-line comment prefix */ resource "terraform_data" "probe" {\n  provisioner "local-exec" {\n    command = "false"\n  }\n}\n',
+      ),
+    );
+    await writeFile(
+      join(bootstrapRoot, "modules.tf"),
+      Buffer.from(
+        '# binary-classification probe \0 remains inside this comment\nmodule "first" { source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }\n/* same-line comment prefix */ module "second" { source = "github.com/collinbentley1/platform//terraform/modules/bootstrap?ref=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }\n',
+      ),
+    );
+    await writeFile(
+      join(root, "safe\n::warning title=Injected::untrusted filename\ntail.yaml"),
+      Buffer.from(
+        '# binary-classification probe \0 remains inside this comment\n# checkov:skip=CKV_TEST:caller suppression must be rejected\n',
+      ),
+    );
+
+    const forbidden = await grep([
+      "-rahcE",
+      '(^|[^[:alnum:]_])(resource|data)[[:space:]]+"|provisioner[[:space:]]+"(local-exec|remote-exec)"|(^|[^[:alnum:]_])external([^[:alnum:]_]|$)',
+      terraformRoot,
+    ]);
+    expect(forbidden.exitCode).toBe(0);
+    expect(sumGrepCounts(forbidden.stdout)).toBe(2);
+    expect(forbidden.stdout).not.toContain("::warning");
+
+    const modules = await grep([
+      "-rahcE",
+      "--include=*.tf",
+      '(^|[^[:alnum:]_])module[[:space:]]+"',
+      bootstrapRoot,
+    ]);
+    expect(modules.exitCode).toBe(0);
+    expect(sumGrepCounts(modules.stdout)).toBe(2);
+
+    const references = await grep([
+      "-rahcE",
+      'collinbentley1/platform|github\\.com/[^"[:space:]]+/platform',
+      terraformRoot,
+    ]);
+    expect(references.exitCode).toBe(0);
+    expect(sumGrepCounts(references.stdout)).toBe(2);
+
+    const suppressions = await grep([
+      "-rahcE",
+      "--exclude-dir=.git",
+      "#[[:space:]]*checkov:skip",
+      root,
+    ]);
+    expect(suppressions.exitCode).toBe(0);
+    expect(sumGrepCounts(suppressions.stdout)).toBe(1);
+    expect(suppressions.stdout).not.toContain("::warning");
   });
 
   test("hosted-runner workflows do not depend on ambient ripgrep", async () => {
@@ -1258,6 +1330,30 @@ async function runVerification(
     new Response(child.stderr).text(),
   ]);
   return { exitCode, stdout, stderr };
+}
+
+async function grep(
+  args: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const child = Bun.spawn(["grep", ...args], {
+    cwd: repoRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+function sumGrepCounts(output: string): number {
+  return output
+    .split("\n")
+    .filter(Boolean)
+    .map((count) => Number.parseInt(count, 10))
+    .reduce((total, count) => total + count, 0);
 }
 
 async function run(
