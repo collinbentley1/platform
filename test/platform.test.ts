@@ -1170,6 +1170,90 @@ describe("platform scaffold and doctor", () => {
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
+  test("Socket check gating accepts one exact app-owned success and rejects drift", async () => {
+    const workflow = Bun.YAML.parse(
+      await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8"),
+    ) as { jobs: { verify: { steps: Array<Record<string, unknown>> } } };
+    const gate = workflow.jobs.verify.steps.find(
+      (step) => step.name === "Require successful Socket GitHub App checks",
+    );
+    expect(gate?.run).toBeString();
+
+    const root = await mkdtemp(join(tmpdir(), "platform-socket-check-gate-"));
+    temporaryRoots.push(root);
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    const fixture = join(root, "check-runs.json");
+    const event = join(root, "event.json");
+    const head = "a".repeat(40);
+    await writeFile(event, JSON.stringify({ pull_request: { head: { sha: head } } }));
+    await writeFile(
+      join(bin, "curl"),
+      [
+        "#!/bin/sh",
+        "set -eu",
+        'output=""',
+        'while [ "$#" -gt 0 ]; do',
+        '  if [ "$1" = "--output" ]; then shift; output="$1"; fi',
+        "  shift",
+        "done",
+        'test -n "$output"',
+        '/bin/cp "$SOCKET_CHECK_FIXTURE" "$output"',
+        "",
+      ].join("\n"),
+    );
+    await writeFile(join(bin, "seq"), "#!/bin/sh\nprintf '1\\n'\n");
+    await writeFile(join(bin, "sleep"), "#!/bin/sh\nexit 88\n");
+    await Promise.all(["curl", "seq", "sleep"].map((name) => chmod(join(bin, name), 0o755)));
+
+    const exactCheck = (name: string, conclusion = "success", appId = 156372) => ({
+      app: { id: appId },
+      conclusion,
+      name,
+      status: "completed",
+    });
+    const successes = [
+      exactCheck("Socket Security: Project Report"),
+      exactCheck("Socket Security: Pull Request Alerts"),
+    ];
+    const execute = async (checkRuns: Array<Record<string, unknown>>) => {
+      await writeFile(fixture, JSON.stringify({ check_runs: checkRuns }));
+      const child = Bun.spawn(
+        ["/bin/bash", "--noprofile", "--norc", "-c", `set -euo pipefail\n${gate?.run as string}`],
+        {
+          cwd: root,
+          env: {
+            GH_TOKEN: "test-token",
+            GITHUB_EVENT_NAME: "pull_request",
+            GITHUB_EVENT_PATH: event,
+            GITHUB_REPOSITORY: "collinbentley1/platform",
+            GITHUB_SHA: head,
+            PATH: `${bin}:/usr/bin:/bin`,
+            RUNNER_TEMP: root,
+            SOCKET_CHECK_FIXTURE: fixture,
+          },
+          stderr: "pipe",
+          stdout: "ignore",
+        },
+      );
+      const [exitCode, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stderr).text(),
+      ]);
+      return { exitCode, stderr };
+    };
+
+    expect(await execute(successes)).toEqual({ exitCode: 0, stderr: "" });
+    const failed = await execute([
+      exactCheck("Socket Security: Project Report", "failure"),
+      successes[1],
+    ]);
+    expect(failed.exitCode).toBe(1);
+    expect(failed.stderr).toContain("completed without success");
+    expect((await execute([...successes, successes[0]])).exitCode).not.toBe(0);
+    expect((await execute([successes[0], exactCheck("Socket Security: Pull Request Alerts", "success", 1)])).exitCode).not.toBe(0);
+  });
+
   test("executable workflow secret contexts reject pre-epoch credential names", async () => {
     for (const path of [
       ".github/workflows/application.yml",

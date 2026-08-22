@@ -183,18 +183,26 @@ jobs:
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${target_sha}/check-runs?filter=latest&per_page=100"
             if jq -e --argjson expected "$expected" '
               .check_runs as $runs
-              | all($expected[] as $name;
-                  ([$runs[] | select(.name == $name and .app.id == 156372)] | length) == 1 and
-                  ([$runs[] | select(.name == $name and .app.id == 156372)][0]
-                    | .status == "completed" and .conclusion == "success"))
+              | [
+                  $expected[] as $name
+                  | [$runs[] | select(.name == $name and .app.id == 156372)] as $matching
+                  | (($matching | length) == 1 and
+                     $matching[0].status == "completed" and
+                     $matching[0].conclusion == "success")
+                ]
+              | all
             ' "$response" >/dev/null; then
               exit 0
             fi
             if jq -e --argjson expected "$expected" '
-              any($expected[] as $name;
-                any(.check_runs[];
-                  .name == $name and .app.id == 156372 and
-                  .status == "completed" and .conclusion != "success"))
+              .check_runs as $runs
+              | [
+                  $expected[] as $name
+                  | any($runs[];
+                      .name == $name and .app.id == 156372 and
+                      .status == "completed" and .conclusion != "success")
+                ]
+              | any
             ' "$response" >/dev/null; then
               echo "A required Socket GitHub App check completed without success." >&2
               exit 1
