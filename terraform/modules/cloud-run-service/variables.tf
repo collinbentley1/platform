@@ -83,7 +83,7 @@ variable "preview_deploy_service_account_email" {
 }
 
 variable "preview_operator_service_account_email" {
-  description = "Preview traffic operator service account email; receives service update only, with no Artifact Registry or runtime actAs grant."
+  description = "Deprecated transition-only preview operator email retained for input compatibility; this module intentionally grants it no IAM role."
   type        = string
 }
 

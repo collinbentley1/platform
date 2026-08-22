@@ -58,7 +58,10 @@ the pinned TypeScript entrypoint by its exact installed path. The package script
 are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
-commit SHA. Deploy callers pass no secrets and must never use `secrets: inherit`.
+commit SHA. Deploy callers forward exactly the five reviewed secret names and
+must never use `secrets: inherit`. The reusable deploy contracts declare only
+those names; the protected called-job environment supplies and overrides each
+value after approval, and callers cannot redirect them.
 The `preview-build` and `production-build` environments contain only the DHI
 registry credentials, an admin-visible `packages:list`-only Socket policy token,
 and the reviewed, non-confidential Grype database manifest stored as an
@@ -73,9 +76,21 @@ and no runtime-service-account `actAs`. The `production` and `preview-cloud`
 deploy identities can update only the pre-created matching Cloud Run service,
 `actAs` only as its matching runtime, and read only its exact image repository;
 they cannot upload or delete registry artifacts. The `preview-operations`
-operator can read and update only the shared preview service and has no Artifact
-Registry or runtime `actAs` grant. A stale-deploy invalidation rechecks the
-current traffic tag under the shared cloud lock and removes it only when it
+workflows authenticate `gha-preview-deploy` through the distinct
+`attribute.preview_operator_workflow_sha` claim path. Cloud Run revalidates the
+attached service identity and image during `update-traffic`, so the API-minimum
+traffic operation requires the same exact-service update, preview-runtime
+`actAs`, and exact-preview-repository Reader grants as deployment. Because that
+underlying capability is coarse, only the exact reviewed cleanup/reconcile
+workflow SHA can exchange it; environment and event claims, the immutable
+numeric-repository-ID project/service map, fixed CLI arguments, and no PR
+checkout or PR-controlled code after authentication contain it. No credential
+reaches the untrusted PR build. The previous SHA may retain its old
+`gha-preview-operator` binding only during repin; active/new SHA trust targets
+`gha-preview-deploy`, and the transition set is empty at steady state. The
+retired operator has no steady-state service, registry, runtime `actAs`, project,
+secret, state, data, or production access. A stale-deploy invalidation rechecks
+the current traffic tag under the shared cloud lock and removes it only when it
 still points to the exact revision created by that stale run.
 The platform repository is the trust root, so its pull-request job always scans
 without that key and the authenticated organization policy runs only from trusted

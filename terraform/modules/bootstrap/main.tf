@@ -32,8 +32,12 @@ locals {
     "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/cleanup-preview.yml@') && assertion.event_name == 'pull_request' && (!has(assertion.environment) || assertion.environment == 'preview-operations')",
     "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/reconcile-previews.yml@') && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
   ])
-  legacy_prod_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
-  legacy_terraform_workflow_condition   = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false" : join(" || ", [
+    for sha in sort(tolist(var.preview_operator_transition_workflow_shas)) : "assertion.job_workflow_sha == '${sha}'"
+  ])
+  legacy_preview_operator_attribute_condition = "(${local.legacy_preview_operator_workflow_condition}) && (${local.preview_operator_transition_workflow_sha_condition})"
+  legacy_prod_deploy_workflow_condition       = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
+  legacy_terraform_workflow_condition         = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'production'"
   legacy_workflow_condition = join(" || ", [
     "(${local.legacy_preview_deploy_workflow_condition})",
     "(${local.legacy_preview_operator_workflow_condition})",
@@ -256,7 +260,7 @@ resource "google_iam_workload_identity_pool_provider" "github" {
     "attribute.prod_publish_workflow_sha"     = "(${local.production_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
     "attribute.terraform_workflow_sha"        = "(${local.terraform_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
     "attribute.legacy_preview_deploy"         = "(${local.legacy_preview_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_workflow_condition}) ? assertion.repository_id : 'denied'"
+    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : 'denied'"
     "attribute.legacy_prod_deploy"            = "(${local.legacy_prod_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
     "attribute.legacy_terraform"              = "(${local.legacy_terraform_workflow_condition}) ? assertion.repository_id : 'denied'"
     # Numeric IDs survive renames. run_id makes the subject non-reusable across runs.
@@ -342,6 +346,18 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
     "run.operations.get",
     "run.services.get",
     "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {
+  project     = var.project_id
+  role_id     = "previewTrafficImageDownloader"
+  title       = "Legacy Preview Traffic Image Downloader"
+  description = "Transition-only role definition retained until the retired preview operator repository binding converges away."
+  permissions = [
+    "artifactregistry.repositories.downloadArtifacts",
   ]
 
   depends_on = [google_project_service.required]
@@ -545,8 +561,18 @@ resource "google_service_account_iam_member" "preview_deploy_wif_workflow_sha" {
   member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
 }
 
+resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_deploy.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
+}
+
+# Keep the previous identity usable only for an explicitly declared transition
+# SHA. The steady-state transition set is empty and this binding disappears.
 resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operator_transition_workflow_shas
 
   service_account_id = google_service_account.preview_operator.name
   role               = "roles/iam.workloadIdentityUser"

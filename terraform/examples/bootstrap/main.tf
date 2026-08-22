@@ -30,6 +30,10 @@ module "bootstrap" {
   trusted_platform_workflow_shas = [
     "0123456789abcdef0123456789abcdef01234567",
   ]
+  preview_operations_active_workflow_shas = [
+    "0123456789abcdef0123456789abcdef01234567",
+  ]
+  preview_operator_transition_workflow_shas              = []
   legacy_compatibility_mode                              = false
   manage_automatic_default_service_account_grants_policy = false
 }

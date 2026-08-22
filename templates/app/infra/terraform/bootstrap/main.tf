@@ -14,6 +14,10 @@ module "bootstrap" {
   trusted_platform_workflow_shas = [
     "__PLATFORM_SHA__",
   ]
+  preview_operations_active_workflow_shas = [
+    "__PLATFORM_SHA__",
+  ]
+  preview_operator_transition_workflow_shas              = []
   legacy_compatibility_mode                              = false
   manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy
   runtime_description                                    = "Runtime identity for the __APP_NAME__ Cloud Run services."

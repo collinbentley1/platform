@@ -144,6 +144,11 @@ the recovery object and stop; never rerun from empty state.
    unsupported wildcard syntax. All other deploy environments remain free of
    runtime values.
    Do this before any caller references the new workflow.
+   The reusable deploy contracts must explicitly declare each secret name they
+   consume, and callers must forward exactly those names without using
+   `secrets: inherit`; the protected called-job environment then supplies and
+   overrides the value. Otherwise cross-repository `workflow_call` jobs receive
+   empty secret values.
    GitHub never releases environment secrets to external-fork or Dependabot
    pull-request jobs. They run only the credential-free checks and never receive
    the org token, DHI credentials, or a cloud preview. Same-repository preview
@@ -192,22 +197,27 @@ the recovery object and stop; never rerun from empty state.
    code with cloud credentials, so a full-SHA rollback would recover that path.
    This first apply must remove every project-wide routine/deployer role,
    all Token Creator grants, routine-Terraform runtime `actAs`, and preview
-   `actAs` on the production runtime. It creates the two publisher identities
-   and the traffic-only preview operator with exact environment/workflow-SHA WIF
-   bindings; neither publisher gets a generic fallback. Compatibility mode
-   retains only path-specific Workload Identity User fallbacks for Terraform,
+   `actAs` on the production runtime. It creates the two publisher identities;
+   neither publisher gets a generic fallback. The active/new SHA's distinct preview-operator workflow attribute
+   binds to `gha-preview-deploy`, while only an explicitly declared transition
+   SHA retains the old `gha-preview-operator` binding during repin. With the
+   empty initial transition set, the retired
+   operator has no workflow binding. Compatibility mode retains only
+   path-specific Workload Identity User fallbacks for Terraform,
    production deploy, preview deploy, and preview traffic operations, so tokens
    admitted on one path cannot impersonate another identity. Old workflows stop
    authenticating at this point.
-   The current stable-preview follow-on starts after that Phase-A migration:
-   `95ad7531492cba2891ec6d02fa2d821955cd36bc` is already active and every
-   prepared consumer head pins it. For a new stable-preview workflow SHA `S`, do
-   not repeat the empty-transition form above. Before repinning any consumer,
-   apply all four protected bootstrap roots with `active_workflow_sha = S`,
-   `transition_workflow_sha =
-   "95ad7531492cba2891ec6d02fa2d821955cd36bc"`, and
-   `legacy_compatibility_mode = true`. Retain both exact SHA bindings until all
-   new-SHA canaries and operations pass. The final Phase-B apply is
+   Every later stable-preview follow-on starts by reading all four live
+   bootstrap states and the prepared consumer heads. Call the exact workflow
+   SHA that every consumer currently pins `P`; do not infer `P` from this
+   document, a branch name, or a mutable tag. Require all four projects to have
+   the same active `P`, and prove that no consumer still runs any existing
+   transition SHA. For a new reviewed workflow SHA `S`, do not repeat the
+   empty-transition form above. Before repinning any consumer, apply all four
+   protected bootstrap roots with `active_workflow_sha = S`,
+   `transition_workflow_sha = P`, and `legacy_compatibility_mode = true`.
+   Retain both exact SHA bindings until all new-SHA canaries and operations
+   pass. The final Phase-B apply is
    `active_workflow_sha = S`, an empty transition, and
    `legacy_compatibility_mode = false`.
 4. Confirm the first bootstrap plan removes the four direct default Compute
@@ -244,8 +254,18 @@ the recovery object and stop; never rerun from empty state.
    repository-scoped Writer member to move from the deploy identity to its
    publisher identity and add only repository-scoped Reader to the matching
    deploy identity. No upload/delete-capable registry grant may remain on a
-   deploy identity, and the preview operator must have no registry or runtime
-   `actAs` grant. Require the subsequent exposure plan to remain empty. For a
+   deploy identity. Remove the preview operator's exact-service Cloud Run and
+   exact-repository download grants during production convergence. Cloud Run
+   revalidates the attached service identity and image during `update-traffic`,
+   so the API-minimum traffic operation uses `gha-preview-deploy`'s existing
+   exact-service update, preview-runtime `actAs`, and exact-preview-repository
+   Reader grants. Those permissions are also sufficient to deploy a preview
+   revision; contain that irreducible API capability with the distinct
+   preview-operator workflow attribute, exact workflow-SHA WIF, protected
+   `preview-operations` environment/event claims, immutable project/service
+   selection, fixed CLI arguments, and no PR checkout or PR-controlled code
+   after authentication. No credential may reach PR-controlled code.
+   Require the subsequent exposure plan to remain empty. For a
    fresh app, apply production first and exposure second. The current Critical
    History service already completed this baseline migration with public preview
    ingress. For its follow-on stable namespace, do not apply the new production
@@ -293,14 +313,22 @@ the recovery object and stop; never rerun from empty state.
     external-principal, public, group, domain, inherited, or custom grant that
     could mint its tokens.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
-    `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish` and require the expected
-    identity-specific `attribute.*_workflow_sha/<new-sha>` Workload Identity User
-    binding on each. Prove both publisher accounts have only one exact
+    `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
+    the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload
+    Identity User binding on every active identity and no active-SHA binding on
+    the retired operator. Prove both publisher accounts have only one exact
     repository-level Artifact Registry Writer grant, both deploy accounts have
     only Reader on their exact image repository, both publishers have zero Cloud
-    Run and runtime `actAs` grants, and the preview operator has zero Artifact
-    Registry and runtime `actAs` grants. The canary alone cannot prove each
-    operational binding.
+    Run and runtime `actAs` grants. Prove the active/new SHA's
+    `attribute.preview_operator_workflow_sha` principalSet targets only
+    `gha-preview-deploy`; only the declared transition SHA may target
+    `gha-preview-operator`, and both the transition set and legacy fallback must
+    be empty at steady state. Prove the retired operator has zero Cloud Run,
+    registry, runtime `actAs`, project, secret, state, data, and production
+    grants. Audit the exact cleanup/reconcile workflow SHA, environment/event
+    claims, immutable project/service map, fixed CLI arguments, and absence of PR
+    checkout or PR-controlled execution after authentication. The canary alone
+    cannot prove each operational binding.
 
 ### Stable-preview rollback boundary
 
@@ -308,15 +336,25 @@ the recovery object and stop; never rerun from empty state.
   before the first new-SHA Critical preview changes ingress, stop with consumer
   Actions disabled and preview ingress still `all`. Leave the protected edge
   resources dormant for diagnosis; do not destroy or partially unwind them.
-- If the first live-tag proof fails after ingress becomes restricted, retain
-  both the new and `95ad7531492cba2891ec6d02fa2d821955cd36bc` workflow-SHA WIF
-  bindings. Restore the Critical preview service to public ingress with the
-  exact reviewed `95ad7531492cba2891ec6d02fa2d821955cd36bc` production root, or
-  use a separately reviewed hotfix, and prove the generated raw URL healthy
-  before any repin or retry.
-- Never apply the `95ad7531492cba2891ec6d02fa2d821955cd36bc` exposure root after
-  the stable frontend exists, and never remove DNS as the first recovery step;
-  that older exposure root does not own the new protected edge resources.
+- The WIF predecessor `P` is not a recovery root. It exists only to keep the
+  immediately previous workflows authenticating during the rollout; never
+  assume that `P`, or any other historical platform root, restores public
+  preview ingress or preserves the current edge resources.
+- If the first live-tag proof fails after ingress becomes restricted, disable
+  Actions in every consumer and wait for every old run to finish. Prepare a
+  separate recovery root `R` from `S` that changes only the immutable Critical
+  preview ingress map and production preview-ingress value back to public
+  ingress while retaining the current exposure resources. Review fresh
+  bootstrap, production, and exposure plans from live state: the recovery plans
+  must contain no deletion or replacement of DNS, certificate, load balancer,
+  NEG, or URL-map resources. Only after no `P` workflow can run may the protected
+  bootstrap transition exact WIF trust from `{P, S}` to `{S, R}`. Run the exact
+  `R` recovery pipeline, prove the generated raw URL healthy, and keep DNS and
+  the dormant protected frontend in place for diagnosis.
+- Never apply `P` or an older exposure root as ingress recovery, and never
+  remove DNS as the first recovery step. If a reviewed `R` cannot meet every
+  precondition above, leave Actions disabled and stop instead of improvising a
+  third trusted SHA or a direct cloud mutation.
 - Remove the old workflow-SHA WIF trust only after the new-SHA production,
   Terraform, stable preview, cleanup, and reconciliation operations all pass.
 

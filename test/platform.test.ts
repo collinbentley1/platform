@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  type SecretContextReference,
+  semanticSecretContextReferences,
+} from "../tools/ci/workflow-secret-contract";
 
 const repoRoot = resolve(import.meta.dir, "..");
 const cli = join(repoRoot, "tools/platform.ts");
@@ -28,9 +33,12 @@ describe("platform scaffold and doctor", () => {
       projectId: "secure-app",
       serviceName: "secure-app",
     });
-    expect(await readFile(join(app, "infra/terraform/bootstrap/main.tf"), "utf8")).toContain(
+    const bootstrap = await readFile(join(app, "infra/terraform/bootstrap/main.tf"), "utf8");
+    expect(bootstrap).toContain(
       "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
     );
+    expect(bootstrap).toContain("preview_operations_active_workflow_shas = [");
+    expect(bootstrap).toContain("preview_operator_transition_workflow_shas");
     expect(await readFile(join(app, "infra/terraform/bootstrap/variables.tf"), "utf8")).toContain(
       'variable "manage_automatic_default_service_account_grants_policy"',
     );
@@ -174,6 +182,43 @@ describe("platform scaffold and doctor", () => {
     const result = await run(["doctor", app]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("uses secrets: inherit");
+  });
+
+  test("doctor rejects missing, redirected, or additional deploy secret mappings", async () => {
+    const mutations = [
+      [
+        "missing-deploy-secret",
+        (workflow: string) =>
+          workflow.replace("      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}\n", ""),
+      ],
+      [
+        "redirected-deploy-secret",
+        (workflow: string) =>
+          workflow.replace(
+            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
+            "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_USERNAME }}",
+          ),
+      ],
+      [
+        "additional-deploy-secret",
+        (workflow: string) =>
+          workflow.replace(
+            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+            "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}\n" +
+              "      UNREVIEWED_TOKEN: ${{ secrets.UNREVIEWED_TOKEN }}",
+          ),
+      ],
+    ] as const;
+
+    for (const [name, mutate] of mutations) {
+      const app = await scaffold(name);
+      const path = join(app, ".github/workflows/deploy-preview.yml");
+      await writeFile(path, mutate(await readFile(path, "utf8")));
+
+      const result = await run(["doctor", app]);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("must exactly match the rendered platform caller template");
+    }
   });
 
   test("doctor rejects caller-controlled Checkov configuration symlinks", async () => {
@@ -610,7 +655,14 @@ describe("platform scaffold and doctor", () => {
     const path = join(app, "infra/terraform/bootstrap/main.tf");
     const original = await readFile(path, "utf8");
     const safePrior = "b".repeat(40);
-    await writeFile(path, original.replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${safePrior}",`));
+    const withTransition = (transition: string) =>
+      original
+        .replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${transition}",`)
+        .replace(
+          /preview_operator_transition_workflow_shas\s*=\s*\[\]/,
+          `preview_operator_transition_workflow_shas = [\n    "${transition}",\n  ]`,
+        );
+    await writeFile(path, withTransition(safePrior));
     expect((await run(["doctor", app])).exitCode).toBe(0);
 
     for (const vulnerable of [
@@ -625,7 +677,7 @@ describe("platform scaffold and doctor", () => {
     ]) {
       await writeFile(
         path,
-        original.replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${vulnerable}",`),
+        withTransition(vulnerable),
       );
       const result = await run(["doctor", app]);
       expect(result.exitCode).not.toBe(0);
@@ -653,6 +705,92 @@ describe("platform scaffold and doctor", () => {
     }
     for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
       const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
+      const expectedSecretContextReferences: SecretContextReference[] = [
+        { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
+        {
+          job: "build",
+          path: "jobs.build.steps.7.env.SOCKET_API_TOKEN",
+          value: "${{ secrets.SOCKET_API_TOKEN }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.9.with.username",
+          value: "${{ secrets.DHI_USERNAME }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.9.with.password",
+          value: "${{ secrets.DHI_ACCESS_TOKEN }}",
+        },
+        {
+          job: "build",
+          path: "jobs.build.steps.17.env.DB_MANIFEST_JSON",
+          value: "${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+        },
+        {
+          job: "deploy",
+          path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
+          value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+        },
+      ];
+      expect(semanticSecretContextReferences(text)).toEqual(expectedSecretContextReferences);
+      for (const hostileScalar of [
+        "${{ secrets.socket_api_token }}",
+        "${{ secrets['socket_api_token'] }}",
+        "${{ format('{0}', secrets.DHI_ACCESS_TOKEN) }}",
+        "${{ toJSON(secrets) }}",
+        "\"${{ \\u0073ecrets.socket_api_token }}\"",
+        "\"${{ \\x73ecrets.socket_api_token }}\"",
+      ]) {
+        const mutated = text.replace(
+          "  canary:\n",
+          `  canary:\n    env:\n      HOSTILE_SECRET_REFERENCE: ${hostileScalar}\n`,
+        );
+        expect(semanticSecretContextReferences(mutated)).not.toEqual(
+          expectedSecretContextReferences,
+        );
+      }
+      const anchoredEnvironment = text
+        .replace(
+          "        env:\n          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+          "        env: &platform_secret_env\n" +
+            "          SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+        )
+        .replace("  canary:\n", "  canary:\n    env: *platform_secret_env\n");
+      expect(semanticSecretContextReferences(anchoredEnvironment)).not.toEqual(
+        expectedSecretContextReferences,
+      );
+      let anchoredStep = text.replace(
+        "      - name: Enforce the organization Socket policy before package extraction",
+        "      - &platform_secret_step\n" +
+          "        name: Enforce the organization Socket policy before package extraction",
+      );
+      const canaryStart = anchoredStep.indexOf("\n  canary:\n");
+      const canarySteps = anchoredStep.indexOf("    steps:\n", canaryStart);
+      const canaryStepsBody = canarySteps + "    steps:\n".length;
+      anchoredStep =
+        anchoredStep.slice(0, canaryStepsBody) +
+        "      - *platform_secret_step\n" +
+        anchoredStep.slice(canaryStepsBody);
+      expect(semanticSecretContextReferences(anchoredStep)).not.toEqual(
+        expectedSecretContextReferences,
+      );
+      const workflowCall = text.slice(0, text.indexOf("\npermissions:"));
+      expect(workflowCall.slice(workflowCall.indexOf("    secrets:\n")).trimEnd()).toBe(
+        [
+          "    secrets:",
+          "      DHI_ACCESS_TOKEN:",
+          "        required: true",
+          "      DHI_USERNAME:",
+          "        required: true",
+          "      GRYPE_DB_MANIFEST_JSON:",
+          "        required: true",
+          "      MAPBOX_PUBLIC_TOKEN:",
+          "        required: false",
+          "      SOCKET_API_TOKEN:",
+          "        required: true",
+        ].join("\n"),
+      );
       expect(text.split("SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}")).toHaveLength(2);
       expect(text).toContain(
         '--config="$GITHUB_WORKSPACE/_platform_policy/tools/ci/bunfig.toml" pm scan',
@@ -664,8 +802,57 @@ describe("platform scaffold and doctor", () => {
       expect(
         text.indexOf("Enforce the organization Socket policy before package extraction"),
       ).toBeLessThan(text.indexOf("Login to Docker Hardened Images"));
+      const buildJob = text.slice(text.indexOf("  build:\n"), text.indexOf("\n  canary:\n"));
+      const deployStart = text.indexOf("  deploy:\n");
+      const deployEnd =
+        workflow === "deploy-preview.yml" ? text.indexOf("\n  invalidate:\n") : text.length;
+      const deployJob = text.slice(deployStart, deployEnd);
+      for (const secret of [
+        "DHI_ACCESS_TOKEN",
+        "DHI_USERNAME",
+        "GRYPE_DB_MANIFEST_JSON",
+        "SOCKET_API_TOKEN",
+      ]) {
+        const reference = `\${{ secrets.${secret} }}`;
+        expect(text.split(reference)).toHaveLength(2);
+        expect(buildJob).toContain(reference);
+        expect(deployJob).not.toContain(reference);
+      }
+      const mapboxReference = "${{ secrets.MAPBOX_PUBLIC_TOKEN }}";
+      expect(text.split(mapboxReference)).toHaveLength(2);
+      expect(deployJob).toContain(mapboxReference);
+      expect(buildJob).not.toContain(mapboxReference);
+    }
+    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+      const caller = await readFile(
+        join(repoRoot, "templates/app/.github/workflows", workflow),
+        "utf8",
+      );
+      const secretMap = caller.slice(caller.indexOf("    secrets:\n")).trimEnd();
+      expect(secretMap).toBe(
+        [
+          "    secrets:",
+          "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
+          "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
+          "      GRYPE_DB_MANIFEST_JSON: ${{ secrets.GRYPE_DB_MANIFEST_JSON }}",
+          "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+          "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
+        ].join("\n"),
+      );
     }
     const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
+    expect(dockerfile).toContain(
+      "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb",
+    );
+    expect(dockerfile).toContain(
+      "dhi.io/bun:1-alpine-dev@sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8",
+    );
+    expect(dockerfile).toContain(
+      "dhi.io/bun:1-alpine@sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3",
+    );
+    expect(dockerfile).not.toContain("dhi.io/bun:1-dev@");
+    expect(dockerfile).not.toContain("dhi.io/bun:1@");
+    expect(dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676")).toHaveLength(3);
     expect(dockerfile).not.toContain("--mount=type=secret");
     expect(dockerfile).toContain(
       "COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts",
@@ -925,8 +1112,10 @@ describe("platform scaffold and doctor", () => {
     expect(caller).toContain("needs: invalidate");
     expect(cleanup).toContain("github.event.action == 'synchronize'");
     expect(cleanup).toContain("github.event.action == 'converted_to_draft'");
-    expect(cleanup).toContain("gha-preview-operator@");
-    expect(cleanup).not.toContain("gha-preview-deploy@");
+    expect(cleanup).toContain("gha-preview-deploy@");
+    expect(cleanup).not.toContain("gha-preview-operator@");
+    expect(cleanup).not.toContain("actions/checkout@");
+    expect(cleanup).toContain("PR_NUMBER: ${{ github.event.pull_request.number }}");
     expect(cleanup).toContain("verify_stable_preview_absent");
     expect(cleanup).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain('--revision-suffix="$revision_suffix"');
@@ -942,16 +1131,73 @@ describe("platform scaffold and doctor", () => {
     );
     expect(deploy).toContain("  invalidate:\n");
     const invalidation = deploy.slice(deploy.indexOf("  invalidate:\n"));
-    expect(invalidation).toContain("gha-preview-operator@");
+    expect(invalidation).toContain("gha-preview-deploy@");
+    expect(invalidation).not.toContain("gha-preview-operator@");
+    expect(invalidation).not.toContain("actions/checkout@");
     expect(invalidation).toContain("verify_stable_preview_absent");
     expect(invalidation).toContain('[ "$status" = "404" ]');
     expect(deploy).toContain("deployed-revision: ${{ steps.deploy.outputs.revision }}");
+    expect(deploy).toContain(
+      'gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body',
+    );
+    expect(deploy).not.toContain('gh pr comment "$PR_NUMBER" --body');
+    const parsedPreview = Bun.YAML.parse(deploy) as {
+      jobs: { deploy: { steps: Array<Record<string, unknown>> } };
+    };
+    const commentStep = parsedPreview.jobs.deploy.steps.find(
+      (step) => step.name === "Comment preview URL",
+    );
+    expect(commentStep).toBeDefined();
+    const commentRun = commentStep?.run as string;
+    const commentRoot = await mkdtemp(join(tmpdir(), "platform-preview-comment-"));
+    temporaryRoots.push(commentRoot);
+    const commentBin = join(commentRoot, "bin");
+    await mkdir(commentBin);
+    const commentCapture = join(commentRoot, "arguments.txt");
+    const fakeCommentGh = join(commentBin, "gh");
+    await writeFile(
+      fakeCommentGh,
+      ["#!/bin/sh", "set -eu", "printf '%s\\n' \"$@\" > \"$FAKE_GH_CAPTURE\"", ""].join(
+        "\n",
+      ),
+    );
+    await chmod(fakeCommentGh, 0o755);
+    const commentChild = Bun.spawn(["/bin/bash", "-c", commentRun], {
+      cwd: commentRoot,
+      env: {
+        EXPECTED_HEAD_SHA: "a".repeat(40),
+        FAKE_GH_CAPTURE: commentCapture,
+        GH_TOKEN: "test-token",
+        GITHUB_REPOSITORY: "collinbentley1/cdbentley",
+        PATH: `${commentBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+        PREVIEW_REVISION: "cdbentley-preview-p31-test",
+        PREVIEW_URL: "https://pr-31.example.test",
+        PR_NUMBER: "31",
+      },
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const [commentExit, commentStderr] = await Promise.all([
+      commentChild.exited,
+      new Response(commentChild.stderr).text(),
+    ]);
+    expect({ commentExit, commentStderr }).toEqual({ commentExit: 0, commentStderr: "" });
+    expect((await readFile(commentCapture, "utf8")).trim().split("\n")).toEqual([
+      "pr",
+      "comment",
+      "31",
+      "--repo",
+      "collinbentley1/cdbentley",
+      "--body",
+      `Preview for commit ${"a".repeat(40)} deployed at https://pr-31.example.test (revision cdbentley-preview-p31-test).`,
+    ]);
     expect(invalidation).toContain("EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}");
     expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
     expect(reconcile).toContain("expected_revision_prefix");
     expect(reconcile).toContain("head_sha:0:12");
-    expect(reconcile).toContain("gha-preview-operator@");
-    expect(reconcile).not.toContain("gha-preview-deploy@");
+    expect(reconcile).toContain("gha-preview-deploy@");
+    expect(reconcile).not.toContain("gha-preview-operator@");
+    expect(reconcile).not.toContain("actions/checkout@");
     expect(reconcile).toContain("verify_stable_preview_absent");
     expect(reconcile).toContain('[ "$status" = "404" ]');
   });
@@ -1056,7 +1302,17 @@ describe("platform scaffold and doctor", () => {
     expect(await concatenatedJq.exited).not.toBe(0);
   });
 
-  test("Artifact Registry publishers, deployers, and preview traffic operators remain disjoint", async () => {
+  test("Artifact Registry identities retain only their repository-scoped delivery permissions", async () => {
+    const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.tf"];
+    for (const moduleName of ["cloud-run-service", "bootstrap"]) {
+      const moduleDirectory = join(repoRoot, "terraform/modules", moduleName);
+      expect((await readdir(moduleDirectory)).sort()).toEqual(approvedModuleFiles);
+      for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
+        expect(await readFile(join(moduleDirectory, name), "utf8")).not.toMatch(
+          /^\s*(?:resource|data|module|locals|provider)\s+(?:"|\{)/m,
+        );
+      }
+    }
     for (const [workflowName, publishEnvironment, publisher, operator] of [
       ["deploy-prod.yml", "production-publish", "gha-prod-publish@", "gha-prod-deploy@"],
       ["deploy-preview.yml", "preview-publish", "gha-preview-publish@", "gha-preview-deploy@"],
@@ -1078,10 +1334,49 @@ describe("platform scaffold and doctor", () => {
       expect(deploy).not.toContain(publisher);
     }
 
-    const serviceModule = await readFile(
-      join(repoRoot, "terraform/modules/cloud-run-service/main.tf"),
-      "utf8",
+    const serviceModuleFiles = await Promise.all(
+      approvedModuleFiles.map((name) =>
+        readFile(join(repoRoot, "terraform/modules/cloud-run-service", name), "utf8"),
+      ),
     );
+    const serviceModule = serviceModuleFiles[0]!;
+    const allServiceModuleTerraform = serviceModuleFiles.join("\n");
+    expect(createHash("sha256").update(serviceModule).digest("hex")).toBe(
+      "ba3a42664087637d024128134e610694a9cb7c19487656de063c2361121daebb",
+    );
+    const productionServiceStart = serviceModule.indexOf(
+      'resource "google_cloud_run_v2_service" "site"',
+    );
+    const productionService = serviceModule.slice(
+      productionServiceStart,
+      serviceModule.indexOf(
+        'resource "google_cloud_run_v2_service_iam_member" "prod_deploy"',
+        productionServiceStart,
+      ),
+    );
+    const previewServiceStart = serviceModule.indexOf(
+      'resource "google_cloud_run_v2_service" "preview"',
+    );
+    const previewService = serviceModule.slice(
+      previewServiceStart,
+      serviceModule.indexOf(
+        'resource "google_cloud_run_v2_service_iam_member" "preview_deploy"',
+        previewServiceStart,
+      ),
+    );
+    const previewLifecycle = previewService.slice(
+      previewService.indexOf("  lifecycle {\n"),
+      previewService.indexOf("\n  depends_on"),
+    );
+    expect(productionService).not.toContain("template[0].revision");
+    expect(previewLifecycle).toContain(
+      "# deploy-preview owns deterministic revision names. Land preview template\n" +
+        "      # changes through that workflow first to avoid immutable-name conflicts.",
+    );
+    expect(previewService.split("template[0].revision")).toHaveLength(2);
+    expect(previewLifecycle.split("      template[0].revision,\n")).toHaveLength(2);
+    expect(serviceModule).not.toMatch(/^\s*module\s+"/m);
+    expect(serviceModule).not.toMatch(/<<|\/\*|^\s*\/\//m);
     expect(serviceModule).toContain(
       'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
     );
@@ -1100,32 +1395,352 @@ describe("platform scaffold and doctor", () => {
     expect(serviceModule).not.toContain(
       'resource "google_artifact_registry_repository_iam_member" "preview_deploy_writer" {',
     );
-    for (const [resource, deployer] of [
-      ["prod_deploy_reader", "prod_deploy_service_account_email"],
-      ["preview_deploy_reader", "preview_deploy_service_account_email"],
+    for (const [resource, reader, repository] of [
+      ["prod_deploy_reader", "prod_deploy_service_account_email", "site"],
+      ["preview_deploy_reader", "preview_deploy_service_account_email", "preview"],
     ] as const) {
       const start = serviceModule.indexOf(
         `resource "google_artifact_registry_repository_iam_member" "${resource}"`,
       );
       const block = serviceModule.slice(start, serviceModule.indexOf("\n}\n", start) + 3);
       expect(block).toContain('role       = "roles/artifactregistry.reader"');
-      expect(block).toContain(`member     = "serviceAccount:\${var.${deployer}}"`);
+      expect(block).toContain(`member     = "serviceAccount:\${var.${reader}}"`);
+      expect(block).toContain(
+        `repository = google_artifact_registry_repository.${repository}.repository_id`,
+      );
       expect(block).not.toContain("roles/artifactregistry.writer");
     }
-    const registryIam = serviceModule.slice(
-      serviceModule.indexOf(
-        'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer"',
+    const repositoryIamMembers = [
+      ...allServiceModuleTerraform.matchAll(
+        /resource\s+"google_artifact_registry_repository_iam_member"\s+"([^"]+)"/g,
       ),
-      serviceModule.indexOf('resource "google_secret_manager_secret" "runtime"'),
+    ]
+      .map((match) => match[1])
+      .sort();
+    expect(repositoryIamMembers).toEqual(
+      [
+        "preview_deploy_reader",
+        "preview_publisher_writer",
+        "prod_deploy_reader",
+        "prod_publisher_writer",
+      ].sort(),
     );
-    expect(registryIam).not.toContain("preview_operator_service_account_email");
-    expect(serviceModule).toContain(
-      'resource "google_cloud_run_v2_service_iam_member" "preview_operator"',
+    expect(allServiceModuleTerraform).not.toMatch(
+      /resource\s+"google_artifact_registry_repository_iam_(?:binding|policy)"/,
+    );
+    expect(allServiceModuleTerraform).not.toMatch(
+      /resource\s+"google_project_iam_(?:member|binding|policy)"/,
+    );
+    const allIamResources = [
+      ...allServiceModuleTerraform.matchAll(
+        /resource\s+"(google_[^"]+_iam_(?:member|binding|policy))"\s+"([^"]+)"/g,
+      ),
+    ]
+      .map((match) => `${match[1]}.${match[2]}`)
+      .sort();
+    expect(allIamResources).toEqual(
+      [
+        "google_artifact_registry_repository_iam_member.preview_deploy_reader",
+        "google_artifact_registry_repository_iam_member.preview_publisher_writer",
+        "google_artifact_registry_repository_iam_member.prod_deploy_reader",
+        "google_artifact_registry_repository_iam_member.prod_publisher_writer",
+        "google_cloud_run_v2_service_iam_member.preview_deploy",
+        "google_cloud_run_v2_service_iam_member.prod_deploy",
+        "google_secret_manager_secret_iam_member.runtime_accessor",
+      ].sort(),
+    );
+    const exactIamBlocks = [
+      [
+        'resource "google_artifact_registry_repository_iam_member" "prod_publisher_writer" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.site.location",
+        "  repository = google_artifact_registry_repository.site.repository_id",
+        '  role       = "roles/artifactregistry.writer"',
+        '  member     = "serviceAccount:${var.prod_publisher_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "preview_publisher_writer" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.preview.location",
+        "  repository = google_artifact_registry_repository.preview.repository_id",
+        '  role       = "roles/artifactregistry.writer"',
+        '  member     = "serviceAccount:${var.preview_publisher_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "prod_deploy_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.site.location",
+        "  repository = google_artifact_registry_repository.site.repository_id",
+        '  role       = "roles/artifactregistry.reader"',
+        '  member     = "serviceAccount:${var.prod_deploy_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.preview.location",
+        "  repository = google_artifact_registry_repository.preview.repository_id",
+        '  role       = "roles/artifactregistry.reader"',
+        '  member     = "serviceAccount:${var.preview_deploy_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
+        "  for_each = var.runtime_secret_accessor_ids",
+        "",
+        "  project   = var.project_id",
+        "  secret_id = google_secret_manager_secret.runtime[each.value].secret_id",
+        '  role      = "roles/secretmanager.secretAccessor"',
+        '  member    = "serviceAccount:${var.runtime_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "prod_deploy" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.site.location",
+        "  name     = google_cloud_run_v2_service.site.name",
+        '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+        '  member   = "serviceAccount:${var.prod_deploy_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.preview.location",
+        "  name     = google_cloud_run_v2_service.preview.name",
+        '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+        '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
+        "}",
+      ].join("\n"),
+    ];
+    for (const exactIamBlock of exactIamBlocks) {
+      expect(serviceModule.split(exactIamBlock)).toHaveLength(2);
+    }
+    expect(serviceModule).not.toContain("preview_operator_service_account_email");
+    expect(allServiceModuleTerraform.split("preview_operator_service_account_email")).toHaveLength(
+      2,
+    );
+    expect(
+      await readFile(
+        join(repoRoot, "terraform/modules/cloud-run-service/variables.tf"),
+        "utf8",
+      ),
+    ).toContain(
+      "Deprecated transition-only preview operator email retained for input compatibility; this module intentionally grants it no IAM role.",
+    );
+
+    for (const [resource, identity, service] of [
+      ["prod_deploy", "prod_deploy_service_account_email", "site"],
+      ["preview_deploy", "preview_deploy_service_account_email", "preview"],
+    ] as const) {
+      const start = serviceModule.indexOf(
+        `resource "google_cloud_run_v2_service_iam_member" "${resource}"`,
+      );
+      const block = serviceModule.slice(start, serviceModule.indexOf("\n}\n", start) + 3);
+      expect(block).toContain(
+        'role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
+      );
+      expect(block).toContain(`member   = "serviceAccount:\${var.${identity}}"`);
+      expect(block).toContain(`name     = google_cloud_run_v2_service.${service}.name`);
+    }
+    const runtimeAccessorStart = serviceModule.indexOf(
+      'resource "google_secret_manager_secret_iam_member" "runtime_accessor"',
+    );
+    const runtimeAccessor = serviceModule.slice(
+      runtimeAccessorStart,
+      serviceModule.indexOf("\n}\n", runtimeAccessorStart) + 3,
+    );
+    expect(runtimeAccessor).toContain('role      = "roles/secretmanager.secretAccessor"');
+    expect(runtimeAccessor).toContain(
+      'member    = "serviceAccount:${var.runtime_service_account_email}"',
     );
 
     const bootstrap = await readFile(
       join(repoRoot, "terraform/modules/bootstrap/main.tf"),
       "utf8",
+    );
+    expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
+      "42b12bb7f5eda9ac0f2131660e54d44fed4174db8a7e4735c48c0f3b995ab7f1",
+    );
+    const expectedImageRole = [
+      'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
+      "  project     = var.project_id",
+      '  role_id     = "previewTrafficImageDownloader"',
+      '  title       = "Legacy Preview Traffic Image Downloader"',
+      '  description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
+      "  permissions = [",
+      '    "artifactregistry.repositories.downloadArtifacts",',
+      "  ]",
+      "",
+      "  depends_on = [google_project_service.required]",
+      "}",
+    ].join("\n");
+    expect(bootstrap.split(expectedImageRole)).toHaveLength(2);
+    expect(
+      bootstrap.match(
+        /^resource\s+"google_project_iam_custom_role"\s+"preview_traffic_image_downloader"\s*\{/gm,
+      ),
+    ).toHaveLength(1);
+    expect(bootstrap).not.toMatch(/<<|\/\*|^\s*\/\//m);
+    const bootstrapIamResources = [
+      ...bootstrap.matchAll(
+        /^resource\s+"(google_[^"]+_iam_(?:member|binding|policy))"\s+"([^"]+)"/gm,
+      ),
+    ]
+      .map((match) => `${match[1]}.${match[2]}`)
+      .sort();
+    expect(bootstrapIamResources).toEqual(
+      [
+        "google_project_iam_binding.editor_absent",
+        "google_project_iam_member.runtime_project_roles",
+        "google_project_iam_member.terraform_convergence_reader",
+        "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
+        "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
+        "google_service_account_iam_member.canary_wif_preview_publish_workflow_sha",
+        "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
+        "google_service_account_iam_member.canary_wif_prod_workflow_sha",
+        "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
+        "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
+        "google_service_account_iam_member.preview_deploy_wif_repo",
+        "google_service_account_iam_member.preview_deploy_wif_preview_operations_workflow_sha",
+        "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
+        "google_service_account_iam_member.preview_operator_wif_repo",
+        "google_service_account_iam_member.preview_operator_wif_workflow_sha",
+        "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
+        "google_service_account_iam_member.prod_deploy_uses_runtime",
+        "google_service_account_iam_member.prod_deploy_wif_prod_env",
+        "google_service_account_iam_member.prod_deploy_wif_workflow_sha",
+        "google_service_account_iam_member.prod_publisher_wif_workflow_sha",
+        "google_service_account_iam_member.terraform_wif_prod_env",
+        "google_service_account_iam_member.terraform_wif_workflow_sha",
+        "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
+        "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
+        "google_storage_bucket_iam_binding.terraform_state_no_legacy_access",
+        "google_storage_bucket_iam_member.terraform_state_access_logs_writer",
+        "google_storage_bucket_iam_member.terraform_state_reader",
+      ].sort(),
+    );
+    for (const exactProjectIamBlock of [
+      [
+        'resource "google_project_iam_member" "terraform_convergence_reader" {',
+        "  project = var.project_id",
+        "  role    = google_project_iam_custom_role.terraform_convergence_reader.name",
+        '  member  = "serviceAccount:${google_service_account.terraform.email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_project_iam_member" "runtime_project_roles" {',
+        "  for_each = var.runtime_project_roles",
+        "",
+        "  project = var.project_id",
+        "  role    = each.value",
+        '  member  = "serviceAccount:${google_service_account.runtime.email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_project_iam_binding" "editor_absent" {',
+        "  #checkov:skip=CKV_GCP_49:An authoritative empty binding removes impersonation-capable basic-role members; it grants no principal access.",
+        "  #checkov:skip=CKV_GCP_117:An authoritative empty Editor binding removes the basic role and prevents drift; it grants no principal access.",
+        "  project = var.project_id",
+        '  role    = "roles/editor"',
+        "  members = []",
+        "",
+        "  depends_on = [google_project_service.required]",
+        "}",
+      ].join("\n"),
+    ]) {
+      expect(bootstrap.split(exactProjectIamBlock)).toHaveLength(2);
+    }
+    expect(bootstrap).not.toMatch(/roles\/artifactregistry\.(?:admin|reader|writer)/);
+    expect(bootstrap).not.toMatch(
+      /google_service_account\.preview_operator\.(?:email|member)/,
+    );
+    expect(bootstrap).not.toContain("serviceAccount:gha-preview-operator@");
+    const imageRoleStart = bootstrap.indexOf(
+      'resource "google_project_iam_custom_role" "preview_traffic_image_downloader"',
+    );
+    const imageRole = bootstrap.slice(
+      imageRoleStart,
+      bootstrap.indexOf("\n}\n", imageRoleStart) + 3,
+    );
+    expect(imageRole).toContain('role_id     = "previewTrafficImageDownloader"');
+    expect(imageRole).toContain(
+      'description = "Transition-only role definition retained until the retired preview operator repository binding converges away."',
+    );
+    expect(imageRole).toContain(
+      '"artifactregistry.repositories.downloadArtifacts",',
+    );
+    expect(imageRole.split("permissions =")).toHaveLength(2);
+    expect(imageRole).toMatch(
+      /permissions\s*=\s*\[\s*"artifactregistry\.repositories\.downloadArtifacts",?\s*\]/,
+    );
+    expect(imageRole).not.toContain("ignore_changes");
+    expect(imageRole.match(/"[a-z]+\.[A-Za-z]+\.[A-Za-z]+",/g)).toEqual([
+      '"artifactregistry.repositories.downloadArtifacts",',
+    ]);
+    expect(
+      await readFile(join(repoRoot, "terraform/modules/bootstrap/variables.tf"), "utf8"),
+    ).toContain(
+      "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants.",
+    );
+    expect(await readFile(join(repoRoot, "README.md"), "utf8")).toContain(
+      "active SHA binds the distinct",
+    );
+    expect(bootstrap).not.toMatch(/^\s*module\s+"/m);
+    for (const outputPath of [
+      "terraform/modules/bootstrap/outputs.tf",
+      "terraform/deployments/bootstrap/outputs.tf",
+      "templates/app/infra/terraform/bootstrap/outputs.tf",
+    ]) {
+      expect(await readFile(join(repoRoot, outputPath), "utf8")).toContain(
+        "Retired transition-only preview operator service account; receives no steady-state operational grants.",
+      );
+    }
+    const activeOperationsBindingStart = bootstrap.indexOf(
+      'resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"',
+    );
+    const activeOperationsBinding = bootstrap.slice(
+      activeOperationsBindingStart,
+      bootstrap.indexOf("\n}\n", activeOperationsBindingStart) + 3,
+    );
+    expect(activeOperationsBinding).toContain(
+      "for_each = var.preview_operations_active_workflow_shas",
+    );
+    expect(activeOperationsBinding).toContain(
+      "service_account_id = google_service_account.preview_deploy.name",
+    );
+    expect(activeOperationsBinding).toContain("/attribute.preview_operator_workflow_sha/");
+    const transitionOperatorBindingStart = bootstrap.indexOf(
+      'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
+    );
+    const transitionOperatorBinding = bootstrap.slice(
+      transitionOperatorBindingStart,
+      bootstrap.indexOf("\n}\n", transitionOperatorBindingStart) + 3,
+    );
+    expect(transitionOperatorBinding).toContain(
+      "for_each = var.preview_operator_transition_workflow_shas",
+    );
+    expect(transitionOperatorBinding).toContain(
+      "service_account_id = google_service_account.preview_operator.name",
+    );
+    expect(transitionOperatorBinding).toContain("/attribute.preview_operator_workflow_sha/");
+    expect(bootstrap).toContain(
+      'preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false"',
+    );
+    expect(bootstrap).toContain(
+      '"attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : \'denied\'"',
+    );
+    const bootstrapVariables = await readFile(
+      join(repoRoot, "terraform/modules/bootstrap/variables.tf"),
+      "utf8",
+    );
+    expect(bootstrapVariables).toContain(
+      "setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas",
+    );
+    expect(bootstrapVariables).toContain(
+      "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
     );
     for (const attribute of [
       "attribute.prod_publish_workflow_sha",
@@ -1150,6 +1765,316 @@ describe("platform scaffold and doctor", () => {
     expect(bootstrap).not.toContain(
       'member             = "serviceAccount:${google_service_account.preview_operator.email}"',
     );
+  });
+
+  test("verified registry copies are isolated from exact-package staging cleanup", async () => {
+    const copyRuns: string[] = [];
+    const cleanupRuns: string[] = [];
+    const occurrences = (value: string, needle: string) => value.split(needle).length - 1;
+    for (const [workflowName, stagingKind] of [
+      ["deploy-prod.yml", "production"],
+      ["deploy-preview.yml", "preview"],
+    ] as const) {
+      const workflow = await readFile(
+        join(repoRoot, ".github/workflows", workflowName),
+        "utf8",
+      );
+      const runTag = "run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}";
+      expect(workflow).toContain(
+        `platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      );
+      expect(workflow).not.toContain(
+        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-${"${GITHUB_RUN_ATTEMPT}"}:${runTag}`,
+      );
+      expect(workflow).not.toContain(`-${stagingKind}-staging:${runTag}`);
+      const parsed = Bun.YAML.parse(workflow) as {
+        jobs: Record<string, Record<string, unknown>>;
+      };
+      const build = parsed.jobs.build;
+      expect(build.outputs).toEqual({
+        digest: "${{ steps.publish.outputs.digest }}",
+        "sbom-artifact-id": "${{ steps.upload_sbom.outputs.artifact-id }}",
+        "sbom-content-digest": "${{ steps.sbom_digest.outputs.digest }}",
+        "staging-image": "${{ steps.metadata.outputs.staging_image }}",
+      });
+      const publish = parsed.jobs.publish;
+      const publishSteps = publish.steps as Array<Record<string, unknown>>;
+      const app = publishSteps.find((step) => step.name === "Resolve trusted application configuration");
+      expect(app).toBeDefined();
+      expect((app?.env as Record<string, string>).BUILD_STAGING_IMAGE).toBe(
+        "${{ needs.build.outputs.staging-image }}",
+      );
+      const appRun = app?.run as string;
+      expect(appRun).toContain(
+        `platform-${"${source_repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*):run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)`,
+      );
+      expect(appRun).toContain('[[ ! "$BUILD_STAGING_IMAGE" =~ $staging_pattern ]]');
+      expect(appRun).toContain('[[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]');
+      expect(appRun).toContain('echo "staging_image=$BUILD_STAGING_IMAGE"');
+      const copyIndex = publishSteps.findIndex(
+        (step) => step.name === "Copy the opaque image by digest",
+      );
+      const verifyIndex = publishSteps.findIndex(
+        (step) => step.name === "Verify registry credentials were retired",
+      );
+      const authIndex = publishSteps.findIndex((step) => step.id === "auth");
+      expect(copyIndex).toBe(authIndex + 1);
+      expect(verifyIndex).toBe(copyIndex + 1);
+      expect(verifyIndex).toBe(publishSteps.length - 1);
+      expect(publish.permissions).toEqual({
+        contents: "read",
+        "id-token": "write",
+        packages: "read",
+      });
+
+      const copy = publishSteps[copyIndex];
+      expect(Object.keys(copy).sort()).toEqual(["env", "id", "name", "run"]);
+      expect(copy.id).toBe("copy");
+      expect(copy.env).toEqual({
+        AR_ACCESS_TOKEN: "${{ steps.auth.outputs.access_token }}",
+        GH_TOKEN: "${{ github.token }}",
+        REMOTE_IMAGE: "${{ steps.app.outputs.remote_image }}",
+        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
+        STAGING_IMAGE: "${{ steps.app.outputs.staging_image }}",
+      });
+      const copyRun = copy.run as string;
+      copyRuns.push(copyRun);
+      expect(copyRun.startsWith("set -euo pipefail\n")).toBe(true);
+      expect(occurrences(copyRun, '"$crane" auth login')).toBe(2);
+      expect(
+        occurrences(copyRun, '"$crane" copy "${STAGING_IMAGE}@${STAGING_DIGEST}" "$REMOTE_IMAGE"'),
+      ).toBe(1);
+      expect(occurrences(copyRun, '"$crane" digest "$REMOTE_IMAGE"')).toBe(1);
+      expect(occurrences(copyRun, 'echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"')).toBe(1);
+      expect(copyRun).toContain('docker_config="$RUNNER_TEMP/platform-publisher-docker"');
+      expect(copyRun).toContain('trap retire_registry_credentials EXIT');
+      expect(copyRun).toContain('export DOCKER_CONFIG="$docker_config"');
+      expect(copyRun).toContain('rm -f -- "$docker_config/config.json"');
+      expect(copyRun.indexOf('"$crane" copy')).toBeLessThan(
+        copyRun.indexOf('remote_digest="$("$crane" digest'),
+      );
+      expect(copyRun.indexOf('if [ "$remote_digest" != "$STAGING_DIGEST" ]')).toBeLessThan(
+        copyRun.indexOf('echo "digest=$remote_digest" >> "$GITHUB_OUTPUT"'),
+      );
+      expect(copyRun).not.toContain("|| true");
+
+      const verify = publishSteps[verifyIndex];
+      expect(Object.keys(verify).sort()).toEqual(["name", "run"]);
+      expect(verify.run).toBe(
+        "set -euo pipefail\n" +
+          'credential_file="$RUNNER_TEMP/platform-publisher-docker/config.json"\n' +
+          'if [ -e "$credential_file" ] || [ -L "$credential_file" ]; then\n' +
+          '  echo "Registry credentials survived the verified copy step." >&2\n' +
+          "  exit 1\n" +
+          "fi\n",
+      );
+
+      const cleanup = parsed.jobs["cleanup-staging"];
+      expect(Object.keys(cleanup).sort()).toEqual([
+        "if",
+        "name",
+        "needs",
+        "permissions",
+        "runs-on",
+        "steps",
+        "timeout-minutes",
+      ]);
+      expect(cleanup.needs).toEqual(["build", "publish"]);
+      expect(cleanup.if).toBe("always() && needs.publish.result == 'success'");
+      expect(cleanup["timeout-minutes"]).toBe(5);
+      expect(cleanup.permissions).toEqual({ packages: "write" });
+      const cleanupSteps = cleanup.steps as Array<Record<string, unknown>>;
+      expect(cleanupSteps).toHaveLength(1);
+      const cleanupStep = cleanupSteps[0];
+      expect(Object.keys(cleanupStep).sort()).toEqual([
+        "env",
+        "name",
+        "run",
+        "timeout-minutes",
+      ]);
+      expect(cleanupStep["timeout-minutes"]).toBe(2);
+      expect(cleanupStep.env).toEqual({
+        GH_TOKEN: "${{ github.token }}",
+        STAGING_DIGEST: "${{ needs.build.outputs.digest }}",
+        STAGING_IMAGE: "${{ needs.build.outputs.staging-image }}",
+      });
+      const cleanupRun = cleanupStep.run as string;
+      cleanupRuns.push(cleanupRun);
+      expect(cleanupRun.startsWith("set -euo pipefail\n")).toBe(true);
+      expect(cleanupRun).toContain(
+        `(platform-${"${repository}"}-${stagingKind}-staging-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*)):(run-${"${GITHUB_RUN_ID}"}-([1-9][0-9]*))`,
+      );
+      expect(cleanupRun).toContain('[[ ! "$STAGING_IMAGE" =~ $staging_pattern ]]');
+      expect(cleanupRun).toContain('[[ "${BASH_REMATCH[2]}" != "${BASH_REMATCH[4]}" ]]');
+      expect(cleanupRun).toContain('package="${BASH_REMATCH[1]}"');
+      expect(cleanupRun).toContain('tag="${BASH_REMATCH[3]}"');
+      expect(cleanupRun).not.toContain('package="platform-${repository}');
+      expect(cleanupRun).not.toContain("--paginate");
+      expect(cleanupRun).not.toContain("AR_ACCESS_TOKEN");
+      expect(cleanupRun).not.toContain("DOCKER_CONFIG");
+      expect(cleanupRun).not.toContain("steps.auth");
+      expect(cleanupRun).not.toContain("us-east4-docker.pkg.dev");
+      expect(occurrences(cleanupRun, "gh api")).toBe(2);
+      expect(occurrences(cleanupRun, "gh api --method DELETE")).toBe(1);
+      expect(occurrences(cleanupRun, '/packages/container/${package}"')).toBe(1);
+      expect(cleanupRun).not.toContain('/versions/${version_id}');
+      expect(occurrences(cleanupRun, "versions?state=active&per_page=100")).toBe(1);
+      expect(cleanupRun).not.toContain("continue-on-error");
+      expect(cleanupRun).not.toContain("|| true");
+    }
+
+    expect(copyRuns[0]).toBe(copyRuns[1]);
+    expect(cleanupRuns[0].replace("production-staging-", "KIND-staging-")).toBe(
+      cleanupRuns[1].replace("preview-staging-", "KIND-staging-"),
+    );
+
+    const digest = `sha256:${"a".repeat(64)}`;
+    const tag = "run-123-1";
+    const exact = {
+      id: 123,
+      metadata: { container: { tags: [tag] }, package_type: "container" },
+      name: digest,
+    };
+    const fixtures = [
+      { versions: [exact], valid: true },
+      { versions: null, valid: false },
+      { versions: {}, valid: false },
+      { versions: [{ ...exact, name: `sha256:${"b".repeat(64)}` }], valid: false },
+      {
+        versions: [{ ...exact, metadata: { ...exact.metadata, container: { tags: ["wrong"] } } }],
+        valid: false,
+      },
+      {
+        versions: [
+          { ...exact, metadata: { ...exact.metadata, container: { tags: [tag, "other"] } } },
+        ],
+        valid: false,
+      },
+      { versions: [{ ...exact, metadata: { ...exact.metadata, package_type: "npm" } }], valid: false },
+      { versions: [{ id: 123, name: digest }], valid: false },
+      { versions: [exact, { ...exact, id: 124 }], valid: false },
+      {
+        versions: [exact, { ...exact, id: 124, name: `sha256:${"b".repeat(64)}` }],
+        valid: false,
+      },
+      { versions: [{ ...exact, id: "123" }], valid: false },
+      { versions: [{ ...exact, id: 123.5 }], valid: false },
+      { versions: [{ ...exact, id: 0 }], valid: false },
+      { versions: [{ ...exact, id: -1 }], valid: false },
+      { versions: [{ ...exact, id: null }], valid: false },
+      { versions: [{ ...exact, id: true }], valid: false },
+    ];
+    for (const cleanupRun of cleanupRuns) {
+      const match = cleanupRun.match(
+        /jq -er --arg digest "\$STAGING_DIGEST" --arg tag "\$tag" '\n([\s\S]*?)\n\s+' "\$versions" 2>\/dev\/null/,
+      );
+      expect(match).not.toBeNull();
+      const predicate = match?.[1] ?? "";
+      for (const fixture of fixtures) {
+        const child = Bun.spawn(
+          ["jq", "-er", "--arg", "digest", digest, "--arg", "tag", tag, predicate],
+          {
+            stdin: new Blob([JSON.stringify(fixture.versions)]),
+            stdout: "ignore",
+            stderr: "ignore",
+          },
+        );
+        expect((await child.exited) === 0).toBe(fixture.valid);
+      }
+    }
+
+    const harnessRoot = await mkdtemp(join(tmpdir(), "platform-ghcr-cleanup-"));
+    temporaryRoots.push(harnessRoot);
+    const fakeBin = join(harnessRoot, "bin");
+    await mkdir(fakeBin);
+    const fakeGh = join(fakeBin, "gh");
+    await writeFile(
+      fakeGh,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        '[ "$1" = "api" ]',
+        "shift",
+        'delete_request="0"',
+        'previous=""',
+        'endpoint=""',
+        'for argument in "$@"; do',
+        '  if [ "$previous" = "--method" ] && [ "$argument" = "DELETE" ]; then',
+        '    delete_request="1"',
+        "  fi",
+        '  previous="$argument"',
+        '  endpoint="$argument"',
+        "done",
+        'if [ "$delete_request" = "1" ]; then',
+        '  case "$endpoint" in',
+        '    */versions/*) exit 64 ;;',
+        '    */packages/container/platform-*) ;;',
+        '    *) exit 65 ;;',
+        '  esac',
+        '  printf \'%s\\n\' "$endpoint" >> "$FAKE_GH_CAPTURE"',
+        "  exit 0",
+        "fi",
+        'case "$endpoint" in',
+        '  /user/packages/*) [ "${FAKE_GH_FAIL_USER:-0}" != "1" ] || exit 1 ;;',
+        "esac",
+        'cat "$FAKE_GH_FIXTURE"',
+        "",
+      ].join("\n"),
+    );
+    await chmod(fakeGh, 0o755);
+
+    const functionalFixtures = [
+      { versions: [exact], expectedId: 123, failUser: false },
+      { versions: [{ ...exact, id: 987654321 }], expectedId: 987654321, failUser: true },
+      ...fixtures.filter((fixture) => !fixture.valid).map((fixture) => ({
+        versions: fixture.versions,
+        expectedId: null,
+        failUser: false,
+      })),
+    ];
+    for (const [runIndex, cleanupRun] of cleanupRuns.entries()) {
+      const stagingKind = runIndex === 0 ? "production" : "preview";
+      for (const [fixtureIndex, fixture] of functionalFixtures.entries()) {
+        const runnerTemp = join(harnessRoot, `runner-${runIndex}-${fixtureIndex}`);
+        await mkdir(runnerTemp);
+        const fixturePath = join(runnerTemp, "fixture.json");
+        const capturePath = join(runnerTemp, "delete.txt");
+        await writeFile(fixturePath, JSON.stringify(fixture.versions));
+        const child = Bun.spawn(["/bin/bash", "-c", cleanupRun], {
+          env: {
+            FAKE_GH_CAPTURE: capturePath,
+            FAKE_GH_FAIL_USER: fixture.failUser ? "1" : "0",
+            FAKE_GH_FIXTURE: fixturePath,
+            GH_TOKEN: "test-token",
+            GITHUB_REPOSITORY: "collinbentley1/cdbentley",
+            GITHUB_REPOSITORY_OWNER: "collinbentley1",
+            GITHUB_RUN_ATTEMPT: "2",
+            GITHUB_RUN_ID: "123",
+            PATH: `${fakeBin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+            RUNNER_TEMP: runnerTemp,
+            STAGING_DIGEST: digest,
+            STAGING_IMAGE: `ghcr.io/collinbentley1/platform-cdbentley-${stagingKind}-staging-123-1:run-123-1`,
+          },
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        const exitCode = await child.exited;
+        const stderr = await new Response(child.stderr).text();
+        const deletes = (await Bun.file(capturePath).exists())
+          ? (await Bun.file(capturePath).text()).trim().split("\n").filter(Boolean)
+          : [];
+        if (fixture.expectedId === null) {
+          expect(exitCode).not.toBe(0);
+          expect(deletes).toEqual([]);
+        } else {
+          const apiRoot = fixture.failUser ? "/users/collinbentley1" : "/user";
+          expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+          expect(deletes).toEqual([
+            `${apiRoot}/packages/container/platform-cdbentley-${stagingKind}-staging-123-1`,
+          ]);
+        }
+      }
+    }
   });
 
   test("image policy blocks an unfixable High vulnerability", async () => {

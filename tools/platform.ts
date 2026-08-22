@@ -403,6 +403,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
 
     const bootstrapText = await readText(join(repoPath, "infra/terraform/bootstrap/main.tf"));
     if (bootstrapText) {
+      let uniqueTrustedRefs: Set<string> | undefined;
       const trustedBlock = bootstrapText.match(
         /^\s*trusted_platform_workflow_shas\s*=\s*\[([^\]]*)\]/m,
       );
@@ -423,7 +424,7 @@ async function doctor(repoArgs: string[]): Promise<void> {
             trustedRefs.push(match[1]!);
           }
         }
-        const uniqueTrustedRefs = new Set(trustedRefs);
+        uniqueTrustedRefs = new Set(trustedRefs);
         if (
           invalidLine ||
           trustedRefs.length !== uniqueTrustedRefs.size ||
@@ -440,6 +441,78 @@ async function doctor(repoArgs: string[]): Promise<void> {
         for (const ref of uniqueTrustedRefs) {
           if (forbiddenPreMigrationWorkflowShas.has(ref)) {
             messages.push(`trusted_platform_workflow_shas contains vulnerable pre-migration SHA ${ref}`);
+          }
+        }
+      }
+
+      const parseOperatorShaSet = (variable: string): Set<string> | undefined => {
+        const block = bootstrapText.match(
+          new RegExp(`^\\s*${variable}\\s*=\\s*\\[([^\\]]*)\\]`, "m"),
+        );
+        if (!block) {
+          messages.push(`bootstrap main.tf is missing ${variable}`);
+          return undefined;
+        }
+        const refs = new Set<string>();
+        let invalidLine = false;
+        for (const line of block[1]!.split("\n").map((value) => value.trim()).filter(Boolean)) {
+          const match = line.match(/^"([0-9a-f]{40})",?(?:\s*#.*)?$/);
+          if (!match || refs.has(match[1]!)) {
+            invalidLine = true;
+          } else {
+            refs.add(match[1]!);
+          }
+        }
+        if (invalidLine) {
+          messages.push(`${variable} must contain only unique full commit SHAs`);
+        }
+        return refs;
+      };
+
+      const activeOperatorRefs = parseOperatorShaSet(
+        "preview_operations_active_workflow_shas",
+      );
+      const transitionOperatorRefs = parseOperatorShaSet(
+        "preview_operator_transition_workflow_shas",
+      );
+      if (activeOperatorRefs && activeOperatorRefs.size !== 1) {
+        messages.push(
+          "preview_operations_active_workflow_shas must contain exactly the active platform SHA",
+        );
+      }
+      if (
+        activeOperatorRefs &&
+        platformRef !== "unknown" &&
+        !activeOperatorRefs.has(platformRef)
+      ) {
+        messages.push(
+          "preview_operations_active_workflow_shas must contain the active platform SHA",
+        );
+      }
+      if (transitionOperatorRefs && transitionOperatorRefs.size > 1) {
+        messages.push(
+          "preview_operator_transition_workflow_shas may contain at most one immediately previous SHA",
+        );
+      }
+      if (activeOperatorRefs && transitionOperatorRefs) {
+        const overlap = [...activeOperatorRefs].filter((ref) => transitionOperatorRefs.has(ref));
+        if (overlap.length > 0) {
+          messages.push("preview operator active and transition workflow SHA sets must be disjoint");
+        }
+        if (uniqueTrustedRefs) {
+          const partition = new Set([...activeOperatorRefs, ...transitionOperatorRefs]);
+          if (
+            partition.size !== uniqueTrustedRefs.size ||
+            [...partition].some((ref) => !uniqueTrustedRefs!.has(ref))
+          ) {
+            messages.push(
+              "preview operator active and transition workflow SHA sets must exactly partition trusted_platform_workflow_shas",
+            );
+          }
+          if (uniqueTrustedRefs.size === 1 && transitionOperatorRefs.size !== 0) {
+            messages.push(
+              "preview_operator_transition_workflow_shas must be empty at steady state",
+            );
           }
         }
       }

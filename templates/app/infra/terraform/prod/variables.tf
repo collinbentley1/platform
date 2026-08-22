@@ -79,7 +79,7 @@ variable "preview_deploy_service_account_email" {
 }
 
 variable "preview_operator_service_account_email" {
-  description = "Preview traffic operator service account email with no Artifact Registry or runtime actAs access."
+  description = "Deprecated transition-only preview operator email retained for input compatibility; receives no IAM grant."
   type        = string
   default     = "gha-preview-operator@__PROJECT_ID__.iam.gserviceaccount.com"
 }
