@@ -8,6 +8,7 @@ import {
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./app-contract";
+import { validateTerraformMirrorContract } from "./terraform-mirror-contract";
 
 const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
 const maximumReviewedPackages = 128;
@@ -28,6 +29,10 @@ const requiredFiles = [
   "tools/build.ts",
   "tools/format.ts",
   "tools/lint.ts",
+  "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
+  "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/variables.tf",
 ];
 const ignoredWalkPaths = new Set([".git", "_platform_policy"]);
 const forbiddenSyftConfigs = new Set([
@@ -79,6 +84,33 @@ if (platformConfig.githubRepositoryId !== trustedRepositoryId) {
   throw new Error(
     ".platform/config.json githubRepositoryId must match the immutable GitHub event repository ID.",
   );
+}
+const typedPlatformConfig = platformConfig as {
+  githubRepositoryId: string;
+  name?: string;
+  projectId?: string;
+  serviceName?: string;
+};
+if (!typedPlatformConfig.projectId) {
+  throw new Error(".platform/config.json projectId is required by the Terraform mirror contract.");
+}
+const [bootstrapMain, bootstrapOutputs, productionMain, productionVariables] = await Promise.all([
+  readFile(join(appRoot, "infra/terraform/bootstrap/main.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/bootstrap/outputs.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/prod/main.tf"), "utf8"),
+  readFile(join(appRoot, "infra/terraform/prod/variables.tf"), "utf8"),
+]);
+const terraformMirrorFailures = validateTerraformMirrorContract(
+  {
+    githubRepositoryId: trustedRepositoryId,
+    name: typedPlatformConfig.name,
+    projectId: typedPlatformConfig.projectId,
+    serviceName: typedPlatformConfig.serviceName,
+  },
+  { bootstrapMain, bootstrapOutputs, productionMain, productionVariables },
+);
+if (terraformMirrorFailures.length > 0) {
+  throw new Error(terraformMirrorFailures.join("\n"));
 }
 if (packageJson.packageManager !== "bun@1.4.0") {
   throw new Error("package.json packageManager must be bun@1.4.0.");

@@ -16,6 +16,8 @@ on:
         required: false
       SOCKET_API_TOKEN:
         required: true
+      WAITLIST_IDENTITY_KEYSET:
+        required: false
 
 permissions: {}
 
@@ -800,6 +802,7 @@ jobs:
           IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
           IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
           MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}
+          WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}
           PROJECT_ID: ${{ steps.app.outputs.project_id }}
           REGION: ${{ steps.app.outputs.region }}
           REPOSITORY_ID: ${{ github.event.repository.id }}
@@ -814,8 +817,11 @@ jobs:
 
           umask 077
           env_file="$RUNNER_TEMP/production-env.json"
-          trap 'rm -f "$env_file" "${env_file}.next"' EXIT
+          service_snapshot="$RUNNER_TEMP/production-service.json"
+          trap 'rm -f "$env_file" "${env_file}.next" "$service_snapshot"' EXIT
           printf '{}\n' > "$env_file"
+          labels="managed-by=github-actions,environment=production"
+          secret_args=(--clear-secrets)
           case "$REPOSITORY_ID" in
             1255553151)
               # cdbentley has no product-specific runtime configuration.
@@ -831,6 +837,73 @@ jobs:
               mv "${env_file}.next" "$env_file"
               ;;
             1025243085)
+              if [[ ! "$WAITLIST_IDENTITY_KEYSET" =~ ^[A-Za-z0-9_-]{43}(,[A-Za-z0-9_-]{43})?$ ]]; then
+                echo "Medlock requires one active waitlist signing secret and permits one prior secret during rotation." >&2
+                exit 1
+              fi
+              IFS=, read -r waitlist_primary waitlist_previous <<< "$WAITLIST_IDENTITY_KEYSET"
+              canonical_base64url_32() {
+                local encoded="$1"
+                local canonical
+                canonical="$(
+                  printf '%s=' "$encoded" \
+                    | tr '_-' '/+' \
+                    | base64 --decode 2>/dev/null \
+                    | base64 --wrap=0 \
+                    | tr '/+' '_-' \
+                    | tr -d '='
+                )" || return 1
+                [ "$canonical" = "$encoded" ]
+              }
+              if ! canonical_base64url_32 "$waitlist_primary" \
+                || { [ -n "${waitlist_previous:-}" ] && ! canonical_base64url_32 "$waitlist_previous"; }; then
+                echo "Medlock waitlist keys must use canonical base64url encoding of exactly 32 bytes." >&2
+                exit 1
+              fi
+              if [ -n "${waitlist_previous:-}" ] && [ "$waitlist_primary" = "$waitlist_previous" ]; then
+                echo "Medlock waitlist rotation keys must be distinct." >&2
+                exit 1
+              fi
+              waitlist_fingerprint="$(printf '%s' "$WAITLIST_IDENTITY_KEYSET" | sha256sum | cut -d ' ' -f1 | cut -c1-48)"
+              if [[ ! "$waitlist_fingerprint" =~ ^[0-9a-f]{48}$ ]]; then
+                echo "Could not derive the Medlock keyset fingerprint." >&2
+                exit 1
+              fi
+              env -u WAITLIST_IDENTITY_KEYSET gcloud run services describe "$SERVICE_NAME" \
+                --project="$PROJECT_ID" \
+                --region="$REGION" \
+                --format=json > "$service_snapshot"
+              current_fingerprint="$(jq -r '.metadata.labels["waitlist-keyset-fingerprint"] // empty' "$service_snapshot")"
+              current_secret_version="$(
+                jq -r '[
+                  .spec.template.spec.containers[0].env[]?
+                  | select(.name == "WAITLIST_IDENTITY_KEYSET")
+                  | .valueFrom.secretKeyRef
+                  | select(.name == "waitlist-identity-keyset")
+                  | .key
+                  | select(type == "string" and test("^[1-9][0-9]*$"))
+                ] | if length == 1 then .[0] else empty end' "$service_snapshot"
+              )"
+              if [ "$current_fingerprint" = "$waitlist_fingerprint" ] \
+                && [[ "$current_secret_version" =~ ^[1-9][0-9]*$ ]]; then
+                secret_version="$current_secret_version"
+              else
+                secret_version_resource="$(
+                  printf '%s' "$WAITLIST_IDENTITY_KEYSET" \
+                    | env -u WAITLIST_IDENTITY_KEYSET gcloud secrets versions add waitlist-identity-keyset \
+                      --project="$PROJECT_ID" \
+                      --data-file=- \
+                      --format='value(name)'
+                )"
+                if [[ ! "$secret_version_resource" =~ ^projects/(229383559510|medlock-1025243085)/secrets/waitlist-identity-keyset/versions/([1-9][0-9]*)$ ]]; then
+                  echo "Secret Manager did not return the exact Medlock secret version resource." >&2
+                  exit 1
+                fi
+                secret_version="${BASH_REMATCH[2]}"
+              fi
+              unset WAITLIST_IDENTITY_KEYSET
+              labels="${labels},waitlist-keyset-fingerprint=${waitlist_fingerprint}"
+              secret_args=(--set-secrets="WAITLIST_IDENTITY_KEYSET=waitlist-identity-keyset:${secret_version}")
               jq '. + {
                 ALLOWED_HOSTS: "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app",
                 ALLOWED_ORIGINS: "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app",
@@ -840,6 +913,7 @@ jobs:
                 FIRESTORE_PROJECT_ID: "medlock-1025243085",
                 LEGACY_HOSTS: "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app",
                 MEDLOCK_VERSION: "0.2.0",
+                PLATFORM_DEPLOY_ENVIRONMENT: "production",
                 WAITLIST_BACKEND: "firestore"
               }' "$env_file" > "${env_file}.next"
               mv "${env_file}.next" "$env_file"
@@ -864,7 +938,7 @@ jobs:
             --region="$REGION" \
             --image="${IMAGE_NAME}@${IMAGE_DIGEST}" \
             --env-vars-file="$env_file" \
-            --clear-secrets \
+            "${secret_args[@]}" \
             --service-account="$RUNTIME_SERVICE_ACCOUNT" \
             --ingress=all \
             --min-instances=0 \
@@ -873,5 +947,5 @@ jobs:
             --cpu=1 \
             --concurrency=80 \
             --timeout=300s \
-            --labels=managed-by=github-actions,environment=production \
+            --labels="$labels" \
             --quiet

@@ -985,12 +985,18 @@ jobs:
             1025243085)
               # Medlock previews use an in-memory waitlist and have no data-plane
               # identity or Firestore coordinates.
-              jq '. + {
+              waitlist_identity_keyset="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+              if [[ ! "$waitlist_identity_keyset" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+                echo "Failed to generate the Medlock preview waitlist signing key." >&2
+                exit 1
+              fi
+              jq --arg waitlist_identity_keyset "$waitlist_identity_keyset" '. + {
                 ALLOWED_HOSTS: "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app",
                 ALLOWED_ORIGINS: "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app",
                 CANONICAL_HOST: "medlock.ai",
                 LEGACY_HOSTS: "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app",
                 MEDLOCK_VERSION: "0.2.0",
+                WAITLIST_IDENTITY_KEYSET: $waitlist_identity_keyset,
                 WAITLIST_BACKEND: "memory"
               }' "$env_file" > "${env_file}.next"
               mv "${env_file}.next" "$env_file"

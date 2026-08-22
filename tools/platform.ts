@@ -10,6 +10,7 @@ import {
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./ci/app-contract";
+import { validateTerraformMirrorContract } from "./ci/terraform-mirror-contract";
 
 type PlatformConfig = {
   readonly name?: string;
@@ -36,7 +37,9 @@ const requiredFiles = [
   "tools/platform-verify.ts",
   "tools/socket-security-scanner.ts",
   "infra/terraform/bootstrap/main.tf",
+  "infra/terraform/bootstrap/outputs.tf",
   "infra/terraform/prod/main.tf",
+  "infra/terraform/prod/variables.tf",
 ];
 const workflowFiles = [
   "application.yml",
@@ -103,10 +106,16 @@ switch (command) {
 async function doctor(repoArgs: string[]): Promise<void> {
   const repos = repoArgs.length > 0 ? repoArgs : ["."];
   const expectedWorkflowSha = Bun.env.PLATFORM_WORKFLOW_SHA;
+  const trustedRepositoryId = Bun.env.TRUSTED_GITHUB_REPOSITORY_ID;
   let failures = 0;
 
   if (expectedWorkflowSha !== undefined && !isFullCommitSha(expectedWorkflowSha)) {
     throw new Error("PLATFORM_WORKFLOW_SHA must be a full lowercase commit SHA when provided.");
+  }
+  if (trustedRepositoryId !== undefined && !/^[1-9][0-9]*$/.test(trustedRepositoryId)) {
+    throw new Error(
+      "TRUSTED_GITHUB_REPOSITORY_ID must be a positive numeric ID when provided.",
+    );
   }
 
   for (const repo of repos) {
@@ -215,6 +224,37 @@ async function doctor(repoArgs: string[]): Promise<void> {
       }
       if (!config.githubRepositoryId || !/^[1-9][0-9]*$/.test(config.githubRepositoryId)) {
         messages.push(".platform/config.json githubRepositoryId must be a positive numeric ID");
+      }
+      if (
+        trustedRepositoryId !== undefined &&
+        config.githubRepositoryId !== trustedRepositoryId
+      ) {
+        messages.push(
+          ".platform/config.json githubRepositoryId must match the immutable GitHub event repository ID",
+        );
+      }
+    }
+
+    if (config?.projectId && (trustedRepositoryId ?? config.githubRepositoryId)) {
+      const [bootstrapMain, bootstrapOutputs, productionMain, productionVariables] =
+        await Promise.all([
+          readText(join(repoPath, "infra/terraform/bootstrap/main.tf")),
+          readText(join(repoPath, "infra/terraform/bootstrap/outputs.tf")),
+          readText(join(repoPath, "infra/terraform/prod/main.tf")),
+          readText(join(repoPath, "infra/terraform/prod/variables.tf")),
+        ]);
+      if (bootstrapMain && bootstrapOutputs && productionMain && productionVariables) {
+        messages.push(
+          ...validateTerraformMirrorContract(
+            {
+              githubRepositoryId: trustedRepositoryId ?? config.githubRepositoryId!,
+              name: config.name,
+              projectId: config.projectId,
+              serviceName: config.serviceName,
+            },
+            { bootstrapMain, bootstrapOutputs, productionMain, productionVariables },
+          ),
+        );
       }
     }
 

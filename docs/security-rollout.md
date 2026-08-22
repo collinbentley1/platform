@@ -141,8 +141,24 @@ the recovery object and stop; never rerun from empty state.
    `https://preview.ycriticalhistory.org`; that narrows preview-to-production use
    but the production parent still includes preview subdomains. Mapbox URL
    restrictions are best-effort abuse controls, not authorization. Do not enter
-   unsupported wildcard syntax. All other deploy environments remain free of
-   runtime values.
+   unsupported wildcard syntax. For Medlock only, generate a 32-byte base64url
+   `WAITLIST_IDENTITY_KEYSET` in `production`; during rotation it may temporarily
+   be `new,old` so the application can accept and re-sign old cookies. The trusted
+   production deploy streams that value over standard input into a new immutable
+   version of the platform-owned `waitlist-identity-keyset` Secret Manager secret,
+   then binds Cloud Run to the returned numeric version. The deploy identity may
+   add versions only to that one secret and cannot read or destroy them; the
+   production runtime may access only that secret. The payload therefore never
+   enters Terraform state, an image layer, deployment arguments, or Cloud Run's
+   readable literal environment configuration. A 192-bit SHA-256 fingerprint in
+   the service label lets an unchanged keyset reuse the current numeric version,
+   so ordinary application releases do not create duplicates. After a successful
+   rotation, an owner-reviewed operation must retain no more than the current and
+   one rollback version enabled, disable older unreferenced versions, and destroy
+   them after the 30-day cookie window. The deploy pipeline deliberately lacks
+   version read, list, disable, and destroy permissions. The trusted preview
+   deploy generates a revision-local key, so no reusable credential reaches PR
+   code. All other deploy environments remain free of runtime values.
    Do this before any caller references the new workflow.
    The reusable deploy contracts must explicitly declare each secret name they
    consume, and callers must forward exactly those names without using
@@ -236,7 +252,8 @@ the recovery object and stop; never rerun from empty state.
 6. Review the immutable runtime map in the platform commit. Confirm Runsetta has
    `RUNSETTA_OFFLINE=1`, no deployed secret mappings, and no runtime secret
    accessor grants; confirm Medlock preview uses memory and production uses only
-   its fixed Firestore coordinates and host/origin policy; confirm cdbentley has
+   its fixed Firestore coordinates, host/origin policy, and environment-scoped
+   waitlist identity keyset; confirm cdbentley has
    no product runtime values and Critical History has only the protected public
    Mapbox token exception. Delete the obsolete `GCP_PROD_ENV_VARS`,
    `GCP_PROD_SECRETS`, `GCP_PREVIEW_ENV_VARS`,
@@ -319,7 +336,10 @@ the recovery object and stop; never rerun from empty state.
     the retired operator. Prove both publisher accounts have only one exact
     repository-level Artifact Registry Writer grant, both deploy accounts have
     only Reader on their exact image repository, both publishers have zero Cloud
-    Run and runtime `actAs` grants. Prove the active/new SHA's
+    Run and runtime `actAs` grants. For Medlock only, prove `gha-prod-deploy` has
+    Secret Version Adder on exactly `waitlist-identity-keyset` and zero version
+    access, get, list, disable, enable, or destroy permission; prove every other
+    deploy identity has zero Secret Manager grants. Prove the active/new SHA's
     `attribute.preview_operator_workflow_sha` principalSet targets only
     `gha-preview-deploy`; only the declared transition SHA may target
     `gha-preview-operator`, and both the transition set and legacy fallback must

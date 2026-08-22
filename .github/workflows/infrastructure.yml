@@ -160,6 +160,7 @@ jobs:
       - name: Prove all consumer pins match this exact reusable workflow
         env:
           PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          TRUSTED_GITHUB_REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
           (

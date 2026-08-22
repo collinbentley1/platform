@@ -29,8 +29,9 @@ const declaredEnvironmentSecrets = [
   "GRYPE_DB_MANIFEST_JSON",
   "MAPBOX_PUBLIC_TOKEN",
   "SOCKET_API_TOKEN",
+  "WAITLIST_IDENTITY_KEYSET",
 ];
-const expectedEnvironmentSecretDeclarations = [
+const expectedPreviewEnvironmentSecretDeclarations = [
   "    secrets:",
   "      DHI_ACCESS_TOKEN:",
   "        required: true",
@@ -43,7 +44,12 @@ const expectedEnvironmentSecretDeclarations = [
   "      SOCKET_API_TOKEN:",
   "        required: true",
 ].join("\n");
-const expectedCallerSecretMap = [
+const expectedProductionEnvironmentSecretDeclarations = [
+  expectedPreviewEnvironmentSecretDeclarations,
+  "      WAITLIST_IDENTITY_KEYSET:",
+  "        required: false",
+].join("\n");
+const expectedPreviewCallerSecretMap = [
   "    secrets:",
   "      DHI_ACCESS_TOKEN: ${{ secrets.DHI_ACCESS_TOKEN }}",
   "      DHI_USERNAME: ${{ secrets.DHI_USERNAME }}",
@@ -51,7 +57,11 @@ const expectedCallerSecretMap = [
   "      MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
   "      SOCKET_API_TOKEN: ${{ secrets.SOCKET_API_TOKEN }}",
 ].join("\n");
-const expectedReusableSecretContextReferences: SecretContextReference[] = [
+const expectedProductionCallerSecretMap = [
+  expectedPreviewCallerSecretMap,
+  "      WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
+].join("\n");
+const expectedPreviewSecretContextReferences: SecretContextReference[] = [
   { job: null, path: "on.workflow_call.<key:secrets>", value: "secrets" },
   {
     job: "build",
@@ -77,6 +87,14 @@ const expectedReusableSecretContextReferences: SecretContextReference[] = [
     job: "deploy",
     path: "jobs.deploy.steps.4.env.MAPBOX_PUBLIC_TOKEN",
     value: "${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  },
+];
+const expectedProductionSecretContextReferences: SecretContextReference[] = [
+  ...expectedPreviewSecretContextReferences,
+  {
+    job: "deploy",
+    path: "jobs.deploy.steps.4.env.WAITLIST_IDENTITY_KEYSET",
+    value: "${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
   },
 ];
 
@@ -124,14 +142,14 @@ requireContains(
 
 const deployPreview = await read(".github/workflows/deploy-preview.yml");
 
-for (const [path, workflow] of [
-  [".github/workflows/deploy-preview.yml", deployPreview],
-  [".github/workflows/deploy-prod.yml", deployProd],
+for (const [path, workflow, expectedDeclarations, count] of [
+  [".github/workflows/deploy-preview.yml", deployPreview, expectedPreviewEnvironmentSecretDeclarations, "five"],
+  [".github/workflows/deploy-prod.yml", deployProd, expectedProductionEnvironmentSecretDeclarations, "six"],
 ] as const) {
   const workflowCall = sectionBetween(workflow, "  workflow_call:\n", "\npermissions:");
   const declarationBlock = sectionFrom(workflowCall, "    secrets:\n").trimEnd();
-  if (declarationBlock !== expectedEnvironmentSecretDeclarations) {
-    failures.push(`${path}: workflow_call secrets must exactly match the reviewed five-name contract.`);
+  if (declarationBlock !== expectedDeclarations) {
+    failures.push(`${path}: workflow_call secrets must exactly match the reviewed ${count}-name contract.`);
   }
 }
 
@@ -187,18 +205,20 @@ for (const needle of [
   );
 }
 const previewDeployJob = sectionBetween(deployPreview, "  deploy:\n", "\n  invalidate:\n");
-for (const [path, workflow, buildJob, deployJob] of [
+for (const [path, workflow, buildJob, deployJob, expectedReferences] of [
   [
     ".github/workflows/deploy-preview.yml",
     deployPreview,
     sectionBetween(deployPreview, "  build:\n", "\n  canary:\n"),
     previewDeployJob,
+    expectedPreviewSecretContextReferences,
   ],
   [
     ".github/workflows/deploy-prod.yml",
     deployProd,
     sectionBetween(deployProd, "  build:\n", "\n  canary:\n"),
     sectionFrom(deployProd, "  deploy:\n"),
+    expectedProductionSecretContextReferences,
   ],
 ] as const) {
   let references: SecretContextReference[];
@@ -208,7 +228,7 @@ for (const [path, workflow, buildJob, deployJob] of [
     failures.push(`${path}: semantic YAML inspection failed: ${String(error)}`);
     references = [];
   }
-  if (JSON.stringify(references) !== JSON.stringify(expectedReusableSecretContextReferences)) {
+  if (JSON.stringify(references) !== JSON.stringify(expectedReferences)) {
     failures.push(`${path}: decoded secret-context references must exactly match the reviewed job paths.`);
   }
   for (const secret of [
@@ -222,9 +242,14 @@ for (const [path, workflow, buildJob, deployJob] of [
       failures.push(`${path}: ${secret} must be referenced exactly once and only by the build job.`);
     }
   }
-  const mapboxReference = "${{ secrets.MAPBOX_PUBLIC_TOKEN }}";
-  if (workflow.split(mapboxReference).length !== 2 || !deployJob.includes(mapboxReference)) {
-    failures.push(`${path}: MAPBOX_PUBLIC_TOKEN must be referenced exactly once and only by the deploy job.`);
+  const deploySecrets = path.endsWith("deploy-prod.yml")
+    ? ["MAPBOX_PUBLIC_TOKEN", "WAITLIST_IDENTITY_KEYSET"]
+    : ["MAPBOX_PUBLIC_TOKEN"];
+  for (const secret of deploySecrets) {
+    const reference = `\${{ secrets.${secret} }}`;
+    if (workflow.split(reference).length !== 2 || !deployJob.includes(reference)) {
+      failures.push(`${path}: ${secret} must be referenced exactly once and only by the deploy job.`);
+    }
   }
 }
 for (const needle of [
@@ -437,17 +462,23 @@ if (syftConfig.trim() !== "{}") {
 }
 
 const deployProduction = await read(".github/workflows/deploy-prod.yml");
-rejectContains(
-  ".github/workflows/deploy-prod.yml",
-  deployProduction,
-  "--set-secrets",
-  "Production workflows must not accept generic Secret Manager mappings.",
-);
 requireContains(
   ".github/workflows/deploy-prod.yml",
   deployProduction,
   "--clear-secrets",
   "The current immutable runtime map must authoritatively clear undeclared secret mappings.",
+);
+requireContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  '--set-secrets="WAITLIST_IDENTITY_KEYSET=waitlist-identity-keyset:${secret_version}"',
+  "Medlock must bind Cloud Run to the exact Secret Manager version created by the trusted deploy.",
+);
+rejectContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "--update-secrets",
+  "Production secret mappings must replace the complete map rather than preserve undeclared entries.",
 );
 rejectContains(
   ".github/workflows/deploy-prod.yml",
@@ -477,6 +508,22 @@ for (const needle of [
 }
 for (const needle of [
   "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  "WAITLIST_IDENTITY_KEYSET: ${{ secrets.WAITLIST_IDENTITY_KEYSET }}",
+  '[[ ! "$WAITLIST_IDENTITY_KEYSET" =~ ^[A-Za-z0-9_-]{43}(,[A-Za-z0-9_-]{43})?$ ]]',
+  "canonical_base64url_32",
+  "base64 --decode",
+  "base64 --wrap=0",
+  'waitlist_fingerprint="$(printf',
+  "gcloud run services describe",
+  'waitlist-keyset-fingerprint',
+  'select(.name == "waitlist-identity-keyset")',
+  "gcloud secrets versions add waitlist-identity-keyset",
+  "env -u WAITLIST_IDENTITY_KEYSET",
+  "--data-file=-",
+  "--format='value(name)'",
+  "^projects/(229383559510|medlock-1025243085)/secrets/waitlist-identity-keyset/versions/([1-9][0-9]*)$",
+  'secret_args=(--set-secrets="WAITLIST_IDENTITY_KEYSET=waitlist-identity-keyset:${secret_version}")',
+  'PLATFORM_DEPLOY_ENVIRONMENT: "production"',
   '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
   ". + {MAPBOX_PUBLIC_TOKEN: $token}",
   'RUNSETTA_OFFLINE: "1"',
@@ -490,6 +537,31 @@ for (const needle of [
     `Immutable production runtime configuration is missing: ${needle}`,
   );
 }
+rejectContains(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "jq --arg waitlist_identity_keyset",
+  "The Medlock signing payload must never enter the literal Cloud Run environment JSON.",
+);
+if (deployProduction.split("--set-secrets").length - 1 !== 1) {
+  failures.push(
+    ".github/workflows/deploy-prod.yml: Exactly one reviewed Secret Manager mapping is permitted.",
+  );
+}
+requireBefore(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  'if ! canonical_base64url_32 "$waitlist_primary"',
+  "gcloud secrets versions add waitlist-identity-keyset",
+  "Canonical key validation must finish before any immutable secret version is created.",
+);
+requireBefore(
+  ".github/workflows/deploy-prod.yml",
+  deployProduction,
+  "gcloud run services describe",
+  "gcloud secrets versions add waitlist-identity-keyset",
+  "The trusted deploy must reuse the exact current version when the keyset fingerprint is unchanged.",
+);
 for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP_PROD_SECRETS"]) {
   rejectContains(
     ".github/workflows/deploy-prod.yml",
@@ -500,6 +572,9 @@ for (const needle of ["PROD_ENV_VARS", "PROD_SECRETS", "GCP_PROD_ENV_VARS", "GCP
 }
 for (const needle of [
   "MAPBOX_PUBLIC_TOKEN: ${{ secrets.MAPBOX_PUBLIC_TOKEN }}",
+  "openssl rand -base64 32",
+  '[[ ! "$waitlist_identity_keyset" =~ ^[A-Za-z0-9_-]{43}$ ]]',
+  'WAITLIST_IDENTITY_KEYSET: $waitlist_identity_keyset',
   '[[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$ ]]',
   ". + {MAPBOX_PUBLIC_TOKEN: $token}",
   'RUNSETTA_OFFLINE: "1"',
@@ -1131,6 +1206,20 @@ for (const boundary of [
   );
 }
 const templateBootstrapOutputs = await read("templates/app/infra/terraform/bootstrap/outputs.tf");
+const templateProductionMain = await read("templates/app/infra/terraform/prod/main.tf");
+const templateProductionVariables = await read("templates/app/infra/terraform/prod/variables.tf");
+requireContains(
+  "templates/app/infra/terraform/prod/main.tf",
+  templateProductionMain,
+  "runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+  "The scaffold must pass the declared exact-secret version-adder set.",
+);
+requireContains(
+  "templates/app/infra/terraform/prod/variables.tf",
+  templateProductionVariables,
+  "setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)",
+  "The scaffold version-adder set must be a subset of retained secret containers.",
+);
 rejectContains(
   "templates/app/infra/terraform/bootstrap/outputs.tf",
   templateBootstrapOutputs,
@@ -1458,14 +1547,23 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
   checkActionPins(path, text, true);
 }
 
-for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+for (const [workflow, expectedSecretMap, count] of [
+  ["deploy-preview.yml", expectedPreviewCallerSecretMap, "five"],
+  ["deploy-prod.yml", expectedProductionCallerSecretMap, "six"],
+] as const) {
   const path = `templates/app/.github/workflows/${workflow}`;
   const text = await read(path);
   const secretMap = sectionFrom(text, "    secrets:\n").trimEnd();
-  if (secretMap !== expectedCallerSecretMap) {
-    failures.push(`${path}: deploy caller secret map must exactly match the reviewed five-name contract.`);
+  if (secretMap !== expectedSecretMap) {
+    failures.push(`${path}: deploy caller secret map must exactly match the reviewed ${count}-name contract.`);
   }
 }
+requireContains(
+  "templates/app/.github/workflows/deploy-preview.yml",
+  await read("templates/app/.github/workflows/deploy-preview.yml"),
+  "github.event.pull_request.draft == false",
+  "Preview callers must not deploy draft pull requests.",
+);
 
 const dockerfile = await read("templates/app/Dockerfile");
 const bunfig = await read("templates/app/bunfig.toml");
@@ -1631,7 +1729,7 @@ const moduleVariables = await read("terraform/modules/cloud-run-service/variable
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
 if (
   createHash("sha256").update(moduleMain).digest("hex") !==
-  "ba3a42664087637d024128134e610694a9cb7c19487656de063c2361121daebb"
+  "bb0be7c548794254309371db48e4800770cad59a72c7457b028bbeff1f6c7682"
 ) {
   failures.push(
     "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
@@ -1678,10 +1776,13 @@ if (
 const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.tf"];
 for (const moduleName of ["cloud-run-service", "bootstrap"]) {
   const moduleDirectory = join(root, "terraform/modules", moduleName);
-  const terraformFiles = (await readdir(moduleDirectory)).sort();
-  if (JSON.stringify(terraformFiles) !== JSON.stringify(approvedModuleFiles)) {
+  const approvedEntries = moduleName === "bootstrap"
+    ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
+    : approvedModuleFiles;
+  const moduleEntries = (await readdir(moduleDirectory)).sort();
+  if (JSON.stringify(moduleEntries) !== JSON.stringify(approvedEntries)) {
     failures.push(
-      `terraform/modules/${moduleName}: Terraform files must be exactly ${approvedModuleFiles.join(", ")}; found ${terraformFiles.join(", ")}.`,
+      `terraform/modules/${moduleName}: entries must be exactly ${approvedEntries.join(", ")}; found ${moduleEntries.join(", ")}.`,
     );
   }
   for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
@@ -1691,6 +1792,34 @@ for (const moduleName of ["cloud-run-service", "bootstrap"]) {
         `terraform/modules/${moduleName}/${name}: Executable Terraform blocks belong only in the reviewed main.tf.`,
       );
     }
+  }
+}
+const bootstrapModuleTests = join(root, "terraform/modules/bootstrap/tests");
+const bootstrapTestFiles = (await readdir(bootstrapModuleTests)).sort();
+if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify(["transition_cardinality.tftest.hcl"])) {
+  failures.push("terraform/modules/bootstrap/tests: only the reviewed transition-cardinality test is allowed.");
+}
+const transitionCardinalityTest = await readFile(
+  join(bootstrapModuleTests, "transition_cardinality.tftest.hcl"),
+  "utf8",
+);
+for (const boundary of [
+  'run "reject_multiple_preview_operator_transition_shas"',
+  "expect_failures = [var.preview_operator_transition_workflow_shas]",
+  '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
+  '"cccccccccccccccccccccccccccccccccccccccc"',
+]) {
+  if (!transitionCardinalityTest.includes(boundary)) {
+    failures.push(`terraform/modules/bootstrap/tests/transition_cardinality.tftest.hcl: missing ${boundary}`);
+  }
+}
+const bootstrapModuleLock = await readFile(
+  join(root, "terraform/modules/bootstrap/.terraform.lock.hcl"),
+  "utf8",
+);
+for (const boundary of ['version     = "7.45.0"', 'constraints = ">= 7.34.0"']) {
+  if (!bootstrapModuleLock.includes(boundary)) {
+    failures.push(`terraform/modules/bootstrap/.terraform.lock.hcl: missing ${boundary}`);
   }
 }
 const allServiceModuleTerraform = (
@@ -1742,6 +1871,12 @@ requireContains(
   "Secret containers must not implicitly grant runtime payload access.",
 );
 requireContains(
+  "terraform/modules/cloud-run-service/main.tf",
+  moduleMain,
+  "for_each = var.runtime_secret_version_adder_ids",
+  "Production deployers must receive version-add permission only through the declared exact-secret set.",
+);
+requireContains(
   "terraform/modules/cloud-run-service/variables.tf",
   sectionFrom(moduleVariables, 'variable "runtime_secret_accessor_ids"'),
   "default     = []",
@@ -1753,7 +1888,20 @@ requireContains(
   "setsubtract(var.runtime_secret_accessor_ids, var.runtime_secret_ids)",
   "Runtime accessor IDs must be validated as a subset of retained secret containers.",
 );
+requireContains(
+  "terraform/modules/cloud-run-service/variables.tf",
+  sectionFrom(moduleVariables, 'variable "runtime_secret_version_adder_ids"'),
+  "default     = []",
+  "Production deploy secret-version addition must default to empty.",
+);
+requireContains(
+  "terraform/modules/cloud-run-service/variables.tf",
+  sectionFrom(moduleVariables, 'variable "runtime_secret_version_adder_ids"'),
+  "setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)",
+  "Production deploy version-adder IDs must be validated as a subset of retained secret containers.",
+);
 const productionDeployment = await read("terraform/deployments/prod/main.tf");
+const bootstrapDeploymentRoot = await read("terraform/deployments/bootstrap/main.tf");
 const exposureDeployment = await read("terraform/deployments/exposure/main.tf");
 const exposureOutputs = await read("terraform/deployments/exposure/outputs.tf");
 const previewDomainMain = await read("terraform/modules/cloud-run-preview-domain/main.tf");
@@ -1856,6 +2004,34 @@ for (const needle of [
     `The immutable Runsetta offline boundary is missing: ${needle}`,
   );
 }
+for (const needle of [
+  '"waitlist-identity-keyset"',
+  "runtime_secret_version_adder_ids = [",
+  "runtime_secret_version_adder_ids        = local.deployment.runtime_secret_version_adder_ids",
+]) {
+  requireContains(
+    "terraform/deployments/prod/main.tf",
+    productionDeployment,
+    needle,
+    `The exact Medlock Secret Manager deployment boundary is missing: ${needle}`,
+  );
+}
+const medlockBootstrapDeployment = sectionBetween(
+  bootstrapDeploymentRoot,
+  '    "1025243085" = {',
+  '    "280932482" = {',
+);
+requireContains(
+  "terraform/deployments/bootstrap/main.tf",
+  medlockBootstrapDeployment,
+  '"secretmanager.googleapis.com"',
+  "Medlock must enable Secret Manager before the exact-version runtime binding is applied.",
+);
+if (productionDeployment.split("runtime_secret_version_adder_ids  = []").length - 1 !== 3) {
+  failures.push(
+    "terraform/deployments/prod/main.tf: Every non-Medlock production deploy identity must retain an empty secret-version-adder set.",
+  );
+}
 for (const [publisherResource, publisherVariable, formerDeployResource] of [
   ["prod_publisher_writer", "prod_publisher_service_account_email", "prod_deploy_writer"],
   ["preview_publisher_writer", "preview_publisher_service_account_email", "preview_deploy_writer"],
@@ -1955,6 +2131,7 @@ const approvedIamResources = [
   "google_artifact_registry_repository_iam_member.prod_publisher_writer",
   "google_cloud_run_v2_service_iam_member.preview_deploy",
   "google_cloud_run_v2_service_iam_member.prod_deploy",
+  "google_secret_manager_secret_iam_member.prod_deploy_version_adder",
   "google_secret_manager_secret_iam_member.runtime_accessor",
 ].sort();
 if (JSON.stringify(allIamResources) !== JSON.stringify(approvedIamResources)) {
@@ -2007,6 +2184,16 @@ const exactIamBlocks = [
     "  secret_id = google_secret_manager_secret.runtime[each.value].secret_id",
     '  role      = "roles/secretmanager.secretAccessor"',
     '  member    = "serviceAccount:${var.runtime_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_secret_manager_secret_iam_member" "prod_deploy_version_adder" {',
+    "  for_each = var.runtime_secret_version_adder_ids",
+    "",
+    "  project   = var.project_id",
+    "  secret_id = google_secret_manager_secret.runtime[each.value].secret_id",
+    '  role      = "roles/secretmanager.secretVersionAdder"',
+    '  member    = "serviceAccount:${var.prod_deploy_service_account_email}"',
     "}",
   ].join("\n"),
   [
@@ -2071,6 +2258,22 @@ for (const needle of [
     runtimeAccessor,
     needle,
     `The runtime-only secret grant is missing: ${needle}`,
+  );
+}
+const prodDeployVersionAdder = sectionBetween(
+  moduleMain,
+  'resource "google_secret_manager_secret_iam_member" "prod_deploy_version_adder"',
+  "\n}\n",
+);
+for (const needle of [
+  'role      = "roles/secretmanager.secretVersionAdder"',
+  'member    = "serviceAccount:${var.prod_deploy_service_account_email}"',
+]) {
+  requireContains(
+    "terraform/modules/cloud-run-service/main.tf",
+    prodDeployVersionAdder,
+    needle,
+    `The production deploy version-adder grant is missing: ${needle}`,
   );
 }
 if (allServiceModuleTerraform.split("preview_operator_service_account_email").length - 1 !== 1) {
@@ -2287,11 +2490,18 @@ for (const outputPath of [
   "terraform/deployments/bootstrap/outputs.tf",
   "templates/app/infra/terraform/bootstrap/outputs.tf",
 ]) {
+  const output = await read(outputPath);
   requireContains(
     outputPath,
-    await read(outputPath),
+    output,
     "Retired transition-only preview operator service account; receives no steady-state operational grants.",
     "The preview operator output must disclose its retired transition-only status.",
+  );
+  requireContains(
+    outputPath,
+    output,
+    "only declared exact-secret version-add grants.",
+    "The production deploy output must disclose its exact-secret version-add boundary.",
   );
 }
 const activePreviewOperationsShas = sectionBetween(
@@ -2318,6 +2528,7 @@ const transitionPreviewOperatorShas = sectionBetween(
 );
 for (const boundary of [
   "default     = []",
+  "length(var.preview_operator_transition_workflow_shas) <= 1",
   "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
 ]) {
   requireContains(
