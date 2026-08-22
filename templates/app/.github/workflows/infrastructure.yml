@@ -9,4 +9,5 @@ jobs:
   infrastructure:
     permissions:
       contents: read
+      id-token: write # Permission ceiling for the main-only convergence job in the trusted reusable workflow.
     uses: collinbentley1/platform/.github/workflows/infrastructure.yml@__PLATFORM_SHA__
