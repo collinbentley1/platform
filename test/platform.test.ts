@@ -92,6 +92,11 @@ describe("platform scaffold and doctor", () => {
     const convergence = reusable.slice(reusable.indexOf("  terraform-convergence:\n"));
     expect(validation).not.toContain("id-token: write");
     expect(checkov).not.toContain("id-token: write");
+    expect(reusable.match(/id-token: write/g) ?? []).toHaveLength(1);
+    expect(convergence).toContain(
+      "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    );
+    expect(convergence).toContain("environment: production");
     expect(convergence).toContain("id-token: write");
   });
 
