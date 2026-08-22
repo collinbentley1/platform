@@ -68,6 +68,33 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("platform version drift");
   });
 
+  test("infrastructure caller grants the OIDC ceiling required by convergence", async () => {
+    const caller = await readFile(
+      join(repoRoot, "templates/app/.github/workflows/infrastructure.yml"),
+      "utf8",
+    );
+    expect(caller).toContain(
+      "permissions:\n      contents: read\n      id-token: write # Permission ceiling for the main-only convergence job in the trusted reusable workflow.",
+    );
+
+    const reusable = await readFile(
+      join(repoRoot, ".github/workflows/infrastructure.yml"),
+      "utf8",
+    );
+    const validation = reusable.slice(
+      reusable.indexOf("  terraform-validate:\n"),
+      reusable.indexOf("  checkov:\n"),
+    );
+    const checkov = reusable.slice(
+      reusable.indexOf("  checkov:\n"),
+      reusable.indexOf("  terraform-convergence:\n"),
+    );
+    const convergence = reusable.slice(reusable.indexOf("  terraform-convergence:\n"));
+    expect(validation).not.toContain("id-token: write");
+    expect(checkov).not.toContain("id-token: write");
+    expect(convergence).toContain("id-token: write");
+  });
+
   test("doctor rejects a block-scalar reusable-call decoy", async () => {
     const app = await scaffold("workflow-decoy");
     const path = join(app, ".github/workflows/deploy-prod.yml");
