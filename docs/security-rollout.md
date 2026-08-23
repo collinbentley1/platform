@@ -511,22 +511,29 @@ the recovery object and stop; never rerun from empty state.
    environment values are present, activate Critical History first. Its first
    reviewed new-SHA preview deploy sets the shared preview service ingress to
    `internal-and-cloud-load-balancing` and must nonce-verify a live tagged
-   revision through `https://pr-N.preview.ycriticalhistory.org`. Only after that
-   proof, apply the reviewed Critical production root to converge the declarative
-   ingress setting; require the stable tagged URL to remain healthy and the
-   generated `run.app` URL to be denied. Then enable each remaining consumer one
-   at a time and run fresh production, Terraform, preview build/publish/deploy,
-   cleanup, and reconciliation jobs at the new SHA. Require every unconditional
-   canary and operation to succeed. Disable that consumer again and stop on any
-   unexpected claim or permission; no broad project role remains during this
-   proof.
+   revision through `https://pr-N.preview.ycriticalhistory.org`. The preview
+   controller, not Terraform, owns the post-bootstrap ingress and invoker fields;
+   the infrastructure workflow shares its deployment-parity lock and must prove
+   the live OPEN/tagged or SEALED/zero-tag state instead of converging exposure.
+   Require the stable tagged URL to remain healthy and the generated `run.app`
+   URL to be denied. Then enable each remaining consumer one at a time and run
+   fresh production, Terraform, preview build/publish/deploy, cleanup, and
+   reconciliation jobs at the new SHA. Require every unconditional canary and
+   operation to succeed. Disable that consumer again and stop on any unexpected
+   claim or permission; no broad project role remains during this proof.
 11. Reconciliation must continue to report zero legacy `${SERVICE}-pr-*`
     services. Re-deploy any needed preview onto the shared service only after
     phase B.
 12. Use Policy Analyzer across the canary service account, project, parent
     folder, and organization. Rule out project roles and every alternate
     external-principal, public, group, domain, inherited, or custom grant that
-    could mint its tokens.
+    could mint its tokens. The project deny policy is a preventive guard for
+    Google-supported, explicitly enumerated in-scope permissions only; it is not
+    an absolute-zero-access claim (`iam.denypolicies.*` itself is not supported
+    in deny rules). Admission also requires bracketed direct project-policy and
+    cross-project Policy Analyzer results proving no effective preview-runtime
+    allow. Either guard failing or returning incomplete evidence keeps previews
+    sealed.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
     `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
     the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload
@@ -617,6 +624,22 @@ deployments.
    without redirects while the other stable preview remains healthy. Run
    reconciliation and repeat the 404 proof for an invalidated tag. Confirm the
    direct generated `run.app` URL remains denied throughout.
+   The production deploy must precede the first preview after every platform
+   pin or DHI-contract change. Confirm each admitted preview independently
+   proves the exact DHI development/runtime top-level and linux/amd64 child
+   tuple read from the 100%-served production revision. Preview application
+   index and runnable digests are expected to differ from production; a matching
+   version string, label, or Dockerfile is not sufficient. Confirm a newly
+   admitted secretless baseline is built from the exact production artifact and
+   returns an empty 404. A later same-DHI application-only production deploy
+   need not invalidate existing previews; the next admission refreshes the
+   baseline while independently reproving the immutable DHI tuple.
+   Before trusting emergency recovery, exercise the two-write label fence on a
+   sealed canary service: the reserved label add and removal must each complete
+   through a known Cloud Run operation, advance both service etag and generation,
+   preserve every non-fence label, and leave revision and traffic projections
+   byte-identical. If either write is a semantic no-op or its response is lost,
+   retain the durable transition marker and stop the rollout.
    These post-cutover operations prove the custom revision-deployer role.
    Cloud-mutation jobs key on immutable repository ID and use `queue: max`,
    serializing up to 100 pending runs FIFO across deploy/apply or

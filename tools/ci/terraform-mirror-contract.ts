@@ -94,6 +94,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     projectId: "medlock-1025243085",
     requiredServicesOverride: [
       "artifactregistry.googleapis.com",
+      "cloudasset.googleapis.com",
       "cloudresourcemanager.googleapis.com",
       "firestore.googleapis.com",
       "iam.googleapis.com",
@@ -126,6 +127,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     projectId: "runsetta",
     requiredServicesOverride: [
       "artifactregistry.googleapis.com",
+      "cloudasset.googleapis.com",
       "cloudresourcemanager.googleapis.com",
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
@@ -159,6 +161,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     requiredServicesOverride: [
       "artifactregistry.googleapis.com",
       "certificatemanager.googleapis.com",
+      "cloudasset.googleapis.com",
       "cloudresourcemanager.googleapis.com",
       "compute.googleapis.com",
       "iam.googleapis.com",
@@ -277,6 +280,20 @@ export function validateTerraformMirrorContract(
   if (productionModule) {
     requireExactTopLevelAttribute(
       productionModule,
+      "deployment_parity_reader_service_account_email",
+      "var.deployment_parity_reader_service_account_email",
+      "infra/terraform/prod/main.tf module site must pass deployment_parity_reader_service_account_email exactly once",
+      failures,
+    );
+    requireExactTopLevelAttribute(
+      productionModule,
+      "preview_commit_service_account_email",
+      "var.preview_commit_service_account_email",
+      "infra/terraform/prod/main.tf module site must pass preview_commit_service_account_email exactly once",
+      failures,
+    );
+    requireExactTopLevelAttribute(
+      productionModule,
       "preview_ingress",
       "var.preview_ingress",
       "infra/terraform/prod/main.tf module site must pass preview_ingress = var.preview_ingress exactly once",
@@ -369,9 +386,71 @@ export function validateTerraformMirrorContract(
   requireCanonicalNamedBlock(
     parsed.productionVariables,
     "variable",
+    "deployment_parity_reader_service_account_email",
+    simpleVariable(
+      "deployment_parity_reader_service_account_email",
+      "Read-only deployment parity service account email.",
+      "string",
+      JSON.stringify(`gha-deploy-parity@${identity.projectId}.iam.gserviceaccount.com`),
+    ),
+    "infra/terraform/prod/variables.tf deployment parity reader input must remain the exact read-only identity",
+    failures,
+  );
+  requireCanonicalNamedBlock(
+    parsed.productionVariables,
+    "variable",
+    "preview_commit_service_account_email",
+    simpleVariable(
+      "preview_commit_service_account_email",
+      "Preview traffic/exposure transaction service account email.",
+      "string",
+      JSON.stringify(`gha-preview-commit@${identity.projectId}.iam.gserviceaccount.com`),
+    ),
+    "infra/terraform/prod/variables.tf preview commit identity must remain exact",
+    failures,
+  );
+  requireCanonicalNamedBlock(
+    parsed.productionVariables,
+    "variable",
     "preview_operator_service_account_email",
     previewOperatorVariable(identity.projectId),
     "infra/terraform/prod/variables.tf preview operator input must retain the retired no-grant semantics",
+    failures,
+  );
+  requireCanonicalNamedBlock(
+    parsed.bootstrapOutputs,
+    "output",
+    "deployment_parity_reader_service_account_email",
+    outputBlock(
+      "deployment_parity_reader_service_account_email",
+      "Read-only identity used by exact deployment workflows for DHI parity checks.",
+      "module.bootstrap.deployment_parity_reader_service_account_email",
+    ),
+    "infra/terraform/bootstrap/outputs.tf deployment parity reader output must remain exact",
+    failures,
+  );
+  requireCanonicalNamedBlock(
+    parsed.bootstrapOutputs,
+    "output",
+    "preview_commit_service_account_email",
+    outputBlock(
+      "preview_commit_service_account_email",
+      "Exact-workflow transaction identity scoped to preview traffic and exposure changes only.",
+      "module.bootstrap.preview_commit_service_account_email",
+    ),
+    "infra/terraform/bootstrap/outputs.tf preview commit identity output must remain exact",
+    failures,
+  );
+  requireCanonicalNamedBlock(
+    parsed.bootstrapOutputs,
+    "output",
+    "preview_iam_audit_service_account_email",
+    outputBlock(
+      "preview_iam_audit_service_account_email",
+      "Exact-workflow, read-only cross-project preview runtime IAM auditor.",
+      "module.bootstrap.preview_iam_audit_service_account_email",
+    ),
+    "infra/terraform/bootstrap/outputs.tf preview IAM auditor output must remain exact",
     failures,
   );
   requireCanonicalNamedBlock(
@@ -998,7 +1077,9 @@ function renderProductionModule(
     "preview_ingress = var.preview_ingress",
     "prod_deploy_service_account_email = var.prod_deploy_service_account_email",
     "prod_publisher_service_account_email = var.prod_publisher_service_account_email",
+    "deployment_parity_reader_service_account_email = var.deployment_parity_reader_service_account_email",
     "preview_deploy_service_account_email = var.preview_deploy_service_account_email",
+    "preview_commit_service_account_email = var.preview_commit_service_account_email",
     "preview_operator_service_account_email = var.preview_operator_service_account_email",
     "preview_publisher_service_account_email = var.preview_publisher_service_account_email",
   );
@@ -1127,10 +1208,22 @@ function renderProductionVariables(
       JSON.stringify(`gha-prod-publish@${projectId}.iam.gserviceaccount.com`),
     ),
     simpleVariable(
+      "deployment_parity_reader_service_account_email",
+      "Read-only deployment parity service account email.",
+      "string",
+      JSON.stringify(`gha-deploy-parity@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
       "preview_deploy_service_account_email",
       "Preview deploy service account email with exact-repository read access.",
       "string",
       JSON.stringify(`gha-preview-deploy@${projectId}.iam.gserviceaccount.com`),
+    ),
+    simpleVariable(
+      "preview_commit_service_account_email",
+      "Preview traffic/exposure transaction service account email.",
+      "string",
+      JSON.stringify(`gha-preview-commit@${projectId}.iam.gserviceaccount.com`),
     ),
     previewOperatorVariable(projectId),
     simpleVariable(
@@ -1274,11 +1367,26 @@ function renderBootstrapOutputs(): string {
       "Cloud Run deploy service account with read-only access to the exact preview image repository.",
       "module.bootstrap.preview_deploy_service_account_email",
     ),
+    outputBlock(
+      "preview_commit_service_account_email",
+      "Exact-workflow transaction identity scoped to preview traffic and exposure changes only.",
+      "module.bootstrap.preview_commit_service_account_email",
+    ),
+    outputBlock(
+      "preview_iam_audit_service_account_email",
+      "Exact-workflow, read-only cross-project preview runtime IAM auditor.",
+      "module.bootstrap.preview_iam_audit_service_account_email",
+    ),
     previewOperatorOutput(),
     outputBlock(
       "preview_publisher_service_account_email",
       "Artifact Registry-only service account used by the preview publish job.",
       "module.bootstrap.preview_publisher_service_account_email",
+    ),
+    outputBlock(
+      "deployment_parity_reader_service_account_email",
+      "Read-only identity used by exact deployment workflows for DHI parity checks.",
+      "module.bootstrap.deployment_parity_reader_service_account_email",
     ),
     outputBlock(
       "runtime_service_account_email",

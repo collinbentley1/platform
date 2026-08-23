@@ -101,6 +101,59 @@ resource "google_artifact_registry_repository_iam_member" "preview_deploy_reader
   member     = "serviceAccount:${var.preview_deploy_service_account_email}"
 }
 
+# Preview admission must inspect the exact image digest currently served by
+# production. This repository-scoped custom role has one permission: blob
+# download. It cannot list repositories, upload/delete artifacts, or read IAM.
+resource "google_artifact_registry_repository_iam_member" "deployment_parity_prod_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.site.location
+  repository = google_artifact_registry_repository.site.repository_id
+  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"
+  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"
+}
+
+# The same read-only identity must validate the immutable OCI graph of every
+# tagged preview before a production transition. Keep this grant scoped to the
+# one preview repository; it cannot enumerate repositories or mutate images.
+resource "google_artifact_registry_repository_iam_member" "deployment_parity_preview_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.preview.location
+  repository = google_artifact_registry_repository.preview.repository_id
+  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"
+  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"
+}
+
+# The transaction committer re-proves every proposed and admitted immutable OCI
+# graph while its rollback trap is armed. These exact-repository grants contain
+# only blob download and confer no list, upload, delete, tag, or IAM permission.
+resource "google_artifact_registry_repository_iam_member" "preview_commit_prod_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.site.location
+  repository = google_artifact_registry_repository.site.repository_id
+  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"
+  member     = "serviceAccount:${var.preview_commit_service_account_email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "preview_commit_preview_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.preview.location
+  repository = google_artifact_registry_repository.preview.repository_id
+  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"
+  member     = "serviceAccount:${var.preview_commit_service_account_email}"
+}
+
+# The preview deployer needs the documented Artifact Registry Reader contract on
+# the exact production repository so Cloud Run can seed the sanitized baseline
+# from the immutable image already proven live in production. Repository scope
+# grants no upload, delete, or IAM permission.
+resource "google_artifact_registry_repository_iam_member" "preview_deploy_prod_image_reader" {
+  project    = var.project_id
+  location   = google_artifact_registry_repository.site.location
+  repository = google_artifact_registry_repository.site.repository_id
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${var.preview_deploy_service_account_email}"
+}
+
 moved {
   from = google_artifact_registry_repository_iam_member.prod_deploy_writer
   to   = google_artifact_registry_repository_iam_member.prod_publisher_writer
@@ -125,7 +178,11 @@ resource "google_artifact_registry_repository" "preview" {
     immutable_tags = false
   }
 
-  cleanup_policy_dry_run = false
+  # Preview revisions may remain routable for the lifetime of an open pull
+  # request. Keep the age policy observable but non-destructive until a
+  # digest-aware collector can prove that no live Cloud Run revision references
+  # an OCI index, runnable child, layer, or attestation before deletion.
+  cleanup_policy_dry_run = true
 
   cleanup_policies {
     id     = "delete-preview-images-after-30-days"
@@ -284,13 +341,16 @@ resource "google_cloud_run_v2_service_iam_member" "prod_deploy" {
 }
 
 resource "google_cloud_run_v2_service" "preview" {
-  project              = var.project_id
-  name                 = local.preview_service_name
-  location             = var.region
-  client               = "terraform"
-  deletion_protection  = true
-  ingress              = var.preview_ingress
-  invoker_iam_disabled = true
+  project             = var.project_id
+  name                = local.preview_service_name
+  location            = var.region
+  client              = "terraform"
+  deletion_protection = true
+  # The non-DHI bootstrap revision must never be publicly invokable. The
+  # serialized preview workflow owns exposure only after every traffic target
+  # has been replaced by and proven against the live production DHI lineage.
+  ingress              = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  invoker_iam_disabled = false
   labels               = merge(local.labels, { environment = "preview" })
 
   template {
@@ -338,11 +398,18 @@ resource "google_cloud_run_v2_service" "preview" {
     ignore_changes = [
       client,
       client_version,
+      # The serialized preview controller owns these two top-level fields. It
+      # opens them only with an admitted tagged graph and atomically reseals the
+      # service when the final tag is removed.
+      ingress,
+      invoker_iam_disabled,
       labels,
       template[0].labels,
       # deploy-preview owns deterministic revision names. Land preview template
       # changes through that workflow first to avoid immutable-name conflicts.
       template[0].revision,
+      template[0].containers[0].args,
+      template[0].containers[0].command,
       template[0].containers[0].env,
       template[0].containers[0].image,
       traffic,
@@ -360,6 +427,49 @@ resource "google_cloud_run_v2_service_iam_member" "preview_deploy" {
   name     = google_cloud_run_v2_service.preview.name
   role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"
   member   = "serviceAccount:${var.preview_deploy_service_account_email}"
+}
+
+# Invoker-IAM enforcement is a service IAM-policy mutation, so keep that single
+# permission out of the shared production/preview revision-deployer role. This
+# second grant is bound only to the exact preview service and only to the preview
+# committer; it cannot alter production or any other service.
+resource "google_cloud_run_v2_service_iam_member" "preview_commit" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.preview.location
+  name     = google_cloud_run_v2_service.preview.name
+  role     = "projects/${var.project_id}/roles/previewTrafficCommitter"
+  member   = "serviceAccount:${var.preview_commit_service_account_email}"
+}
+
+# The dedicated parity identity can get only these two exact services and their
+# named revisions. It cannot list, update, delete, read IAM, actAs, or access
+# secrets. Preview uses production metadata; production uses preview metadata
+# to reject a base transition that would strand non-parity live tags.
+resource "google_cloud_run_v2_service_iam_member" "deployment_parity_prod_reader" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.site.location
+  name     = google_cloud_run_v2_service.site.name
+  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"
+  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"
+}
+
+# The transaction committer re-proves the currently served production baseline
+# immediately before preview CAS mutations. This second exact-service grant is
+# read-only; production update and IAM-policy permissions remain absent.
+resource "google_cloud_run_v2_service_iam_member" "preview_commit_prod_reader" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.site.location
+  name     = google_cloud_run_v2_service.site.name
+  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"
+  member   = "serviceAccount:${var.preview_commit_service_account_email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "deployment_parity_preview_reader" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.preview.location
+  name     = google_cloud_run_v2_service.preview.name
+  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"
+  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"
 }
 
 removed {

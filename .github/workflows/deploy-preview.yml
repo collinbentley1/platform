@@ -230,6 +230,8 @@ jobs:
       - name: Verify the exact checked-out pull request head
         env:
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(/usr/bin/git rev-parse --verify 'HEAD^{commit}')" = "$EXPECTED_HEAD_SHA"
@@ -579,6 +581,7 @@ jobs:
           esac
           {
             echo "project_id=$project_id"
+            echo "project_number=$project_number"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
@@ -668,6 +671,7 @@ jobs:
     outputs:
       image-digest: ${{ steps.copy.outputs.digest }}
       image-name: ${{ steps.app.outputs.image_name }}
+      runnable-digest: ${{ needs.verify-image.outputs.runnable-digest }}
 
     steps:
       - name: Reject workflow reruns before any privileged action
@@ -811,6 +815,7 @@ jobs:
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
           service_account: ${{ steps.app.outputs.publisher_service_account }}
           token_format: access_token
+          access_token_lifetime: 300s
           create_credentials_file: false
           export_environment_variables: false
 
@@ -896,23 +901,27 @@ jobs:
   deploy:
     name: Deploy isolated preview
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     needs:
       - attest
+      - prefetch-bases
       - publish
     if: >-
       needs.attest.result == 'success' &&
+      needs.prefetch-bases.result == 'success' &&
       needs.publish.result == 'success'
     environment: preview-cloud
     permissions:
+      actions: read # Download only this run's exact DHI base closure before OIDC.
       contents: read
       id-token: write # Exchange only for the service-scoped preview deploy identity.
       pull-requests: write # Post the validated tagged preview URL on its pull request.
     outputs:
+      admission-open: ${{ steps.traffic-commit.outcome }}
       deployed-revision: ${{ steps.deploy.outputs.revision }}
-      lifecycle-keep: ${{ steps.lifecycle.outputs.keep }}
+      lifecycle-keep: ${{ steps.traffic-commit.outputs.admitted }}
     concurrency:
-      group: preview-cloud-${{ github.event.repository.id }}
+      group: deployment-parity-${{ github.event.repository.id }}
       queue: max
       cancel-in-progress: false
 
@@ -930,10 +939,10 @@ jobs:
         run: |
           set -euo pipefail
           case "$REPOSITORY_ID" in
-            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; preview_ingress="all"; stable_preview_domain="" ;;
-            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; preview_ingress="all"; stable_preview_domain="" ;;
-            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; preview_ingress="all"; stable_preview_domain="" ;;
-            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; preview_ingress="internal-and-cloud-load-balancing"; stable_preview_domain="preview.ycriticalhistory.org" ;;
+            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api"; preview_ingress="all"; stable_preview_domain="" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site"; preview_ingress="internal-and-cloud-load-balancing"; stable_preview_domain="preview.ycriticalhistory.org" ;;
             *) echo "Repository id $REPOSITORY_ID is not registered for preview deployment." >&2; exit 1 ;;
           esac
           {
@@ -944,10 +953,82 @@ jobs:
             echo "service_name=$service_name"
             echo "stable_preview_domain=$stable_preview_domain"
             echo "preview_service=${service_name}-preview"
+            echo "production_image=us-east4-docker.pkg.dev/${project_id}/${repository}/${service_name}"
+            echo "preview_image=us-east4-docker.pkg.dev/${project_id}/${repository}-preview/${service_name}"
             echo "runtime_service_account=cloud-run-preview@${project_id}.iam.gserviceaccount.com"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"
+            echo "commit_service_account=gha-preview-commit@${project_id}.iam.gserviceaccount.com"
+            echo "iam_audit_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
+            echo "parity_service_account=gha-deploy-parity@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the exact reusable-workflow parity policy before OIDC
+        id: parity-policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-live-parity-policy"
+          repository="$RUNNER_TEMP/platform-live-parity-repository"
+          git_home="$RUNNER_TEMP/platform-live-parity-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" \
+            tools/ci/container-artifact-contract.sh \
+            tools/ci/cloud-run-dhi-parity.sh \
+            tools/ci/cloud-run-preview-controller.sh \
+            tools/ci/cloud-run-preview-traffic.sh \
+            tools/ci/deployment-parity-transition.sh \
+            tools/ci/preview-runtime-iam-contract.sh | tar -x -C "$destination"
+          for helper in container-artifact-contract.sh cloud-run-dhi-parity.sh cloud-run-preview-controller.sh cloud-run-preview-traffic.sh deployment-parity-transition.sh preview-runtime-iam-contract.sh; do
+            test -f "$destination/tools/ci/$helper" && test ! -L "$destination/tools/ci/$helper"
+          done
+          test -x "$destination/tools/ci/deployment-parity-transition.sh"
+          dhi_parity_id="$(/bin/bash "$destination/tools/ci/container-artifact-contract.sh" print-dhi-parity-id)"
+          [[ "$dhi_parity_id" =~ ^[a-z0-9]{50}$ ]]
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+          echo "dhi-parity-id=$dhi_parity_id" >> "$GITHUB_OUTPUT"
+
+      - name: Bind the exact DHI base artifact before OIDC
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          response="$RUNNER_TEMP/live-parity-base-artifact.json"
+          gh api --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$response"
+          jq -e --arg digest "sha256:${ARTIFACT_DIGEST}" --arg id "$ARTIFACT_ID" \
+            --arg name "platform-preview-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" \
+            --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson repo "${{ github.event.repository.id }}" '
+            (.id | tostring) == $id and .name == $name and .expired == false and .digest == $digest and
+            (.workflow_run.id | tostring) == $run and .workflow_run.head_sha == $sha and
+            .workflow_run.repository_id == $repo and .workflow_run.head_repository_id == $repo and
+            (.size_in_bytes > 0 and .size_in_bytes <= 1611661312)
+          ' "$response" >/dev/null
+
+      - name: Download only the exact DHI base artifact id
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/platform-live-parity-bases
+          skip-decompress: true
 
       - name: Install checksum-pinned Google Cloud CLI
         env:
@@ -974,12 +1055,154 @@ jobs:
             echo "CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true"
           } >> "$GITHUB_ENV"
 
+      - name: Authenticate the read-only deployment parity identity
+        id: parity-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.parity_service_account }}
+          create_credentials_file: true
+          export_environment_variables: false
+
+      - name: Prove exact live production DHI parity under the deployment lock
+        id: parity
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-live-parity-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EXPECTED_SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+          PARITY_CREDENTIAL_FILE: ${{ steps.parity-auth.outputs.credentials_file_path }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          REGION: ${{ steps.app.outputs.region }}
+          SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          token_file="$RUNNER_TEMP/deployment-parity-access-token"
+          header_file="$RUNNER_TEMP/deployment-parity-rest-header"
+          cleanup_parity_credentials() {
+            rm -f -- "$token_file" "$header_file"
+            if [[ "${PARITY_CREDENTIAL_FILE:-}" == "$GITHUB_WORKSPACE"/* ]] &&
+               { [ -f "$PARITY_CREDENTIAL_FILE" ] || [ -L "$PARITY_CREDENTIAL_FILE" ]; }; then
+              rm -f -- "$PARITY_CREDENTIAL_FILE"
+            fi
+          }
+          trap cleanup_parity_credentials EXIT
+          [[ "$PARITY_CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+          test -f "$PARITY_CREDENTIAL_FILE" && test ! -L "$PARITY_CREDENTIAL_FILE"
+          CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$PARITY_CREDENTIAL_FILE" gcloud auth print-access-token > "$token_file"
+          printf 'Authorization: Bearer %s\n' "$(<"$token_file")" > "$header_file"
+          service_json="$RUNNER_TEMP/live-production-service.json"
+          revision_json="$RUNNER_TEMP/live-production-revision.json"
+          gcloud --access-token-file="$token_file" run services describe "$SERVICE_NAME" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$service_json"
+          revision="$(jq -er '.status.latestReadyRevisionName | select(test("^[a-z][a-z0-9-]{0,62}$"))' "$service_json")"
+          gcloud --access-token-file="$token_file" run revisions describe "$revision" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$revision_json"
+          PARITY_SERVICE_JSON="$service_json" PARITY_REVISION_JSON="$revision_json" \
+            /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/cloud-run-dhi-parity.sh" prove-production
+          output_value() { sed -n "s/^$1=//p" "$2" | tail -n 1; }
+          live_index_image="$(output_value live_production_index_image "$GITHUB_OUTPUT")"
+          live_runnable_image="$(output_value live_production_runnable_image "$GITHUB_OUTPUT")"
+          live_head="$(jq -er '.metadata.labels["git-head-sha"]' "$revision_json")"
+          fetch_production_v2() {
+            local service_out="$1" revision_out="$2" exact_revision="$3"
+            curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+              --header "@$header_file" --output "$service_out" \
+              "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}"
+            curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+              --header "@$header_file" --output "$revision_out" \
+              "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}/revisions/${exact_revision}"
+          }
+          validate_production_v2() {
+            local service_v2="$1" revision_v2="$2" exact_revision="$3" index_image="$4" runnable_image="$5"
+            jq -e --arg name "projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}" --arg revision "$exact_revision" '
+              .name == $name and (.reconciling // false) == false and
+              .ingress == "INGRESS_TRAFFIC_ALL" and .invokerIamDisabled == true and
+              (.defaultUriDisabled // false) == false and
+              .generation == .observedGeneration and
+              .terminalCondition.type == "Ready" and .terminalCondition.state == "CONDITION_SUCCEEDED" and
+              all(.template.containers[]?; ((.baseImageUri // "") == "")) and
+              (.latestReadyRevision | split("/")[-1]) == $revision and
+              (.traffic | length) == 1 and .traffic[0].type == "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" and
+              .traffic[0].percent == 100 and ((.traffic[0].tag // "") == "") and ((.traffic[0].revision // "") == "") and
+              (.trafficStatuses | length) == 1 and .trafficStatuses[0].type == "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST" and
+              .trafficStatuses[0].percent == 100 and ((.trafficStatuses[0].tag // "") == "") and
+              ((.trafficStatuses[0].revision // "") == "")
+            ' "$service_v2" >/dev/null
+            jq -e --arg name "projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}/revisions/${exact_revision}" \
+              --arg image "$runnable_image" --arg index "${index_image##*@}" --arg runnable "${runnable_image##*@}" '
+              def exact_value($name):
+                [.containers[0].env[]? | select(.name == $name and (keys | sort) == ["name","value"]) | .value]
+                | if length == 1 then .[0] else error("missing or duplicate immutable image identity") end;
+              .name == $name and (.reconciling // false) == false and
+              (.containers | length) == 1 and .containers[0].image == $image and
+              ((.containers[0].baseImageUri // "") == "") and
+              exact_value("PLATFORM_IMAGE_INDEX_DIGEST") == $index and
+              exact_value("PLATFORM_IMAGE_RUNNABLE_DIGEST") == $runnable and
+              ([.conditions[]? | select(.type == "Ready" and .state == "CONDITION_SUCCEEDED")] | length) == 1
+            ' "$revision_v2" >/dev/null
+          }
+          v2_service_before="$RUNNER_TEMP/live-production-v2-service.json"
+          v2_revision_before="$RUNNER_TEMP/live-production-v2-revision.json"
+          fetch_production_v2 "$v2_service_before" "$v2_revision_before" "$revision"
+          validate_production_v2 "$v2_service_before" "$v2_revision_before" "$revision" "$live_index_image" "$live_runnable_image"
+          v2_service_before_sha="$(jq -cS '{name,generation,observedGeneration,ingress,invokerIamDisabled,defaultUriDisabled,traffic,trafficStatuses,latestReadyRevision,reconciling,terminalCondition,urls,uri,etag,template}' "$v2_service_before" | sha256sum | cut -d ' ' -f 1)"
+          v2_revision_before_sha="$(jq -cS '{name,generation,labels,serviceAccount,containers,reconciling,conditions,etag}' "$v2_revision_before" | sha256sum | cut -d ' ' -f 1)"
+          AR_ACCESS_TOKEN="$(<"$token_file")" LIVE_PRODUCTION_INDEX_IMAGE="$live_index_image" \
+            LIVE_PRODUCTION_RUNNABLE_IMAGE="$live_runnable_image" LIVE_PRODUCTION_HEAD_SHA="$live_head" \
+            /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/container-artifact-contract.sh" verify-live-production
+          service_after="$RUNNER_TEMP/live-production-service-after-oci.json"
+          revision_after="$RUNNER_TEMP/live-production-revision-after-oci.json"
+          after_outputs="$RUNNER_TEMP/live-production-after-oci.outputs"
+          gcloud --access-token-file="$token_file" run services describe "$SERVICE_NAME" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$service_after"
+          revision_after_name="$(jq -er '.status.latestReadyRevisionName | select(test("^[a-z][a-z0-9-]{0,62}$"))' "$service_after")"
+          gcloud --access-token-file="$token_file" run revisions describe "$revision_after_name" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$revision_after"
+          GITHUB_OUTPUT="$after_outputs" PARITY_SERVICE_JSON="$service_after" PARITY_REVISION_JSON="$revision_after" \
+            /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/cloud-run-dhi-parity.sh" prove-production
+          v2_service_after="$RUNNER_TEMP/live-production-v2-service-after-oci.json"
+          v2_revision_after="$RUNNER_TEMP/live-production-v2-revision-after-oci.json"
+          fetch_production_v2 "$v2_service_after" "$v2_revision_after" "$revision_after_name"
+          validate_production_v2 "$v2_service_after" "$v2_revision_after" "$revision_after_name" \
+            "$(output_value live_production_index_image "$after_outputs")" \
+            "$(output_value live_production_runnable_image "$after_outputs")"
+          v2_service_after_sha="$(jq -cS '{name,generation,observedGeneration,ingress,invokerIamDisabled,defaultUriDisabled,traffic,trafficStatuses,latestReadyRevision,reconciling,terminalCondition,urls,uri,etag,template}' "$v2_service_after" | sha256sum | cut -d ' ' -f 1)"
+          v2_revision_after_sha="$(jq -cS '{name,generation,labels,serviceAccount,containers,reconciling,conditions,etag}' "$v2_revision_after" | sha256sum | cut -d ' ' -f 1)"
+          if [ "$v2_service_before_sha" != "$v2_service_after_sha" ] ||
+             [ "$v2_revision_before_sha" != "$v2_revision_after_sha" ]; then
+            echo "Production v2 service or revision changed while its remote OCI graph was being verified." >&2
+            exit 1
+          fi
+          for key in live_production_head_sha live_production_index_digest live_production_index_image live_production_runnable_digest live_production_runnable_image production_revision revision_projection_sha256 service_projection_sha256; do
+            test "$(output_value "$key" "$GITHUB_OUTPUT")" = "$(output_value "$key" "$after_outputs")" || {
+              echo "Production changed while its remote OCI graph was being verified." >&2
+              exit 1
+            }
+          done
+          echo "v2_service_projection_sha256=$v2_service_after_sha" >> "$GITHUB_OUTPUT"
+          echo "v2_revision_projection_sha256=$v2_revision_after_sha" >> "$GITHUB_OUTPUT"
+          cleanup_parity_credentials
+          trap - EXIT
+
       - name: Authenticate preview deployer
+        id: deploy-auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
           service_account: ${{ steps.app.outputs.deploy_service_account }}
+          token_format: access_token
+          access_token_lifetime: 300s
 
       - name: Confirm the pull request is still deployable
         env:
@@ -1003,10 +1226,21 @@ jobs:
       - name: Deploy preview to Cloud Run
         id: deploy
         env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-live-parity-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          DHI_PARITY_ID: ${{ steps.parity.outputs.dhi_parity_id }}
+          EXPECTED_PREVIEW_IMAGE_NAME: ${{ steps.app.outputs.preview_image }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
           IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
+          RUNNABLE_DIGEST: ${{ needs.publish.outputs.runnable-digest }}
           MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}
+          LIVE_PRODUCTION_HEAD_SHA: ${{ steps.parity.outputs.live_production_head_sha }}
+          LIVE_PRODUCTION_INDEX_IMAGE: ${{ steps.parity.outputs.live_production_index_image }}
+          LIVE_PRODUCTION_RUNNABLE_IMAGE: ${{ steps.parity.outputs.live_production_runnable_image }}
           PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
           PREVIEW_INGRESS: ${{ steps.app.outputs.preview_ingress }}
           PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
@@ -1021,14 +1255,23 @@ jobs:
           set -euo pipefail
           if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
              [[ ! "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ ! "$LIVE_PRODUCTION_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+             [ "$LIVE_PRODUCTION_INDEX_IMAGE" != "${EXPECTED_PRODUCTION_IMAGE_NAME}@${LIVE_PRODUCTION_INDEX_IMAGE##*@}" ] ||
+             [[ ! "$LIVE_PRODUCTION_INDEX_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] ||
+             [ "$LIVE_PRODUCTION_RUNNABLE_IMAGE" != "${EXPECTED_PRODUCTION_IMAGE_NAME}@${LIVE_PRODUCTION_RUNNABLE_IMAGE##*@}" ] ||
+             [[ ! "$LIVE_PRODUCTION_RUNNABLE_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] ||
+             [[ ! "$DHI_PARITY_ID" =~ ^[a-z0-9]{50}$ ]] ||
              [[ ! "$PLATFORM_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] ||
              [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+             [[ ! "$RUNNABLE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+             [ "$IMAGE_DIGEST" = "$RUNNABLE_DIGEST" ] ||
              [[ ! "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] ||
              [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] ||
              [[ ! "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]; then
             echo "Invalid pull request, commit, workflow-run, or image identity." >&2
             exit 1
           fi
+
           case "$REPOSITORY_ID" in
             280932482)
               if [ "$PREVIEW_INGRESS" != "internal-and-cloud-load-balancing" ] ||
@@ -1056,69 +1299,90 @@ jobs:
             echo "Derived Cloud Run revision identity is invalid: $expected_revision" >&2
             exit 1
           fi
-          tag="pr-${PR_NUMBER}"
-
           umask 077
           env_file="$RUNNER_TEMP/preview-env.json"
+          baseline_env_file="$RUNNER_TEMP/preview-baseline-env.json"
+          baseline_response="$RUNNER_TEMP/cloud-run-preview-baseline.json"
+          baseline_revision_response="$RUNNER_TEMP/cloud-run-preview-baseline-revision.json"
           response="$RUNNER_TEMP/cloud-run-preview-deploy.json"
           revision_response="$RUNNER_TEMP/cloud-run-preview-revision.json"
           health_body="$RUNNER_TEMP/preview-health.json"
           rollback_response="$RUNNER_TEMP/cloud-run-preview-rollback.json"
-          rollback_tag=false
+          route_service="$RUNNER_TEMP/cloud-run-preview-routes.json"
+          route_revisions="$RUNNER_TEMP/cloud-run-preview-route-revisions"
+          route_v2_revisions="$RUNNER_TEMP/cloud-run-preview-route-v2-revisions"
+          route_token="$RUNNER_TEMP/cloud-run-preview-route-token"
+          rest_token="$RUNNER_TEMP/cloud-run-preview-rest-token"
+          rest_header="$RUNNER_TEMP/cloud-run-preview-rest-header"
+          preseal_service="$RUNNER_TEMP/cloud-run-preview-preseal.json"
+          sealed_v2_service="$RUNNER_TEMP/cloud-run-preview-sealed-v2.json"
+          graph_outputs=""
+          image_set=""
+          routes_after=""
+          routes_before=""
+          routes_public=""
+          routes_sealed=""
           cleanup() {
             exit_status=$?
             set +e
-            if [ "$rollback_tag" = "true" ]; then
-              if gcloud run services describe "$PREVIEW_SERVICE" \
-                --region="$REGION" \
-                --project="$PROJECT_ID" \
-                --format=json > "$rollback_response" 2>/dev/null; then
-                current_revision="$(jq -er --arg tag "$tag" \
-                  '[.status.traffic[]? | select(.tag == $tag) | .revisionName] | if length == 1 then .[0] else "__unsafe__" end' \
-                  "$rollback_response" 2>/dev/null)"
-                if [ "$current_revision" = "$expected_revision" ]; then
-                  if gcloud run services update-traffic "$PREVIEW_SERVICE" \
-                    --region="$REGION" \
-                    --project="$PROJECT_ID" \
-                    --remove-tags="$tag" \
-                    --quiet >/dev/null 2>&1; then
-                    echo "Removed failed preview tag $tag from $expected_revision."
-                    if [ "$REPOSITORY_ID" = "280932482" ]; then
-                      stable_gone=false
-                      for attempt in $(seq 1 30); do
-                        if status="$(curl --silent --show-error \
-                          --output /dev/null \
-                          --write-out '%{http_code}' \
-                          --max-time 10 \
-                          --proto '=https' \
-                          "https://pr-${PR_NUMBER}.preview.ycriticalhistory.org")" &&
-                           [ "$status" = "404" ]; then
-                          stable_gone=true
-                          break
-                        fi
-                        if [ "$attempt" -lt 30 ]; then
-                          sleep 5
-                        fi
-                      done
-                      if [ "$stable_gone" != "true" ]; then
-                        echo "Failed preview remained routable after tag rollback." >&2
-                      fi
-                    fi
-                  else
-                    echo "Failed to remove invalid preview tag $tag; reconciliation is required." >&2
-                  fi
-                else
-                  echo "Preserving $tag because it no longer targets this run's revision." >&2
-                fi
-              else
-                echo "Could not inspect $tag during failed-deploy rollback; reconciliation is required." >&2
-              fi
+            rm -f "$env_file" "${env_file}.next" "$baseline_env_file" "$baseline_response" "$baseline_revision_response" "$response" "$revision_response" "$health_body" "$rollback_response" "$route_service" "$route_token" "$rest_token" "$rest_header" "$preseal_service" "$sealed_v2_service"
+            for artifact in "$graph_outputs" "$image_set" "$routes_after" "$routes_before" "$routes_public" "$routes_sealed"; do
+              [ -z "$artifact" ] || rm -f -- "$artifact"
+            done
+            find "$RUNNER_TEMP" -mindepth 1 -maxdepth 1 -type f -name 'preview-route-*-service.json' -delete
+            if [ -d "$route_revisions" ] && [ ! -L "$route_revisions" ]; then
+              find "$route_revisions" -depth -delete
             fi
-            rm -f "$env_file" "${env_file}.next" "$response" "$revision_response" "$health_body" "$rollback_response"
+            if [ -d "$route_v2_revisions" ] && [ ! -L "$route_v2_revisions" ]; then
+              find "$route_v2_revisions" -depth -delete
+            fi
             trap - EXIT
             exit "$exit_status"
           }
           trap cleanup EXIT
+          gcloud auth print-access-token > "$rest_token"
+          printf 'Authorization: Bearer %s\n' "$(<"$rest_token")" > "$rest_header"
+          fetch_preview_v2_service() {
+            local destination="$1"
+            curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+              --header "@$rest_header" --output "$destination" \
+              "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${PREVIEW_SERVICE}"
+          }
+          assert_preview_sealed() {
+            local service_v2="$1"
+            jq -e --arg name "projects/${PROJECT_ID}/locations/${REGION}/services/${PREVIEW_SERVICE}" '
+              .name == $name and (.reconciling // false) == false and
+              .ingress == "INGRESS_TRAFFIC_INTERNAL_ONLY" and (.invokerIamDisabled // false) == false and
+              (.defaultUriDisabled // false) == false and
+              .generation == .observedGeneration and
+              .terminalCondition.type == "Ready" and .terminalCondition.state == "CONDITION_SUCCEEDED" and
+              all(.template.containers[]?; ((.baseImageUri // "") == ""))
+            ' "$service_v2" >/dev/null
+          }
+          assert_preview_open() {
+            local service_v2="$1" expected_ingress
+            case "$PREVIEW_INGRESS" in
+              all) expected_ingress="INGRESS_TRAFFIC_ALL" ;;
+              internal-and-cloud-load-balancing) expected_ingress="INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER" ;;
+              *) return 1 ;;
+            esac
+            jq -e --arg name "projects/${PROJECT_ID}/locations/${REGION}/services/${PREVIEW_SERVICE}" --arg ingress "$expected_ingress" '
+              .name == $name and (.reconciling // false) == false and
+              .ingress == $ingress and .invokerIamDisabled == true and
+              (.defaultUriDisabled // false) == false and
+              .generation == .observedGeneration and
+              .terminalCondition.type == "Ready" and .terminalCondition.state == "CONDITION_SUCCEEDED" and
+              all(.template.containers[]?; ((.baseImageUri // "") == ""))
+            ' "$service_v2" >/dev/null
+          }
+          jq -n \
+            --arg index "${LIVE_PRODUCTION_INDEX_IMAGE##*@}" \
+            --arg runnable "${LIVE_PRODUCTION_RUNNABLE_IMAGE##*@}" \
+            '{
+              PLATFORM_DEPLOY_ENVIRONMENT:"preview-baseline",
+              PLATFORM_IMAGE_INDEX_DIGEST:$index,
+              PLATFORM_IMAGE_RUNNABLE_DIGEST:$runnable
+            }' > "$baseline_env_file"
           preview_nonce="$(openssl rand -hex 32)"
           if [[ ! "$preview_nonce" =~ ^[0-9a-f]{64}$ ]]; then
             echo "Failed to generate a valid preview deployment nonce." >&2
@@ -1126,10 +1390,14 @@ jobs:
           fi
           jq -n \
             --arg deploy_nonce "$preview_nonce" \
+            --arg index "$IMAGE_DIGEST" \
             --arg preview_number "$PR_NUMBER" \
+            --arg runnable "$RUNNABLE_DIGEST" \
             '{
               PLATFORM_DEPLOY_ENVIRONMENT: "preview",
               PLATFORM_DEPLOY_NONCE: $deploy_nonce,
+              PLATFORM_IMAGE_INDEX_DIGEST: $index,
+              PLATFORM_IMAGE_RUNNABLE_DIGEST: $runnable,
               PLATFORM_PREVIEW_NUMBER: $preview_number
             }' > "$env_file"
           case "$REPOSITORY_ID" in
@@ -1180,43 +1448,133 @@ jobs:
               ;;
           esac
 
-          rollback_tag=true
+          # Classify exposure before the first Cloud Run mutation. A local,
+          # credential, configuration, or read failure before this point must
+          # leave a previously admitted service byte-for-byte untouched.
+          gcloud run services describe "$PREVIEW_SERVICE" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$preseal_service"
+          fetch_preview_v2_service "$sealed_v2_service"
+          if assert_preview_open "$sealed_v2_service"; then
+            initial_exposure=open
+          elif assert_preview_sealed "$sealed_v2_service"; then
+            initial_exposure=sealed
+          else
+            echo "Preview service has an unknown exposure state; refusing to stage a revision." >&2
+            exit 1
+          fi
+          echo "initial-exposure=$initial_exposure" >> "$GITHUB_OUTPUT"
+
+          # Both deploys are deliberately unrouted. Their failures must not
+          # rewrite traffic or exposure; the etag-bound transaction below is
+          # the only admission mutation and owns its own exact rollback trap.
+
+          baseline_digest="${LIVE_PRODUCTION_INDEX_IMAGE##*@sha256:}"
+          baseline_suffix="b${LIVE_PRODUCTION_HEAD_SHA:0:10}-${baseline_digest:0:10}-r${run_tail}a${GITHUB_RUN_ATTEMPT}"
+          baseline_revision="${PREVIEW_SERVICE}-${baseline_suffix}"
+          if [[ ! "$baseline_revision" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || [ "${#baseline_revision}" -gt 63 ]; then
+            echo "Derived preview baseline revision identity is invalid: $baseline_revision" >&2
+            exit 1
+          fi
           gcloud run deploy "$PREVIEW_SERVICE" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
-            --image="${IMAGE_NAME}@${IMAGE_DIGEST}" \
-            --revision-suffix="$revision_suffix" \
-            --tag="$tag" \
+            --image="$LIVE_PRODUCTION_INDEX_IMAGE" \
+            --clear-base-image \
+            --revision-suffix="$baseline_suffix" \
             --no-traffic \
-            --env-vars-file="$env_file" \
+            --env-vars-file="$baseline_env_file" \
             --clear-secrets \
+            --command=bun \
+            '--args=^~^-e~Bun.serve({port:+process.env.PORT,fetch(){return new Response(null,{status:404})}})' \
             --service-account="$RUNTIME_SERVICE_ACCOUNT" \
-            --ingress="$PREVIEW_INGRESS" \
             --min-instances=0 \
             --max-instances=2 \
             --memory=512Mi \
             --cpu=1 \
             --concurrency=80 \
             --timeout=300s \
-            --labels="managed-by=github-actions,environment=preview,git-head-sha=${EXPECTED_HEAD_SHA},github-repository-id=${REPOSITORY_ID},github-pr=${PR_NUMBER},github-run-id=${GITHUB_RUN_ID},github-run-attempt=${GITHUB_RUN_ATTEMPT},platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}" \
+            --labels="managed-by=github-actions,environment=preview,preview-role=baseline,dhi-parity-id=${DHI_PARITY_ID},git-head-sha=${LIVE_PRODUCTION_HEAD_SHA},github-repository-id=${REPOSITORY_ID},github-run-id=${GITHUB_RUN_ID},github-run-attempt=${GITHUB_RUN_ATTEMPT},platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}" \
+            --quiet \
+            --format=json > "$baseline_response"
+          gcloud run revisions describe "$baseline_revision" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$baseline_revision_response"
+          jq -e --arg image "$LIVE_PRODUCTION_RUNNABLE_IMAGE" --arg head "$LIVE_PRODUCTION_HEAD_SHA" \
+            --arg index "${LIVE_PRODUCTION_INDEX_IMAGE##*@}" --arg runnable "${LIVE_PRODUCTION_RUNNABLE_IMAGE##*@}" \
+            --arg name "$baseline_revision" --arg parity "$DHI_PARITY_ID" --arg repository_id "$REPOSITORY_ID" '
+            def exact_value($name):
+              [.spec.containers[0].env[]? | select(.name == $name and (keys | sort) == ["name","value"]) | .value]
+              | if length == 1 then .[0] else error("missing or duplicate immutable image identity") end;
+            .metadata.name == $name and
+            .metadata.labels["preview-role"] == "baseline" and
+            .metadata.labels.environment == "preview" and
+            .metadata.labels["managed-by"] == "github-actions" and
+            .metadata.labels["dhi-parity-id"] == $parity and
+            .metadata.labels["git-head-sha"] == $head and
+            .metadata.labels["github-repository-id"] == $repository_id and
+            (.metadata.labels | has("github-pr") | not) and
+            ([.metadata.annotations // {} | keys[] | select(test("(^|/)(base-images|build-base-image|build-enable-automatic-updates|enable-automatic-updates|base-image-update)$"))] | length) == 0 and
+            ((.spec.runtimeClassName // "") == "") and
+            .spec.containers[0].image == $image and .status.imageDigest == $image and
+            exact_value("PLATFORM_IMAGE_INDEX_DIGEST") == $index and
+            exact_value("PLATFORM_IMAGE_RUNNABLE_DIGEST") == $runnable and
+            .spec.containers[0].command == ["bun"] and
+            .spec.containers[0].args == ["-e","Bun.serve({port:+process.env.PORT,fetch(){return new Response(null,{status:404})}})"]
+          ' "$baseline_revision_response" >/dev/null || {
+            echo "Preview baseline did not retain its exact image, 404 command, or provenance." >&2
+            exit 1
+          }
+          echo "baseline-revision=$baseline_revision" >> "$GITHUB_OUTPUT"
+
+          gcloud run deploy "$PREVIEW_SERVICE" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="${IMAGE_NAME}@${IMAGE_DIGEST}" \
+            --clear-base-image \
+            --revision-suffix="$revision_suffix" \
+            --no-traffic \
+            --env-vars-file="$env_file" \
+            --clear-secrets \
+            --command="" \
+            --args="" \
+            --service-account="$RUNTIME_SERVICE_ACCOUNT" \
+            --min-instances=0 \
+            --max-instances=2 \
+            --memory=512Mi \
+            --cpu=1 \
+            --concurrency=80 \
+            --timeout=300s \
+            --labels="managed-by=github-actions,environment=preview,preview-role=pr,dhi-parity-id=${DHI_PARITY_ID},git-head-sha=${EXPECTED_HEAD_SHA},github-repository-id=${REPOSITORY_ID},github-pr=${PR_NUMBER},github-run-id=${GITHUB_RUN_ID},github-run-attempt=${GITHUB_RUN_ATTEMPT},platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}" \
             --quiet \
             --format=json > "$response"
-          preview_record="$(jq -cer --arg tag "$tag" \
-            '[.status.traffic[]? | select(.tag == $tag) | {url, revisionName}] | if length == 1 then .[0] else error("expected exactly one tagged preview record") end' \
-            "$response")"
-          preview_url="$(jq -er '.url | select(type == "string" and startswith("https://"))' <<< "$preview_record")"
-          preview_revision="$(jq -er '.revisionName | select(type == "string")' <<< "$preview_record")"
-          if [ "$preview_revision" != "$expected_revision" ]; then
-            echo "Cloud Run tagged an unexpected revision: $preview_revision" >&2
+          preview_revision="$expected_revision"
+          deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
+          preview_url="$deterministic_url"
+          public_preview_url="$preview_url"
+          if [ "$REPOSITORY_ID" = "280932482" ]; then
+            public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"
+          fi
+          # The candidate has no tag and no traffic until the later etag-bound
+          # commit step. An older pr-N tag may exist, but it must never serve
+          # this run's fresh nonce before the atomic traffic PATCH.
+          sealed_candidate_body="$RUNNER_TEMP/preview-sealed-candidate-health.json"
+          sealed_candidate_status="$(curl --silent --show-error --output "$sealed_candidate_body" --write-out '%{http_code}' \
+            --max-filesize 1024 --max-time 10 --proto '=https' "${public_preview_url}/livez" 2>/dev/null || true)"
+          if [ "$sealed_candidate_status" = 200 ] &&
+             jq -e -s --arg nonce "$preview_nonce" 'length == 1 and .[0] == {deployment:$nonce,ok:true}' "$sealed_candidate_body" >/dev/null 2>&1; then
+            echo "New preview candidate was externally invokable before OCI admission." >&2
             exit 1
           fi
+          rm -f -- "$sealed_candidate_body"
           gcloud run revisions describe "$preview_revision" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
             --format=json > "$revision_response"
           jq -e \
             --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg dhi_parity_id "$DHI_PARITY_ID" \
             --arg head "$EXPECTED_HEAD_SHA" \
+            --arg image "${IMAGE_NAME}@${RUNNABLE_DIGEST}" \
+            --arg index "$IMAGE_DIGEST" --arg runnable "$RUNNABLE_DIGEST" \
             --arg name "$preview_revision" \
             --arg pr "$PR_NUMBER" \
             --arg repository_id "$REPOSITORY_ID" \
@@ -1228,82 +1586,315 @@ jobs:
             .metadata.labels["github-pr"] == $pr and
             .metadata.labels["github-run-id"] == $run and
             .metadata.labels["github-run-attempt"] == $attempt and
+            .metadata.labels["dhi-parity-id"] == $dhi_parity_id and
             .metadata.labels["managed-by"] == "github-actions" and
             .metadata.labels.environment == "preview" and
-            .metadata.labels["platform-workflow-sha"] == $workflow_sha
+            .metadata.labels["preview-role"] == "pr" and
+            .metadata.labels["platform-workflow-sha"] == $workflow_sha and
+            ([.metadata.annotations // {} | keys[] | select(test("(^|/)(base-images|build-base-image|build-enable-automatic-updates|enable-automatic-updates|base-image-update)$"))] | length) == 0 and
+            ((.spec.runtimeClassName // "") == "") and
+            (.spec.containers | length) == 1 and
+            .spec.containers[0].image == $image and
+            .status.imageDigest == $image and
+            ([.spec.containers[0].env[]? | select(.name == "PLATFORM_IMAGE_INDEX_DIGEST" and .value == $index)] | length) == 1 and
+            ([.spec.containers[0].env[]? | select(.name == "PLATFORM_IMAGE_RUNNABLE_DIGEST" and .value == $runnable)] | length) == 1 and
+            ((.spec.containers[0].command // []) | length) == 0 and
+            ((.spec.containers[0].args // []) | length) == 0
           ' "$revision_response" >/dev/null || {
             echo "Cloud Run revision provenance labels do not match this exact source and run." >&2
             exit 1
           }
-          deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
-          if [ "$preview_url" != "$deterministic_url" ] &&
-             [[ ! "$preview_url" =~ ^https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-[a-z0-9.-]+\.run\.app$ ]]; then
-            echo "Cloud Run returned an unexpected tagged preview origin." >&2
-            exit 1
-          fi
-
-          public_preview_url="$preview_url"
-          if [ "$REPOSITORY_ID" = "280932482" ]; then
-            public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"
-          fi
-
-          healthy=false
-          for attempt in $(seq 1 30); do
-            if health_status="$(curl --silent --show-error \
-              --output "$health_body" \
-              --write-out '%{http_code}' \
-              --max-filesize 1024 \
-              --max-time 10 \
-              "${public_preview_url}/livez")"; then
-              if [ "$health_status" = "200" ] &&
-                 jq -e -s --arg nonce "$preview_nonce" \
-                   'length == 1 and .[0] == {deployment: $nonce, ok: true}' \
-                   "$health_body" >/dev/null 2>&1; then
-                healthy=true
-                break
-              fi
-            fi
-            if [ "$attempt" -lt 30 ]; then
-              sleep 5
-            fi
-          done
-          if [ "$healthy" != "true" ]; then
-            echo "Preview health endpoint did not return the exact approved response." >&2
-            exit 1
-          fi
-
-          rollback_tag=false
-          echo "url=$public_preview_url" >> "$GITHUB_OUTPUT"
           echo "revision=$preview_revision" >> "$GITHUB_OUTPUT"
+          echo "url=$public_preview_url" >> "$GITHUB_OUTPUT"
+          # The two newly created revisions are deliberately unrouted. Traffic
+          # is committed only after a second production proof and a fresh
+          # lifecycle/OCI proof in the etag-bound transaction below.
 
-      - name: Recheck pull request state after deployment
-        id: lifecycle
+      - name: Retire preview deploy credentials before production reproof
+        if: steps.deploy.outcome == 'success'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
-          EXPECTED_REPOSITORY: ${{ github.repository }}
+          CREDENTIAL_FILE: ${{ steps.deploy-auth.outputs.credentials_file_path }}
         run: |
           set -euo pipefail
-          pr_json="$RUNNER_TEMP/post-deploy-pr.json"
-          if ! gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$pr_json"; then
-            echo "keep=false" >> "$GITHUB_OUTPUT"
-            echo "Current pull request state could not be proven; the exact deployed revision will be invalidated." >&2
-            exit 0
-          fi
-          if jq -e --arg head "$EXPECTED_HEAD_SHA" --arg repository "$EXPECTED_REPOSITORY" --arg repository_id "$EXPECTED_REPOSITORY_ID" '
-            .state == "open" and .draft == false and .head.sha == $head and
-            (.head.repo.id | tostring) == $repository_id and .head.repo.full_name == $repository and
-            .base.ref == "main"
-          ' "$pr_json" >/dev/null; then
-            echo "keep=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "keep=false" >> "$GITHUB_OUTPUT"
-          fi
+          [[ "$CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+          test -f "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
+          rm -f -- "$CREDENTIAL_FILE"
+          test ! -e "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "GOOGLE_GHA_CREDS_PATH="
+          } >> "$GITHUB_ENV"
 
-      - name: Comment preview URL
-        if: steps.lifecycle.outputs.keep == 'true'
+      - name: Re-authenticate the read-only parity identity before traffic commit
+        if: steps.deploy.outcome == 'success'
+        id: post-parity-auth
+        continue-on-error: true
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.parity_service_account }}
+          create_credentials_file: true
+          export_environment_variables: false
+
+      - name: Re-prove unchanged production and its OCI graph before traffic commit
+        if: steps.deploy.outcome == 'success' && steps.post-parity-auth.outcome == 'success'
+        id: post-parity
+        continue-on-error: true
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-live-parity-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          EXPECTED_LIVE_PRODUCTION_HEAD_SHA: ${{ steps.parity.outputs.live_production_head_sha }}
+          EXPECTED_LIVE_PRODUCTION_INDEX_IMAGE: ${{ steps.parity.outputs.live_production_index_image }}
+          EXPECTED_LIVE_PRODUCTION_RUNNABLE_IMAGE: ${{ steps.parity.outputs.live_production_runnable_image }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EXPECTED_REVISION_PROJECTION_SHA256: ${{ steps.parity.outputs.revision_projection_sha256 }}
+          EXPECTED_SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+          EXPECTED_SERVICE_PROJECTION_SHA256: ${{ steps.parity.outputs.service_projection_sha256 }}
+          EXPECTED_V2_REVISION_PROJECTION_SHA256: ${{ steps.parity.outputs.v2_revision_projection_sha256 }}
+          EXPECTED_V2_SERVICE_PROJECTION_SHA256: ${{ steps.parity.outputs.v2_service_projection_sha256 }}
+          PARITY_CREDENTIAL_FILE: ${{ steps.post-parity-auth.outputs.credentials_file_path }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          token_file="$RUNNER_TEMP/post-preview-parity-access-token"
+          header_file="$RUNNER_TEMP/post-preview-parity-rest-header"
+          cleanup_parity_credentials() {
+            rm -f -- "$token_file" "$header_file"
+            if [[ "${PARITY_CREDENTIAL_FILE:-}" == "$GITHUB_WORKSPACE"/* ]] &&
+               { [ -f "$PARITY_CREDENTIAL_FILE" ] || [ -L "$PARITY_CREDENTIAL_FILE" ]; }; then
+              rm -f -- "$PARITY_CREDENTIAL_FILE"
+            fi
+          }
+          trap cleanup_parity_credentials EXIT
+          [[ "$PARITY_CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+          test -f "$PARITY_CREDENTIAL_FILE" && test ! -L "$PARITY_CREDENTIAL_FILE"
+          CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$PARITY_CREDENTIAL_FILE" gcloud auth print-access-token > "$token_file"
+          printf 'Authorization: Bearer %s\n' "$(<"$token_file")" > "$header_file"
+          service_json="$RUNNER_TEMP/post-preview-production-service.json"
+          revision_json="$RUNNER_TEMP/post-preview-production-revision.json"
+          outputs="$RUNNER_TEMP/post-preview-production.outputs"
+          gcloud --access-token-file="$token_file" run services describe "$SERVICE_NAME" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$service_json"
+          revision="$(jq -er '.status.latestReadyRevisionName | select(test("^[a-z][a-z0-9-]{0,62}$"))' "$service_json")"
+          gcloud --access-token-file="$token_file" run revisions describe "$revision" \
+            --project="$PROJECT_ID" --region="$REGION" --format=json > "$revision_json"
+          GITHUB_OUTPUT="$outputs" PARITY_SERVICE_JSON="$service_json" PARITY_REVISION_JSON="$revision_json" \
+            /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/cloud-run-dhi-parity.sh" prove-production
+          actual_service="$(sed -n 's/^service_projection_sha256=//p' "$outputs" | tail -n 1)"
+          actual_revision="$(sed -n 's/^revision_projection_sha256=//p' "$outputs" | tail -n 1)"
+          if [ "$actual_service" != "$EXPECTED_SERVICE_PROJECTION_SHA256" ] ||
+             [ "$actual_revision" != "$EXPECTED_REVISION_PROJECTION_SHA256" ]; then
+            echo "Production changed before the admitted preview completed health validation." >&2
+            exit 1
+          fi
+          production_v2="$RUNNER_TEMP/post-preview-production-v2-service.json"
+          revision_v2="$RUNNER_TEMP/post-preview-production-v2-revision.json"
+          curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+            --header "@$header_file" --output "$production_v2" \
+            "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}"
+          curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+            --header "@$header_file" --output "$revision_v2" \
+            "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}/revisions/${revision}"
+          actual_v2_service="$(jq -cS '{name,generation,observedGeneration,ingress,invokerIamDisabled,defaultUriDisabled,traffic,trafficStatuses,latestReadyRevision,reconciling,terminalCondition,urls,uri,etag,template}' "$production_v2" | sha256sum | cut -d ' ' -f 1)"
+          actual_v2_revision="$(jq -cS '{name,generation,labels,serviceAccount,containers,reconciling,conditions,etag}' "$revision_v2" | sha256sum | cut -d ' ' -f 1)"
+          if [ "$actual_v2_service" != "$EXPECTED_V2_SERVICE_PROJECTION_SHA256" ] ||
+             [ "$actual_v2_revision" != "$EXPECTED_V2_REVISION_PROJECTION_SHA256" ]; then
+            echo "Production v2 service or revision changed before final preview admission." >&2
+            exit 1
+          fi
+          actual_head="$(jq -er '.metadata.labels["git-head-sha"]' "$revision_json")"
+          actual_index="$(sed -n 's/^live_production_index_image=//p' "$outputs" | tail -n 1)"
+          actual_runnable="$(sed -n 's/^live_production_runnable_image=//p' "$outputs" | tail -n 1)"
+          if [ "$actual_head" != "$EXPECTED_LIVE_PRODUCTION_HEAD_SHA" ] ||
+             [ "$actual_index" != "$EXPECTED_LIVE_PRODUCTION_INDEX_IMAGE" ] ||
+             [ "$actual_runnable" != "$EXPECTED_LIVE_PRODUCTION_RUNNABLE_IMAGE" ]; then
+            echo "Production immutable image identity changed before preview traffic commit." >&2
+            exit 1
+          fi
+          AR_ACCESS_TOKEN="$(<"$token_file")" LIVE_PRODUCTION_HEAD_SHA="$actual_head" \
+            LIVE_PRODUCTION_INDEX_IMAGE="$actual_index" LIVE_PRODUCTION_RUNNABLE_IMAGE="$actual_runnable" \
+            /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/container-artifact-contract.sh" verify-live-production
+          cleanup_parity_credentials
+          trap - EXIT
+
+      - name: Retire post-health parity credentials before any rollback identity
+        if: steps.deploy.outcome == 'success'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          CREDENTIAL_FILE: ${{ steps.post-parity-auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CREDENTIAL_FILE" ]; then
+            [[ "$CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+            test ! -L "$CREDENTIAL_FILE"
+            rm -f -- "$CREDENTIAL_FILE"
+            test ! -e "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
+          fi
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "GOOGLE_GHA_CREDS_PATH="
+          } >> "$GITHUB_ENV"
+
+      - name: Prove the read-only identity is absent before traffic mutation
+        if: >-
+          steps.deploy.outcome == 'success' &&
+          steps.post-parity-auth.outcome == 'success' &&
+          steps.post-parity.outcome == 'success'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          READ_CREDENTIAL_FILE: ${{ steps.post-parity-auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          [[ "$READ_CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+          test ! -e "$READ_CREDENTIAL_FILE" && test ! -L "$READ_CREDENTIAL_FILE"
+          test -z "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}"
+          test -z "${GOOGLE_APPLICATION_CREDENTIALS:-}"
+          test -z "${GOOGLE_GHA_CREDS_PATH:-}"
+
+      - name: Authenticate the dedicated preview runtime IAM auditor
+        if: >-
+          steps.deploy.outcome == 'success' &&
+          steps.post-parity-auth.outcome == 'success' &&
+          steps.post-parity.outcome == 'success'
+        id: iam-audit-auth
+        continue-on-error: true
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.iam_audit_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Prove every preview runtime remains access-free before traffic mutation
+        id: iam-audit
+        if: steps.iam-audit-auth.outcome == 'success'
+        continue-on-error: true
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ACCESS_TOKEN: ${{ steps.iam-audit-auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/preview-runtime-iam-contract.sh" verify
+          echo "admitted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate the dedicated preview transaction committer
+        if: steps.deploy.outcome == 'success'
+        id: commit-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.commit_service_account }}
+          token_format: access_token
+          access_token_lifetime: 300s
+
+      - name: Prove current routes and atomically commit candidate traffic
+        if: >-
+          steps.commit-auth.outcome == 'success' &&
+          steps.post-parity-auth.outcome == 'success' &&
+          steps.post-parity.outcome == 'success' &&
+          steps.iam-audit.outputs.admitted == 'true'
+        id: traffic-commit
+        continue-on-error: true
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-live-parity-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          BASELINE_REVISION: ${{ steps.deploy.outputs.baseline-revision }}
+          DHI_PARITY_ID: ${{ steps.parity.outputs.dhi_parity_id }}
+          EXPECTED_BASELINE_PRODUCTION_HEAD_SHA: ${{ steps.parity.outputs.live_production_head_sha }}
+          EXPECTED_BASELINE_PRODUCTION_INDEX_IMAGE: ${{ steps.parity.outputs.live_production_index_image }}
+          EXPECTED_BASELINE_PRODUCTION_RUNNABLE_IMAGE: ${{ steps.parity.outputs.live_production_runnable_image }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_PREVIEW_IMAGE_NAME: ${{ steps.app.outputs.preview_image }}
+          EXPECTED_PREVIEW_RUNTIME_SERVICE_ACCOUNT: ${{ steps.app.outputs.runtime_service_account }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_REPOSITORY_ID: ${{ github.event.repository.id }}
+          EXPECTED_REVISION: ${{ steps.deploy.outputs.revision }}
+          GH_TOKEN: ${{ github.token }}
+          INITIAL_EXPOSURE: ${{ steps.deploy.outputs.initial-exposure }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_INGRESS: ${{ steps.app.outputs.preview_ingress }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+          STABLE_PREVIEW_DOMAIN: ${{ steps.app.outputs.stable_preview_domain }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "${PARITY_POLICY_ROOT}/tools/ci/cloud-run-preview-traffic.sh" commit
+
+      - name: Seal preview exposure when admission evidence is unavailable
+        id: fail-closed-seal
+        if: >-
+          steps.commit-auth.outcome == 'success' &&
+          (steps.post-parity-auth.outcome != 'success' ||
+           steps.post-parity.outcome != 'success' ||
+           steps.iam-audit.outputs.admitted != 'true' ||
+           steps.traffic-commit.outcome == 'failure')
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ACCESS_TOKEN: ${{ steps.commit-auth.outputs.access_token }}
+          DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "$PARITY_POLICY_ROOT/tools/ci/cloud-run-preview-controller.sh" seal
+
+      - name: Retire traffic-commit credentials
+        if: always() && github.run_attempt == '1'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          CREDENTIAL_FILE: ${{ steps.commit-auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CREDENTIAL_FILE" ]; then
+            [[ "$CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+            test ! -L "$CREDENTIAL_FILE"
+            rm -f -- "$CREDENTIAL_FILE"
+            test ! -e "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
+          fi
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "GOOGLE_GHA_CREDS_PATH="
+          } >> "$GITHUB_ENV"
+
+      - name: Report fail-closed preview admission failure
+        if: steps.fail-closed-seal.outputs.admitted == 'true'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          echo "Preview exposure was sealed because production, runtime IAM, or transaction evidence was unavailable." >&2
+          exit 1
+      - name: Comment preview URL only after final admission
+        if: steps.traffic-commit.outputs.admitted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -1317,17 +1908,21 @@ jobs:
   invalidate:
     name: Invalidate stale preview
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    needs: deploy
+    timeout-minutes: 30
+    needs:
+      - deploy
+      - prefetch-bases
     if: >-
       always() &&
       needs.deploy.outputs.deployed-revision != '' &&
-      needs.deploy.outputs.lifecycle-keep != 'true'
+      (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')
     environment: preview-operations
     permissions:
-      id-token: write # Exchange only for the exact-SHA preview-operations path.
+      actions: read # Download only this run's exact DHI base closure.
+      id-token: write # Exchange only for exact-SHA read and transaction identities.
+      pull-requests: read # Re-prove every surviving tag before mutation.
     concurrency:
-      group: preview-cloud-${{ github.event.repository.id }}
+      group: deployment-parity-${{ github.event.repository.id }}
       queue: max
       cancel-in-progress: false
 
@@ -1345,22 +1940,102 @@ jobs:
         run: |
           set -euo pipefail
           case "$REPOSITORY_ID" in
-            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley" ;;
-            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta" ;;
-            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock" ;;
-            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history" ;;
+            1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api"; preview_ingress="all"; stable_preview_domain="" ;;
+            1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site"; preview_ingress="internal-and-cloud-load-balancing"; stable_preview_domain="preview.ycriticalhistory.org" ;;
             *) echo "Repository id $REPOSITORY_ID is not registered for preview invalidation." >&2; exit 1 ;;
           esac
           {
             echo "project_id=$project_id"
+            echo "project_number=$project_number"
             echo "region=us-east4"
+            echo "service_name=$service_name"
             echo "preview_service=${service_name}-preview"
+            echo "preview_ingress=$preview_ingress"
+            echo "stable_preview_domain=$stable_preview_domain"
+            echo "production_image=us-east4-docker.pkg.dev/${project_id}/${repository}/${service_name}"
+            echo "preview_image=us-east4-docker.pkg.dev/${project_id}/${repository}-preview/${service_name}"
+            echo "runtime_service_account=cloud-run-preview@${project_id}.iam.gserviceaccount.com"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
-            echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"
+            echo "commit_service_account=gha-preview-commit@${project_id}.iam.gserviceaccount.com"
+            echo "iam_audit_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Fetch exact preview controller policy before OIDC
+        id: parity-policy
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-invalidate-parity-policy"
+          repository="$RUNNER_TEMP/platform-invalidate-parity-repository"
+          git_home="$RUNNER_TEMP/platform-invalidate-parity-git-home"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" \
+            tools/ci/cloud-run-dhi-parity.sh \
+            tools/ci/cloud-run-preview-controller.sh \
+            tools/ci/container-artifact-contract.sh \
+            tools/ci/deployment-parity-transition.sh \
+            tools/ci/preview-runtime-iam-contract.sh | tar -x -C "$destination"
+          for helper in cloud-run-dhi-parity.sh cloud-run-preview-controller.sh container-artifact-contract.sh deployment-parity-transition.sh preview-runtime-iam-contract.sh; do
+            test -f "$destination/tools/ci/$helper" && test ! -L "$destination/tools/ci/$helper"
+          done
+          test -x "$destination/tools/ci/deployment-parity-transition.sh"
+          dhi_parity_id="$(/bin/bash "$destination/tools/ci/container-artifact-contract.sh" print-dhi-parity-id)"
+          [[ "$dhi_parity_id" =~ ^[a-z0-9]{50}$ ]]
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+          echo "dhi-parity-id=$dhi_parity_id" >> "$GITHUB_OUTPUT"
+
+      - name: Bind the exact DHI base artifact before OIDC
+        id: artifact-bind
+        if: needs.prefetch-bases.result == 'success'
+        continue-on-error: true
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          response="$RUNNER_TEMP/invalidate-base-artifact.json"
+          gh api --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$response"
+          jq -e --arg digest "sha256:${ARTIFACT_DIGEST}" --arg id "$ARTIFACT_ID" \
+            --arg name "platform-preview-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" \
+            --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson repo "${{ github.event.repository.id }}" '
+            (.id | tostring) == $id and .name == $name and .expired == false and .digest == $digest and
+            (.workflow_run.id | tostring) == $run and .workflow_run.head_sha == $sha and
+            .workflow_run.repository_id == $repo and .workflow_run.head_repository_id == $repo and
+            (.size_in_bytes > 0 and .size_in_bytes <= 1611661312)
+          ' "$response" >/dev/null
+
+      - name: Download only the exact DHI base artifact id
+        id: artifact-download
+        if: needs.prefetch-bases.result == 'success' && steps.artifact-bind.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/platform-invalidate-bases
+          skip-decompress: true
+
       - name: Install checksum-pinned Google Cloud CLI
+        id: gcloud
+        continue-on-error: true
         env:
           GCLOUD_SHA256: deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6
         run: |
@@ -1376,8 +2051,7 @@ jobs:
           export CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true
           export CLOUDSDK_CORE_DISABLE_PROMPTS=1
           export CLOUDSDK_CORE_DISABLE_USAGE_REPORTING=true
-          "$sdk_root/bin/gcloud" version --format=json \
-            | jq -e '.["Google Cloud SDK"] == "581.0.0"' >/dev/null
+          "$sdk_root/bin/gcloud" version --format=json | jq -e '.["Google Cloud SDK"] == "581.0.0"' >/dev/null
           echo "$sdk_root/bin" >> "$GITHUB_PATH"
           {
             echo "CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK=true"
@@ -1386,6 +2060,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prove exact preview operator workflow-SHA WIF trust
+        id: wif-canary
+        continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
@@ -1395,85 +2071,128 @@ jobs:
           create_credentials_file: false
           export_environment_variables: false
 
-      - name: Authenticate trusted preview deployer for stale-tag invalidation
+      - name: Authenticate the dedicated preview runtime IAM auditor for invalidation
+        id: iam-audit-auth
+        continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
-          service_account: ${{ steps.app.outputs.deploy_service_account }}
+          service_account: ${{ steps.app.outputs.iam_audit_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
 
-      - name: Remove a tag deployed after its pull request changed
+      - name: Prove every preview runtime remains access-free before invalidation
+        id: iam-audit
+        if: steps.iam-audit-auth.outcome == 'success'
+        continue-on-error: true
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          PROJECT_ID: ${{ steps.app.outputs.project_id }}
-          REGION: ${{ steps.app.outputs.region }}
-          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY_ID: ${{ github.event.repository.id }}
-          EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}
-          CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
+          ACCESS_TOKEN: ${{ steps.iam-audit-auth.outputs.access_token }}
         run: |
           set -euo pipefail
-          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] ||
-             [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]] ||
-             [[ ! "$EXPECTED_REVISION" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
-            echo "Refusing invalid preview tag or revision identity." >&2
-            exit 1
-          fi
+          set +x
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/preview-runtime-iam-contract.sh" verify
+          echo "admitted=true" >> "$GITHUB_OUTPUT"
 
-          tag="pr-${PR_NUMBER}"
-          service_json="$(mktemp)"
-          describe_error="$(mktemp)"
-          trap 'rm -f "$service_json" "$describe_error"' EXIT
+      - name: Authenticate the dedicated preview transaction committer for invalidation
+        id: commit-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.commit_service_account }}
+          token_format: access_token
+          access_token_lifetime: 300s
 
-          verify_stable_preview_absent() {
-            if [ "$REPOSITORY_ID" != "280932482" ]; then
-              return 0
-            fi
-            stable_url="https://pr-${PR_NUMBER}.preview.ycriticalhistory.org"
-            for attempt in $(seq 1 30); do
-              if status="$(curl --silent --show-error \
-                --output /dev/null \
-                --write-out '%{http_code}' \
-                --max-time 10 \
-                --proto '=https' \
-                "$stable_url")" && [ "$status" = "404" ]; then
-                return 0
-              fi
-              if [ "$attempt" -lt 30 ]; then
-                sleep 5
-              fi
-            done
-            echo "Stable preview URL remained routable after removing $tag." >&2
-            return 1
-          }
-          if ! gcloud run services describe "$PREVIEW_SERVICE" \
-            --region="$REGION" \
-            --project="$PROJECT_ID" \
-            --format=json > "$service_json" 2> "$describe_error"; then
-            cat "$describe_error" >&2
-            exit 1
-          fi
+      - name: Remove only the failed run's exact tag with one proven etag transaction
+        id: maintenance
+        continue-on-error: true
+        if: >-
+          needs.prefetch-bases.result == 'success' &&
+          steps.artifact-bind.outcome == 'success' &&
+          steps.artifact-download.outcome == 'success' &&
+          steps.gcloud.outcome == 'success' &&
+          steps.wif-canary.outcome == 'success' &&
+          steps.iam-audit.outputs.admitted == 'true' &&
+          steps.commit-auth.outcome == 'success'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-invalidate-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_PREVIEW_IMAGE_NAME: ${{ steps.app.outputs.preview_image }}
+          EXPECTED_PREVIEW_RUNTIME_SERVICE_ACCOUNT: ${{ steps.app.outputs.runtime_service_account }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_TARGET_REVISION: ${{ needs.deploy.outputs.deployed-revision }}
+          GH_TOKEN: ${{ github.token }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_INGRESS: ${{ steps.app.outputs.preview_ingress }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          SERVICE_NAME: ${{ steps.app.outputs.service_name }}
+          STABLE_PREVIEW_DOMAIN: ${{ steps.app.outputs.stable_preview_domain }}
+          TARGET_TAG: pr-${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "$PARITY_POLICY_ROOT/tools/ci/cloud-run-preview-controller.sh" remove
 
-          current_revision="$(jq -er --arg tag "$tag" \
-            '[.status.traffic[]? | select(.tag == $tag) | .revisionName] | if length == 0 then "__absent__" elif length == 1 then .[0] else error("duplicate preview traffic tag") end' \
-            "$service_json")"
-          if [ "$current_revision" = "__absent__" ]; then
-            echo "Preview tag $tag is already absent; nothing to invalidate."
-            verify_stable_preview_absent
-            exit 0
-          fi
-          if [[ ! "$current_revision" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
-            echo "Cloud Run returned an invalid current revision identity; preserving $tag." >&2
-            exit 1
-          fi
-          if [ "$current_revision" != "$EXPECTED_REVISION" ]; then
-            echo "Preserving $tag at $current_revision because this run deployed $EXPECTED_REVISION."
-            exit 0
-          fi
+      - name: Seal preview exposure when invalidation evidence is unavailable
+        id: fail-closed-seal
+        if: >-
+          steps.commit-auth.outcome == 'success' &&
+          (needs.prefetch-bases.result != 'success' ||
+           steps.artifact-bind.outcome != 'success' ||
+           steps.artifact-download.outcome != 'success' ||
+           steps.gcloud.outcome != 'success' ||
+           steps.wif-canary.outcome != 'success' ||
+           steps.iam-audit.outputs.admitted != 'true' ||
+           steps.maintenance.outcome == 'failure')
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ACCESS_TOKEN: ${{ steps.commit-auth.outputs.access_token }}
+          DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "$PARITY_POLICY_ROOT/tools/ci/cloud-run-preview-controller.sh" seal
 
-          gcloud run services update-traffic "$PREVIEW_SERVICE" \
-            --region="$REGION" \
-            --project="$PROJECT_ID" \
-            --remove-tags="$tag" \
-            --quiet
-          verify_stable_preview_absent
+      - name: Retire invalidation transaction credentials
+        if: always() && github.run_attempt == '1'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          CREDENTIAL_FILE: ${{ steps.commit-auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CREDENTIAL_FILE" ]; then
+            [[ "$CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+            test ! -L "$CREDENTIAL_FILE"
+            rm -f -- "$CREDENTIAL_FILE"
+            test ! -e "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
+          fi
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "GOOGLE_GHA_CREDS_PATH="
+          } >> "$GITHUB_ENV"
+
+      - name: Report fail-closed invalidation evidence failure
+        if: steps.fail-closed-seal.outputs.admitted == 'true'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          echo "Preview exposure was sealed because invalidation evidence was unavailable." >&2
+          exit 1

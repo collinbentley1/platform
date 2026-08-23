@@ -85,6 +85,20 @@ does not attest the overlaid Oven binary. Preview and production are required to
 use byte-identical base contexts and exporter/provenance settings, though their
 application source and final image digest naturally differ.
 
+That requirement is enforced against the workload actually serving traffic,
+not merely against two build configurations. Preview admission reads the exact
+untagged, 100%-served production revision, binds both its outer OCI index and
+Cloud Run's runnable child digest, and verifies the live provenance graph
+against the reviewed DHI closure. New revisions are staged with no traffic; an
+already admitted service may remain open while those unrouted revisions are
+proved. A strongly consistent transition marker excludes a concurrent DHI
+epoch change, and one exact-etag transaction routes only the fully proved graph.
+Its default route is a secretless 404 baseline with the proved production DHI
+lineage, and every `pr-N` revision is checked for the same DHI lineage, no-data
+runtime configuration, and current pull-request head. A service that began
+sealed opens only after the final proof. Production deployment likewise refuses
+to cross a DHI lineage boundary while any tagged preview is routable.
+
 Each preview revision records the exact 40-hex platform workflow commit. A
 consumer `main` push runs reconciliation immediately (with the hourly schedule
 as a backstop) and removes every preview tag whose revision lacks that commit or
@@ -92,6 +106,12 @@ names an older one. Consequently, a platform-pin change cannot leave an active
 preview on a different DHI contract: even if the corresponding production
 deployment fails, the old preview is made unavailable rather than presented as
 production parity.
+
+Cleanup and reconciliation remove only the intended tag while preserving other
+fully admitted routes. A zero-tag service, an unknown exposure state, or an
+ambiguous survivor proof is sealed to internal-only ingress with invoker IAM
+checks enabled. Release rollouts therefore deploy production first and create
+fresh previews only after the new production image has passed live parity.
 
 Socket scanning is credential-free. The local scanner enforces the public
 policy, and the `Socket Firewall` check additionally requires the exact

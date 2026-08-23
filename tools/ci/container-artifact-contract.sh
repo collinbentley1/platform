@@ -13,6 +13,11 @@ readonly DHI_DEV_TOP_DIGEST=sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c
 readonly DHI_RUNTIME_TOP_DIGEST=sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3
 readonly DHI_DEV_AMD64_DIGEST=sha256:58a392f5dec3be5cb20a2495baca84ac785f237a2d2904c5b9cad7ba11f3e475
 readonly DHI_RUNTIME_AMD64_DIGEST=sha256:0f9e5f506d653e0f87e44bb5c24fece19f9fb7253016f6e49d7a4783026f876d
+# Lossless base36 encoding of SHA-256(canonical dev/runtime top+amd64 tuple),
+# left-zero-padded to exactly 50 characters. It fits in a Cloud Run label while
+# preserving the full 256-bit identifier, including hashes whose base36 form is
+# naturally shorter than 50 characters.
+readonly DHI_PARITY_ID=1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8
 readonly MAX_BASE_BYTES=1610612736
 readonly MAX_IMAGE_BYTES=1073741824
 readonly MAX_TAR_ENTRIES=4096
@@ -789,6 +794,33 @@ validate_runtime_manifest_lineage() {
   ' "$manifest" >/dev/null || die "Final runtime layers do not exactly extend the reviewed DHI runtime descriptors."
 }
 
+validate_buildkit_provenance_statement() {
+  local statement="$1" runnable_digest="$2" expected_kind="$3" expected_head="$4"
+  local oven_child="$5" dev_child="$6" runtime_child="$7"
+  require_json_file "$statement" "$MAX_ATTESTATION_JSON_BYTES"
+  require_digest "$runnable_digest"
+  [[ "$expected_kind" == preview || "$expected_kind" == production ]] || die "BuildKit provenance kind is invalid."
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die "BuildKit provenance source SHA is invalid."
+  require_digest "$oven_child"
+  require_digest "$dev_child"
+  require_digest "$runtime_child"
+  jq -e --arg image "${runnable_digest#sha256:}" --arg kind "$expected_kind" --arg head "$expected_head" --arg oven "${oven_child#sha256:}" --arg dev "${dev_child#sha256:}" --arg runtime "${runtime_child#sha256:}" '
+    (keys | sort) == ["_type", "predicate", "predicateType", "subject"] and
+    ._type == "https://in-toto.io/Statement/v1" and
+    .predicateType == "https://slsa.dev/provenance/v1" and
+    .subject == [{
+      digest:{sha256:$image},
+      name:("pkg:docker/platform-" + $kind + "@" + $head + "?platform=linux%2Famd64")
+    }] and
+    .predicate.buildDefinition.buildType == "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md" and
+    .predicate.buildDefinition.resolvedDependencies == [
+      {digest:{sha256:$oven},uri:("pkg:oci/platform.invalid/bun-release?digest=sha256:" + $oven + "&platform=linux%2Famd64")},
+      {digest:{sha256:$dev},uri:("pkg:oci/platform.invalid/dhi-bun-dev?digest=sha256:" + $dev + "&platform=linux%2Famd64")},
+      {digest:{sha256:$runtime},uri:("pkg:oci/platform.invalid/dhi-bun-runtime?digest=sha256:" + $runtime + "&platform=linux%2Famd64")}
+    ]
+  ' "$statement" >/dev/null || die "OCI provenance statement drifted from the pinned BuildKit v0.32.2 contract."
+}
+
 validate_application_oci_impl() {
   local image_root="$1" expected_index_digest="$2" expected_runnable_digest="$3" trusted_base_root="$4" expected_kind="$5" expected_head="$6"
   [[ "$expected_kind" == preview || "$expected_kind" == production ]] || die "Application OCI kind is invalid."
@@ -910,21 +942,7 @@ validate_application_oci_impl() {
   oven_child="$(jq -er '.images[] | select(.role == "oven") | .childDigest' "$trusted_base_root/manifest.json")"
   dev_child="$(jq -er '.images[] | select(.role == "dhi_dev") | .childDigest' "$trusted_base_root/manifest.json")"
   runtime_child="$(jq -er '.images[] | select(.role == "dhi_runtime") | .childDigest' "$trusted_base_root/manifest.json")"
-  jq -e --arg image "${runnable_digest#sha256:}" --arg kind "$expected_kind" --arg head "$expected_head" --arg oven "${oven_child#sha256:}" --arg dev "${dev_child#sha256:}" --arg runtime "${runtime_child#sha256:}" '
-    (keys | sort) == ["_type", "predicate", "predicateType", "subject"] and
-    ._type == "https://in-toto.io/Statement/v1" and
-    .predicateType == "https://slsa.dev/provenance/v1" and
-    .subject == [{
-      digest:{sha256:$image},
-      name:("pkg:docker/platform-" + $kind + "@" + $head + "?platform=linux%2Famd64")
-    }] and
-    .predicate.buildDefinition.buildType == "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md" and
-    .predicate.buildDefinition.resolvedDependencies == [
-      {digest:{sha256:$oven},uri:("pkg:oci/platform.invalid/bun-release?digest=sha256:" + $oven + "&platform=linux%2Famd64")},
-      {digest:{sha256:$dev},uri:("pkg:oci/platform.invalid/dhi-bun-dev?digest=sha256:" + $dev + "&platform=linux%2Famd64")},
-      {digest:{sha256:$runtime},uri:("pkg:oci/platform.invalid/dhi-bun-runtime?digest=sha256:" + $runtime + "&platform=linux%2Famd64")}
-    ]
-  ' "$statement" >/dev/null || die "OCI provenance statement drifted from the pinned BuildKit v0.32.2 contract."
+  validate_buildkit_provenance_statement "$statement" "$runnable_digest" "$expected_kind" "$expected_head" "$oven_child" "$dev_child" "$runtime_child"
 
   local reachable="$RUNNER_TEMP/application-reachable-$RANDOM"
   {
@@ -1219,6 +1237,229 @@ validate_promoted() {
   echo "image_archive=$root/image.oci.tar" >> "$GITHUB_OUTPUT"
 }
 
+validate_live_production_graph() {
+  local index="$1" manifest="$2" config="$3" attestation_manifest="$4" statement="$5"
+  local trusted_base_root="$6" expected_index_digest="$7" expected_head="$8" expected_kind="${9:-production}"
+  local expected_runnable_digest="${10:?}"
+  require_digest "$expected_index_digest"
+  require_digest "$expected_runnable_digest"
+  [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]] || die "Live production source SHA is invalid."
+  [[ "$expected_kind" == preview || "$expected_kind" == production ]] || die "Live image kind is invalid."
+  require_json_file "$index" "$MAX_INDEX_JSON_BYTES"
+  test "$(sha256_file "$index")" = "${expected_index_digest#sha256:}" || die "Live production index differs from the Cloud Run image digest."
+  jq -e '
+    (keys | sort) == ["manifests", "mediaType", "schemaVersion"] and
+    .schemaVersion == 2 and .mediaType == "application/vnd.oci.image.index.v1+json" and
+    (.manifests | type == "array" and length == 2) and
+    (.manifests[0] | (keys | sort) == ["digest", "mediaType", "platform", "size"] and
+      (.digest | test("^sha256:[0-9a-f]{64}$")) and
+      .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+      (.size | type == "number" and . > 0) and
+      .platform == {architecture:"amd64",os:"linux"}) and
+    (.manifests[1] | (keys | sort) == ["annotations", "digest", "mediaType", "platform", "size"] and
+      (.digest | test("^sha256:[0-9a-f]{64}$")) and
+      .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+      (.size | type == "number" and . > 0) and
+      .platform == {architecture:"unknown",os:"unknown"}) and
+    .manifests[1].annotations == {
+      "vnd.docker.reference.digest":.manifests[0].digest,
+      "vnd.docker.reference.type":"attestation-manifest"
+    }
+  ' "$index" >/dev/null || die "Live production OCI index schema drifted."
+
+  local runnable_digest runnable_size
+  runnable_digest="$(jq -er '.manifests[0].digest' "$index")"
+  runnable_size="$(jq -er '.manifests[0].size' "$index")"
+  test "$runnable_digest" = "$expected_runnable_digest" || die "Cloud Run runnable digest is not the child selected by the proven OCI index."
+  require_json_file "$manifest" "$MAX_MANIFEST_JSON_BYTES"
+  test "$(file_size "$manifest")" = "$runnable_size" || die "Live production runnable manifest size drifted."
+  verify_sha256 "${runnable_digest#sha256:}" "$manifest"
+  jq -e '
+    (keys | sort) == ["config", "layers", "mediaType", "schemaVersion"] and
+    .schemaVersion == 2 and .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+    (.config | (keys | sort) == ["digest", "mediaType", "size"]) and
+    .config.mediaType == "application/vnd.oci.image.config.v1+json" and
+    (.config.digest | test("^sha256:[0-9a-f]{64}$")) and (.config.size > 0) and
+    (.layers | length > 0 and length <= 256) and
+    all(.layers[];
+      ((keys | sort) == ["digest", "mediaType", "size"] or
+       (keys | sort) == ["annotations", "digest", "mediaType", "size"]) and
+      (.digest | test("^sha256:[0-9a-f]{64}$")) and (.size > 0) and
+      ((.annotations // {}) | type == "object" and all(to_entries[]; (.key | type == "string") and (.value | type == "string"))) and
+      (.mediaType == "application/vnd.oci.image.layer.v1.tar+gzip" or .mediaType == "application/vnd.oci.image.layer.v1.tar+zstd"))
+  ' "$manifest" >/dev/null || die "Live production runnable manifest schema drifted."
+
+  local config_digest
+  config_digest="$(jq -er '.config.digest' "$manifest")"
+  require_json_file "$config" "$MAX_CONFIG_JSON_BYTES"
+  test "$(file_size "$config")" = "$(jq -er '.config.size' "$manifest")" || die "Live production config size drifted."
+  verify_sha256 "${config_digest#sha256:}" "$config"
+
+  local runtime_manifest="$trusted_base_root/layouts/dhi_runtime/blobs/sha256/${DHI_RUNTIME_AMD64_DIGEST#sha256:}"
+  local runtime_config_digest runtime_config
+  runtime_config_digest="$(jq -er '.config.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$runtime_manifest")"
+  runtime_config="$trusted_base_root/layouts/dhi_runtime/blobs/sha256/${runtime_config_digest#sha256:}"
+  require_json_file "$runtime_config" "$MAX_CONFIG_JSON_BYTES"
+  test "$(file_size "$runtime_config")" = "$(jq -er '.config.size' "$runtime_manifest")"
+  verify_sha256 "${runtime_config_digest#sha256:}" "$runtime_config"
+  validate_runtime_config_lineage "$config" "$runtime_config" "$expected_head" "${GITHUB_REPOSITORY:?}"
+  validate_runtime_manifest_lineage "$manifest" "$runtime_manifest"
+
+  local attestation_digest attestation_size
+  attestation_digest="$(jq -er '.manifests[1].digest' "$index")"
+  attestation_size="$(jq -er '.manifests[1].size' "$index")"
+  require_json_file "$attestation_manifest" "$MAX_MANIFEST_JSON_BYTES"
+  test "$(file_size "$attestation_manifest")" = "$attestation_size" || die "Live production provenance manifest size drifted."
+  verify_sha256 "${attestation_digest#sha256:}" "$attestation_manifest"
+  jq -e --arg image "$runnable_digest" --argjson imageSize "$runnable_size" '
+    (keys | sort) == ["artifactType", "config", "layers", "mediaType", "schemaVersion", "subject"] and
+    .schemaVersion == 2 and .mediaType == "application/vnd.oci.image.manifest.v1+json" and
+    .artifactType == "application/vnd.docker.attestation.manifest.v1+json" and
+    .subject == {digest:$image,mediaType:"application/vnd.oci.image.manifest.v1+json",size:$imageSize} and
+    .config == {
+      data:"e30=",digest:"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      mediaType:"application/vnd.oci.empty.v1+json",size:2
+    } and
+    .layers == [(.layers[0])] and
+    (.layers[0] | (keys | sort) == ["annotations", "digest", "mediaType", "size"] and
+      .annotations == {"in-toto.io/predicate-type":"https://slsa.dev/provenance/v1"} and
+      .mediaType == "application/vnd.in-toto+json" and
+      (.digest | test("^sha256:[0-9a-f]{64}$")) and (.size > 0))
+  ' "$attestation_manifest" >/dev/null || die "Live production provenance manifest schema drifted."
+  local statement_digest statement_size
+  statement_digest="$(jq -er '.layers[0].digest' "$attestation_manifest")"
+  statement_size="$(jq -er '.layers[0].size' "$attestation_manifest")"
+  require_json_file "$statement" "$MAX_ATTESTATION_JSON_BYTES"
+  test "$(file_size "$statement")" = "$statement_size" || die "Live production provenance statement size drifted."
+  verify_sha256 "${statement_digest#sha256:}" "$statement"
+
+  local oven_child dev_child runtime_child
+  oven_child="$(jq -er '.images[] | select(.role == "oven") | .childDigest' "$trusted_base_root/manifest.json")"
+  dev_child="$(jq -er '.images[] | select(.role == "dhi_dev") | .childDigest' "$trusted_base_root/manifest.json")"
+  runtime_child="$(jq -er '.images[] | select(.role == "dhi_runtime") | .childDigest' "$trusted_base_root/manifest.json")"
+  validate_buildkit_provenance_statement "$statement" "$runnable_digest" "$expected_kind" "$expected_head" "$oven_child" "$dev_child" "$runtime_child"
+}
+
+fetch_and_validate_live_image() {
+  local regctl="$1" trusted_base_root="$2" live_kind="$3" live_head="$4"
+  local expected_image_name="$5" live_index_image="$6" live_runnable_image="$7" graph_id="$8"
+  [[ "$live_kind" == preview || "$live_kind" == production ]] || die "Live image kind is invalid."
+  [[ "$live_head" =~ ^[0-9a-f]{40}$ ]] || die "Live revision lacks an exact source SHA."
+  [[ "$expected_image_name" =~ ^us-east4-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+$ ]] || die "Expected live image name is invalid."
+  local expected_index_digest="${live_index_image##*@}"
+  require_digest "$expected_index_digest"
+  test "$live_index_image" = "${expected_image_name}@${expected_index_digest}" || die "Live OCI index reference is not canonical or is outside the exact repository."
+  local expected_runnable_digest="${live_runnable_image##*@}"
+  require_digest "$expected_runnable_digest"
+  test "$live_runnable_image" = "${expected_image_name}@${expected_runnable_digest}" || die "Cloud Run runnable reference is not canonical or is outside the exact repository."
+  [[ "$graph_id" =~ ^[1-9][0-9]*$ ]] || die "Live image graph id is invalid."
+  local graph="$RUNNER_TEMP/platform-live-image-session-$BASHPID/graph-${graph_id}"
+  test ! -e "$graph" && test ! -L "$graph" || die "Live image graph path exists."
+  install -d -m 0700 "$graph"
+  local repository="$expected_image_name"
+  "$regctl" manifest get "$live_index_image" --format raw-body > "$graph/index.json"
+  local runnable_digest attestation_digest
+  runnable_digest="$(jq -er '.manifests[0].digest | select(test("^sha256:[0-9a-f]{64}$"))' "$graph/index.json")"
+  test "$runnable_digest" = "$expected_runnable_digest" || die "Cloud Run runnable digest is not the child selected by the proven OCI index."
+  attestation_digest="$(jq -er '.manifests[1].digest | select(test("^sha256:[0-9a-f]{64}$"))' "$graph/index.json")"
+  "$regctl" manifest get "${repository}@${runnable_digest}" --format raw-body > "$graph/manifest.json"
+  local config_digest
+  config_digest="$(jq -er '.config.digest | select(test("^sha256:[0-9a-f]{64}$"))' "$graph/manifest.json")"
+  "$regctl" blob get "$repository" "$config_digest" > "$graph/config.json"
+  "$regctl" manifest get "${repository}@${attestation_digest}" --format raw-body > "$graph/attestation.json"
+  local statement_digest
+  statement_digest="$(jq -er '.layers[0].digest | select(test("^sha256:[0-9a-f]{64}$"))' "$graph/attestation.json")"
+  "$regctl" blob get "$repository" "$statement_digest" > "$graph/statement.json"
+
+  validate_live_production_graph "$graph/index.json" "$graph/manifest.json" "$graph/config.json" \
+    "$graph/attestation.json" "$graph/statement.json" "$trusted_base_root" "$expected_index_digest" "$live_head" "$live_kind" "$expected_runnable_digest"
+}
+
+verify_live_production() {
+  require_linux_x64
+  require_sha256 "${BASE_CONTENT_SHA256:?}"
+  require_sha256 "${BASE_MANIFEST_SHA256:?}"
+  test -n "${AR_ACCESS_TOKEN:-}" || die "Deployment parity access token is absent."
+
+  local base_artifact session trusted_base_root
+  base_artifact="$(single_regular_file "${BASE_DOWNLOAD_DIR:?}")"
+  verify_sha256 "$BASE_CONTENT_SHA256" "$base_artifact"
+  session="$RUNNER_TEMP/platform-live-image-session-$BASHPID"
+  test ! -e "$session" && test ! -L "$session" || die "Live image validation session path exists."
+  install -d -m 0700 "$session"
+  trusted_base_root="$session/bases"
+  trap 'rm -rf -- "$session"; unset AR_ACCESS_TOKEN DOCKER_CONFIG REGCTL_CONFIG' EXIT
+  safe_extract_tar "$base_artifact" "$trusted_base_root" "$((MAX_BASE_BYTES + 1048576))"
+  verify_sha256 "$BASE_MANIFEST_SHA256" "$trusted_base_root/manifest.json"
+  validate_base_bundle "$trusted_base_root"
+
+  local regctl="$RUNNER_TEMP/regctl-v${REGCTL_VERSION}"
+  if [ -f "$regctl" ] && [ ! -L "$regctl" ]; then
+    test "$(sha256_file "$regctl")" = "$REGCTL_SHA256" || die "Prepared regctl drifted."
+    "$regctl" version | grep -F "v${REGCTL_VERSION}" >/dev/null
+  else
+    install_regctl "$regctl"
+  fi
+  local auth="$session/auth"
+  install -d -m 0700 "$auth/docker" "$auth/regctl"
+  export DOCKER_CONFIG="$auth/docker" REGCTL_CONFIG="$auth/regctl/config.json"
+  printf '{"auths":{}}\n' > "$DOCKER_CONFIG/config.json"
+  printf '{"hosts":{}}\n' > "$REGCTL_CONFIG"
+  printf '%s' "$AR_ACCESS_TOKEN" | "$regctl" registry login us-east4-docker.pkg.dev --user oauth2accesstoken --pass-stdin
+  unset AR_ACCESS_TOKEN
+
+  local graph_id=0
+  if [ -n "${LIVE_IMAGE_SET_FILE:-}" ]; then
+    require_json_file "$LIVE_IMAGE_SET_FILE" "$MAX_INDEX_JSON_BYTES"
+    jq -e '
+      type == "array" and length > 0 and length <= 100 and
+      all(.[];
+        (keys | sort) == ["head", "index", "kind", "name", "runnable"] and
+        (.kind == "preview" or .kind == "production") and
+        (.head | test("^[0-9a-f]{40}$")) and
+        (.name | test("^us-east4-docker\\.pkg\\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+$")) and
+        (.index | test("^us-east4-docker\\.pkg\\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+@sha256:[0-9a-f]{64}$")) and
+        (.runnable | test("^us-east4-docker\\.pkg\\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+@sha256:[0-9a-f]{64}$")))
+    ' "$LIVE_IMAGE_SET_FILE" >/dev/null || die "Live image set schema drifted."
+    local live_kind live_head expected_image_name live_index_image live_runnable_image
+    while IFS=$'\t' read -r live_kind live_head expected_image_name live_index_image live_runnable_image; do
+      graph_id=$((graph_id + 1))
+      fetch_and_validate_live_image "$regctl" "$trusted_base_root" "$live_kind" "$live_head" \
+        "$expected_image_name" "$live_index_image" "$live_runnable_image" "$graph_id"
+    done < <(jq -r '.[] | [.kind, .head, .name, .index, .runnable] | @tsv' "$LIVE_IMAGE_SET_FILE")
+  else
+    graph_id=1
+    fetch_and_validate_live_image "$regctl" "$trusted_base_root" \
+      "${LIVE_IMAGE_KIND:-production}" \
+      "${LIVE_IMAGE_HEAD_SHA:-${LIVE_PRODUCTION_HEAD_SHA:-}}" \
+      "${EXPECTED_IMAGE_NAME:-${EXPECTED_PRODUCTION_IMAGE_NAME:-}}" \
+      "${LIVE_INDEX_IMAGE:-${LIVE_PRODUCTION_INDEX_IMAGE:-}}" \
+      "${LIVE_RUNNABLE_IMAGE:-${LIVE_PRODUCTION_RUNNABLE_IMAGE:-}}" "$graph_id"
+  fi
+  "$regctl" registry logout us-east4-docker.pkg.dev
+  rm -rf -- "$session"
+  unset DOCKER_CONFIG REGCTL_CONFIG
+  trap - EXIT
+  echo "dhi_parity_id=$DHI_PARITY_ID" >> "$GITHUB_OUTPUT"
+}
+
+test_live_production_graph() {
+  local outer_digest index runnable_digest manifest config_digest config attestation_digest attestation statement_digest statement
+  outer_digest="$(jq -er '.manifests[0].digest' "${TEST_IMAGE_ROOT:?}/index.json")"
+  index="$TEST_IMAGE_ROOT/blobs/sha256/${outer_digest#sha256:}"
+  runnable_digest="$(jq -er '.manifests[0].digest' "$index")"
+  manifest="$TEST_IMAGE_ROOT/blobs/sha256/${runnable_digest#sha256:}"
+  config_digest="$(jq -er '.config.digest' "$manifest")"
+  config="$TEST_IMAGE_ROOT/blobs/sha256/${config_digest#sha256:}"
+  attestation_digest="$(jq -er '.manifests[1].digest' "$index")"
+  attestation="$TEST_IMAGE_ROOT/blobs/sha256/${attestation_digest#sha256:}"
+  statement_digest="$(jq -er '.layers[0].digest' "$attestation")"
+  statement="$TEST_IMAGE_ROOT/blobs/sha256/${statement_digest#sha256:}"
+  validate_live_production_graph "$index" "$manifest" "$config" "$attestation" "$statement" \
+    "${TEST_BASE_ROOT:?}" "${TEST_EXPECTED_INDEX_DIGEST:-$outer_digest}" "${TEST_HEAD_SHA:?}" \
+    "${TEST_KIND:-production}" "${TEST_EXPECTED_RUNNABLE_DIGEST:-$runnable_digest}"
+}
+
 publish_image() {
   require_linux_x64
   require_digest "${EXPECTED_PUBLISHED_INDEX_DIGEST:?}"
@@ -1261,8 +1502,12 @@ case "${1:-}" in
   verify-base) verify_base ;;
   promote) promote_image ;;
   validate-promoted) validate_promoted ;;
+  verify-live-production) verify_live_production ;;
+  verify-live-image) verify_live_production ;;
+  verify-live-images) verify_live_production ;;
   prepare-publisher) prepare_publisher ;;
   publish) publish_image ;;
+  print-dhi-parity-id) printf '%s\n' "$DHI_PARITY_ID" ;;
   test-application-oci)
     test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The application OCI test entry point is disabled."
     validate_application_oci "${TEST_IMAGE_ROOT:?}" "${TEST_EXPECTED_INDEX_DIGEST:?}" "${TEST_EXPECTED_RUNNABLE_DIGEST:?}" "${TEST_BASE_ROOT:?}" "${TEST_KIND:?}" "${TEST_HEAD_SHA:?}"
@@ -1274,6 +1519,10 @@ case "${1:-}" in
   test-runtime-manifest)
     test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The runtime manifest test entry point is disabled."
     validate_runtime_manifest_lineage "${TEST_BUILT_MANIFEST:?}" "${TEST_RUNTIME_MANIFEST:?}"
+    ;;
+  test-live-production-graph)
+    test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The live production graph test entry point is disabled."
+    test_live_production_graph
     ;;
   test-safe-extract)
     test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The tar extraction test entry point is disabled."
@@ -1288,5 +1537,5 @@ case "${1:-}" in
     test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The Grype manifest test entry point is disabled."
     load_reviewed_grype_db_manifest >/dev/null
     ;;
-  *) echo "usage: container-artifact-contract.sh {prefetch|verify-base|promote|validate-promoted|prepare-publisher|publish}" >&2; exit 64 ;;
+  *) echo "usage: container-artifact-contract.sh {prefetch|verify-base|promote|validate-promoted|verify-live-production|verify-live-images|prepare-publisher|publish}" >&2; exit 64 ;;
 esac

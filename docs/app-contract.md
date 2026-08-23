@@ -116,6 +116,20 @@ to the hourly backstop, and removes traffic from a revision with a stale or
 missing commit label. If the matching production rollout fails, the old preview
 is unavailable rather than falsely retained as a parity preview.
 
+Preview admission proves this against the exact image currently serving 100%
+of untagged production traffic. It verifies the remote outer OCI index and the
+runnable child selected by Cloud Run, stages a secretless 404 default route,
+and validates every tagged revision's immutable OCI graph and no-data runtime
+configuration before any staged revision receives traffic. An already admitted
+service may remain open while new revisions are unrouted; the durable transition
+marker and final exact-etag traffic transaction, rather than staging itself,
+form the privileged admission boundary. A service that began sealed opens only
+after the final re-bracketed proof. A production transition is rejected while
+any routable preview has a different or unknown DHI lineage.
+Cleanup and reconciliation preserve proven sibling tags, but seal zero-tag or
+ambiguous service states. Rollouts must deploy production before publishing
+fresh previews for a new platform pin.
+
 Socket is credential-free: the local public-policy scanner is byte-bound to the
 platform, and `Socket Firewall` requires the exact successful checks from Socket
 GitHub App id `156372`. No Socket token or `dependency-scan` environment exists.

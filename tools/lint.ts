@@ -65,6 +65,8 @@ for (const workflow of platformWorkflows) {
         "${{ vars.DHI_USERNAME }}",
         "${{ vars.MAPBOX_PUBLIC_TOKEN }}",
       ]
+    : path.endsWith("cleanup-preview.yml") || path.endsWith("reconcile-previews.yml")
+    ? ["${{ vars.DHI_USERNAME }}"]
     : [];
   let unreviewedVariables = text;
   for (const variable of allowedVariables) {
@@ -93,6 +95,7 @@ requireContains(
 );
 
 const deployPreview = await read(".github/workflows/deploy-preview.yml");
+const previewTrafficTransaction = await read("tools/ci/cloud-run-preview-traffic.sh");
 
 for (const [path, workflow] of [
   [".github/workflows/deploy-preview.yml", deployPreview],
@@ -195,21 +198,16 @@ for (const needle of [
   'stable_preview_domain="preview.ycriticalhistory.org"',
   'preview_ingress="internal-and-cloud-load-balancing"',
   'echo "project_number=$project_number"',
-  '--ingress="$PREVIEW_INGRESS"',
   'deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"',
-  '[a-z0-9.-]+\\.run\\.app',
   'public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"',
   "PLATFORM_DEPLOY_NONCE: $deploy_nonce",
   'preview_nonce="$(openssl rand -hex 32)"',
   '"${public_preview_url}/livez"',
   "--max-filesize 1024",
-  'if health_status="$(curl --silent --show-error',
   'jq -e -s --arg nonce "$preview_nonce"',
-  'length == 1 and .[0] == {deployment: $nonce, ok: true}',
-  "rollback_tag=true",
-  'if [ "$current_revision" = "$expected_revision" ]',
-  '--remove-tags="$tag"',
-  "rollback_tag=false",
+  "--no-traffic",
+  '--command=""',
+  'steps.traffic-commit.outputs.admitted == \'true\'',
 ]) {
   requireContains(
     ".github/workflows/deploy-preview.yml",
@@ -218,22 +216,76 @@ for (const needle of [
     `Stable Critical History preview routing is missing: ${needle}`,
   );
 }
-requireBefore(
+rejectContains(
   ".github/workflows/deploy-preview.yml",
   previewDeployJob,
-  "rollback_tag=true",
-  'gcloud run deploy "$PREVIEW_SERVICE"',
-  "Preview rollback must arm before Cloud Run can mutate the shared service.",
+  '--tag="pr-${PR_NUMBER}"',
+  "A preview candidate must remain unrouted until the etag-bound transaction proves its complete graph.",
+);
+requireBefore(
+  "tools/ci/cloud-run-preview-traffic.sh",
+  sectionBetween(
+    previewTrafficTransaction,
+    "# Prove the complete proposed graph",
+    "trap - EXIT",
+  ),
+  "capture_snapshot before true",
+  "patched=true",
+  "The proposed route graph must be remotely proven before rollback is armed for the traffic CAS.",
 );
 requireContains(
-  ".github/workflows/deploy-preview.yml",
+  "tools/ci/cloud-run-preview-traffic.sh",
+  sectionBetween(previewTrafficTransaction, "patched=true", "patched=false"),
+  "capture_snapshot health-after false",
+  "The exact rollback must remain armed through post-health route and lifecycle revalidation.",
+);
+for (const needle of [
+  "capture_snapshot before true",
+  "capture_snapshot after false",
+  "preview-traffic-before-full.sha256",
+  "preview-traffic-after-full.sha256",
+  "etag:.etag",
+  "commit_update_mask=traffic",
+  "commit_update_mask=traffic,ingress,invokerIamDisabled",
+  "rollback_update_mask=traffic,ingress,invokerIamDisabled",
+  "?updateMask=${commit_update_mask}&allowMissing=false",
+  "rollback_exact_traffic",
+  "capture_snapshot sealed-admitted true",
+  "capture_snapshot sealed-admitted-after false",
+  "capture_snapshot final false",
+  "length == 1 and .[0] == {deployment:$nonce,ok:true}",
+  "capture_snapshot health-after false",
+  '[ "$live_url" = "$PREVIEW_URL" ]',
+  "patched=false",
+]) {
+  requireContains(
+    "tools/ci/cloud-run-preview-traffic.sh",
+    previewTrafficTransaction,
+    needle,
+    `Preview traffic transaction is missing: ${needle}`,
+  );
+}
+requireBefore(
+  "tools/ci/cloud-run-preview-traffic.sh",
   sectionBetween(
-    previewDeployJob,
-    'jq -e -s --arg nonce "$preview_nonce"',
-    'echo "url=$public_preview_url"',
+    previewTrafficTransaction,
+    "# Prove the complete proposed graph",
+    "trap - EXIT",
   ),
-  "rollback_tag=false",
-  "Preview rollback must remain armed until the stable health response is validated.",
+  "patched=true",
+  "?updateMask=${commit_update_mask}&allowMissing=false",
+  "Preview rollback must arm before the etag-bound traffic mutation.",
+);
+requireBefore(
+  "tools/ci/cloud-run-preview-traffic.sh",
+  sectionBetween(
+    previewTrafficTransaction,
+    "# Prove the complete proposed graph",
+    "trap - EXIT",
+  ),
+  "capture_snapshot health-after false",
+  "patched=false",
+  "Preview rollback must remain armed until stable health and lifecycle are revalidated.",
 );
 rejectContains(
   ".github/workflows/deploy-preview.yml",
@@ -624,13 +676,13 @@ requireContains(
 requireContains(
   ".github/workflows/deploy-preview.yml",
   previewInvalidation,
-  "gha-preview-deploy@",
-  "Stale-preview invalidation must authenticate the existing preview deploy identity.",
+  "gha-preview-commit@",
+  "Stale-preview invalidation must authenticate the dedicated preview transaction committer.",
 );
 for (const boundary of [
   "deployed-revision: ${{ steps.deploy.outputs.revision }}",
-  "EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}",
-  'if [ "$current_revision" != "$EXPECTED_REVISION" ]',
+  "EXPECTED_TARGET_REVISION: ${{ needs.deploy.outputs.deployed-revision }}",
+  'cloud-run-preview-controller.sh" remove',
 ]) {
   requireContains(
     ".github/workflows/deploy-preview.yml",
@@ -642,20 +694,10 @@ for (const boundary of [
 rejectContains(
   ".github/workflows/deploy-preview.yml",
   previewInvalidation,
-  "gha-preview-operator@",
-  "Active stale-preview invalidation must not authenticate the retired preview operator.",
-);
-rejectContains(
-  ".github/workflows/deploy-preview.yml",
-  previewInvalidation,
   "actions/checkout@",
   "Privileged stale-preview invalidation must not checkout or execute PR-controlled code.",
 );
-for (const needle of [
-  "verify_stable_preview_absent",
-  'preview.ycriticalhistory.org"',
-  '[ "$status" = "404" ]',
-]) {
+for (const needle of ["cloud-run-preview-controller.sh", "deployment-parity-transition.sh"]) {
   requireContains(
     ".github/workflows/deploy-preview.yml",
     previewInvalidation,
@@ -666,8 +708,7 @@ for (const needle of [
 for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
   const path = `.github/workflows/${workflowName}`;
   const workflow = await read(path);
-  requireContains(path, workflow, "gha-preview-deploy@", "Preview traffic operations must authenticate the existing preview deploy identity.");
-  rejectContains(path, workflow, "gha-preview-operator@", "Active preview traffic operations must not authenticate the retired operator identity.");
+  requireContains(path, workflow, "gha-preview-commit@", "Preview traffic operations must authenticate the dedicated preview transaction committer.");
   rejectContains(path, workflow, "gha-preview-publish@", "Preview traffic operations must not authenticate the publisher identity.");
   rejectContains(
     path,
@@ -675,25 +716,30 @@ for (const workflowName of ["cleanup-preview.yml", "reconcile-previews.yml"]) {
     "actions/checkout@",
     "Privileged preview traffic operations must not checkout or execute repository code.",
   );
+  requireContains(path, workflow, "cloud-run-preview-controller.sh", "Preview traffic operations must use the shared proven etag controller.");
+}
+for (const boundary of [
+  'removed_url="https://${removed_tag}.${STABLE_PREVIEW_DOMAIN}"',
+  '[ "$status" = 404 ]',
+]) {
   requireContains(
-    path,
-    workflow,
-    "verify_stable_preview_absent",
-    "Preview traffic operations must verify the stable Critical History URL is unroutable.",
-  );
-  requireContains(path, workflow, '[ "$status" = "404" ]', "Stable preview cleanup must require an exact 404 without redirects.");
-  rejectContains(
-    path,
-    sectionFrom(workflow, "verify_stable_preview_absent()"),
-    "--location",
-    "Stable preview teardown probes must not follow redirects.",
+    "tools/ci/cloud-run-preview-controller.sh",
+    await read("tools/ci/cloud-run-preview-controller.sh"),
+    boundary,
+    `The shared controller must prove exact stable-route teardown: ${boundary}`,
   );
 }
+rejectContains(
+  "tools/ci/cloud-run-preview-controller.sh",
+  sectionFrom(await read("tools/ci/cloud-run-preview-controller.sh"), "removed_checks="),
+  "--location",
+  "Stable preview teardown probes must not follow redirects.",
+);
 const cleanupPreview = await read(".github/workflows/cleanup-preview.yml");
 for (const boundary of [
   "github.event.pull_request.head.repo.full_name == github.repository",
   "PR_NUMBER: ${{ github.event.pull_request.number }}",
-  'preview_tag="pr-${PR_NUMBER}"',
+  'export TARGET_TAG="pr-${{ github.event.pull_request.number }}"',
 ]) {
   requireContains(
     ".github/workflows/cleanup-preview.yml",
@@ -706,7 +752,7 @@ const reconcilePreviews = await read(".github/workflows/reconcile-previews.yml")
 for (const boundary of [
   "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')",
   "github.ref == 'refs/heads/main'",
-  'gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}"',
+  'cloud-run-preview-controller.sh" reconcile',
 ]) {
   requireContains(
     ".github/workflows/reconcile-previews.yml",
@@ -1034,7 +1080,7 @@ const templateProductionVariables = await read("templates/app/infra/terraform/pr
 requireContains(
   "templates/app/infra/terraform/prod/main.tf",
   templateProductionMain,
-  "runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+  "runtime_secret_version_adder_ids               = var.runtime_secret_version_adder_ids",
   "The scaffold must pass the declared exact-secret version-adder set.",
 );
 requireContains(
@@ -1555,7 +1601,7 @@ const moduleVariables = await read("terraform/modules/cloud-run-service/variable
 const moduleVersions = await read("terraform/modules/cloud-run-service/versions.tf");
 if (
   createHash("sha256").update(moduleMain).digest("hex") !==
-  "8491d3a4c1acd5b5e463ff5e154ba601581d1cc3c777526c5a3ea22a4b521c21"
+  "349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab"
 ) {
   failures.push(
     "terraform/modules/cloud-run-service/main.tf: Security-critical module content changed; review it and both independent hash contracts together.",
@@ -1603,7 +1649,7 @@ const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.
 for (const moduleName of ["cloud-run-service", "bootstrap"]) {
   const moduleDirectory = join(root, "terraform/modules", moduleName);
   const approvedEntries = moduleName === "bootstrap"
-    ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
+    ? [...approvedModuleFiles, ".terraform.lock.hcl", "preview-runtime-deny.tf", "tests"].sort()
     : approvedModuleFiles;
   const moduleEntries = (await readdir(moduleDirectory)).sort();
   if (JSON.stringify(moduleEntries) !== JSON.stringify(approvedEntries)) {
@@ -1803,7 +1849,7 @@ rejectContains(
 requireContains(
   "terraform/deployments/prod/main.tf",
   productionDeployment,
-  'preview_ingress                   = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
+  'preview_ingress                          = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
   "Critical History previews must reject direct public run.app ingress after the frontend exists.",
 );
 for (const needle of [
@@ -1818,7 +1864,7 @@ for (const needle of [
   );
 }
 for (const needle of [
-  "runtime_secret_accessor_ids       = []",
+  "runtime_secret_accessor_ids              = []",
   'RUNSETTA_OFFLINE   = "1"',
   'RUNSETTA_TTS_MODEL = "gpt-4o-mini-tts"',
   'RUNSETTA_TTS_VOICE = "marin"',
@@ -1833,7 +1879,7 @@ for (const needle of [
 for (const needle of [
   '"waitlist-identity-keyset"',
   "runtime_secret_version_adder_ids = [",
-  "runtime_secret_version_adder_ids        = local.deployment.runtime_secret_version_adder_ids",
+  "runtime_secret_version_adder_ids               = local.deployment.runtime_secret_version_adder_ids",
 ]) {
   requireContains(
     "terraform/deployments/prod/main.tf",
@@ -1853,7 +1899,7 @@ requireContains(
   '"secretmanager.googleapis.com"',
   "Medlock must enable Secret Manager before the exact-version runtime binding is applied.",
 );
-if (productionDeployment.split("runtime_secret_version_adder_ids  = []").length - 1 !== 3) {
+if (productionDeployment.split("runtime_secret_version_adder_ids         = []").length - 1 !== 3) {
   failures.push(
     "terraform/deployments/prod/main.tf: Every non-Medlock production deploy identity must retain an empty secret-version-adder set.",
   );
@@ -1923,6 +1969,11 @@ const repositoryIamMembers = [
   .map((match) => match[1])
   .sort();
 const approvedRepositoryIamMembers = [
+  "deployment_parity_preview_image_reader",
+  "deployment_parity_prod_image_reader",
+  "preview_commit_preview_image_reader",
+  "preview_commit_prod_image_reader",
+  "preview_deploy_prod_image_reader",
   "preview_deploy_reader",
   "preview_publisher_writer",
   "prod_deploy_reader",
@@ -1951,10 +2002,19 @@ const allIamResources = [
   .map((match) => `${match[1]}.${match[2]}`)
   .sort();
 const approvedIamResources = [
+  "google_artifact_registry_repository_iam_member.deployment_parity_preview_image_reader",
+  "google_artifact_registry_repository_iam_member.deployment_parity_prod_image_reader",
+  "google_artifact_registry_repository_iam_member.preview_commit_preview_image_reader",
+  "google_artifact_registry_repository_iam_member.preview_commit_prod_image_reader",
+  "google_artifact_registry_repository_iam_member.preview_deploy_prod_image_reader",
   "google_artifact_registry_repository_iam_member.preview_deploy_reader",
   "google_artifact_registry_repository_iam_member.preview_publisher_writer",
   "google_artifact_registry_repository_iam_member.prod_deploy_reader",
   "google_artifact_registry_repository_iam_member.prod_publisher_writer",
+  "google_cloud_run_v2_service_iam_member.deployment_parity_preview_reader",
+  "google_cloud_run_v2_service_iam_member.deployment_parity_prod_reader",
+  "google_cloud_run_v2_service_iam_member.preview_commit",
+  "google_cloud_run_v2_service_iam_member.preview_commit_prod_reader",
   "google_cloud_run_v2_service_iam_member.preview_deploy",
   "google_cloud_run_v2_service_iam_member.prod_deploy",
   "google_secret_manager_secret_iam_member.prod_deploy_version_adder",
@@ -2004,6 +2064,42 @@ const exactIamBlocks = [
     "}",
   ].join("\n"),
   [
+    'resource "google_artifact_registry_repository_iam_member" "deployment_parity_prod_image_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.site.location",
+    "  repository = google_artifact_registry_repository.site.repository_id",
+    '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+    '  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "deployment_parity_preview_image_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.preview.location",
+    "  repository = google_artifact_registry_repository.preview.repository_id",
+    '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+    '  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "preview_commit_prod_image_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.site.location",
+    "  repository = google_artifact_registry_repository.site.repository_id",
+    '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+    '  member     = "serviceAccount:${var.preview_commit_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_artifact_registry_repository_iam_member" "preview_commit_preview_image_reader" {',
+    "  project    = var.project_id",
+    "  location   = google_artifact_registry_repository.preview.location",
+    "  repository = google_artifact_registry_repository.preview.repository_id",
+    '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+    '  member     = "serviceAccount:${var.preview_commit_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
     'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
     "  for_each = var.runtime_secret_accessor_ids",
     "",
@@ -2039,6 +2135,33 @@ const exactIamBlocks = [
     "  name     = google_cloud_run_v2_service.preview.name",
     '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
     '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "preview_commit" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.preview.location",
+    "  name     = google_cloud_run_v2_service.preview.name",
+    '  role     = "projects/${var.project_id}/roles/previewTrafficCommitter"',
+    '  member   = "serviceAccount:${var.preview_commit_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "deployment_parity_prod_reader" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.site.location",
+    "  name     = google_cloud_run_v2_service.site.name",
+    '  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"',
+    '  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+    "}",
+  ].join("\n"),
+  [
+    'resource "google_cloud_run_v2_service_iam_member" "deployment_parity_preview_reader" {',
+    "  project  = var.project_id",
+    "  location = google_cloud_run_v2_service.preview.location",
+    "  name     = google_cloud_run_v2_service.preview.name",
+    '  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"',
+    '  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
     "}",
   ].join("\n"),
 ];
@@ -2130,7 +2253,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "2f0d1579828f2afe7f8c5620cc4a843a5a9a9e0b321f6cf44038c797e19def61"
+  "9d63169bc57be55961cd0793bd30580b75cea2fc76293f993ed15fe58c0716b5"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2145,6 +2268,7 @@ const bootstrapIamResources = [
   .sort();
 const approvedBootstrapIamResources = [
   "google_project_iam_binding.editor_absent",
+  "google_project_iam_member.preview_iam_auditors",
   "google_project_iam_member.runtime_project_roles",
   "google_project_iam_member.terraform_convergence_reader",
   "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
@@ -2153,12 +2277,19 @@ const approvedBootstrapIamResources = [
   "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
   "google_service_account_iam_member.canary_wif_prod_workflow_sha",
   "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
+  "google_service_account_iam_member.deployment_parity_wif_preview_workflow_sha",
+  "google_service_account_iam_member.deployment_parity_wif_prod_workflow_sha",
+  "google_service_account_iam_member.preview_commit_wif_preview_operations_workflow_sha",
+  "google_service_account_iam_member.preview_commit_wif_prod_workflow_sha",
+  "google_service_account_iam_member.preview_commit_wif_workflow_sha",
   "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
   "google_service_account_iam_member.preview_deploy_wif_repo",
-  "google_service_account_iam_member.preview_deploy_wif_preview_operations_workflow_sha",
+  "google_service_account_iam_member.preview_deploy_wif_prod_workflow_sha",
   "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
   "google_service_account_iam_member.preview_operator_wif_repo",
   "google_service_account_iam_member.preview_operator_wif_workflow_sha",
+  "google_service_account_iam_member.preview_iam_audit_wif_preview_operations_workflow_sha",
+  "google_service_account_iam_member.preview_iam_audit_wif_workflow_sha",
   "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
   "google_service_account_iam_member.prod_deploy_uses_runtime",
   "google_service_account_iam_member.prod_deploy_wif_prod_env",
@@ -2167,9 +2298,11 @@ const approvedBootstrapIamResources = [
   "google_service_account_iam_member.terraform_wif_prod_env",
   "google_service_account_iam_member.terraform_wif_workflow_sha",
   "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
+  "google_storage_bucket_iam_binding.deployment_parity_transition_no_legacy_access",
   "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
   "google_storage_bucket_iam_binding.terraform_state_no_legacy_access",
   "google_storage_bucket_iam_member.terraform_state_access_logs_writer",
+  "google_storage_bucket_iam_member.preview_commit_transition_coordinator",
   "google_storage_bucket_iam_member.terraform_state_reader",
 ].sort();
 if (
@@ -2219,14 +2352,16 @@ if (/roles\/artifactregistry\.(?:admin|reader|writer)/.test(bootstrapMain)) {
     "terraform/modules/bootstrap/main.tf: Bootstrap must not grant predefined Artifact Registry roles.",
   );
 }
-if (
-  /google_service_account\.preview_operator\.(?:email|member)/.test(bootstrapMain) ||
-  bootstrapMain.includes("serviceAccount:gha-preview-operator@")
-) {
-  failures.push(
-    "terraform/modules/bootstrap/main.tf: The preview operator must not receive direct project, registry, state, secret, or runtime grants.",
-  );
-}
+requireContains(
+  "terraform/modules/bootstrap/main.tf",
+  sectionBetween(
+    bootstrapMain,
+    'resource "google_project_iam_member" "preview_iam_auditors"',
+    '\n}\n',
+  ),
+  "role    = google_project_iam_custom_role.preview_iam_auditor.name",
+  "The migration-stable preview operator may receive only the dedicated read-only IAM-auditor project role.",
+);
 const previewTrafficImageDownloaderRole = sectionBetween(
   bootstrapMain,
   'resource "google_project_iam_custom_role" "preview_traffic_image_downloader"',
@@ -2431,6 +2566,7 @@ for (const boundary of [
   'account_id   = "gha-prod-publish"',
   'account_id   = "gha-preview-publish"',
   'account_id   = "gha-preview-operator"',
+  'account_id   = "gha-preview-commit"',
   '"attribute.preview_deploy_workflow_sha"',
   '"attribute.preview_operator_workflow_sha"',
   '"attribute.prod_publish_workflow_sha"',
@@ -2441,7 +2577,8 @@ for (const boundary of [
   '"attribute.legacy_terraform"',
   'resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha"',
   'resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha"',
-  'resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"',
+  'resource "google_service_account_iam_member" "preview_commit_wif_workflow_sha"',
+  'resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha"',
   'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
   'resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha"',
   'resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha"',
@@ -2480,8 +2617,13 @@ for (const [binding, serviceAccount, attribute] of [
   ["prod_publisher_wif_workflow_sha", "prod_publisher", "prod_publish_workflow_sha"],
   ["preview_deploy_wif_workflow_sha", "preview_deploy", "preview_deploy_workflow_sha"],
   [
-    "preview_deploy_wif_preview_operations_workflow_sha",
-    "preview_deploy",
+    "preview_commit_wif_workflow_sha",
+    "preview_commit",
+    "preview_deploy_workflow_sha",
+  ],
+  [
+    "preview_commit_wif_preview_operations_workflow_sha",
+    "preview_commit",
     "preview_operator_workflow_sha",
   ],
   ["preview_operator_wif_workflow_sha", "preview_operator", "preview_operator_workflow_sha"],
@@ -2508,7 +2650,7 @@ for (const [binding, serviceAccount, attribute] of [
 }
 for (const [binding, forEach] of [
   [
-    "preview_deploy_wif_preview_operations_workflow_sha",
+    "preview_commit_wif_preview_operations_workflow_sha",
     "var.preview_operations_active_workflow_shas",
   ],
   ["preview_operator_wif_workflow_sha", "var.preview_operator_transition_workflow_shas"],

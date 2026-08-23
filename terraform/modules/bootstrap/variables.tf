@@ -127,6 +127,7 @@ variable "required_services" {
   type        = set(string)
   default = [
     "artifactregistry.googleapis.com",
+    "cloudasset.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
