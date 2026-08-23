@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "capability": "preview-deployment-parity",
+  "dhiParityId": "1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8",
+  "maxMutatorTokenLifetimeSeconds": 300,
+  "marker": {
+    "bucketSuffix": "-deployment-parity-state",
+    "object": "deployment-parity-transition",
+    "metadataVersion": "1"
+  },
+  "requiredFiles": {
+    ".github/workflows/cleanup-preview.yml": "sha256:d7e36659c24f259458bd38aa416a9338cfa64e90f2b0f7365aa5c32fe331f2ba",
+    ".github/workflows/deploy-preview.yml": "sha256:0d5d00863b4fe32de2d23b4ce4f3280aaf8f230fae51739402af7d86b16fb25e",
+    ".github/workflows/deploy-prod.yml": "sha256:4c1738cda03cd597278cf6b10ec9de7e65c8d9474a8bd99ba77d1ea17e9261c7",
+    ".github/workflows/infrastructure.yml": "sha256:2477f01ab74030075051b593de4911fbdff0d2fb7fd219df542d154af798d31f",
+    ".github/workflows/reconcile-previews.yml": "sha256:9ee51a051db4bf2de673980f14fddfdbeea96cdab0d04fed6254ffdb3fc5e135",
+    "terraform/modules/bootstrap/main.tf": "sha256:defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270",
+    "terraform/modules/bootstrap/preview-runtime-deny.tf": "sha256:e2b4799cddc80b105e519fe69459cff174fc7df02961f17d3bfb4a4966a3a98b",
+    "terraform/modules/bootstrap/variables.tf": "sha256:f7310af1189e80b819e2fbdb59c70eb0b1a55f2eebf1a9c1013bafd7b5b7b8ed",
+    "terraform/modules/cloud-run-service/main.tf": "sha256:349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",
+    "tools/ci/cloud-run-dhi-parity.sh": "sha256:bb3b759148c081b0135378046db1b09c32f710733bca9a96c00fa34d1815ce32",
+    "tools/ci/cloud-run-preview-controller.sh": "sha256:696a1f387d1f13bfe434829e591885ac59be6c18241f158f0244ca404e8d97e9",
+    "tools/ci/cloud-run-preview-traffic.sh": "sha256:dcdd2e9ae327053670faa210b33939db35de3dd7732199b4819384b92e224164",
+    "tools/ci/cloud-run-prod-dhi-transition.sh": "sha256:e3e4df7033e00ffd0b055efba63c1b5ab0ccb0c0490f78ddd790d2834beb5e04",
+    "tools/ci/container-artifact-contract.sh": "sha256:4b5737e8f5bee57c1de1e5c1371817f41b57559716f2a08ee07afb1933feba33",
+    "tools/ci/deployment-parity-transition.sh": "sha256:4fc1bd6aa4ce56926e8d5c305b557574b87dadf48dd56835f1d06b14be6ce5dc",
+    "tools/ci/preview-runtime-iam-contract.sh": "sha256:761ffb177acd54a1ef400264674f1480b48b1b417211c7f667a3bcfb8c4d64cb"
+  }
+}

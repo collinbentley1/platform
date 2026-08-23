@@ -89,6 +89,20 @@ locals {
     managed-by = "terraform"
   }
 
+  deployment_parity_transition_bucket = "${var.project_id}-deployment-parity-state"
+  deployment_parity_transition_object = "deployment-parity-transition"
+
+  # Every standalone project grants the same narrowly read-only custom role to
+  # each repository-local auditor. A preview transaction can therefore prove
+  # that none of the four preview runtime identities gained access in a sibling
+  # project without giving the traffic committer any IAM-read capability.
+  preview_iam_auditor_members = toset([
+    "serviceAccount:gha-preview-operator@cdbentley.iam.gserviceaccount.com",
+    "serviceAccount:gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com",
+    "serviceAccount:gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com",
+    "serviceAccount:gha-preview-operator@runsetta.iam.gserviceaccount.com",
+  ])
+
   # Organization Policy Service is useful only when this module manages the
   # preventive policy. Remove a caller-supplied/default entry for standalone
   # projects, and add it authoritatively for an organization-backed project.
@@ -197,6 +211,60 @@ resource "google_storage_bucket" "bootstrap_state" {
   ]
 }
 
+# A separate, non-state bucket contains one pre-created metadata-only CAS
+# marker. Preview admission and DHI epoch transitions update only this object's
+# custom metadata with generation + metageneration preconditions. They cannot
+# create, delete, list, or read any Terraform state object.
+resource "google_storage_bucket" "deployment_parity_transition" {
+  name                        = local.deployment_parity_transition_bucket
+  project                     = var.project_id
+  location                    = var.state_bucket_location
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  logging {
+    log_bucket        = google_storage_bucket.terraform_state_access_logs.name
+    log_object_prefix = "deployment-parity-transition/"
+  }
+
+  versioning {
+    enabled = true
+  }
+
+  labels = local.labels
+
+  lifecycle {
+    prevent_destroy = true
+  }
+
+  depends_on = [
+    google_project_service.required,
+    google_project_iam_binding.editor_absent,
+    google_storage_bucket_iam_member.terraform_state_access_logs_writer,
+  ]
+}
+
+resource "google_storage_bucket_object" "deployment_parity_transition" {
+  name         = local.deployment_parity_transition_object
+  bucket       = google_storage_bucket.deployment_parity_transition.name
+  content      = "{\"version\":1}\n"
+  content_type = "application/json"
+
+  metadata = {
+    version       = "1"
+    repository-id = var.github_repository_id
+    state         = "clear"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+    # CI owns only this strongly consistent metadata map. Object bytes,
+    # identity, bucket policy, and every other property remain Terraform-owned.
+    ignore_changes = [metadata]
+  }
+}
+
 resource "google_storage_bucket" "terraform_state_access_logs" {
   #checkov:skip=CKV_GCP_62:This bucket is the sink for Terraform state access logs.
   name                        = "${var.state_bucket_name}-access-logs"
@@ -258,6 +326,14 @@ resource "google_storage_bucket_iam_binding" "terraform_state_logs_no_legacy_acc
   for_each = local.legacy_storage_roles
 
   bucket  = google_storage_bucket.terraform_state_access_logs.name
+  role    = each.value
+  members = []
+}
+
+resource "google_storage_bucket_iam_binding" "deployment_parity_transition_no_legacy_access" {
+  for_each = local.legacy_storage_roles
+
+  bucket  = google_storage_bucket.deployment_parity_transition.name
   role    = each.value
   members = []
 }
@@ -330,11 +406,20 @@ resource "google_service_account" "preview_deploy" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_service_account" "preview_commit" {
+  project      = var.project_id
+  account_id   = "gha-preview-commit"
+  display_name = "GitHub Actions Preview Transaction Committer"
+  description  = "Commits only fully proven preview traffic and exposure transitions on the exact pre-created preview service; no runtime impersonation, secret, or artifact-write access."
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_service_account" "preview_operator" {
   project      = var.project_id
   account_id   = "gha-preview-operator"
-  display_name = "GitHub Actions Preview Operator"
-  description  = var.preview_operator_service_account_description
+  display_name = "GitHub Actions Preview IAM Auditor"
+  description  = "Migration-stable account ID repurposed as an exact-workflow, read-only cross-project preview runtime IAM auditor; it has no Cloud Run mutation grant."
 
   depends_on = [google_project_service.required]
 }
@@ -344,6 +429,15 @@ resource "google_service_account" "preview_publisher" {
   account_id   = "gha-preview-publish"
   display_name = "GitHub Actions Preview Publisher"
   description  = var.preview_publisher_service_account_description
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_service_account" "deployment_parity_reader" {
+  project      = var.project_id
+  account_id   = "gha-deploy-parity"
+  display_name = "GitHub Actions Deployment Parity Reader"
+  description  = "Reads only the exact production image plus production and preview Cloud Run metadata needed to enforce DHI parity in serialized deploy transitions."
 
   depends_on = [google_project_service.required]
 }
@@ -361,11 +455,82 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
   project     = var.project_id
   role_id     = "cloudRunRevisionDeployer"
   title       = "Cloud Run Revision Deployer"
-  description = "Updates and observes pre-created Cloud Run services without create, delete, or IAM policy permissions."
+  description = "Updates and observes pre-created Cloud Run services; no IAM-policy mutation, create, delete, list, or service-account impersonation."
   permissions = [
     "run.operations.get",
+    "run.revisions.get",
     "run.services.get",
     "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "preview_traffic_committer" {
+  project     = var.project_id
+  role_id     = "previewTrafficCommitter"
+  title       = "Preview Traffic Committer"
+  description = "Reads exact preview revisions and service IAM, then commits traffic plus exposure only on the exact preview service; no create, delete, list, runtime impersonation, secret, or artifact-write permission."
+  permissions = [
+    "run.operations.get",
+    "run.revisions.get",
+    "run.services.get",
+    "run.services.getIamPolicy",
+    "run.services.setIamPolicy",
+    "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "deployment_parity_transition_coordinator" {
+  project     = var.project_id
+  role_id     = "deploymentParityTransitionCoordinator"
+  title       = "Deployment Parity Transition Coordinator"
+  description = "Gets and conditionally updates only the pre-created deployment parity marker; no object create, delete, list, state-bucket, or data-plane permissions."
+  permissions = [
+    "storage.objects.get",
+    "storage.objects.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "preview_iam_auditor" {
+  project     = var.project_id
+  role_id     = "previewIamAuditor"
+  title       = "Preview Runtime IAM Auditor"
+  description = "Analyzes IAM for exact preview runtime identities and brackets direct project policies; no list, mutation, secret, data, or impersonation permissions."
+  permissions = [
+    "cloudasset.assets.analyzeIamPolicy",
+    "resourcemanager.projects.get",
+    "resourcemanager.projects.getIamPolicy",
+    "serviceusage.services.use",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "deployment_parity_cloud_run_reader" {
+  project     = var.project_id
+  role_id     = "deploymentParityCloudRunReader"
+  title       = "Deployment Parity Cloud Run Reader"
+  description = "Gets only the exact production and preview Cloud Run service and revision resources used by the DHI parity gate."
+  permissions = [
+    "run.revisions.get",
+    "run.services.get",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_custom_role" "deployment_parity_image_downloader" {
+  project     = var.project_id
+  role_id     = "deploymentParityImageDownloader"
+  title       = "Deployment Parity Image Downloader"
+  description = "Downloads blobs only from the exact production image repository so preview admission can verify the live DHI lineage."
+  permissions = [
+    "artifactregistry.repositories.downloadArtifacts",
   ]
 
   depends_on = [google_project_service.required]
@@ -444,6 +609,75 @@ resource "google_project_iam_custom_role" "terraform_convergence_reader" {
   depends_on = [google_project_service.required]
 }
 
+# The protected owner bridge uses this role only for an approved production
+# apply and only through a time-bounded project binding to a random single-run
+# executor. It intentionally contains control-plane permissions only: no
+# Secret Manager payload access/version mutation, Firestore entity access, or
+# Artifact Registry upload/download/file/version permissions are present.
+resource "google_project_iam_custom_role" "protected_terraform_apply" {
+  project     = var.project_id
+  role_id     = "protectedTerraformApply"
+  title       = "Protected Terraform Apply"
+  description = "Manages the declared production control plane without application data or artifact content access."
+  permissions = concat(
+    [
+      "artifactregistry.locations.get",
+      "artifactregistry.locations.list",
+      "artifactregistry.repositories.create",
+      "artifactregistry.repositories.delete",
+      "artifactregistry.repositories.get",
+      "artifactregistry.repositories.getIamPolicy",
+      "artifactregistry.repositories.list",
+      "artifactregistry.repositories.listEffectiveTags",
+      "artifactregistry.repositories.listTagBindings",
+      "artifactregistry.repositories.setIamPolicy",
+      "artifactregistry.repositories.update",
+      "resourcemanager.projects.get",
+      "resourcemanager.projects.getIamPolicy",
+      "run.locations.list",
+      "run.operations.get",
+      "run.operations.list",
+      "run.services.create",
+      "run.services.delete",
+      "run.services.get",
+      "run.services.getIamPolicy",
+      "run.services.list",
+      "run.services.listEffectiveTags",
+      "run.services.listTagBindings",
+      "run.services.setIamPolicy",
+      "run.services.update",
+      "serviceusage.services.get",
+      "serviceusage.services.list",
+      "serviceusage.services.use",
+    ],
+    contains(var.required_services, "firestore.googleapis.com") ? [
+      "datastore.databases.create",
+      "datastore.databases.delete",
+      "datastore.databases.get",
+      "datastore.databases.getMetadata",
+      "datastore.databases.list",
+      "datastore.databases.update",
+      "datastore.operations.get",
+      "datastore.operations.list",
+    ] : [],
+    contains(var.required_services, "secretmanager.googleapis.com") ? [
+      "secretmanager.locations.get",
+      "secretmanager.locations.list",
+      "secretmanager.secrets.create",
+      "secretmanager.secrets.delete",
+      "secretmanager.secrets.get",
+      "secretmanager.secrets.getIamPolicy",
+      "secretmanager.secrets.list",
+      "secretmanager.secrets.listEffectiveTags",
+      "secretmanager.secrets.listTagBindings",
+      "secretmanager.secrets.setIamPolicy",
+      "secretmanager.secrets.update",
+    ] : [],
+  )
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_service_account" "runtime" {
   project      = var.project_id
   account_id   = "cloud-run-runtime"
@@ -475,6 +709,14 @@ resource "google_project_iam_member" "terraform_convergence_reader" {
   project = var.project_id
   role    = google_project_iam_custom_role.terraform_convergence_reader.name
   member  = "serviceAccount:${google_service_account.terraform.email}"
+}
+
+resource "google_project_iam_member" "preview_iam_auditors" {
+  for_each = local.preview_iam_auditor_members
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.preview_iam_auditor.name
+  member  = each.value
 }
 
 resource "google_project_iam_member" "runtime_project_roles" {
@@ -527,6 +769,18 @@ resource "google_storage_bucket_iam_member" "terraform_state_reader" {
   member = "serviceAccount:${google_service_account.terraform.email}"
 }
 
+resource "google_storage_bucket_iam_member" "preview_commit_transition_coordinator" {
+  bucket = google_storage_bucket.deployment_parity_transition.name
+  role   = google_project_iam_custom_role.deployment_parity_transition_coordinator.name
+  member = "serviceAccount:${google_service_account.preview_commit.email}"
+
+  condition {
+    title       = "exact_deployment_parity_transition_object"
+    description = "Restrict the coordinator's get/update permissions to the one pre-created per-repository marker."
+    expression  = "resource.name == 'projects/_/buckets/${google_storage_bucket.deployment_parity_transition.name}/objects/${google_storage_bucket_object.deployment_parity_transition.name}'"
+  }
+}
+
 moved {
   from = google_storage_bucket_iam_member.terraform_state_admin
   to   = google_storage_bucket_iam_member.terraform_state_reader
@@ -564,7 +818,7 @@ moved {
 # Each service account trusts only its reviewed reusable workflow, exact platform
 # commit, immutable caller repository IDs, and expected event/ref/environment.
 resource "google_service_account_iam_member" "terraform_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.terraform.name
   role               = "roles/iam.workloadIdentityUser"
@@ -572,7 +826,7 @@ resource "google_service_account_iam_member" "terraform_wif_workflow_sha" {
 }
 
 resource "google_service_account_iam_member" "prod_deploy_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.prod_deploy.name
   role               = "roles/iam.workloadIdentityUser"
@@ -580,7 +834,7 @@ resource "google_service_account_iam_member" "prod_deploy_wif_workflow_sha" {
 }
 
 resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.prod_publisher.name
   role               = "roles/iam.workloadIdentityUser"
@@ -588,17 +842,60 @@ resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha" {
 }
 
 resource "google_service_account_iam_member" "preview_deploy_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.preview_deploy.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
 }
 
-resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha" {
+# The active production workflow may stage only the sanitized preview baseline
+# through this existing preview deployer. A transition SHA has no binding, so a
+# predecessor token cannot roll a completed DHI epoch backward.
+resource "google_service_account_iam_member" "preview_deploy_wif_prod_workflow_sha" {
   for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.preview_deploy.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_commit_wif_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_commit.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_commit.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_commit_wif_prod_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_commit.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_iam_audit_wif_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_operator.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "preview_iam_audit_wif_preview_operations_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.preview_operator.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
 }
@@ -614,11 +911,31 @@ resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"
 }
 
 resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
+  for_each = var.preview_operations_active_workflow_shas
 
   service_account_id = google_service_account.preview_publisher.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_publish_workflow_sha/${each.value}"
+}
+
+# This identity is deliberately read-only and has no legacy binding. Both
+# deployment paths may mint it only through their exact workflow-SHA attribute:
+# preview verifies the live production image, while production proves that all
+# still-routable preview tags carry the same DHI lineage identifier.
+resource "google_service_account_iam_member" "deployment_parity_wif_preview_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.deployment_parity_reader.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
+}
+
+resource "google_service_account_iam_member" "deployment_parity_wif_prod_workflow_sha" {
+  for_each = var.preview_operations_active_workflow_shas
+
+  service_account_id = google_service_account.deployment_parity_reader.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
 }
 
 # The canary has no project permissions and no legacy WIF binding. A successful

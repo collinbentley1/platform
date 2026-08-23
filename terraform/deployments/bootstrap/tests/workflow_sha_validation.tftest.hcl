@@ -54,7 +54,7 @@ run "migration_partitions_previous_preview_operator_sha" {
     repository_id             = "1255553151"
     active_workflow_sha       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     transition_workflow_sha   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    legacy_compatibility_mode = true
+    legacy_compatibility_mode = false
   }
 
   assert {
@@ -66,4 +66,17 @@ run "migration_partitions_previous_preview_operator_sha" {
     condition     = local.preview_operator_transition_workflow_shas == toset(["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"])
     error_message = "Only the immediately previous SHA may retain the retired preview operator during migration."
   }
+}
+
+run "reject_transition_sha_with_legacy_compatibility_bindings" {
+  command = plan
+
+  variables {
+    repository_id             = "1255553151"
+    active_workflow_sha       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    transition_workflow_sha   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    legacy_compatibility_mode = true
+  }
+
+  expect_failures = [var.transition_workflow_sha]
 }

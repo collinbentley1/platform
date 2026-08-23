@@ -82,6 +82,11 @@ variable "preview_deploy_service_account_email" {
   type        = string
 }
 
+variable "preview_commit_service_account_email" {
+  description = "Preview transaction service account email; receives only exact-service traffic/exposure mutation and exact-repository blob-download grants."
+  type        = string
+}
+
 variable "preview_operator_service_account_email" {
   description = "Deprecated transition-only preview operator email retained for input compatibility; this module intentionally grants it no IAM role."
   type        = string
@@ -89,6 +94,11 @@ variable "preview_operator_service_account_email" {
 
 variable "preview_publisher_service_account_email" {
   description = "Artifact Registry-only preview publisher service account email."
+  type        = string
+}
+
+variable "deployment_parity_reader_service_account_email" {
+  description = "Read-only deployment parity service account with exact production-image download and production/preview service metadata access."
   type        = string
 }
 

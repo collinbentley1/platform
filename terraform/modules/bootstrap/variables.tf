@@ -110,6 +110,11 @@ variable "legacy_compatibility_mode" {
   description = "Temporarily retain only constrained repository/environment Workload Identity User bindings during a verified exact-SHA migration. Broad project roles, Token Creator, and cross-boundary actAs grants are always removed. Must be false at steady state."
   type        = bool
   default     = false
+
+  validation {
+    condition     = !(var.legacy_compatibility_mode && length(var.preview_operator_transition_workflow_shas) != 0)
+    error_message = "legacy_compatibility_mode is allowed only for the initial migration with an empty transition workflow set."
+  }
 }
 
 variable "manage_automatic_default_service_account_grants_policy" {
@@ -122,6 +127,7 @@ variable "required_services" {
   type        = set(string)
   default = [
     "artifactregistry.googleapis.com",
+    "cloudasset.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",

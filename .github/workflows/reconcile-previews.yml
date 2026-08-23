@@ -18,19 +18,99 @@ jobs:
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
 
+  prefetch-bases:
+    name: Prefetch exact public DHI bases for reconciliation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main'
+    environment: dhi-base-prefetch-20260822-098dca9280b3
+    permissions: {}
+    outputs:
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      content-sha256: ${{ steps.bundle.outputs.content_sha256 }}
+      manifest-sha256: ${{ steps.bundle.outputs.manifest_sha256 }}
+    steps:
+      - name: Reject workflow reruns before any privileged action
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Fetch exact base-prefetch policy before secret use
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-reconcile-prefetch-policy"
+          git_home="$RUNNER_TEMP/platform-reconcile-prefetch-git-home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$destination" init --quiet
+          git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          helper="$destination/tools/ci/container-artifact-contract.sh"
+          test -f "$helper" && test ! -L "$helper"
+          rm -rf -- "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and close the exact public DHI base graph
+        id: bundle
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ARTIFACT_KIND: preview
+          DHI_PUBLIC_READ_TOKEN: ${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}
+          DHI_USERNAME: ${{ vars.DHI_USERNAME }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" prefetch
+
+      - name: Verify DHI credentials were retired
+        if: always() && github.run_attempt == '1'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          auth_root="$RUNNER_TEMP/platform-regctl-auth"
+          artifact="${{ steps.bundle.outputs.artifact }}"
+          test ! -e "$auth_root" && test ! -L "$auth_root"
+          test -f "$artifact" && test ! -L "$artifact"
+
+      - name: Upload the one-day public base closure as one raw artifact
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.bundle.outputs.artifact }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
   reconcile:
     name: Reconcile previews
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
+    needs: prefetch-bases
     if: >-
+      always() &&
       (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main'
     environment: preview-operations
     permissions:
+      actions: read # Download only the exact prefetch artifact id.
       id-token: write # Exchange only for the exact-SHA preview reconciliation identity.
       pull-requests: read # Authoritatively distinguish open and closed preview tags.
     concurrency:
-      group: preview-cloud-${{ github.event.repository.id }}
+      group: deployment-parity-${{ github.event.repository.id }}
       queue: max
       cancel-in-progress: false
 
@@ -52,21 +132,33 @@ jobs:
               project_id="cdbentley"
               project_number="882468538648"
               service_name="cdbentley"
+              repository="site"
+              preview_ingress="all"
+              stable_preview_domain=""
               ;;
             711292980)
               project_id="runsetta"
               project_number="601124730704"
               service_name="runsetta"
+              repository="api"
+              preview_ingress="all"
+              stable_preview_domain=""
               ;;
             1025243085)
               project_id="medlock-1025243085"
               project_number="229383559510"
               service_name="medlock"
+              repository="site"
+              preview_ingress="all"
+              stable_preview_domain=""
               ;;
             280932482)
               project_id="critical-history-16823277"
               project_number="422714632513"
               service_name="critical-history"
+              repository="site"
+              preview_ingress="internal-and-cloud-load-balancing"
+              stable_preview_domain="preview.ycriticalhistory.org"
               ;;
             *)
               echo "Repository id $REPOSITORY_ID is not registered for preview reconciliation." >&2
@@ -76,14 +168,95 @@ jobs:
 
           {
             echo "project_id=$project_id"
+            echo "project_number=$project_number"
             echo "region=us-east4"
             echo "service_name=$service_name"
+            echo "preview_ingress=$preview_ingress"
+            echo "stable_preview_domain=$stable_preview_domain"
+            echo "preview_service=${service_name}-preview"
+            echo "production_image=us-east4-docker.pkg.dev/${project_id}/${repository}/${service_name}"
+            echo "preview_image=us-east4-docker.pkg.dev/${project_id}/${repository}-preview/${service_name}"
+            echo "runtime_service_account=cloud-run-preview@${project_id}.iam.gserviceaccount.com"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"
+            echo "commit_service_account=gha-preview-commit@${project_id}.iam.gserviceaccount.com"
+            echo "iam_audit_service_account=gha-preview-operator@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Fetch exact preview route policy before OIDC
+        id: parity-policy
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-reconcile-parity-policy"
+          repository="$RUNNER_TEMP/platform-reconcile-parity-repository"
+          git_home="$RUNNER_TEMP/platform-reconcile-parity-git-home"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" \
+            tools/ci/cloud-run-dhi-parity.sh \
+            tools/ci/cloud-run-preview-controller.sh \
+            tools/ci/container-artifact-contract.sh \
+            tools/ci/deployment-parity-transition.sh \
+            tools/ci/preview-runtime-iam-contract.sh | tar -x -C "$destination"
+          for helper in cloud-run-dhi-parity.sh cloud-run-preview-controller.sh container-artifact-contract.sh deployment-parity-transition.sh preview-runtime-iam-contract.sh; do
+            test -f "$destination/tools/ci/$helper" && test ! -L "$destination/tools/ci/$helper"
+          done
+          test -x "$destination/tools/ci/deployment-parity-transition.sh"
+          dhi_parity_id="$(/bin/bash "$destination/tools/ci/container-artifact-contract.sh" print-dhi-parity-id)"
+          [[ "$dhi_parity_id" =~ ^[a-z0-9]{50}$ ]]
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+          echo "dhi-parity-id=$dhi_parity_id" >> "$GITHUB_OUTPUT"
+
+      - name: Bind the exact DHI base artifact before OIDC
+        id: artifact-bind
+        if: needs.prefetch-bases.result == 'success'
+        continue-on-error: true
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          response="$RUNNER_TEMP/reconcile-base-artifact.json"
+          gh api --header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$response"
+          jq -e --arg digest "sha256:${ARTIFACT_DIGEST}" --arg id "$ARTIFACT_ID" \
+            --arg name "platform-preview-bases-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar" \
+            --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson repo "${{ github.event.repository.id }}" '
+            (.id | tostring) == $id and .name == $name and .expired == false and .digest == $digest and
+            (.workflow_run.id | tostring) == $run and .workflow_run.head_sha == $sha and
+            .workflow_run.repository_id == $repo and .workflow_run.head_repository_id == $repo and
+            (.size_in_bytes > 0 and .size_in_bytes <= 1611661312)
+          ' "$response" >/dev/null
+
+      - name: Download only the exact DHI base artifact id
+        id: artifact-download
+        if: needs.prefetch-bases.result == 'success' && steps.artifact-bind.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prefetch-bases.outputs.artifact-id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/platform-reconcile-bases
+          skip-decompress: true
+
       - name: Install checksum-pinned Google Cloud CLI
+        id: gcloud
+        continue-on-error: true
         env:
           GCLOUD_SHA256: deffdbe82ca6e3d19ffb291d063a651488e04e1b33799b5a238e4b5c6784e3c6
         run: |
@@ -109,6 +282,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prove exact workflow-SHA WIF trust
+        id: wif-canary
+        continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
@@ -118,178 +293,126 @@ jobs:
           create_credentials_file: false
           export_environment_variables: false
 
-      - name: Authenticate trusted preview deployer for reconciliation
+      - name: Authenticate the dedicated preview runtime IAM auditor for reconciliation
+        id: iam-audit-auth
+        continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
-          service_account: ${{ steps.app.outputs.deploy_service_account }}
+          service_account: ${{ steps.app.outputs.iam_audit_service_account }}
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
 
-      - name: Remove traffic tags that do not match an active pull request head
+      - name: Prove every preview runtime remains access-free before reconciliation
+        id: iam-audit
+        if: steps.iam-audit-auth.outcome == 'success'
+        continue-on-error: true
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
+          ACCESS_TOKEN: ${{ steps.iam-audit-auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/preview-runtime-iam-contract.sh" verify
+          echo "admitted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate the dedicated preview transaction committer for reconciliation
+        id: commit-auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ steps.app.outputs.project_id }}
+          workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
+          service_account: ${{ steps.app.outputs.commit_service_account }}
+          token_format: access_token
+          access_token_lifetime: 300s
+
+      - name: Reconcile every route with one proven etag transaction
+        id: maintenance
+        continue-on-error: true
+        if: >-
+          needs.prefetch-bases.result == 'success' &&
+          steps.artifact-bind.outcome == 'success' &&
+          steps.artifact-download.outcome == 'success' &&
+          steps.gcloud.outcome == 'success' &&
+          steps.wif-canary.outcome == 'success' &&
+          steps.iam-audit.outputs.admitted == 'true' &&
+          steps.commit-auth.outcome == 'success'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
+          BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-reconcile-bases
+          BASE_MANIFEST_SHA256: ${{ needs.prefetch-bases.outputs.manifest-sha256 }}
+          DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_PREVIEW_IMAGE_NAME: ${{ steps.app.outputs.preview_image }}
+          EXPECTED_PREVIEW_RUNTIME_SERVICE_ACCOUNT: ${{ steps.app.outputs.runtime_service_account }}
+          EXPECTED_PRODUCTION_IMAGE_NAME: ${{ steps.app.outputs.production_image }}
+          EXPECTED_PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_INGRESS: ${{ steps.app.outputs.preview_ingress }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
           PROJECT_ID: ${{ steps.app.outputs.project_id }}
           REGION: ${{ steps.app.outputs.region }}
           REPOSITORY_ID: ${{ github.event.repository.id }}
           SERVICE_NAME: ${{ steps.app.outputs.service_name }}
-          CLOUDSDK_CORE_DISABLE_PROMPTS: '1'
+          STABLE_PREVIEW_DOMAIN: ${{ steps.app.outputs.stable_preview_domain }}
         run: |
           set -euo pipefail
-          if [[ ! "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]] ||
-             [[ ! "$PLATFORM_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Refusing invalid preview reconciliation identity." >&2
-            exit 1
+          set +x
+          /bin/bash "$PARITY_POLICY_ROOT/tools/ci/cloud-run-preview-controller.sh" reconcile
+
+      - name: Seal preview exposure when reconciliation evidence is unavailable
+        id: fail-closed-seal
+        if: >-
+          steps.commit-auth.outcome == 'success' &&
+          (needs.prefetch-bases.result != 'success' ||
+           steps.artifact-bind.outcome != 'success' ||
+           steps.artifact-download.outcome != 'success' ||
+           steps.gcloud.outcome != 'success' ||
+           steps.wif-canary.outcome != 'success' ||
+           steps.iam-audit.outputs.admitted != 'true' ||
+           steps.maintenance.outcome == 'failure')
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          ACCESS_TOKEN: ${{ steps.commit-auth.outputs.access_token }}
+          DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
+          EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PARITY_POLICY_ROOT: ${{ steps.parity-policy.outputs.root }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+          REGION: ${{ steps.app.outputs.region }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          set +x
+          /bin/bash "$PARITY_POLICY_ROOT/tools/ci/cloud-run-preview-controller.sh" seal
+
+      - name: Retire reconciliation transaction credentials
+        if: always() && github.run_attempt == '1'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          CREDENTIAL_FILE: ${{ steps.commit-auth.outputs.credentials_file_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CREDENTIAL_FILE" ]; then
+            [[ "$CREDENTIAL_FILE" == "$GITHUB_WORKSPACE"/* ]]
+            test ! -L "$CREDENTIAL_FILE"
+            rm -f -- "$CREDENTIAL_FILE"
+            test ! -e "$CREDENTIAL_FILE" && test ! -L "$CREDENTIAL_FILE"
           fi
-          service="${SERVICE_NAME}-preview"
-          service_json="$(mktemp)"
-          describe_error="$(mktemp)"
-          revision_json="$(mktemp)"
-          revision_error="$(mktemp)"
-          trap 'rm -f "$service_json" "$describe_error" "$revision_json" "$revision_error"' EXIT
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="
+            echo "GOOGLE_APPLICATION_CREDENTIALS="
+            echo "GOOGLE_GHA_CREDS_PATH="
+          } >> "$GITHUB_ENV"
 
-          verify_stable_preview_absent() {
-            local pr_number="$1"
-            local preview_tag="$2"
-            if [ "$REPOSITORY_ID" != "280932482" ]; then
-              return 0
-            fi
-            stable_url="https://pr-${pr_number}.preview.ycriticalhistory.org"
-            for attempt in $(seq 1 30); do
-              if status="$(curl --silent --show-error \
-                --output /dev/null \
-                --write-out '%{http_code}' \
-                --max-time 10 \
-                --proto '=https' \
-                "$stable_url")" && [ "$status" = "404" ]; then
-                return 0
-              fi
-              if [ "$attempt" -lt 30 ]; then
-                sleep 5
-              fi
-            done
-            echo "Stable preview URL remained routable after removing $preview_tag." >&2
-            return 1
-          }
-
-          if gcloud run services describe "$service" \
-            --project="$PROJECT_ID" \
-            --region="$REGION" \
-            --format=json > "$service_json" 2> "$describe_error"; then
-            while IFS=$'\t' read -r preview_tag revision_name; do
-              if [[ ! "$preview_tag" =~ ^pr-([0-9]+)$ ]]; then
-                echo "Refusing unexpected preview tag: $preview_tag" >&2
-                exit 1
-              fi
-              pr_number="${BASH_REMATCH[1]}"
-
-              if ! pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}")"; then
-                echo "Could not authoritatively read pull request #$pr_number; preserving $preview_tag." >&2
-                exit 1
-              fi
-              state="$(jq -r 'if (.state == "open" or .state == "closed") then .state else "invalid" end' <<< "$pr_json")"
-              draft="$(jq -r 'if (.draft | type) == "boolean" then (.draft | tostring) else "invalid" end' <<< "$pr_json")"
-              head_sha="$(jq -r 'if (.head.sha | type) == "string" then .head.sha else "" end' <<< "$pr_json")"
-              head_repo_id="$(jq -r 'if (.head.repo.id | type) == "number" then (.head.repo.id | tostring) else "" end' <<< "$pr_json")"
-              head_repo_name="$(jq -r 'if (.head.repo.full_name | type) == "string" then .head.repo.full_name else "" end' <<< "$pr_json")"
-              base_ref="$(jq -r 'if (.base.ref | type) == "string" then .base.ref else "" end' <<< "$pr_json")"
-
-              revision_identity_valid=false
-              if [[ "$revision_name" =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
-                if ! gcloud run revisions describe "$revision_name" \
-                  --project="$PROJECT_ID" \
-                  --region="$REGION" \
-                  --format=json > "$revision_json" 2> "$revision_error"; then
-                  cat "$revision_error" >&2
-                  echo "Could not authoritatively read tagged revision $revision_name; preserving all tags." >&2
-                  exit 1
-                fi
-                if jq -e \
-                  --arg head "$head_sha" \
-                  --arg name "$revision_name" \
-                  --arg pr "$pr_number" \
-                  --arg repository_id "$REPOSITORY_ID" \
-                  --arg workflow_sha "$PLATFORM_WORKFLOW_SHA" '
-                  .metadata.name == $name and
-                  .metadata.labels["git-head-sha"] == $head and
-                  .metadata.labels["github-repository-id"] == $repository_id and
-                  .metadata.labels["github-pr"] == $pr and
-                  (.metadata.labels["github-run-id"] | type == "string" and test("^[0-9]+$")) and
-                  .metadata.labels["github-run-attempt"] == "1" and
-                  .metadata.labels["managed-by"] == "github-actions" and
-                  .metadata.labels.environment == "preview" and
-                  .metadata.labels["platform-workflow-sha"] == $workflow_sha
-                ' "$revision_json" >/dev/null; then
-                  revision_identity_valid=true
-                fi
-              fi
-              if [ "$state" = "open" ] && [ "$draft" = "false" ] &&
-                 [ "$head_repo_id" = "$REPOSITORY_ID" ] &&
-                 [ "$head_repo_name" = "$GITHUB_REPOSITORY" ] &&
-                 [ "$base_ref" = "main" ] &&
-                 [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] &&
-                 [ "$revision_identity_valid" = "true" ]; then
-                echo "Keeping $preview_tag at $revision_name for pull request #$pr_number head $head_sha."
-                continue
-              fi
-
-              echo "Removing invalid tag $preview_tag: state=$state draft=$draft head=$head_sha head_repo_id=$head_repo_id base=$base_ref revision=$revision_name."
-              gcloud run services update-traffic "$service" \
-                --project="$PROJECT_ID" \
-                --region="$REGION" \
-                --remove-tags="$preview_tag" \
-                --quiet
-              verify_stable_preview_absent "$pr_number" "$preview_tag"
-            done < <(jq -r '.status.traffic[]? | select(.tag != null) | [.tag, (.revisionName // "")] | @tsv' "$service_json")
-          else
-            if grep -Eqi 'not[ _-]?found|could not be found|404' "$describe_error"; then
-              echo "Shared preview service $service does not exist yet."
-            else
-              cat "$describe_error" >&2
-              exit 1
-            fi
-          fi
-
-          # Migration-only cleanup for the former one-service-per-PR design. The
-          # list permission disappears when preview IAM is narrowed to the shared
-          # service, so lack of list access is an expected steady state.
-          legacy_json="$(mktemp)"
-          list_error="$(mktemp)"
-          trap 'rm -f "$service_json" "$describe_error" "$revision_json" "$revision_error" "$legacy_json" "$list_error"' EXIT
-          if ! gcloud run services list \
-            --project="$PROJECT_ID" \
-            --region="$REGION" \
-            --format=json > "$legacy_json" 2> "$list_error"; then
-            if grep -Eqi 'permission.denied|permission denied|forbidden|403' "$list_error"; then
-              echo "Project-wide service listing is unavailable; scoped preview IAM is active."
-              exit 0
-            fi
-            cat "$list_error" >&2
-            exit 1
-          fi
-
-          while IFS=$'\t' read -r legacy_service pr_number; do
-            if [[ ! "$pr_number" =~ ^[0-9]+$ ]] || [ "$legacy_service" != "${SERVICE_NAME}-pr-${pr_number}" ]; then
-              echo "Refusing unexpected legacy preview: service=$legacy_service pr=$pr_number" >&2
-              exit 1
-            fi
-
-            if ! state="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" --jq .state)"; then
-              echo "Could not authoritatively read pull request #$pr_number; preserving $legacy_service." >&2
-              exit 1
-            fi
-            if [ "$state" != "open" ] && [ "$state" != "closed" ]; then
-              echo "Unexpected pull request state for #$pr_number: $state" >&2
-              exit 1
-            fi
-
-            echo "Deleting legacy preview $legacy_service for $state pull request #$pr_number; future previews use the shared tagged service."
-            gcloud run services delete "$legacy_service" \
-              --project="$PROJECT_ID" \
-              --region="$REGION" \
-              --quiet
-          done < <(
-            jq -r \
-              '.[] | select(.metadata.labels["managed-by"] == "github-actions" and .metadata.labels.environment == "preview" and .metadata.labels.pr != null) | [.metadata.name, .metadata.labels.pr] | @tsv' \
-              "$legacy_json"
-          )
+      - name: Report fail-closed reconciliation evidence failure
+        if: steps.fail-closed-seal.outputs.admitted == 'true'
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          echo "Preview exposure was sealed because reconciliation evidence was unavailable." >&2
+          exit 1

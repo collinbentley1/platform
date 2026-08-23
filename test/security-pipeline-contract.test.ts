@@ -20,6 +20,7 @@ const exactRuntimeConfigFixture = join(
 );
 const headSha = "0123456789abcdef0123456789abcdef01234567";
 const platformWorkflowSha = "3".repeat(40);
+const dhiParityId = "1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8";
 const ovenChild = "8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b";
 const devChild = "58a392f5dec3be5cb20a2495baca84ac785f237a2d2904c5b9cad7ba11f3e475";
 const runtimeChild = "0f9e5f506d653e0f87e44bb5c24fece19f9fb7253016f6e49d7a4783026f876d";
@@ -155,6 +156,86 @@ describe("protected container and preview lifecycle contracts", () => {
       runtimeManifestPath,
     );
     expect(manifestResult.exitCode, manifestResult.stderr).toBe(0);
+  });
+
+  test("the live image graph validator proves exact DHI lineage independently of parity labels", async () => {
+    const application = await buildApplicationFixture();
+    const loaded = await loadApplicationDocuments(application);
+    loaded.documents.statement.subject[0].name =
+      `pkg:docker/platform-production@${headSha}?platform=linux%2Famd64`;
+    const graph = await persistApplicationGraph(
+      application.imageRoot,
+      loaded.documents,
+      loaded.layerBlobs,
+      new Set(["statementSubject"]),
+    );
+    application.indexDigest = graph.indexDigest;
+    application.runnableDigest = graph.runnableDigest;
+    const accepted = await validateLiveProductionFixture(application);
+    expect(accepted.exitCode, accepted.stderr).toBe(0);
+
+    const foreignParent = await validateLiveProductionFixture(application, "production", {
+      index: `sha256:${"f".repeat(64)}`,
+    });
+    expect(foreignParent.exitCode).not.toBe(0);
+    expect(foreignParent.stderr).toContain("Live production index differs from the Cloud Run image digest");
+
+    const foreignChild = await validateLiveProductionFixture(application, "production", {
+      runnable: `sha256:${"e".repeat(64)}`,
+    });
+    expect(foreignChild.exitCode).not.toBe(0);
+    expect(foreignChild.stderr).toContain("Cloud Run runnable digest is not the child selected by the proven OCI index");
+
+    const hostile = await loadApplicationDocuments(application);
+    hostile.documents.statement.predicate.buildDefinition.resolvedDependencies[1].digest.sha256 =
+      "f".repeat(64);
+    const hostileGraph = await persistApplicationGraph(
+      application.imageRoot,
+      hostile.documents,
+      hostile.layerBlobs,
+      new Set(["statementSubject"]),
+    );
+    application.indexDigest = hostileGraph.indexDigest;
+    application.runnableDigest = hostileGraph.runnableDigest;
+    const rejected = await validateLiveProductionFixture(application);
+    expect(rejected.exitCode).not.toBe(0);
+    expect(rejected.stderr).toContain("OCI provenance statement drifted");
+
+    const preview = await buildApplicationFixture();
+    const previewDocuments = await loadApplicationDocuments(preview);
+    const previewOnlyLayer = Buffer.from("preview application bytes deliberately differ from production\n");
+    const previewOnlyDescriptor = descriptorForBytes(previewOnlyLayer);
+    previewDocuments.documents.runnable.layers.push(previewOnlyDescriptor);
+    previewDocuments.layerBlobs.set(previewOnlyDescriptor.digest, previewOnlyLayer);
+    const previewGraph = await persistApplicationGraph(
+      preview.imageRoot,
+      previewDocuments.documents,
+      previewDocuments.layerBlobs,
+    );
+    preview.indexDigest = previewGraph.indexDigest;
+    preview.runnableDigest = previewGraph.runnableDigest;
+    expect(preview.indexDigest).not.toBe(application.indexDigest);
+    expect(preview.runnableDigest).not.toBe(application.runnableDigest);
+    const unchangedCloudRunLabels = { "dhi-parity-id": dhiParityId };
+    const acceptedPreview = await validateLiveProductionFixture(preview, "preview");
+    expect(acceptedPreview.exitCode, acceptedPreview.stderr).toBe(0);
+    expect(unchangedCloudRunLabels["dhi-parity-id"]).toBe(dhiParityId);
+
+    const hostilePreview = await loadApplicationDocuments(preview);
+    hostilePreview.documents.statement.predicate.buildDefinition.resolvedDependencies[1].digest.sha256 =
+      "e".repeat(64);
+    const hostilePreviewGraph = await persistApplicationGraph(
+      preview.imageRoot,
+      hostilePreview.documents,
+      hostilePreview.layerBlobs,
+      new Set(["statementSubject"]),
+    );
+    preview.indexDigest = hostilePreviewGraph.indexDigest;
+    preview.runnableDigest = hostilePreviewGraph.runnableDigest;
+    const rejectedPreview = await validateLiveProductionFixture(preview, "preview");
+    expect(rejectedPreview.exitCode).not.toBe(0);
+    expect(rejectedPreview.stderr).toContain("OCI provenance statement drifted");
+    expect(unchangedCloudRunLabels["dhi-parity-id"]).toBe(dhiParityId);
   });
 
   test("application OCI validation rejects provenance and graph confusion", async () => {
@@ -499,7 +580,13 @@ describe("protected container and preview lifecycle contracts", () => {
     );
     expect(lifecycle?.run).toBeString();
     for (const step of cleanup.jobs.cleanup.steps.slice(2)) {
-      expect(step.if).toBe("steps.lifecycle.outputs.proceed == 'true'");
+      if (step.name === "Retire cleanup transaction credentials") {
+        expect(step.if).toBe("always() && github.run_attempt == '1'");
+      } else if (step.name === "Report fail-closed cleanup evidence failure") {
+        expect(step.if).toBe("steps.fail-closed-seal.outputs.admitted == 'true'");
+      } else {
+        expect(step.if).toContain("steps.lifecycle.outputs.proceed == 'true'");
+      }
     }
 
     const sameRepository = {
@@ -539,59 +626,22 @@ describe("protected container and preview lifecycle contracts", () => {
       await readFile(join(repoRoot, ".github/workflows/reconcile-previews.yml"), "utf8"),
     ) as { jobs: { reconcile: { if: string; steps: Array<Record<string, any>> } } };
     expect(workflow.jobs.reconcile.if).toBe(
-      "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'",
+      "always() && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'",
     );
     const reconcile = workflow.jobs.reconcile.steps.find(
-      (step) => step.name === "Remove traffic tags that do not match an active pull request head",
+      (step) => step.name === "Reconcile every route with one proven etag transaction",
     );
     expect(reconcile?.run).toBeString();
-    expect(reconcile?.env?.PLATFORM_WORKFLOW_SHA).toBe("${{ job.workflow_sha }}");
-    const prefix = "aaaaaaaaaaaa";
-    const staleHead = `${prefix}${"1".repeat(28)}`;
-    const currentHead = `${prefix}${"2".repeat(28)}`;
-    const revision = `cdbentley-preview-p31-${prefix}-r123456a1`;
-
-    for (const [labelHead, labelWorkflowSha, shouldRemove] of [
-      [staleHead, platformWorkflowSha, true],
-      [currentHead, platformWorkflowSha, false],
-      [currentHead, "4".repeat(40), true],
-      [currentHead, undefined, true],
-    ] as const) {
-      const execution = await executeReconcileStep(
-        reconcile?.run as string,
-        {
-          base: { ref: "main" },
-          draft: false,
-          head: {
-            repo: { full_name: "collinbentley1/cdbentley", id: 1255553151 },
-            sha: currentHead,
-          },
-          state: "open",
-        },
-        {
-          metadata: {
-            labels: {
-              environment: "preview",
-              "git-head-sha": labelHead,
-              "github-pr": "31",
-              "github-repository-id": "1255553151",
-              "github-run-attempt": "1",
-              "github-run-id": "987654321",
-              "managed-by": "github-actions",
-              ...(labelWorkflowSha === undefined
-                ? {}
-                : { "platform-workflow-sha": labelWorkflowSha }),
-            },
-            name: revision,
-          },
-        },
-        {
-          status: { traffic: [{ revisionName: revision, tag: "pr-31" }] },
-        },
-      );
-      expect(execution.exitCode, execution.stderr).toBe(0);
-      expect(execution.mutations.includes("update-traffic")).toBe(shouldRemove);
-    }
+    expect(reconcile?.env?.EXPECTED_PLATFORM_WORKFLOW_SHA).toBe("${{ job.workflow_sha }}");
+    expect(reconcile?.run).toContain('cloud-run-preview-controller.sh" reconcile');
+    const controller = await readFile(
+      join(repoRoot, "tools/ci/cloud-run-preview-controller.sh"),
+      "utf8",
+    );
+    expect(controller).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
+    expect(controller).toContain('.metadata.labels["git-head-sha"] | test("^[0-9a-f]{40}$")');
+    expect(controller).toContain('.state == "open" and .draft == false and .head.sha == $head');
+    expect(controller).toContain("capture_proposed admitted true");
   });
 
   test("preview deployment stamps and verifies the exact reusable-workflow commit", async () => {
@@ -660,25 +710,36 @@ describe("protected container and preview lifecycle contracts", () => {
     ) as {
       jobs: Record<string, Record<string, any>>;
     };
-    const lifecycle = workflow.jobs.deploy.steps.find(
-      (step: Record<string, any>) => step.name === "Recheck pull request state after deployment",
+    const transaction = await readFile(
+      join(repoRoot, "tools/ci/cloud-run-preview-traffic.sh"),
+      "utf8",
     );
-    const result = await executeGhBackedStep(lifecycle.run, {}, {
-      EXPECTED_HEAD_SHA: headSha,
-      EXPECTED_REPOSITORY: "collinbentley1/cdbentley",
-      EXPECTED_REPOSITORY_ID: "1255553151",
-      PR_NUMBER: "31",
-    }, true);
-    expect(result.exitCode, result.stderr).toBe(0);
-    expect(result.output).toContain("keep=false");
+    expect(transaction).toContain('gh api "repos/${GITHUB_REPOSITORY}/pulls/${live_pr}"');
+    expect(transaction).toContain("trap cleanup EXIT");
+    expect(transaction).toContain("rollback_exact_traffic");
+    expect(workflow.jobs.deploy.outputs["lifecycle-keep"]).toBe(
+      "${{ steps.traffic-commit.outputs.admitted }}",
+    );
     expect(workflow.jobs.invalidate.if).toBe(
-      "always() && needs.deploy.outputs.deployed-revision != '' && needs.deploy.outputs.lifecycle-keep != 'true'",
+      "always() && needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')",
     );
-    const invalidateRun = workflow.jobs.invalidate.steps.find(
-      (step: Record<string, any>) => step.name === "Remove a tag deployed after its pull request changed",
-    ).run as string;
-    expect(invalidateRun).toContain("EXPECTED_REVISION");
-    expect(invalidateRun).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
+    const invalidate = workflow.jobs.invalidate.steps.find(
+      (step: Record<string, any>) =>
+        step.name === "Remove only the failed run's exact tag with one proven etag transaction",
+    );
+    const invalidateRun = invalidate.run as string;
+    expect(invalidate.env.EXPECTED_TARGET_REVISION).toBe(
+      "${{ needs.deploy.outputs.deployed-revision }}",
+    );
+    expect(invalidateRun).toContain('cloud-run-preview-controller.sh" remove');
+    expect(transaction).toContain("rollback_exact_traffic");
+    const controller = await readFile(
+      join(repoRoot, "tools/ci/cloud-run-preview-controller.sh"),
+      "utf8",
+    );
+    expect(controller).toContain(
+      'if [ -n "$EXPECTED_TARGET_REVISION" ] && [ "$live_revision" != "$EXPECTED_TARGET_REVISION" ]',
+    );
   });
 });
 
@@ -1304,6 +1365,35 @@ async function validateApplicationFixture(
   return { exitCode, stderr, stdout };
 }
 
+async function validateLiveProductionFixture(
+  fixtureRoot: ApplicationFixture,
+  kind: "preview" | "production" = "production",
+  expected: { index?: string; runnable?: string } = {},
+): Promise<{ exitCode: number; stderr: string }> {
+  const child = Bun.spawn(["/bin/bash", helper, "test-live-production-graph"], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      CONTRACT_TEST_ONLY: "platform-buildkit-v0.32.2-fixture",
+      GITHUB_REPOSITORY: "collinbentley1/example",
+      RUNNER_TEMP: dirname(fixtureRoot.imageRoot),
+      TEST_BASE_ROOT: fixtureRoot.baseRoot,
+      TEST_HEAD_SHA: headSha,
+      TEST_IMAGE_ROOT: fixtureRoot.imageRoot,
+      TEST_KIND: kind,
+      TEST_EXPECTED_INDEX_DIGEST: expected.index ?? fixtureRoot.indexDigest,
+      TEST_EXPECTED_RUNNABLE_DIGEST: expected.runnable ?? fixtureRoot.runnableDigest,
+    },
+    stderr: "pipe",
+    stdout: "ignore",
+  });
+  const [exitCode, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stderr };
+}
+
 async function executeGhBackedStep(
   run: string,
   response: JsonObject,
@@ -1370,6 +1460,7 @@ async function executeReconcileStep(
   await writeFile(mutations, "");
   const gh = join(bin, "gh");
   const gcloud = join(bin, "gcloud");
+  const curl = join(bin, "curl");
   await writeFile(gh, "#!/bin/sh\nset -eu\ncat \"$FAKE_PR_JSON\"\n");
   await writeFile(
     gcloud,
@@ -1379,15 +1470,35 @@ async function executeReconcileStep(
       "case \"$*\" in",
       "  *\"run services describe\"*) cat \"$FAKE_SERVICE_JSON\" ;;",
       "  *\"run revisions describe\"*) cat \"$FAKE_REVISION_JSON\" ;;",
-      "  *\"run services update-traffic\"*) printf 'update-traffic\\n' >> \"$FAKE_MUTATIONS\" ;;",
+      "  *\"run services update-traffic\"*) jq '.status.traffic = []' \"$FAKE_SERVICE_JSON\" > \"$FAKE_SERVICE_JSON.next\"; mv \"$FAKE_SERVICE_JSON.next\" \"$FAKE_SERVICE_JSON\"; printf 'update-traffic\\n' >> \"$FAKE_MUTATIONS\" ;;",
+      "  *\"run services update\"*) printf 'seal\\n' >> \"$FAKE_MUTATIONS\" ;;",
+      "  *\"auth print-access-token\"*) printf 'fixture-access-token\\n' ;;",
       "  *\"run services list\"*) echo 'PERMISSION_DENIED' >&2; exit 1 ;;",
       "  *) echo \"unexpected gcloud argv: $*\" >&2; exit 64 ;;",
       "esac",
       "",
     ].join("\n"),
   );
+  await writeFile(
+    curl,
+    [
+      "#!/bin/sh",
+      "set -eu",
+      "output=",
+      "all_args=$*",
+      "while [ $# -gt 0 ]; do",
+      "  if [ \"$1\" = --output ]; then shift; output=$1; fi",
+      "  shift",
+      "done",
+      "case \"$all_args\" in *'/livez'*) printf '404'; exit 0 ;; esac",
+      "test -n \"$output\"",
+      "printf '%s\\n' '{\"reconciling\":false,\"ingress\":\"INGRESS_TRAFFIC_INTERNAL_ONLY\",\"invokerIamDisabled\":false}' > \"$output\"",
+      "",
+    ].join("\n"),
+  );
   await chmod(gh, 0o755);
   await chmod(gcloud, 0o755);
+  await chmod(curl, 0o755);
   const child = Bun.spawn(["/bin/bash", "--noprofile", "--norc", "-c", run], {
     cwd: root,
     env: {
@@ -1398,6 +1509,14 @@ async function executeReconcileStep(
       GH_TOKEN: "fixture-token",
       GITHUB_REPOSITORY: "collinbentley1/cdbentley",
       PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+      RUNNER_TEMP: root,
+      EXPECTED_PLATFORM_WORKFLOW_SHA: platformWorkflowSha,
+      EXPECTED_PREVIEW_IMAGE_NAME: "us-east4-docker.pkg.dev/cdbentley/site-preview/cdbentley",
+      EXPECTED_PREVIEW_RUNTIME_SERVICE_ACCOUNT: "cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+      EXPECTED_PRODUCTION_IMAGE_NAME: "us-east4-docker.pkg.dev/cdbentley/site/cdbentley",
+      EXPECTED_PROJECT_NUMBER: "882468538648",
+      EXPECTED_REPOSITORY: "collinbentley1/cdbentley",
+      PARITY_POLICY_ROOT: repoRoot,
       PLATFORM_WORKFLOW_SHA: platformWorkflowSha,
       PROJECT_ID: "cdbentley",
       REGION: "us-east4",

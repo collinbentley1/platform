@@ -39,9 +39,11 @@ describe("platform scaffold and doctor", () => {
             true,
           );
           expect(timeout as number, `${entry}:${jobName} timeout must be positive`).toBeGreaterThan(0);
-          expect(timeout as number, `${entry}:${jobName} timeout must not exceed 35 minutes`).toBeLessThanOrEqual(
-            35,
-          );
+          const maximumTimeout = entry === "deploy-prod.yml" && jobName === "deploy" ? 60 : 35;
+          expect(
+            timeout as number,
+            `${entry}:${jobName} timeout must not exceed ${maximumTimeout} minutes`,
+          ).toBeLessThanOrEqual(maximumTimeout);
         }
       }
     }
@@ -365,22 +367,22 @@ describe("platform scaffold and doctor", () => {
       path,
       original
         .replace(
-          "  preview_ingress                         = var.preview_ingress",
+          "  preview_ingress                                = var.preview_ingress",
           "  # preview_ingress = var.preview_ingress",
         )
         .replace(
-          "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+          "  runtime_secret_version_adder_ids               = var.runtime_secret_version_adder_ids",
           "  /* runtime_secret_version_adder_ids = var.runtime_secret_version_adder_ids */",
         )
         .replace(
-          "  runtime_secret_ids                      = var.runtime_secret_ids",
+          "  runtime_secret_ids                             = var.runtime_secret_ids",
           [
             '  runtime_secret_ids = ["attacker-controlled-secret"]',
             "  # runtime_secret_ids = var.runtime_secret_ids",
           ].join("\n"),
         )
         .replace(
-          "  runtime_secret_accessor_ids             = var.runtime_secret_accessor_ids",
+          "  runtime_secret_accessor_ids                    = var.runtime_secret_accessor_ids",
           [
             "  runtime_secret_accessor_ids = var.runtime_secret_ids",
             "  /* runtime_secret_accessor_ids = var.runtime_secret_accessor_ids */",
@@ -1903,6 +1905,10 @@ describe("platform scaffold and doctor", () => {
       join(repoRoot, "templates/app/.github/workflows/reconcile-previews.yml"),
       "utf8",
     );
+    const controller = await readFile(
+      join(repoRoot, "tools/ci/cloud-run-preview-controller.sh"),
+      "utf8",
+    );
 
     expect(caller).toContain("- converted_to_draft");
     expect(caller).toContain("github.event.action == 'synchronize'");
@@ -1913,11 +1919,11 @@ describe("platform scaffold and doctor", () => {
     expect(cleanup).toContain("github.event.action == 'synchronize'");
     expect(cleanup).toContain("github.event.action == 'converted_to_draft'");
     expect(cleanup).toContain("gha-preview-deploy@");
-    expect(cleanup).not.toContain("gha-preview-operator@");
+    expect(cleanup).toContain("iam_audit_service_account=gha-preview-operator@");
+    expect(cleanup).not.toContain("deploy_service_account=gha-preview-operator@");
     expect(cleanup).not.toContain("actions/checkout@");
     expect(cleanup).toContain("PR_NUMBER: ${{ github.event.pull_request.number }}");
-    expect(cleanup).toContain("verify_stable_preview_absent");
-    expect(cleanup).toContain('[ "$status" = "404" ]');
+    expect(cleanup).toContain('cloud-run-preview-controller.sh" remove');
     expect(deploy).toContain('--revision-suffix="$revision_suffix"');
     expect(deploy).toContain("EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}");
     const publishCanary = deploy.slice(
@@ -1931,11 +1937,12 @@ describe("platform scaffold and doctor", () => {
     );
     expect(deploy).toContain("  invalidate:\n");
     const invalidation = deploy.slice(deploy.indexOf("  invalidate:\n"));
-    expect(invalidation).toContain("gha-preview-deploy@");
-    expect(invalidation).not.toContain("gha-preview-operator@");
+    expect(invalidation).toContain("gha-preview-commit@");
+    expect(invalidation).not.toContain("gha-preview-deploy@");
+    expect(invalidation).toContain("iam_audit_service_account=gha-preview-operator@");
+    expect(invalidation).not.toContain("deploy_service_account=gha-preview-operator@");
     expect(invalidation).not.toContain("actions/checkout@");
-    expect(invalidation).toContain("verify_stable_preview_absent");
-    expect(invalidation).toContain('[ "$status" = "404" ]');
+    expect(invalidation).toContain('cloud-run-preview-controller.sh" remove');
     expect(deploy).toContain("deployed-revision: ${{ steps.deploy.outputs.revision }}");
     expect(deploy).toContain(
       'gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body',
@@ -1945,7 +1952,7 @@ describe("platform scaffold and doctor", () => {
       jobs: { deploy: { steps: Array<Record<string, unknown>> } };
     };
     const commentStep = parsedPreview.jobs.deploy.steps.find(
-      (step) => step.name === "Comment preview URL",
+      (step) => step.name === "Comment preview URL only after final admission",
     );
     expect(commentStep).toBeDefined();
     const commentRun = commentStep?.run as string;
@@ -1991,26 +1998,31 @@ describe("platform scaffold and doctor", () => {
       "--body",
       `Preview for commit ${"a".repeat(40)} deployed at https://pr-31.example.test (revision cdbentley-preview-p31-test).`,
     ]);
-    expect(invalidation).toContain("EXPECTED_REVISION: ${{ needs.deploy.outputs.deployed-revision }}");
-    expect(invalidation).toContain('if [ "$current_revision" != "$EXPECTED_REVISION" ]');
+    expect(invalidation).toContain(
+      "EXPECTED_TARGET_REVISION: ${{ needs.deploy.outputs.deployed-revision }}",
+    );
+    expect(controller).toContain(
+      'if [ -n "$EXPECTED_TARGET_REVISION" ] && [ "$live_revision" != "$EXPECTED_TARGET_REVISION" ]',
+    );
     expect(deploy).toContain("git-head-sha=${EXPECTED_HEAD_SHA}");
     expect(deploy).toContain("github-repository-id=${REPOSITORY_ID}");
     expect(deploy).toContain("platform-workflow-sha=${PLATFORM_WORKFLOW_SHA}");
     expect(deploy).toContain("PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}");
     expect(deploy).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
     expect(deploy).toContain('gcloud run revisions describe "$preview_revision"');
-    expect(reconcile).toContain('gcloud run revisions describe "$revision_name"');
-    expect(reconcile).toContain('.metadata.labels["git-head-sha"] == $head');
-    expect(reconcile).toContain('.metadata.labels["github-repository-id"] == $repository_id');
-    expect(reconcile).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
-    expect(reconcile).toContain("PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}");
+    expect(reconcile).toContain('cloud-run-preview-controller.sh" reconcile');
+    expect(controller).toContain('gcloud run revisions describe "$live_revision"');
+    expect(controller).toContain('.head.sha == $head');
+    expect(controller).toContain('.metadata.labels["github-repository-id"] == $repository_id');
+    expect(controller).toContain('.metadata.labels["platform-workflow-sha"] == $workflow_sha');
+    expect(reconcile).toContain("EXPECTED_PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}");
     expect(reconcileCaller).toContain("on:\n  push:\n    branches:\n      - main\n  schedule:");
     expect(reconcile).not.toContain("expected_revision_prefix");
     expect(reconcile).toContain("gha-preview-deploy@");
-    expect(reconcile).not.toContain("gha-preview-operator@");
+    expect(reconcile).toContain("iam_audit_service_account=gha-preview-operator@");
+    expect(reconcile).not.toContain("deploy_service_account=gha-preview-operator@");
     expect(reconcile).not.toContain("actions/checkout@");
-    expect(reconcile).toContain("verify_stable_preview_absent");
-    expect(reconcile).toContain('[ "$status" = "404" ]');
+    expect(controller).toContain('[ "$status" = 404 ]');
   });
 
   test("Critical History previews use one stable origin without a run.app bypass", async () => {
@@ -2022,15 +2034,17 @@ describe("platform scaffold and doctor", () => {
       preview.indexOf("  deploy:\n"),
       preview.indexOf("\n  invalidate:\n"),
     );
+    const transaction = await readFile(
+      join(repoRoot, "tools/ci/cloud-run-preview-traffic.sh"),
+      "utf8",
+    );
 
     expect(deploy).toContain('stable_preview_domain="preview.ycriticalhistory.org"');
     expect(deploy).toContain('preview_ingress="internal-and-cloud-load-balancing"');
-    expect(deploy).toContain('--ingress="$PREVIEW_INGRESS"');
     expect(deploy).not.toContain("--ingress=all");
     expect(deploy).toContain(
       'deterministic_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"',
     );
-    expect(deploy).toContain('[a-z0-9.-]+\\.run\\.app');
     expect(deploy).toContain(
       'public_preview_url="https://pr-${PR_NUMBER}.${STABLE_PREVIEW_DOMAIN}"',
     );
@@ -2038,19 +2052,19 @@ describe("platform scaffold and doctor", () => {
     expect(deploy).toContain('preview_nonce="$(openssl rand -hex 32)"');
     expect(deploy).toContain('"${public_preview_url}/livez"');
     expect(deploy).toContain("--max-filesize 1024");
-    expect(deploy).toContain('if health_status="$(curl --silent --show-error');
     expect(deploy).not.toContain('"${public_preview_url}/livez" || true');
     expect(deploy).toContain('jq -e -s --arg nonce "$preview_nonce"');
-    expect(deploy).toContain('length == 1 and .[0] == {deployment: $nonce, ok: true}');
     expect(deploy).not.toContain("*.preview.ycriticalhistory.org");
-    expect(deploy).toContain("rollback_tag=true");
-    expect(deploy).toContain('if [ "$current_revision" = "$expected_revision" ]');
-    expect(deploy).toContain('--remove-tags="$tag"');
-    expect(deploy.indexOf("rollback_tag=true")).toBeLessThan(
-      deploy.indexOf('gcloud run deploy "$PREVIEW_SERVICE"'),
+    expect(deploy).toContain("cloud-run-preview-traffic.sh\" commit");
+    expect(deploy).toContain("steps.traffic-commit.outputs.admitted == 'true'");
+    expect(transaction).toContain('live_url="https://${live_tag}.${STABLE_PREVIEW_DOMAIN}"');
+    expect(transaction).toContain('length == 1 and .[0] == {deployment:$nonce,ok:true}');
+    expect(transaction).toContain("capture_snapshot health-after false");
+    expect(transaction.indexOf("patched=true")).toBeLessThan(
+      transaction.indexOf("?updateMask=${commit_update_mask}&allowMissing=false", transaction.indexOf("patched=true")),
     );
-    expect(deploy.indexOf('jq -e -s --arg nonce "$preview_nonce"')).toBeLessThan(
-      deploy.lastIndexOf("rollback_tag=false"),
+    expect(transaction.lastIndexOf("capture_snapshot health-after false")).toBeLessThan(
+      transaction.lastIndexOf("patched=false"),
     );
 
     const templateServer = await readFile(
@@ -2087,7 +2101,7 @@ describe("platform scaffold and doctor", () => {
     );
     expect(exposureOutputs).not.toContain("try(");
     expect(production).toContain(
-      'preview_ingress                   = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
+      'preview_ingress                          = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
     );
 
     const nonce = "a".repeat(64);
@@ -2118,7 +2132,7 @@ describe("platform scaffold and doctor", () => {
     for (const moduleName of ["cloud-run-service", "bootstrap"]) {
       const moduleDirectory = join(repoRoot, "terraform/modules", moduleName);
       const approvedEntries = moduleName === "bootstrap"
-        ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
+        ? [...approvedModuleFiles, ".terraform.lock.hcl", "preview-runtime-deny.tf", "tests"].sort()
         : approvedModuleFiles;
       expect((await readdir(moduleDirectory)).sort()).toEqual(approvedEntries);
       for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
@@ -2163,7 +2177,7 @@ describe("platform scaffold and doctor", () => {
     const serviceModule = serviceModuleFiles[0]!;
     const allServiceModuleTerraform = serviceModuleFiles.join("\n");
     expect(createHash("sha256").update(serviceModule).digest("hex")).toBe(
-      "8491d3a4c1acd5b5e463ff5e154ba601581d1cc3c777526c5a3ea22a4b521c21",
+      "349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",
     );
     const productionServiceStart = serviceModule.indexOf(
       'resource "google_cloud_run_v2_service" "site"',
@@ -2240,6 +2254,11 @@ describe("platform scaffold and doctor", () => {
       .sort();
     expect(repositoryIamMembers).toEqual(
       [
+        "deployment_parity_preview_image_reader",
+        "deployment_parity_prod_image_reader",
+        "preview_commit_preview_image_reader",
+        "preview_commit_prod_image_reader",
+        "preview_deploy_prod_image_reader",
         "preview_deploy_reader",
         "preview_publisher_writer",
         "prod_deploy_reader",
@@ -2261,10 +2280,19 @@ describe("platform scaffold and doctor", () => {
       .sort();
     expect(allIamResources).toEqual(
       [
+        "google_artifact_registry_repository_iam_member.deployment_parity_preview_image_reader",
+        "google_artifact_registry_repository_iam_member.deployment_parity_prod_image_reader",
+        "google_artifact_registry_repository_iam_member.preview_commit_preview_image_reader",
+        "google_artifact_registry_repository_iam_member.preview_commit_prod_image_reader",
+        "google_artifact_registry_repository_iam_member.preview_deploy_prod_image_reader",
         "google_artifact_registry_repository_iam_member.preview_deploy_reader",
         "google_artifact_registry_repository_iam_member.preview_publisher_writer",
         "google_artifact_registry_repository_iam_member.prod_deploy_reader",
         "google_artifact_registry_repository_iam_member.prod_publisher_writer",
+        "google_cloud_run_v2_service_iam_member.deployment_parity_preview_reader",
+        "google_cloud_run_v2_service_iam_member.deployment_parity_prod_reader",
+        "google_cloud_run_v2_service_iam_member.preview_commit",
+        "google_cloud_run_v2_service_iam_member.preview_commit_prod_reader",
         "google_cloud_run_v2_service_iam_member.preview_deploy",
         "google_cloud_run_v2_service_iam_member.prod_deploy",
         "google_secret_manager_secret_iam_member.prod_deploy_version_adder",
@@ -2310,6 +2338,42 @@ describe("platform scaffold and doctor", () => {
         "}",
       ].join("\n"),
       [
+        'resource "google_artifact_registry_repository_iam_member" "deployment_parity_prod_image_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.site.location",
+        "  repository = google_artifact_registry_repository.site.repository_id",
+        '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+        '  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "deployment_parity_preview_image_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.preview.location",
+        "  repository = google_artifact_registry_repository.preview.repository_id",
+        '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+        '  member     = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "preview_commit_prod_image_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.site.location",
+        "  repository = google_artifact_registry_repository.site.repository_id",
+        '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+        '  member     = "serviceAccount:${var.preview_commit_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_artifact_registry_repository_iam_member" "preview_commit_preview_image_reader" {',
+        "  project    = var.project_id",
+        "  location   = google_artifact_registry_repository.preview.location",
+        "  repository = google_artifact_registry_repository.preview.repository_id",
+        '  role       = "projects/${var.project_id}/roles/deploymentParityImageDownloader"',
+        '  member     = "serviceAccount:${var.preview_commit_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
         'resource "google_secret_manager_secret_iam_member" "runtime_accessor" {',
         "  for_each = var.runtime_secret_accessor_ids",
         "",
@@ -2345,6 +2409,42 @@ describe("platform scaffold and doctor", () => {
         "  name     = google_cloud_run_v2_service.preview.name",
         '  role     = "projects/${var.project_id}/roles/cloudRunRevisionDeployer"',
         '  member   = "serviceAccount:${var.preview_deploy_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "preview_commit" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.preview.location",
+        "  name     = google_cloud_run_v2_service.preview.name",
+        '  role     = "projects/${var.project_id}/roles/previewTrafficCommitter"',
+        '  member   = "serviceAccount:${var.preview_commit_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "preview_commit_prod_reader" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.site.location",
+        "  name     = google_cloud_run_v2_service.site.name",
+        '  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"',
+        '  member   = "serviceAccount:${var.preview_commit_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "deployment_parity_prod_reader" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.site.location",
+        "  name     = google_cloud_run_v2_service.site.name",
+        '  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"',
+        '  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
+        "}",
+      ].join("\n"),
+      [
+        'resource "google_cloud_run_v2_service_iam_member" "deployment_parity_preview_reader" {',
+        "  project  = var.project_id",
+        "  location = google_cloud_run_v2_service.preview.location",
+        "  name     = google_cloud_run_v2_service.preview.name",
+        '  role     = "projects/${var.project_id}/roles/deploymentParityCloudRunReader"',
+        '  member   = "serviceAccount:${var.deployment_parity_reader_service_account_email}"',
         "}",
       ].join("\n"),
     ];
@@ -2408,7 +2508,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "cd0642a94606dba447bddaed2eb1ba20cfb4ed98d8ecf2d79e75e362104645c6",
+      "defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2440,6 +2540,7 @@ describe("platform scaffold and doctor", () => {
     expect(bootstrapIamResources).toEqual(
       [
         "google_project_iam_binding.editor_absent",
+        "google_project_iam_member.preview_iam_auditors",
         "google_project_iam_member.runtime_project_roles",
         "google_project_iam_member.terraform_convergence_reader",
         "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
@@ -2448,10 +2549,17 @@ describe("platform scaffold and doctor", () => {
         "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
         "google_service_account_iam_member.canary_wif_prod_workflow_sha",
         "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
+        "google_service_account_iam_member.deployment_parity_wif_preview_workflow_sha",
+        "google_service_account_iam_member.deployment_parity_wif_prod_workflow_sha",
+        "google_service_account_iam_member.preview_commit_wif_preview_operations_workflow_sha",
+        "google_service_account_iam_member.preview_commit_wif_prod_workflow_sha",
+        "google_service_account_iam_member.preview_commit_wif_workflow_sha",
         "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
+        "google_service_account_iam_member.preview_deploy_wif_prod_workflow_sha",
         "google_service_account_iam_member.preview_deploy_wif_repo",
-        "google_service_account_iam_member.preview_deploy_wif_preview_operations_workflow_sha",
         "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
+        "google_service_account_iam_member.preview_iam_audit_wif_preview_operations_workflow_sha",
+        "google_service_account_iam_member.preview_iam_audit_wif_workflow_sha",
         "google_service_account_iam_member.preview_operator_wif_repo",
         "google_service_account_iam_member.preview_operator_wif_workflow_sha",
         "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
@@ -2462,8 +2570,10 @@ describe("platform scaffold and doctor", () => {
         "google_service_account_iam_member.terraform_wif_prod_env",
         "google_service_account_iam_member.terraform_wif_workflow_sha",
         "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
+        "google_storage_bucket_iam_binding.deployment_parity_transition_no_legacy_access",
         "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
         "google_storage_bucket_iam_binding.terraform_state_no_legacy_access",
+        "google_storage_bucket_iam_member.preview_commit_transition_coordinator",
         "google_storage_bucket_iam_member.terraform_state_access_logs_writer",
         "google_storage_bucket_iam_member.terraform_state_reader",
       ].sort(),
@@ -2503,7 +2613,12 @@ describe("platform scaffold and doctor", () => {
     expect(bootstrap).not.toMatch(
       /google_service_account\.preview_operator\.(?:email|member)/,
     );
-    expect(bootstrap).not.toContain("serviceAccount:gha-preview-operator@");
+    expect(bootstrap).toContain(
+      'role    = google_project_iam_custom_role.preview_iam_auditor.name',
+    );
+    expect(bootstrap).toContain(
+      '"serviceAccount:gha-preview-operator@cdbentley.iam.gserviceaccount.com"',
+    );
     const imageRoleStart = bootstrap.indexOf(
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader"',
     );
@@ -2547,7 +2662,7 @@ describe("platform scaffold and doctor", () => {
       expect(output).toContain("only declared exact-secret version-add grants.");
     }
     const activeOperationsBindingStart = bootstrap.indexOf(
-      'resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"',
+      'resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha"',
     );
     const activeOperationsBinding = bootstrap.slice(
       activeOperationsBindingStart,
@@ -2557,7 +2672,7 @@ describe("platform scaffold and doctor", () => {
       "for_each = var.preview_operations_active_workflow_shas",
     );
     expect(activeOperationsBinding).toContain(
-      "service_account_id = google_service_account.preview_deploy.name",
+      "service_account_id = google_service_account.preview_commit.name",
     );
     expect(activeOperationsBinding).toContain("/attribute.preview_operator_workflow_sha/");
     const transitionOperatorBindingStart = bootstrap.indexOf(
@@ -2818,8 +2933,8 @@ describe("platform scaffold and doctor", () => {
           "deploy",
         ],
       ],
-      ["cleanup-preview.yml", ["rerun-guard", "cleanup"]],
-      ["reconcile-previews.yml", ["rerun-guard", "reconcile"]],
+      ["cleanup-preview.yml", ["rerun-guard", "prefetch-bases", "cleanup"]],
+      ["reconcile-previews.yml", ["rerun-guard", "prefetch-bases", "reconcile"]],
       [
         "infrastructure.yml",
         ["rerun-guard", "terraform-validate", "checkov", "terraform-convergence"],
@@ -2843,8 +2958,10 @@ describe("platform scaffold and doctor", () => {
         publish:
           "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish-canary.result == 'success' && needs.verify-image.result == 'success'",
         attest: "needs.publish.result == 'success'",
-        deploy: "needs.attest.result == 'success' && needs.publish.result == 'success'",
-        invalidate: "always() && needs.deploy.outputs.deployed-revision != '' && needs.deploy.outputs.lifecycle-keep != 'true'",
+        deploy:
+          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
+        invalidate:
+          "always() && needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')",
       },
       "deploy-prod.yml": {
         "rerun-guard": null,
@@ -2854,17 +2971,22 @@ describe("platform scaffold and doctor", () => {
         canary: "github.event_name == 'push' && github.ref == 'refs/heads/main'",
         publish: "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.verify-image.result == 'success'",
         attest: "needs.publish.result == 'success'",
-        deploy: "needs.attest.result == 'success' && needs.publish.result == 'success'",
+        deploy:
+          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
       },
       "cleanup-preview.yml": {
         "rerun-guard": null,
+        "prefetch-bases":
+          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && (github.event.action == 'closed' ||\n github.event.action == 'synchronize' ||\n github.event.action == 'converted_to_draft')",
         cleanup:
-          "github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && (github.event.action == 'closed' ||\n github.event.action == 'synchronize' ||\n github.event.action == 'converted_to_draft') &&\ngithub.event.pull_request.head.repo.full_name == github.repository",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && (github.event.action == 'closed' ||\n github.event.action == 'synchronize' ||\n github.event.action == 'converted_to_draft') &&\ngithub.event.pull_request.head.repo.full_name == github.repository",
       },
       "reconcile-previews.yml": {
         "rerun-guard": null,
-        reconcile:
+        "prefetch-bases":
           "(github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'",
+        reconcile:
+          "always() && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'",
       },
       "infrastructure.yml": {
         "rerun-guard": null,
@@ -3158,17 +3280,17 @@ describe("platform scaffold and doctor", () => {
       "setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)",
     );
     expect(templateProductionMain).toContain(
-      "runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+      "runtime_secret_version_adder_ids               = var.runtime_secret_version_adder_ids",
     );
     expect(templateProductionVariables).toContain(
       "setsubtract(var.runtime_secret_version_adder_ids, var.runtime_secret_ids)",
     );
-    expect(deployment).toContain("runtime_secret_accessor_ids       = []");
+    expect(deployment).toContain("runtime_secret_accessor_ids              = []");
     expect(deployment).toContain("runtime_secret_version_adder_ids = [");
-    expect(deployment.split("runtime_secret_version_adder_ids  = []")).toHaveLength(4);
+    expect(deployment.split("runtime_secret_version_adder_ids         = []")).toHaveLength(4);
     expect(deployment).toContain('"waitlist-identity-keyset"');
     expect(deployment).toContain(
-      "runtime_secret_version_adder_ids        = local.deployment.runtime_secret_version_adder_ids",
+      "runtime_secret_version_adder_ids               = local.deployment.runtime_secret_version_adder_ids",
     );
     expect(deployment).toContain('RUNSETTA_OFFLINE   = "1"');
     const medlockProduction = deployment.slice(
@@ -3269,11 +3391,11 @@ async function configureReviewedMedlock(app: string): Promise<void> {
   const productionMainPath = join(app, "infra/terraform/prod/main.tf");
   let productionMain = await readFile(productionMainPath, "utf8");
   productionMain = productionMain
-    .replace('artifact_registry_description           = "Container images for medlock."', 'artifact_registry_description           = "Container images for Medlock."')
+    .replace('artifact_registry_description                  = "Container images for medlock."', 'artifact_registry_description                  = "Container images for Medlock."')
     .replace(
-      "  preview_publisher_service_account_email = var.preview_publisher_service_account_email",
+      "  preview_publisher_service_account_email        = var.preview_publisher_service_account_email",
       [
-        "  preview_publisher_service_account_email = var.preview_publisher_service_account_email",
+        "  preview_publisher_service_account_email        = var.preview_publisher_service_account_email",
         "  container_env = {",
         '    ALLOWED_HOSTS    = "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app"',
         '    ALLOWED_ORIGINS  = "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app"',
@@ -3285,9 +3407,9 @@ async function configureReviewedMedlock(app: string): Promise<void> {
       ].join("\n"),
     )
     .replace(
-      "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+      "  runtime_secret_version_adder_ids               = var.runtime_secret_version_adder_ids",
       [
-        "  runtime_secret_version_adder_ids        = var.runtime_secret_version_adder_ids",
+        "  runtime_secret_version_adder_ids               = var.runtime_secret_version_adder_ids",
         "  firestore_database = {",
         '    name                         = "(default)"',
         '    location_id                  = "nam5"',
@@ -3332,6 +3454,7 @@ async function configureReviewedMedlock(app: string): Promise<void> {
       [
         "  required_services = [",
         '    "artifactregistry.googleapis.com",',
+        '    "cloudasset.googleapis.com",',
         '    "cloudresourcemanager.googleapis.com",',
         '    "firestore.googleapis.com",',
         '    "iam.googleapis.com",',

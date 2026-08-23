@@ -1,0 +1,353 @@
+name: Protected owner Terraform bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repository:
+        description: Consumer repository whose one Google Cloud project is in scope.
+        required: true
+        type: choice
+        options:
+          - cdbentley
+          - runsetta
+          - healthmcp
+          - critical-history
+      terraform_root:
+        description: Exact consumer Terraform root to plan or apply.
+        required: true
+        type: choice
+        options:
+          - bootstrap
+          - prod
+      mode:
+        description: Plan emits a sanitized digest; apply recomputes and requires that digest.
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+      consumer_sha:
+        description: Full reviewed consumer commit SHA to fetch without a branch or tag.
+        required: true
+        type: string
+      legacy_compatibility_mode:
+        description: Bootstrap initial adoption only; requires an empty transition SHA.
+        required: true
+        type: boolean
+        default: false
+      transition_workflow_sha:
+        description: Bootstrap exact-SHA transition only; optional immediately previous reviewed platform SHA and incompatible with legacy mode.
+        required: false
+        type: string
+      approved_manifest_sha256:
+        description: Empty for plan; exact digest from the reviewed plan summary for apply.
+        required: false
+        type: string
+      approved_plan_run_id:
+        description: Empty for plan; fresh successful plan run whose immutable receipt is consumed once by apply.
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: protected-owner-terraform-${{ inputs.target_repository }}
+  cancel-in-progress: false
+
+jobs:
+  owner-terraform:
+    name: ${{ inputs.target_repository }} ${{ inputs.terraform_root }} ${{ inputs.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: protected-bootstrap-owner-token
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Reject every route except an owner dispatch from platform main
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          APPROVED_MANIFEST_SHA256: ${{ inputs.approved_manifest_sha256 }}
+          APPROVED_PLAN_RUN_ID: ${{ inputs.approved_plan_run_id }}
+          CONSUMER_SHA: ${{ inputs.consumer_sha }}
+          EXECUTION_MODE: ${{ inputs.mode }}
+          GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
+          GITHUB_EVENT_NAME_EXACT: ${{ github.event_name }}
+          GITHUB_REF_EXACT: ${{ github.ref }}
+          GITHUB_REPOSITORY_EXACT: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID_EXACT: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID_EXACT: ${{ github.repository_owner_id }}
+          GITHUB_RUN_ATTEMPT_EXACT: ${{ github.run_attempt }}
+          GITHUB_SHA_EXACT: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF_EXACT: ${{ github.workflow_ref }}
+          LEGACY_COMPATIBILITY_MODE: ${{ inputs.legacy_compatibility_mode }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          TERRAFORM_ROOT: ${{ inputs.terraform_root }}
+          TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME_EXACT" = "workflow_dispatch"
+          test "$GITHUB_REF_EXACT" = "refs/heads/main"
+          test "$GITHUB_REPOSITORY_EXACT" = "collinbentley1/platform"
+          test "$GITHUB_REPOSITORY_ID_EXACT" = "1255856466"
+          test "$GITHUB_REPOSITORY_OWNER_ID_EXACT" = "16823277"
+          test "$GITHUB_ACTOR_ID_EXACT" = "16823277"
+          test "$GITHUB_RUN_ATTEMPT_EXACT" = "1"
+          test "$GITHUB_WORKFLOW_REF_EXACT" = \
+            "collinbentley1/platform/.github/workflows/protected-bootstrap-implementation.yml@refs/heads/main"
+          case "$TARGET_REPOSITORY" in
+            cdbentley|runsetta|healthmcp|critical-history) ;;
+            *) exit 1 ;;
+          esac
+          case "$TERRAFORM_ROOT" in bootstrap|prod) ;; *) exit 1 ;; esac
+          case "$EXECUTION_MODE" in plan|apply) ;; *) exit 1 ;; esac
+          [[ "$CONSUMER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_SHA_EXACT" =~ ^[0-9a-f]{40}$ ]]
+          case "$LEGACY_COMPATIBILITY_MODE" in true|false) ;; *) exit 1 ;; esac
+          if [ -n "$TRANSITION_WORKFLOW_SHA" ]; then
+            [[ "$TRANSITION_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$TRANSITION_WORKFLOW_SHA" != "$GITHUB_SHA_EXACT"
+            test "$LEGACY_COMPATIBILITY_MODE" = "false"
+          fi
+          if [ "$TERRAFORM_ROOT" = "prod" ]; then
+            test "$LEGACY_COMPATIBILITY_MODE" = "false"
+            test -z "$TRANSITION_WORKFLOW_SHA"
+          elif [ "$LEGACY_COMPATIBILITY_MODE" = "true" ]; then
+            test -z "$TRANSITION_WORKFLOW_SHA"
+          fi
+          if [ "$EXECUTION_MODE" = "plan" ]; then
+            test -z "$APPROVED_MANIFEST_SHA256"
+            test -z "$APPROVED_PLAN_RUN_ID"
+          else
+            [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$APPROVED_PLAN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          fi
+
+      - name: Fetch the exact public platform, consumer, and transition commits
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          CONSUMER_SHA: ${{ inputs.consumer_sha }}
+          PLATFORM_SHA: ${{ github.sha }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PLATFORM_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CONSUMER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          case "$TARGET_REPOSITORY" in
+            cdbentley|runsetta|healthmcp|critical-history) ;;
+            *) exit 1 ;;
+          esac
+          if [ -n "$TRANSITION_WORKFLOW_SHA" ]; then
+            [[ "$TRANSITION_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
+
+          git_command=(/usr/bin/env -i HOME="$RUNNER_TEMP" PATH=/usr/bin:/bin
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+            /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null
+            -c core.fsmonitor=false -c diff.external= -c protocol.file.allow=never
+            -c protocol.version=2)
+          fetch_exact_public_commit() {
+            local destination="$1" repository="$2" expected_sha="$3"
+            test ! -e "$destination" && test ! -L "$destination"
+            mkdir -m 0700 "$destination"
+            "${git_command[@]}" -C "$destination" init --quiet
+            "${git_command[@]}" -C "$destination" remote add origin \
+              "https://github.com/collinbentley1/${repository}.git"
+            "${git_command[@]}" -C "$destination" fetch --quiet --depth=1 --no-tags origin \
+              "$expected_sha"
+            test "$("${git_command[@]}" -C "$destination" rev-parse FETCH_HEAD)" = \
+              "$expected_sha"
+            "${git_command[@]}" -C "$destination" checkout --quiet --detach "$expected_sha"
+            test "$("${git_command[@]}" -C "$destination" rev-parse HEAD)" = "$expected_sha"
+            test -z "$("${git_command[@]}" -C "$destination" status \
+              --porcelain=v1 --untracked-files=all)"
+          }
+
+          platform_root="$RUNNER_TEMP/platform"
+          test ! -e "$platform_root" && test ! -L "$platform_root"
+          mkdir -m 0700 "$platform_root"
+          "${git_command[@]}" -C "$platform_root" init --quiet
+          "${git_command[@]}" -C "$platform_root" remote add origin \
+            https://github.com/collinbentley1/platform.git
+          if [ -n "$TRANSITION_WORKFLOW_SHA" ]; then
+            # Fetch both objects into one repository without a shallow boundary,
+            # so the controller can independently prove transition ancestry.
+            "${git_command[@]}" -C "$platform_root" fetch --quiet --no-tags origin \
+              "$PLATFORM_SHA" "$TRANSITION_WORKFLOW_SHA"
+          else
+            "${git_command[@]}" -C "$platform_root" fetch --quiet --depth=1 --no-tags origin \
+              "$PLATFORM_SHA"
+          fi
+          "${git_command[@]}" -C "$platform_root" checkout --quiet --detach "$PLATFORM_SHA"
+          test "$("${git_command[@]}" -C "$platform_root" rev-parse HEAD)" = "$PLATFORM_SHA"
+          test -z "$("${git_command[@]}" -C "$platform_root" status \
+            --porcelain=v1 --untracked-files=all)"
+          fetch_exact_public_commit "$RUNNER_TEMP/consumer" "$TARGET_REPOSITORY" "$CONSUMER_SHA"
+          if [ -n "$TRANSITION_WORKFLOW_SHA" ]; then
+            "${git_command[@]}" -C "$platform_root" merge-base --is-ancestor \
+              "$TRANSITION_WORKFLOW_SHA" "$PLATFORM_SHA"
+            transition_root="$RUNNER_TEMP/transition-platform"
+            test ! -e "$transition_root" && test ! -L "$transition_root"
+            "${git_command[@]}" -C "$platform_root" worktree add --quiet --detach \
+              "$transition_root" "$TRANSITION_WORKFLOW_SHA"
+            test "$("${git_command[@]}" -C "$transition_root" rev-parse HEAD)" = \
+              "$TRANSITION_WORKFLOW_SHA"
+            test -z "$("${git_command[@]}" -C "$transition_root" status \
+              --porcelain=v1 --untracked-files=all)"
+          fi
+
+      - name: Install checksum-pinned Bun 1.4.0
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -m 0700 "$destination"
+          unzip -q "$archive" -d "$destination"
+          test "$("$destination/bun-linux-x64/bun" --revision | cut -d+ -f1)" = "1.4.0"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Extract checksum-pinned Terraform 1.14.5 without host execution
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          TERRAFORM_SHA256: ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/terraform.zip"
+          destination="$RUNNER_TEMP/terraform-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip
+          echo "${TERRAFORM_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -m 0700 "$destination"
+          unzip -q "$archive" -d "$destination"
+          test -f "$destination/terraform" && test ! -L "$destination/terraform"
+          chmod 0500 "$destination/terraform"
+
+      - name: Extract the exact checksum-pinned Google provider without host execution
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          GOOGLE_PROVIDER_SHA256: fb1b9d1ea7bc79b7409f02aa7c19ba39afa22dbead69e83ae7eb2691ac5c2426
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/terraform-provider-google-7.45.0-linux-amd64.zip"
+          destination="$RUNNER_TEMP/terraform-provider-google"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://releases.hashicorp.com/terraform-provider-google/7.45.0/terraform-provider-google_7.45.0_linux_amd64.zip
+          echo "${GOOGLE_PROVIDER_SHA256}  ${archive}" | sha256sum --check --strict
+          test "$(unzip -Z1 "$archive")" = $'LICENSE.txt\nterraform-provider-google_v7.45.0_x5'
+          mkdir -m 0700 "$destination"
+          unzip -q "$archive" -d "$destination"
+          test -f "$destination/LICENSE.txt" && test ! -L "$destination/LICENSE.txt"
+          test -f "$destination/terraform-provider-google_v7.45.0_x5"
+          test ! -L "$destination/terraform-provider-google_v7.45.0_x5"
+          chmod 0400 "$destination/LICENSE.txt"
+          chmod 0500 "$destination/terraform-provider-google_v7.45.0_x5"
+
+      - name: Pull the exact Terraform sandbox image before any secret exists
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
+        run: |
+          set -euo pipefail
+          /usr/bin/docker pull --platform=linux/amd64 "$TERRAFORM_SANDBOX_IMAGE"
+          /usr/bin/docker image inspect "$TERRAFORM_SANDBOX_IMAGE" \
+            --format '{{json .RepoDigests}}' | \
+            jq -e --arg image "$TERRAFORM_SANDBOX_IMAGE" 'index($image) != null' >/dev/null
+
+      - name: Plan or apply through a random single-run executor
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          APPROVED_MANIFEST_SHA256: ${{ inputs.approved_manifest_sha256 }}
+          APPROVED_PLAN_RUN_ID: ${{ inputs.approved_plan_run_id }}
+          CONSUMER_ROOT: ${{ runner.temp }}/consumer
+          CONSUMER_SHA: ${{ inputs.consumer_sha }}
+          EXECUTION_MODE: ${{ inputs.mode }}
+          GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
+          GITHUB_EVENT_NAME_EXACT: ${{ github.event_name }}
+          GITHUB_REF_EXACT: ${{ github.ref }}
+          GITHUB_REPOSITORY_EXACT: ${{ github.repository }}
+          GITHUB_REPOSITORY_ID_EXACT: ${{ github.repository_id }}
+          GITHUB_REPOSITORY_OWNER_ID_EXACT: ${{ github.repository_owner_id }}
+          GITHUB_RUN_ATTEMPT_EXACT: ${{ github.run_attempt }}
+          GITHUB_RUN_ID_EXACT: ${{ github.run_id }}
+          GITHUB_SHA_EXACT: ${{ github.sha }}
+          GITHUB_WORKFLOW_REF_EXACT: ${{ github.workflow_ref }}
+          LEGACY_COMPATIBILITY_MODE: ${{ inputs.legacy_compatibility_mode }}
+          PLATFORM_ROOT: ${{ runner.temp }}/platform
+          RUNNER_ARCH_EXACT: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT_EXACT: ${{ runner.environment }}
+          RUNNER_OS_EXACT: ${{ runner.os }}
+          RUNNER_TEMP_EXACT: ${{ runner.temp }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+          TERRAFORM_BINARY: ${{ runner.temp }}/terraform-bin/terraform
+          TERRAFORM_PROVIDER_ARCHIVE: ${{ runner.temp }}/terraform-provider-google-7.45.0-linux-amd64.zip
+          TERRAFORM_PROVIDER_DIRECTORY: ${{ runner.temp }}/terraform-provider-google
+          TERRAFORM_ROOT: ${{ inputs.terraform_root }}
+          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
+          TRANSITION_PLATFORM_ROOT: ${{ runner.temp }}/transition-platform
+          TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}
+          CONSUMER_ACTIONS_READ_TOKEN: ${{ secrets.CONSUMER_ACTIONS_READ_TOKEN }}
+          OWNER_OAUTH_ACCESS_TOKEN: ${{ secrets.OWNER_OAUTH_ACCESS_TOKEN }}
+          PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Copy once into non-exported shell variables and remove the exported
+          # names before any child is created. Only Bash builtins handle the
+          # values; Bun then consumes and closes the anonymous pipe under an
+          # empty initial environment before any API or child process starts.
+          owner_token="$OWNER_OAUTH_ACCESS_TOKEN"
+          consumer_token="$CONSUMER_ACTIONS_READ_TOKEN"
+          platform_token="$PLATFORM_ACTIONS_READ_TOKEN"
+          unset OWNER_OAUTH_ACCESS_TOKEN CONSUMER_ACTIONS_READ_TOKEN PLATFORM_ACTIONS_READ_TOKEN
+          export -n owner_token consumer_token platform_token
+          shopt -s lastpipe
+          {
+            printf '%s\0%s\0%s\0' "$owner_token" "$consumer_token" "$platform_token"
+            owner_token= consumer_token= platform_token=
+            unset owner_token consumer_token platform_token
+          } | \
+          exec /usr/bin/env -i \
+            APPROVED_MANIFEST_SHA256="$APPROVED_MANIFEST_SHA256" \
+            APPROVED_PLAN_RUN_ID="$APPROVED_PLAN_RUN_ID" \
+            CONSUMER_ROOT="$CONSUMER_ROOT" \
+            CONSUMER_SHA="$CONSUMER_SHA" \
+            EXECUTION_MODE="$EXECUTION_MODE" \
+            GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
+            GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \
+            GITHUB_REF_EXACT="$GITHUB_REF_EXACT" \
+            GITHUB_REPOSITORY_EXACT="$GITHUB_REPOSITORY_EXACT" \
+            GITHUB_REPOSITORY_ID_EXACT="$GITHUB_REPOSITORY_ID_EXACT" \
+            GITHUB_REPOSITORY_OWNER_ID_EXACT="$GITHUB_REPOSITORY_OWNER_ID_EXACT" \
+            GITHUB_RUN_ATTEMPT_EXACT="$GITHUB_RUN_ATTEMPT_EXACT" \
+            GITHUB_RUN_ID_EXACT="$GITHUB_RUN_ID_EXACT" \
+            GITHUB_SHA_EXACT="$GITHUB_SHA_EXACT" \
+            GITHUB_STEP_SUMMARY_EXACT="$GITHUB_STEP_SUMMARY" \
+            GITHUB_WORKFLOW_REF_EXACT="$GITHUB_WORKFLOW_REF_EXACT" \
+            HOME="$RUNNER_TEMP_EXACT" \
+            LEGACY_COMPATIBILITY_MODE="$LEGACY_COMPATIBILITY_MODE" \
+            PATH=/usr/bin:/bin \
+            PLATFORM_ROOT="$PLATFORM_ROOT" \
+            RUNNER_ARCH_EXACT="$RUNNER_ARCH_EXACT" \
+            RUNNER_ENVIRONMENT_EXACT="$RUNNER_ENVIRONMENT_EXACT" \
+            RUNNER_OS_EXACT="$RUNNER_OS_EXACT" \
+            RUNNER_TEMP_EXACT="$RUNNER_TEMP_EXACT" \
+            TARGET_REPOSITORY="$TARGET_REPOSITORY" \
+            TERRAFORM_BINARY="$TERRAFORM_BINARY" \
+            TERRAFORM_PROVIDER_ARCHIVE="$TERRAFORM_PROVIDER_ARCHIVE" \
+            TERRAFORM_PROVIDER_DIRECTORY="$TERRAFORM_PROVIDER_DIRECTORY" \
+            TERRAFORM_ROOT="$TERRAFORM_ROOT" \
+            TERRAFORM_SANDBOX_IMAGE="$TERRAFORM_SANDBOX_IMAGE" \
+            TRANSITION_PLATFORM_ROOT="$TRANSITION_PLATFORM_ROOT" \
+            TRANSITION_WORKFLOW_SHA="$TRANSITION_WORKFLOW_SHA" \
+            "$RUNNER_TEMP_EXACT/bun-bin/bun-linux-x64/bun" --no-env-file --no-orphans \
+              "$PLATFORM_ROOT/tools/ci/protected-bootstrap-bridge.ts"

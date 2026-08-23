@@ -29,6 +29,7 @@ variable "active_workflow_sha" {
         "4f032955477c26b942fdd4f1b01f5272380390ea",
         "92c73184bc527388b5e10ccb5e4f0222a84e68b5",
         "33ab9b9a5f3d8a0553372980c22540cad001f776",
+        "ddaa918319be123c780876d510efb4715c1f879d",
       ], var.active_workflow_sha)
     )
     error_message = "active_workflow_sha must be a reviewed full SHA and must not be a vulnerable pre-migration release."
@@ -59,10 +60,16 @@ variable "transition_workflow_sha" {
           "4f032955477c26b942fdd4f1b01f5272380390ea",
           "92c73184bc527388b5e10ccb5e4f0222a84e68b5",
           "33ab9b9a5f3d8a0553372980c22540cad001f776",
+          "ddaa918319be123c780876d510efb4715c1f879d",
         ], var.transition_workflow_sha)
       )
     )
     error_message = "transition_workflow_sha must be empty or an immediately previous reviewed safe SHA, never a vulnerable pre-migration release."
+  }
+
+  validation {
+    condition     = !(var.legacy_compatibility_mode && var.transition_workflow_sha != "")
+    error_message = "legacy_compatibility_mode is allowed only for the initial migration with an empty transition_workflow_sha."
   }
 }
 
@@ -90,6 +97,7 @@ locals {
       github_repository_id        = "1255553151"
       required_services = [
         "artifactregistry.googleapis.com",
+        "cloudasset.googleapis.com",
         "cloudresourcemanager.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
@@ -112,6 +120,7 @@ locals {
       github_repository_id        = "711292980"
       required_services = [
         "artifactregistry.googleapis.com",
+        "cloudasset.googleapis.com",
         "cloudresourcemanager.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
@@ -135,6 +144,7 @@ locals {
       github_repository_id        = "1025243085"
       required_services = [
         "artifactregistry.googleapis.com",
+        "cloudasset.googleapis.com",
         "cloudresourcemanager.googleapis.com",
         "firestore.googleapis.com",
         "iam.googleapis.com",
@@ -162,6 +172,7 @@ locals {
       required_services = [
         "artifactregistry.googleapis.com",
         "certificatemanager.googleapis.com",
+        "cloudasset.googleapis.com",
         "cloudresourcemanager.googleapis.com",
         "compute.googleapis.com",
         "iam.googleapis.com",

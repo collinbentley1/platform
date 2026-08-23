@@ -312,7 +312,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
     concurrency:
-      group: production-${{ github.event.repository.id }}
+      group: deployment-parity-${{ github.event.repository.id }}
       queue: max
       cancel-in-progress: false
     permissions:
@@ -354,24 +354,32 @@ jobs:
             1255553151)
               project_id="cdbentley"
               project_number="882468538648"
+              service_name="cdbentley"
+              preview_ingress="INGRESS_TRAFFIC_ALL"
               state_bucket="cdbentley-tfstate-882468538648"
               state_prefix="cdbentley/prod"
               ;;
             711292980)
               project_id="runsetta"
               project_number="601124730704"
+              service_name="runsetta"
+              preview_ingress="INGRESS_TRAFFIC_ALL"
               state_bucket="runsetta-tfstate-601124730704"
               state_prefix="runsetta/prod"
               ;;
             1025243085)
               project_id="medlock-1025243085"
               project_number="229383559510"
+              service_name="medlock"
+              preview_ingress="INGRESS_TRAFFIC_ALL"
               state_bucket="medlock-tfstate-1025243085"
               state_prefix="medlock/prod"
               ;;
             280932482)
               project_id="critical-history-16823277"
               project_number="422714632513"
+              service_name="critical-history"
+              preview_ingress="INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
               state_bucket="critical-history-tfstate-422714632513"
               state_prefix="critical-history/prod"
               ;;
@@ -386,6 +394,8 @@ jobs:
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/github-actions/providers/github"
             echo "terraform_service_account=gha-terraform@${project_id}.iam.gserviceaccount.com"
             echo "canary_service_account=gha-wif-canary@${project_id}.iam.gserviceaccount.com"
+            echo "preview_service=${service_name}-preview"
+            echo "preview_ingress=$preview_ingress"
             echo "state_bucket=$state_bucket"
             echo "state_prefix=$state_prefix"
           } >> "$GITHUB_OUTPUT"
@@ -455,11 +465,14 @@ jobs:
           export_environment_variables: false
 
       - name: Authenticate the metadata-only Terraform convergence reader
+        id: terraform_auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
           project_id: ${{ steps.app.outputs.project_id }}
           workload_identity_provider: ${{ steps.app.outputs.workload_identity_provider }}
           service_account: ${{ steps.app.outputs.terraform_service_account }}
+          token_format: access_token
+          access_token_lifetime: 300s
 
       - name: Require production infrastructure to be converged
         env:
@@ -491,3 +504,72 @@ jobs:
               ;;
             *) exit "$plan_status" ;;
           esac
+
+      - name: Require coherent controller-owned preview exposure
+        env:
+          ACCESS_TOKEN: ${{ steps.terraform_auth.outputs.access_token }}
+          EXPECTED_OPEN_INGRESS: ${{ steps.app.outputs.preview_ingress }}
+          PREVIEW_SERVICE: ${{ steps.app.outputs.preview_service }}
+          PROJECT_ID: ${{ steps.app.outputs.project_id }}
+        run: |
+          set -euo pipefail
+          [[ "$PREVIEW_SERVICE" =~ ^[a-z][a-z0-9-]{0,62}$ ]]
+          case "$EXPECTED_OPEN_INGRESS" in
+            INGRESS_TRAFFIC_ALL|INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER) ;;
+            *) exit 1 ;;
+          esac
+          service_json="$RUNNER_TEMP/terraform-preview-service.json"
+          cleanup() {
+            rm -f -- "$service_json"
+          }
+          trap cleanup EXIT
+          curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+            --header "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --output "$service_json" \
+            "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/us-east4/services/${PREVIEW_SERVICE}"
+          jq -e --arg project "$PROJECT_ID" --arg service "$PREVIEW_SERVICE" \
+            --arg open_ingress "$EXPECTED_OPEN_INGRESS" '
+            def explicit_revision:
+              .type == "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION" and
+              (.revision | type == "string") and
+              (.revision | split("/")[-1] | test("^[a-z][a-z0-9-]{0,62}$"));
+            def has_no_automatic_base_update:
+              ([((.annotations // {}) | keys[]?), ((.template.annotations // {}) | keys[]?)] |
+                map(select(. == "run.googleapis.com/base-images" or
+                           . == "run.googleapis.com/build-base-image" or
+                           . == "run.googleapis.com/build-enable-automatic-updates" or
+                           . == "run.googleapis.com/enable-automatic-updates")) |
+                length) == 0 and
+              ((.template.runtimeClassName // "") != "run.googleapis.com/linux-base-image-update") and
+              ((.template.containers // []) | length) == 1 and
+              all(.template.containers[]; ((.baseImageUri // "") == ""));
+            (.name == "projects/\($project)/locations/us-east4/services/\($service)") and
+            (.etag | type == "string" and length > 0 and length <= 1024 and
+              (test("[[:cntrl:]]") | not)) and
+            (.generation == .observedGeneration) and
+            ((.reconciling // false) == false) and
+            (.terminalCondition.type == "Ready") and
+            (.terminalCondition.state == "CONDITION_SUCCEEDED") and
+            ((.defaultUriDisabled // false) == false) and
+            ((.buildConfig // {}) == {}) and
+            has_no_automatic_base_update and
+            ((.traffic // []) as $traffic |
+              [$traffic[] | select((.tag // "") != "")] as $tags |
+              [$traffic[] | select((.tag // "") == "")] as $untagged |
+              (($tags | map(.tag) | unique | length) == ($tags | length)) and
+              all($tags[];
+                (.tag | test("^pr-[1-9][0-9]*$")) and
+                (.percent // 0) == 0 and explicit_revision) and
+              if ($tags | length) == 0 then
+                ($traffic | length) == 1 and ($untagged | length) == 1 and
+                (($untagged[0].percent // 0) == 100) and
+                .ingress == "INGRESS_TRAFFIC_INTERNAL_ONLY" and
+                ((.invokerIamDisabled // false) == false)
+              else
+                ($untagged | length) == 1 and
+                (($untagged[0].percent // 0) == 100) and
+                ($untagged[0] | explicit_revision) and
+                all($traffic[]; explicit_revision) and
+                .ingress == $open_ingress and .invokerIamDisabled == true
+              end)
+          ' "$service_json" >/dev/null
