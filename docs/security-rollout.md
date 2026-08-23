@@ -1,8 +1,9 @@
 # Security Rollout
 
-The `0.5.0` trust-boundary migration is deliberately two phase. Do not set
-`legacy_compatibility_mode = false` until fresh jobs pinned to the reviewed
-platform commit have authenticated successfully.
+The `0.5.0` trust-boundary migration is deliberately staged. Legacy mode is a
+single-use initial-adoption exception: it is valid only with an empty transition
+SHA. Every later two-SHA rollout uses `legacy_compatibility_mode = false`; never
+combine a transition SHA with legacy mode.
 
 ## Pipeline prerequisite
 
@@ -16,17 +17,167 @@ Consequently, the normal infrastructure workflow is a convergence check; it
 cannot apply either bootstrap or production infrastructure and must not pretend
 that it can.
 
-Before the cloud half of this migration can run, provision an owner-controlled,
-review-gated bootstrap pipeline identity with only the permissions required by
-the reviewed plan. Do not copy a user refresh token or static service-account
-key into GitHub. The pipeline must check out an exact reviewed `platform` SHA
-and execute only `terraform/deployments/bootstrap`,
-`terraform/deployments/prod`, and `terraform/deployments/exposure`; it must never
-check out or execute consumer Terraform, provider configuration, lockfiles, caches,
-functions, or outputs. Its repository ID, target workflow SHA, optional prior
-safe transition SHA, migration phase, and backend settings are protected
-owner-reviewed inputs. Until that pipeline exists, keep
-consumer Actions disabled so no cloud workflow can start against incomplete IAM.
+The migration bridge is
+`.github/workflows/protected-bootstrap-implementation.yml`. It accepts only an
+owner `workflow_dispatch` from the platform `main` ref, one repository, and
+one exact `bootstrap` or `prod` root. The active workflow SHA is always the
+immutable platform commit running the bridge. Initial adoption requires
+`legacy_compatibility_mode = true` and an empty transition. A later staged
+repin requires `false` and a transition SHA equal to the exact consumer
+commit's single consistent, capability-proven current workflow pin; retirement
+requires `false` and an empty transition. A DHI-parity-changing rollout cannot
+use a two-SHA transition at all and follows the disabled-Actions active-only
+protocol below. Production forbids both
+migration controls. Its protected environment contains one
+fresh Google user OAuth access token, never a refresh token or service-account
+key, plus a fine-grained GitHub token with repository **Actions: read** and
+**Administration: read** for the four consumers. Keep all four consumers'
+Actions disabled: the bridge verifies
+that setting, their numeric repository identities, and the absence of active
+runs before planning, before applying, and after applying.
+
+The bridge uses hardened system Git to fetch exact public platform and consumer
+commits without credentials or checkout actions. `consumer_sha` may be the
+current head of an open, unmerged public consumer PR: the fetch asks the public
+origin for that exact object, verifies `FETCH_HEAD`, checks out a clean detached
+HEAD, and deliberately imposes no consumer-`main` ancestry requirement. The
+controller then requires every reusable-workflow call in that exact tree to pin
+one consistent expected platform SHA, binds the consumer commit and tree in the
+review digest, and runs the trusted platform doctor before authentication.
+It executes only the immutable platform deployment root and never runs consumer
+Terraform or application scripts. Every run creates a cryptographically random
+`gha-pbt-*` service account and random read/mutation custom roles, rejects a
+collision, inventories and disables/deletes orphaned prefix artifacts, and
+deletes the current identity by immutable unique ID during cleanup. It requires
+zero user-managed keys, standing IAM policy, project/resource binding, or
+effective state/control-plane/runtime `actAs` permission. The owner OAuth token
+is used only by the trusted controller for exact etag-CAS leases, lifecycle
+operations on that random identity/role set, and one 30-minute token mint. The
+workflow copies exported secrets into non-exported shell variables, unsets the
+exported names, and passes one bounded NUL-delimited bundle to Bun over a pipe
+after `exec env -i`; Bun consumes and closes stdin. Only the random executor
+token reaches Terraform.
+
+Each executor description records an exact versioned repository, run, root,
+mode, approved-plan, and lease-expiry provenance tuple. Startup first minimally
+identifies every account in the reserved `gha-pbt-*` namespace, reconfirms its
+immutable project/email/name/unique-ID tuple, and disables it by unique ID
+before trusting the mutable description or display name. Only after all
+reserved accounts are contained does it strictly validate provenance, inspect
+keys, or read authority. A self-mutated description/display name, key, or
+key-inventory API failure therefore stops with every safely identified reserved
+executor already disabled; unrelated default and permanent service accounts are
+never lifecycle targets. A provenance mismatch remains a manual-cleanup stop
+and the controller never re-enables that identity. Google IAM documents that
+[`projects.serviceAccounts.disable`](https://cloud.google.com/iam/docs/reference/rest/v1/projects.serviceAccounts/disable)
+immediately rejects existing access tokens and new token requests, so mutable
+metadata cannot preserve the orphan's token-bearing authority after containment. It
+etag-fences and removes only the closed grammar of that run's project/state/receipt/marker,
+three runtime-`actAs`, and owner-mint leases across all four projects and exact
+service-account policies, deletes the executor and its verified custom roles,
+and proves their absence. Expired conditions are still removed. A lost or late
+IAM response is reconciled behind an advancing CAS fence; any unknown or altered
+binding leaves the executor disabled and stops with an explicit manual-cleanup
+error rather than guessing at ownership.
+
+The active and any transition platform commits must each carry the exact
+`platform-capabilities/preview-deployment-parity-v1.json` contract. The bridge
+recomputes every fixed file hash, requires the transition to be an ancestor of
+the active commit, requires both commits to declare the same 50-character DHI
+parity ID, and rejects a marker-unaware predecessor. Before any non-initial
+bootstrap change, all four fixed GCS markers must exist with positive generation
+and metageneration and exactly `{version:"1", repository-id:<immutable-id>,
+state:"clear"}` metadata. A marker may be absent only during that repository's
+legacy=true, transition-empty initial bootstrap, whose reviewed plan must create
+the exact object and whose post-apply proof must observe it clear.
+
+For a DHI tuple change from `P` to `S`, use this active-only cutover; never put
+both parity IDs in the trusted set:
+
+1. Open one public PR per consumer whose exact head `C_repo` pins every reusable
+   workflow to `S`. Record each full head SHA and do not merge, rebase, amend, or
+   force-push it.
+2. Keep Actions disabled in all four consumers. Require no active run, drain all
+   possible old-`P` tokens, and prove all four markers exactly clear.
+3. For each repository, run protected bootstrap plan then apply with
+   `consumer_sha=C_repo`, `active=S`, `transition=""`, and
+   `legacy_compatibility_mode=false`. The bridge fetches the unmerged public
+   head by exact SHA and refuses a tree whose workflow pins are not all `S`.
+4. Do not merge any PR until four immutable result receipts exist—one for each
+   repository—and each binds `platformSha=S`, its recorded `consumerSha` and
+   `consumerTreeSha`, `terraformRoot=bootstrap`, an empty transition, the
+   reviewed active-only manifest digest, and the post-300-second-plus-skew
+   Actions/run/marker proofs. A missing, stale, failed, or mismatched receipt
+   stops all four merges.
+5. With Actions still disabled, merge the four unchanged prepared heads. Verify
+   each resulting `main^{tree}` equals the receipt's `consumerTreeSha`; a rebase,
+   conflict resolution, squash-content change, or follow-up commit requires a
+   fresh protected plan/apply and four-receipt gate.
+6. Recheck disabled Actions, zero runs, and exact-clear markers. Then re-enable
+   consumers in the rollout order; the first `S` production deploy performs the
+   sealed DHI epoch transition before any preview may use the new tuple.
+
+The active-only apply removes `P` trust and adds only `S`; the bridge waits 300
+seconds plus skew before its second freeze/marker proof. Never merge an `S` pin
+before all four projects trust `S`, and never use the mixed-SHA transition path
+when `P` and `S` declare different DHI parity IDs.
+
+Terraform and the pinned Google provider run only in a pinned Docker image as a
+non-root user with a read-only root filesystem, all capabilities dropped,
+private PID/IPC namespaces, no host PID or Docker socket, and closed exact
+mounts. The exact provider archive SHA-256, committed readonly lock hash,
+version/source constraint, extracted two-file shape, and `/plugins` path are
+verified before execution. A token-bearing provider with IAM `setIamPolicy` and
+runtime `actAs` is inherently privileged; permissions alone cannot contain a
+malicious provider. The exact verified provider binary is therefore an explicit
+cryptographic trust boundary, followed by a zero-diff post-apply plan and live
+policy/permission cleanup proofs.
+
+The executor receives a 47-minute conditioned lease, safely beyond the 35-minute
+job timeout, while a 24-minute internal deadline leaves a reserved cleanup
+window. Apply refuses before consuming/elevating unless at least 15 minutes
+remain, reserving seven minutes for the post-WIF drain and eight for bounded
+apply/readback/proof work. Plan gets only read control permissions, read-only state, and immutable
+receipt creation; it uses `-lock=false`. Apply creates the mutation role and the
+three exact production runtime `actAs` leases only after consuming the approved
+receipt. Marker access consists of four distinct conditional bindings whose
+`resource.type` and full `resource.name` select only each project's fixed
+`deployment-parity-transition` object; no marker lease reaches Terraform state.
+Storage is otherwise restricted to registered buckets and exact state/lock
+objects. Receipts have separate exact-object create-only and read-only leases;
+the executor never gets receipt overwrite or delete authority. Permission
+propagation and revocation use
+`testIamPermissions`; validation never lists or reads a state object. Every API
+request and subprocess has a bounded deadline. The `finally` path CAS-removes
+only the exact leases from the latest policies, restores the original policy
+version when conditions no longer require version 3, proves the still-live token
+lost every tested project/state/`actAs` permission, verifies zero keys and
+standing bindings, and deletes the executor. Expiration is only the
+crash/runner-loss backstop. Every ambiguous IAM write is fenced by CAS-adding,
+observing, and CAS-removing an inert already-expired binding with advancing
+etags; a delayed predecessor write must fail before cleanup can succeed.
+
+Run `plan` first with empty approved-run and approved-digest inputs. The summary
+contains only allowlisted resource identities/actions and SHA-256 commitments;
+raw before/after values, variables, outputs, plans, and state never leave the
+runner. The plan writes an immutable, six-hour receipt under its exact backend
+prefix; the manifest and receipt explicitly bind the plan mode, root, consumer
+and platform commits, compatibility phase, transition SHA, and digest. After
+reviewing the summary, dispatch `apply` with both the plan run ID and digest.
+Apply verifies that the referenced run is a fresh successful owner dispatch at
+the same platform SHA, reads the exact receipt, recomputes from live state, and
+atomically creates a consumed marker before applying the local saved plan. A
+receipt cannot be replayed; a failed apply requires a fresh plan. Plan,
+pre-apply-consume, and post-apply result receipts bind exact four-marker
+generation/metageneration/metadata snapshots plus Actions-disable, active-run,
+and token-drain snapshots. After bootstrap apply and convergence, the bridge
+waits 300 seconds plus skew from the completed WIF mutation, then rechecks all
+four markers and every consumer before publishing the immutable result receipt.
+No raw
+plan, state, token, or Actions artifact is uploaded. Delete the temporary OAuth
+environment secret after the protected runs. This bridge intentionally rejects
+exposure roots; a future exposure mutation requires its own reviewed state lease
+and workflow expansion.
 
 Before its first apply, inventory every Compute Engine default service account,
 instance, job, trigger, and attached workload and prove nothing depends on the
@@ -261,14 +412,22 @@ the recovery object and stop; never rerun from empty state.
    SHA that every consumer currently pins `P`; do not infer `P` from this
    document, a branch name, or a mutable tag. Require all four projects to have
    the same active `P`, and prove that no consumer still runs any existing
-   transition SHA. For a new reviewed workflow SHA `S`, do not repeat the
-   empty-transition form above. Before repinning any consumer, apply all four
+   transition SHA. For a new reviewed workflow SHA `S` with the same DHI parity
+   ID, do not repeat the initial legacy form above. First require all four marker objects exactly
+   clear, Actions disabled, no active consumer run, and the previous token
+   issuance window drained. Before repinning any consumer, apply all four
    protected bootstrap roots with `active_workflow_sha = S`,
-   `transition_workflow_sha = P`, and `legacy_compatibility_mode = true`.
+   `transition_workflow_sha = P`, and `legacy_compatibility_mode = false`.
    Retain both exact SHA bindings until all new-SHA canaries and operations
    pass. The final Phase-B apply is
    `active_workflow_sha = S`, an empty transition, and
-   `legacy_compatibility_mode = false`.
+   `legacy_compatibility_mode = false`. That apply removes `P`; do not admit an
+   `S` DHI epoch until the bridge's post-mutation 300-second-plus-skew barrier,
+   second Actions/run drain, and second four-marker clear snapshot are present
+   in the immutable result receipt.
+   If `S` changes the DHI parity ID, skip the transition set and use the
+   prepared-consumer, disabled-Actions active-only protocol documented above;
+   the same-parity `{S,P}` sequence is forbidden for that cutover.
 4. Confirm the first bootstrap plan removes the four direct default Compute
    `Editor` grants and all state-bucket convenience principals before it creates
    the protected bucket. For the current standalone projects, confirm the plan
@@ -278,10 +437,16 @@ the recovery object and stop; never rerun from empty state.
    Compute and routine `gha-terraform` identities cannot read bootstrap state
    and neither can write it. Read the live project IAM policy again and require
    exactly zero direct `roles/editor` members before continuing.
-5. Merge the prepared consumer PRs. The normal production Terraform job now
-   executes only `terraform/deployments/prod` from the exact platform SHA;
-   checked-out consumer Terraform is validation/documentation and is never
-   executed after Google authentication.
+5. Merge prepared consumer PRs only after the applicable protocol above is
+   complete. For a DHI-changing active-only cutover, that means all four exact
+   unmerged heads were independently fetched, planned, applied, and named by
+   four immutable successful result receipts before the first merge. Keep
+   Actions disabled across the entire four-project gate and all merges, merge
+   no changed head, and compare each resulting `main^{tree}` with the receipt's
+   `consumerTreeSha`. The normal production Terraform job now executes only
+   `terraform/deployments/prod` from the exact platform SHA; checked-out
+   consumer Terraform is validation/documentation and is never executed after
+   Google authentication.
 6. Review the immutable runtime map in the platform commit. Confirm Runsetta has
    `RUNSETTA_OFFLINE=1`, no deployed secret mappings, and no runtime secret
    accessor grants; confirm Medlock preview uses memory and production uses only
@@ -409,7 +574,10 @@ the recovery object and stop; never rerun from empty state.
   precondition above, leave Actions disabled and stop instead of improvising a
   third trusted SHA or a direct cloud mutation.
 - Remove the old workflow-SHA WIF trust only after the new-SHA production,
-  Terraform, stable preview, cleanup, and reconciliation operations all pass.
+  Terraform, stable preview, cleanup, and reconciliation operations all pass,
+  all four markers are exactly clear, and Actions is disabled with no active
+  run. After removal, wait the declared 300-second token lifetime plus skew and
+  repeat both proofs before any new-SHA DHI epoch can begin.
 
 Artifact Registry does not provide a predefined upload-only Docker role. The
 repository-scoped Writer role is the smallest Google-documented role for a
@@ -455,11 +623,15 @@ deployments.
    deploy/cleanup/reconcile. Keep hourly reconciliation green and alert on
    failure as recovery for queue saturation, API errors, and lifecycle races.
 5. Require only the reviewed post-migration SHA in the WIF trust set. For a
-   later safe update, the protected bootstrap pipeline first applies
+   later same-DHI safe update, the protected bootstrap pipeline first applies
    `{active=new, transition=old}`, consumers repin, all canaries and cloud
    operations are verified, and the pipeline then reapplies
-   `{active=new, transition=""}`. Consumer validation permits at most those two
+   `{active=new, transition=""}`. Both applies use
+   `legacy_compatibility_mode = false`; exact-clear markers and the post-removal
+   token barrier are mandatory. Consumer validation permits at most those two
    reviewed safe SHAs. Never use a pre-migration SHA as the transition.
+   A later DHI-changing update instead uses the active-only protocol and may
+   never put old and new parity IDs in one trusted transition set.
 
 If phase B authentication fails despite a green canary, fail closed. Use the
 privileged pipeline to correct or add only the exact reviewed workflow-SHA

@@ -444,6 +444,75 @@ resource "google_project_iam_custom_role" "terraform_convergence_reader" {
   depends_on = [google_project_service.required]
 }
 
+# The protected owner bridge uses this role only for an approved production
+# apply and only through a time-bounded project binding to a random single-run
+# executor. It intentionally contains control-plane permissions only: no
+# Secret Manager payload access/version mutation, Firestore entity access, or
+# Artifact Registry upload/download/file/version permissions are present.
+resource "google_project_iam_custom_role" "protected_terraform_apply" {
+  project     = var.project_id
+  role_id     = "protectedTerraformApply"
+  title       = "Protected Terraform Apply"
+  description = "Manages the declared production control plane without application data or artifact content access."
+  permissions = concat(
+    [
+      "artifactregistry.locations.get",
+      "artifactregistry.locations.list",
+      "artifactregistry.repositories.create",
+      "artifactregistry.repositories.delete",
+      "artifactregistry.repositories.get",
+      "artifactregistry.repositories.getIamPolicy",
+      "artifactregistry.repositories.list",
+      "artifactregistry.repositories.listEffectiveTags",
+      "artifactregistry.repositories.listTagBindings",
+      "artifactregistry.repositories.setIamPolicy",
+      "artifactregistry.repositories.update",
+      "resourcemanager.projects.get",
+      "resourcemanager.projects.getIamPolicy",
+      "run.locations.list",
+      "run.operations.get",
+      "run.operations.list",
+      "run.services.create",
+      "run.services.delete",
+      "run.services.get",
+      "run.services.getIamPolicy",
+      "run.services.list",
+      "run.services.listEffectiveTags",
+      "run.services.listTagBindings",
+      "run.services.setIamPolicy",
+      "run.services.update",
+      "serviceusage.services.get",
+      "serviceusage.services.list",
+      "serviceusage.services.use",
+    ],
+    contains(var.required_services, "firestore.googleapis.com") ? [
+      "datastore.databases.create",
+      "datastore.databases.delete",
+      "datastore.databases.get",
+      "datastore.databases.getMetadata",
+      "datastore.databases.list",
+      "datastore.databases.update",
+      "datastore.operations.get",
+      "datastore.operations.list",
+    ] : [],
+    contains(var.required_services, "secretmanager.googleapis.com") ? [
+      "secretmanager.locations.get",
+      "secretmanager.locations.list",
+      "secretmanager.secrets.create",
+      "secretmanager.secrets.delete",
+      "secretmanager.secrets.get",
+      "secretmanager.secrets.getIamPolicy",
+      "secretmanager.secrets.list",
+      "secretmanager.secrets.listEffectiveTags",
+      "secretmanager.secrets.listTagBindings",
+      "secretmanager.secrets.setIamPolicy",
+      "secretmanager.secrets.update",
+    ] : [],
+  )
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_service_account" "runtime" {
   project      = var.project_id
   account_id   = "cloud-run-runtime"

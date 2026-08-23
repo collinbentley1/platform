@@ -64,6 +64,11 @@ variable "transition_workflow_sha" {
     )
     error_message = "transition_workflow_sha must be empty or an immediately previous reviewed safe SHA, never a vulnerable pre-migration release."
   }
+
+  validation {
+    condition     = !(var.legacy_compatibility_mode && var.transition_workflow_sha != "")
+    error_message = "legacy_compatibility_mode is allowed only for the initial migration with an empty transition_workflow_sha."
+  }
 }
 
 locals {

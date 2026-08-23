@@ -22,7 +22,11 @@ const reusableWorkflows = [
   "cleanup-preview.yml",
   "reconcile-previews.yml",
 ];
-const platformWorkflows = [...reusableWorkflows, "platform.yml"];
+const platformWorkflows = [
+  ...reusableWorkflows,
+  "platform.yml",
+  "protected-bootstrap-implementation.yml",
+];
 const declaredEnvironmentSecrets = [
   "DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3",
 ];
@@ -2126,7 +2130,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "cd0642a94606dba447bddaed2eb1ba20cfb4ed98d8ecf2d79e75e362104645c6"
+  "2f0d1579828f2afe7f8c5620cc4a843a5a9a9e0b321f6cf44038c797e19def61"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
