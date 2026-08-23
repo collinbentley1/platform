@@ -14,7 +14,7 @@
     ".github/workflows/deploy-prod.yml": "sha256:4c1738cda03cd597278cf6b10ec9de7e65c8d9474a8bd99ba77d1ea17e9261c7",
     ".github/workflows/infrastructure.yml": "sha256:2477f01ab74030075051b593de4911fbdff0d2fb7fd219df542d154af798d31f",
     ".github/workflows/reconcile-previews.yml": "sha256:9ee51a051db4bf2de673980f14fddfdbeea96cdab0d04fed6254ffdb3fc5e135",
-    "terraform/modules/bootstrap/main.tf": "sha256:9d63169bc57be55961cd0793bd30580b75cea2fc76293f993ed15fe58c0716b5",
+    "terraform/modules/bootstrap/main.tf": "sha256:defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270",
     "terraform/modules/bootstrap/preview-runtime-deny.tf": "sha256:e2b4799cddc80b105e519fe69459cff174fc7df02961f17d3bfb4a4966a3a98b",
     "terraform/modules/bootstrap/variables.tf": "sha256:f7310af1189e80b819e2fbdb59c70eb0b1a55f2eebf1a9c1013bafd7b5b7b8ed",
     "terraform/modules/cloud-run-service/main.tf": "sha256:349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",

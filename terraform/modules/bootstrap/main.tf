@@ -228,6 +228,10 @@ resource "google_storage_bucket" "deployment_parity_transition" {
     log_object_prefix = "deployment-parity-transition/"
   }
 
+  versioning {
+    enabled = true
+  }
+
   labels = local.labels
 
   lifecycle {

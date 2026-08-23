@@ -2253,7 +2253,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "9d63169bc57be55961cd0793bd30580b75cea2fc76293f993ed15fe58c0716b5"
+  "defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
