@@ -39,11 +39,6 @@ variable "active_workflow_sha" {
 variable "legacy_compatibility_mode" {
   description = "Owner-selected WIF migration phase. True retains only constrained compatibility bindings; false is the required steady state."
   type        = bool
-
-  validation {
-    condition     = !var.legacy_compatibility_mode || var.transition_workflow_sha == ""
-    error_message = "legacy_compatibility_mode may be true only for first adoption with an empty transition_workflow_sha."
-  }
 }
 
 variable "transition_workflow_sha" {

@@ -78,5 +78,5 @@ run "reject_transition_sha_with_legacy_compatibility_bindings" {
     legacy_compatibility_mode = true
   }
 
-  expect_failures = [var.legacy_compatibility_mode]
+  expect_failures = [var.transition_workflow_sha]
 }
