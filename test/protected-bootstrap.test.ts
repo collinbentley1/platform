@@ -144,6 +144,12 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(workflow).toContain("export -n owner_token consumer_token platform_token");
     expect(workflow).toContain("docker.io/oven/bun@sha256:");
+    expect(workflow).toContain(
+      'canonical_image="${TERRAFORM_SANDBOX_IMAGE#docker.io/}"',
+    );
+    expect(workflow).toContain('test "$canonical_image" != "$TERRAFORM_SANDBOX_IMAGE"');
+    expect(workflow).toContain('--arg image "$canonical_image"');
+    expect(workflow).not.toContain('--arg image "$TERRAFORM_SANDBOX_IMAGE"');
 
     const exactConsumerFetch = workflow.slice(
       workflow.indexOf("fetch_exact_public_commit()"),
