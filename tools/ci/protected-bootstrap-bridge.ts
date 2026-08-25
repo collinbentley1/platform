@@ -34,7 +34,15 @@ const MAX_REVIEW_MANIFEST_BYTES = 800 * 1024;
 const MAX_GITHUB_RUNS_PER_STATUS = 10_000;
 const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CLEANUP_RETRY_INTERVAL_MS = 2_000;
+const IAM_CONSISTENCY_MAX_WAIT_MS = 5 * 60_000;
+const IAM_RETRY_INITIAL_MS = 1_000;
+const IAM_RETRY_MAX_MS = 32_000;
+const IAM_RETRY_MAX_ATTEMPTS = 16;
 const IAM_FENCE_EXPIRED_AT = "2000-01-01T00:00:00.000Z";
+const CLEANUP_FENCE_DESCRIPTION =
+  "Expired inert binding used only to advance the cleanup CAS generation.";
+const ORPHAN_FENCE_DESCRIPTION =
+  "Expired inert binding used only to advance the orphan-recovery CAS generation.";
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
 const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
 const TOKEN_DRAIN_SKEW_SECONDS = 120;
@@ -277,6 +285,8 @@ export interface ProjectCustomRole {
   readonly stage: "GA";
   readonly title: string;
 }
+
+type EphemeralRoleIntent = Omit<ProjectCustomRole, "deleted" | "etag">;
 
 export interface ExecutorSession {
   readonly accessToken: string;
@@ -2676,12 +2686,18 @@ export class ExecutorLeaseManager {
   readonly #randomHex: () => string;
   readonly #sleep: (milliseconds: number) => Promise<void>;
   #accountId: string | undefined;
+  #accountDescription: string | undefined;
+  #accountIdentity: ServiceAccountIdentity | undefined;
+  #acceptedRoleDeletions = new Set<string>();
   #apiDeadlineMs = 0;
   #account: ServiceAccount | undefined;
+  #executorDeleteAccepted = false;
   #executorLifecycleArmed = false;
   #elevated = false;
   #invocation: Invocation | undefined;
   #mutations: PolicyMutationRecord[] = [];
+  #policyCleanupComplete = false;
+  #roleIntents = new Map<string, EphemeralRoleIntent>();
   #roles: ProjectCustomRole[] = [];
   #session: ExecutorSession | undefined;
 
@@ -2719,16 +2735,30 @@ export class ExecutorLeaseManager {
         throw new Error("A cryptographically random executor identifier collided; refusing reuse.");
       }
       this.#accountId = accountId;
-      this.#executorLifecycleArmed = true;
-      const account = await createEphemeralExecutor(
+      this.#accountDescription = executorDescription(executorProvenance(invocation, leaseExpiresAt));
+      let account = await createEphemeralExecutor(
         contract.projectId,
         accountId,
         invocation,
         leaseExpiresAt,
         invocation.ownerAccessToken,
         this.#fetcher,
+        this.#sleep,
+        operationDeadlineMs,
+        () => {
+          this.#executorLifecycleArmed = true;
+        },
+        () => {
+          this.#executorLifecycleArmed = false;
+        },
+        (created) => {
+          // The create response is the first authoritative source of the stable
+          // unique ID. Arm exact-identity cleanup before any visibility read.
+          this.#accountIdentity = created;
+        },
       );
       this.#account = account;
+      this.#accountIdentity = account;
       const readRole = await createEphemeralRole(
         contract.projectId,
         readRoleId,
@@ -2737,17 +2767,28 @@ export class ExecutorLeaseManager {
         executorControlPermissions(invocation.repository, invocation.terraformRoot, "read"),
         invocation.ownerAccessToken,
         this.#fetcher,
+        (intent) => this.#roleIntents.set(intent.name, intent),
+        (name) => this.#roleIntents.delete(name),
+        (created) => {
+          this.#roleIntents.delete(created.name);
+          this.#roles.push(created);
+        },
       );
-      this.#roles.push(readRole);
-      await requireNoUserManagedKeys(
-        account,
-        invocation.ownerAccessToken,
-        this.#fetcher,
+      await this.#retryIamConsistency(
+        "post-create executor key inventory",
+        () => requireNoUserManagedKeys(
+          account,
+          invocation.ownerAccessToken,
+          this.#fetcher,
+        ),
       );
-      const executorPolicy = await getServiceAccountPolicy(
-        account.email,
-        invocation.ownerAccessToken,
-        this.#fetcher,
+      const executorPolicy = await this.#retryIamConsistency(
+        "post-create executor policy read",
+        () => getServiceAccountPolicy(
+          account,
+          invocation.ownerAccessToken,
+          this.#fetcher,
+        ),
       );
       if (executorPolicy.bindings.length !== 0 || executorPolicy.auditConfigs !== undefined) {
         throw new Error("The dedicated executor has an unexpected standing IAM policy.");
@@ -2770,29 +2811,42 @@ export class ExecutorLeaseManager {
           ),
         ],
         () =>
-          getServiceAccountPolicy(
-            account.email,
-            invocation.ownerAccessToken,
-            this.#fetcher,
+          this.#retryIamConsistency(
+            "post-create executor policy read-modify-write read",
+            () => getServiceAccountPolicy(
+              account,
+              invocation.ownerAccessToken,
+              this.#fetcher,
+            ),
           ),
         (policy) =>
-          setServiceAccountPolicy(
-            account.email,
-            invocation.ownerAccessToken,
-            policy,
-            this.#fetcher,
+          this.#retryIamConsistency(
+            "post-create executor policy read-modify-write write",
+            () => setServiceAccountPolicy(
+              account,
+              invocation.ownerAccessToken,
+              policy,
+              this.#fetcher,
+            ),
           ),
       );
-      await setExecutorDisabled(
+      account = await setExecutorDisabled(
         account,
         false,
         invocation.ownerAccessToken,
         this.#fetcher,
+        this.#sleep,
+        operationDeadlineMs,
       );
-      const session = await mintExecutorToken(
-        account,
-        invocation.ownerAccessToken,
-        this.#fetcher,
+      this.#account = account;
+      const session = await this.#retryIamConsistency(
+        "post-create executor token mint",
+        () => mintExecutorToken(
+          account,
+          invocation.ownerAccessToken,
+          this.#fetcher,
+        ),
+        true,
       );
       if (
         session.accessToken === invocation.ownerAccessToken ||
@@ -2818,12 +2872,15 @@ export class ExecutorLeaseManager {
         this.#fetcher,
         this.#sleep,
       );
-      await setExecutorDisabled(
+      account = await setExecutorDisabled(
         account,
         true,
         invocation.ownerAccessToken,
         this.#fetcher,
+        this.#sleep,
+        operationDeadlineMs,
       );
+      this.#account = account;
 
       const projectLeases = [
         ...buildExecutorProjectLeases(
@@ -2899,12 +2956,15 @@ export class ExecutorLeaseManager {
         );
       }
 
-      await setExecutorDisabled(
+      account = await setExecutorDisabled(
         account,
         false,
         invocation.ownerAccessToken,
         this.#fetcher,
+        this.#sleep,
+        operationDeadlineMs,
       );
+      this.#account = account;
       assertSession(session, Date.now(), operationDeadlineMs);
       await waitForStatePermissions(
         contract.state[invocation.terraformRoot],
@@ -2969,8 +3029,13 @@ export class ExecutorLeaseManager {
       executorControlPermissions(invocation.repository, invocation.terraformRoot, "mutation"),
       invocation.ownerAccessToken,
       this.#fetcher,
+      (intent) => this.#roleIntents.set(intent.name, intent),
+      (name) => this.#roleIntents.delete(name),
+      (created) => {
+        this.#roleIntents.delete(created.name);
+        this.#roles.push(created);
+      },
     );
-    this.#roles.push(mutationRole);
     await this.#recordAndAdd(
       `mutation project ${contract.projectId}`,
       [
@@ -3064,24 +3129,74 @@ export class ExecutorLeaseManager {
       requireNoExecutorProjectBindings(original, forbiddenMemberEmail);
     }
     const record: PolicyMutationRecord = { get, label, leases, original, set };
+    this.#policyCleanupComplete = false;
     this.#mutations.push(record);
     await addBindingsWithCas(record);
   }
 
+  async #retryIamConsistency<T>(
+    label: string,
+    operation: () => Promise<T>,
+    retryForbidden = false,
+  ): Promise<T> {
+    const consistencyDeadlineMs = Math.min(
+      this.#apiDeadlineMs,
+      Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS,
+    );
+    let lastRetryableError: unknown;
+    for (let attempt = 0; attempt < IAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+      if (Date.now() >= consistencyDeadlineMs) break;
+      try {
+        return await operation();
+      } catch (error) {
+        const contextualPropagationDenial = retryForbidden && error instanceof Error &&
+          /HTTP 403\b/.test(error.message);
+        if (!contextualPropagationDenial && !retryableIamConsistencyError(error)) throw error;
+        lastRetryableError = error;
+      }
+      const remainingMs = consistencyDeadlineMs - Date.now();
+      if (remainingMs <= 0) break;
+      await this.#sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+    }
+    throw new AggregateError(
+      lastRetryableError === undefined ? [] : [lastRetryableError],
+      `${label} did not converge before the IAM consistency deadline.`,
+    );
+  }
+
   async #releaseAll(invocation: Invocation, cleanupDeadlineMs: number): Promise<unknown[]> {
     const errors: unknown[] = [];
-    await fencePolicyMutations(
-      [...this.#mutations].reverse(),
-      this.#sleep,
-      cleanupDeadlineMs,
-      () => this.#randomHex(),
-    ).catch((error) => errors.push(error));
-    if (errors.length === 0 && this.#account !== undefined) {
-      for (const mutation of this.#mutations) {
-        await mutation.get().then((policy) =>
-          requireNoExecutorProjectBindings(policy, this.#account!.email)
-        ).catch((error) => errors.push(error));
+    // Containment is independent of policy bookkeeping and always runs first.
+    // In particular, a create response recorded in #account must be disabled by
+    // its stable unique ID even when the first read-after-create never converged.
+    if (this.#executorLifecycleArmed && !this.#executorDeleteAccepted) {
+      await this.#containExecutor(invocation, cleanupDeadlineMs).catch((error) =>
+        errors.push(error)
+      );
+    }
+    if (!this.#policyCleanupComplete) {
+      const policyErrors: unknown[] = [];
+      let fenceSucceeded = false;
+      await fencePolicyMutations(
+        [...this.#mutations].reverse(),
+        this.#sleep,
+        cleanupDeadlineMs,
+        () => this.#randomHex(),
+      ).then(() => {
+        fenceSucceeded = true;
+      }).catch((error) => policyErrors.push(error));
+      if (fenceSucceeded && this.#account !== undefined) {
+        for (const mutation of this.#mutations) {
+          await mutation.get().then((policy) =>
+            requireNoExecutorProjectBindings(policy, this.#account!.email)
+          ).catch((error) => policyErrors.push(error));
+        }
       }
+      if (fenceSucceeded && policyErrors.length === 0) {
+        this.#policyCleanupComplete = true;
+        this.#mutations = [];
+      }
+      errors.push(...policyErrors);
     }
     if (errors.length === 0 && this.#session !== undefined) {
       await this.#proveExecutorPermissionsGone(invocation).catch((error) => errors.push(error));
@@ -3096,12 +3211,102 @@ export class ExecutorLeaseManager {
     }
     if (errors.length === 0) {
       this.#mutations = [];
+      this.#roleIntents.clear();
       this.#roles = [];
       this.#session = undefined;
       this.#account = undefined;
       this.#accountId = undefined;
+      this.#accountDescription = undefined;
+      this.#accountIdentity = undefined;
+      this.#acceptedRoleDeletions.clear();
+      this.#executorDeleteAccepted = false;
+      this.#policyCleanupComplete = false;
     }
     return errors;
+  }
+
+  async #containExecutor(invocation: Invocation, cleanupDeadlineMs: number): Promise<void> {
+    const contract = REPOSITORIES[invocation.repository];
+    if (this.#account === undefined) {
+      if (this.#accountId === undefined || this.#accountDescription === undefined) {
+        throw new Error("An ambiguous executor create lacks its exact recovery identity.");
+      }
+      if (this.#accountIdentity === undefined) {
+        const consistencyDeadlineMs = Math.min(
+          cleanupDeadlineMs,
+          Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS,
+        );
+        let lastRetryableError: unknown;
+        for (let attempt = 0; attempt < IAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+          if (Date.now() >= consistencyDeadlineMs) break;
+          try {
+            const observed = await getExecutorIdentity(
+              contract.projectId,
+              executorEmail(contract.projectId, this.#accountId),
+              invocation.ownerAccessToken,
+              this.#fetcher,
+              false,
+            );
+            if (observed === undefined) {
+              throw new Error("Ambiguous executor lookup unexpectedly returned no identity.");
+            }
+            exact(
+              observed.email,
+              executorEmail(contract.projectId, this.#accountId),
+              "ambiguous executor email",
+            );
+            this.#accountIdentity = observed;
+            break;
+          } catch (error) {
+            if (!retryableIamConsistencyError(error)) throw error;
+            lastRetryableError = error;
+          }
+          const remainingMs = consistencyDeadlineMs - Date.now();
+          if (remainingMs <= 0) break;
+          await this.#sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+        }
+        if (this.#accountIdentity === undefined) {
+          throw new AggregateError(
+            lastRetryableError === undefined ? [] : [lastRetryableError],
+            "Ambiguous executor creation did not become observable before containment.",
+          );
+        }
+      }
+      let disabled: ServiceAccount;
+      try {
+        disabled = await setExecutorDisabled(
+          this.#accountIdentity,
+          true,
+          invocation.ownerAccessToken,
+          this.#fetcher,
+          this.#sleep,
+          cleanupDeadlineMs,
+        );
+      } catch (error) {
+        throw new AggregateError(
+          [error],
+          "The ambiguous executor was targeted for containment but its full provenance could not be verified; manual cleanup is required.",
+        );
+      }
+      try {
+        exact(disabled.description, this.#accountDescription, "ambiguous executor provenance");
+      } catch (error) {
+        throw new AggregateError(
+          [error],
+          "The ambiguous executor identity has foreign provenance; manual cleanup is required.",
+        );
+      }
+      this.#account = disabled;
+      return;
+    }
+    this.#account = await setExecutorDisabled(
+      this.#account,
+      true,
+      invocation.ownerAccessToken,
+      this.#fetcher,
+      this.#sleep,
+      cleanupDeadlineMs,
+    );
   }
 
   async #proveExecutorPermissionsGone(invocation: Invocation): Promise<void> {
@@ -3128,15 +3333,52 @@ export class ExecutorLeaseManager {
     if (!this.#executorLifecycleArmed) return;
     const contract = REPOSITORIES[invocation.repository];
     let lastError: unknown;
+    let attempt = 0;
     while (Date.now() < cleanupDeadlineMs) {
       try {
+        for (const intent of this.#roleIntents.values()) {
+          const observed = await getProjectCustomRole(
+            intent.name,
+            invocation.ownerAccessToken,
+            this.#fetcher,
+            true,
+          );
+          if (observed === undefined) {
+            throw new Error("Ambiguous executor role creation is not yet observable.");
+          }
+          try {
+            requireExactEphemeralRole(observed, intent);
+          } catch (error) {
+            throw new AggregateError(
+              [error],
+              "The ambiguous executor role has foreign provenance; manual cleanup is required.",
+            );
+          }
+          this.#roleIntents.delete(intent.name);
+          if (!this.#roles.some((role) => role.name === observed.name)) {
+            this.#roles.push(observed);
+          }
+        }
         for (const role of this.#roles) {
-          await deleteEphemeralRole(role, invocation.ownerAccessToken, this.#fetcher);
+          if (this.#acceptedRoleDeletions.has(role.name)) continue;
+          const deletion = await deleteEphemeralRole(
+            role,
+            invocation.ownerAccessToken,
+            this.#fetcher,
+          );
+          if (deletion === "deleted") {
+            this.#acceptedRoleDeletions.add(role.name);
+          } else {
+            throw new Error("Ephemeral executor role deletion is not yet observable.");
+          }
         }
         if (this.#accountId !== undefined) {
+          if (this.#account === undefined || !this.#account.disabled) {
+            throw new Error("Exact disabled executor identity was lost before deletion.");
+          }
           const observed = await getExecutor(
             contract.projectId,
-            executorEmail(contract.projectId, this.#accountId),
+            this.#account.uniqueId,
             invocation.ownerAccessToken,
             this.#fetcher,
             true,
@@ -3146,18 +3388,30 @@ export class ExecutorLeaseManager {
               exact(observed.uniqueId, this.#account.uniqueId, "executor unique ID");
             }
             if (!observed.disabled) {
-              await setExecutorDisabled(
+              this.#account = await setExecutorDisabled(
                 observed,
                 true,
                 invocation.ownerAccessToken,
                 this.#fetcher,
+                this.#sleep,
+                cleanupDeadlineMs,
               );
             }
-            await requireNoUserManagedKeys(observed, invocation.ownerAccessToken, this.#fetcher);
-            const policy = await getServiceAccountPolicy(
-              observed.email,
-              invocation.ownerAccessToken,
-              this.#fetcher,
+            await this.#retryIamConsistency(
+              "executor cleanup key inventory",
+              () => requireNoUserManagedKeys(
+                observed,
+                invocation.ownerAccessToken,
+                this.#fetcher,
+              ),
+            );
+            const policy = await this.#retryIamConsistency(
+              "executor cleanup policy read",
+              () => getServiceAccountPolicy(
+                observed,
+                invocation.ownerAccessToken,
+                this.#fetcher,
+              ),
             );
             if (policy.bindings.length !== 0 || policy.auditConfigs !== undefined) {
               throw new Error("The executor retained an IAM policy before deletion.");
@@ -3168,15 +3422,30 @@ export class ExecutorLeaseManager {
               this.#fetcher,
             );
             requireNoExecutorProjectBindings(projectPolicy, observed.email);
-            await deleteExecutorByUniqueId(
+            const deletion = await deleteExecutorByUniqueId(
               observed,
               invocation.ownerAccessToken,
               this.#fetcher,
             );
+            this.#executorDeleteAccepted ||= deletion === "deleted";
+            throw new Error("Executor deletion is not yet observable.");
+          } else if (!this.#executorDeleteAccepted) {
+            // A GET or DELETE 404 can be a post-create visibility result. Keep
+            // issuing the exact stable-ID DELETE until Google acknowledges it
+            // with a successful write response.
+            const deletion = await deleteExecutorByUniqueId(
+              this.#account,
+              invocation.ownerAccessToken,
+              this.#fetcher,
+            );
+            this.#executorDeleteAccepted ||= deletion === "deleted";
             throw new Error("Executor deletion is not yet observable.");
           }
         }
         for (const role of this.#roles) {
+          if (!this.#acceptedRoleDeletions.has(role.name)) {
+            throw new Error("Ephemeral executor role deletion lacks a successful write acknowledgement.");
+          }
           const observed = await getProjectCustomRole(
             role.name,
             invocation.ownerAccessToken,
@@ -3196,11 +3465,14 @@ export class ExecutorLeaseManager {
         }
         lastError = error;
       }
-      await this.#sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, cleanupDeadlineMs - Date.now()));
+      const remainingMs = cleanupDeadlineMs - Date.now();
+      if (remainingMs <= 0) break;
+      await this.#sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+      attempt = Math.min(attempt + 1, IAM_RETRY_MAX_ATTEMPTS - 1);
     }
     throw new AggregateError(
       lastError === undefined ? [] : [lastError],
-      "Random executor or custom role survived the cleanup deadline.",
+      "Random executor or custom-role deletion could not be proven before the cleanup deadline; manual reconciliation is required.",
     );
   }
 }
@@ -3232,7 +3504,7 @@ export async function fencePolicyMutations(
     if (basis === undefined) throw new Error("An IAM mutation record has no exact lease.");
     const fence: IamBinding = {
       condition: {
-        description: "Expired inert binding used only to advance the cleanup CAS generation.",
+        description: CLEANUP_FENCE_DESCRIPTION,
         expression: `request.time < timestamp('${IAM_FENCE_EXPIRED_AT}')`,
         title: `codex-cleanup-fence-${createHash("sha256").update(record.label).digest("hex").slice(0, 12)}-${suffix}`,
       },
@@ -3315,6 +3587,26 @@ function retryableCleanupError(error: unknown): boolean {
   );
 }
 
+function retryableIamConsistencyError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  if (error instanceof TypeError && /fetch|network|socket/i.test(error.message)) return true;
+  if (!(error instanceof Error)) return false;
+  // IAM documents these statuses for truncated exponential backoff. A 404 is
+  // retryable only in this narrowly post-create/post-lifecycle context.
+  return /fetch failed|network|socket|timed out|HTTP (?:404|408|429|500|502|503|504)\b|HTTP 409 ABORTED\b/i.test(
+    error.message,
+  );
+}
+
+function iamRetryDelayMs(attempt: number): number {
+  if (!Number.isInteger(attempt) || attempt < 0) {
+    throw new Error("IAM retry attempt escaped its non-negative integer bound.");
+  }
+  const exponential = Math.min(IAM_RETRY_INITIAL_MS * 2 ** attempt, IAM_RETRY_MAX_MS);
+  const jitter = randomBytes(4).readUInt32BE(0) % IAM_RETRY_INITIAL_MS;
+  return Math.min(exponential + jitter, IAM_RETRY_MAX_MS);
+}
+
 export function addExactBindings(
   policy: IamPolicy,
   leases: readonly IamBinding[],
@@ -3331,16 +3623,13 @@ export function removeExactBindings(
 ): IamPolicy {
   let result = policy;
   for (const lease of leases) result = removeExactLease(result, lease);
-  const withoutEtag = (value: IamPolicy): JsonValue => ({
-    ...(value.auditConfigs === undefined ? {} : { auditConfigs: [...value.auditConfigs] }),
-    bindings: value.bindings.map((binding) => json(binding, "IAM binding")),
-  });
-  const version = hashJson(withoutEtag(result)) === hashJson(withoutEtag(original))
-    ? original.version
-    : result.bindings.some((binding) => binding.condition !== undefined)
-    ? 3
-    : original.version;
-  return { ...result, version };
+  if (!Number.isInteger(original.version) || original.version < 1 || original.version > 3) {
+    throw new Error("Original IAM policy version escaped its reviewed range.");
+  }
+  // Once a conditional fence has advanced the CAS generation, keep all
+  // cleanup writes at policy version 3. Downgrading the removal request can
+  // silently discard conditions that were concurrently introduced.
+  return { ...result, version: 3 };
 }
 
 function requireContainsExactBindings(
@@ -3450,7 +3739,7 @@ async function setPolicy(
   const response = await fetcher(
     `https://cloudresourcemanager.googleapis.com/v1/projects/${projectId}:setIamPolicy`,
     {
-      body: JSON.stringify({ policy }),
+      body: JSON.stringify({ policy: { ...policy, version: 3 } }),
       headers: googleHeaders(token),
       method: "POST",
       redirect: "error",
@@ -3481,39 +3770,32 @@ export async function inventoryBridgeArtifacts(
       containmentErrors.push(error);
     }
   }
-  const disabledIdentities: ServiceAccountIdentity[] = [];
-  for (const account of reservedAccounts) {
-    try {
-      disabledIdentities.push(await disableOrphanExecutor(
+  const disabledAccounts: ServiceAccount[] = [];
+  // Start containment for every exact reserved identity before awaiting any
+  // one account's convergence. A single stuck IAM replica must never consume
+  // the shared deadline while a peer remains enabled and untouched.
+  const containmentResults = await Promise.allSettled(
+    reservedAccounts.map((account) =>
+      disableOrphanExecutor(
         account,
         ownerToken,
         fetcher,
         sleep,
         cleanupDeadlineMs,
-      ));
-    } catch (error) {
-      containmentErrors.push(error);
+      )
+    ),
+  );
+  for (const result of containmentResults) {
+    if (result.status === "fulfilled") {
+      disabledAccounts.push(result.value);
+    } else {
+      containmentErrors.push(result.reason);
     }
   }
   if (containmentErrors.length > 0) {
     throw new AggregateError(
       containmentErrors,
       "Every safely identified reserved executor was processed, but orphan containment was incomplete; manual cleanup is required.",
-    );
-  }
-  const disabledAccounts: ServiceAccount[] = [];
-  const provenanceErrors: unknown[] = [];
-  for (const identity of disabledIdentities) {
-    try {
-      disabledAccounts.push(await requireStrictDisabledOrphan(identity, ownerToken, fetcher));
-    } catch (error) {
-      provenanceErrors.push(error);
-    }
-  }
-  if (provenanceErrors.length > 0) {
-    throw new AggregateError(
-      provenanceErrors,
-      "Reserved executors were disabled, but exact provenance validation failed; manual cleanup is required.",
     );
   }
   for (const disabled of disabledAccounts) {
@@ -3541,11 +3823,7 @@ export async function inventoryBridgeArtifacts(
     );
   }
   for (const role of roles) {
-    if (!role.deleted) await deleteEphemeralRole(role, ownerToken, fetcher);
-    const observed = await getProjectCustomRole(role.name, ownerToken, fetcher, true);
-    if (observed !== undefined && !observed.deleted) {
-      throw new Error("An orphan bridge role survived recovery; manual cleanup is required.");
-    }
+    await deleteOrphanRole(role, ownerToken, fetcher, sleep, cleanupDeadlineMs);
   }
   return { accountIds, roleIds };
 }
@@ -3557,6 +3835,25 @@ interface OrphanPolicySurface {
   readonly get: () => Promise<IamPolicy>;
   readonly label: string;
   readonly set: (policy: IamPolicy) => Promise<IamPolicy | undefined>;
+  readonly strandedFences: readonly StrandedFenceContract[];
+}
+
+interface StrandedFenceContract {
+  readonly basis: IamBinding;
+  readonly description: string;
+  readonly titlePrefix: string;
+}
+
+function strandedFenceContract(
+  kind: "cleanup" | "orphan",
+  label: string,
+  basis: IamBinding,
+): StrandedFenceContract {
+  return {
+    basis,
+    description: kind === "cleanup" ? CLEANUP_FENCE_DESCRIPTION : ORPHAN_FENCE_DESCRIPTION,
+    titlePrefix: `codex-${kind}-fence-${createHash("sha256").update(label).digest("hex").slice(0, 12)}-`,
+  };
 }
 
 async function disableOrphanExecutor(
@@ -3565,63 +3862,16 @@ async function disableOrphanExecutor(
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void>,
   cleanupDeadlineMs: number,
-): Promise<ServiceAccountIdentity> {
-  let lastError: unknown;
-  while (Date.now() < cleanupDeadlineMs) {
-    try {
-      const observed = await getExecutorIdentity(
-        account.projectId,
-        account.uniqueId,
-        ownerToken,
-        fetcher,
-        false,
-      );
-      if (observed === undefined) throw new Error("Orphan executor disappeared before recovery.");
-      requireSameServiceAccountIdentity(observed, account, "orphan executor containment");
-      if (observed.disabled) return observed;
-      const response = await fetcher(
-        `${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}:disable`,
-        {
-          body: "{}",
-          headers: googleHeaders(ownerToken),
-          method: "POST",
-          redirect: "error",
-        },
-      );
-      if (!response.ok) throw new Error(`Executor disable failed with HTTP ${response.status}.`);
-      await boundedJson(response, 64 * 1024);
-      lastError = undefined;
-    } catch (error) {
-      if (!retryableCleanupError(error)) throw error;
-      lastError = error;
-    }
-    await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, cleanupDeadlineMs - Date.now()));
-  }
-  throw new AggregateError(
-    lastError === undefined ? [] : [lastError],
-    "Enabled orphan executor could not be disabled before the recovery deadline.",
-  );
-}
-
-async function requireStrictDisabledOrphan(
-  identity: ServiceAccountIdentity,
-  ownerToken: string,
-  fetcher: Fetcher,
 ): Promise<ServiceAccount> {
   try {
-    const observed = await getExecutor(
-      identity.projectId,
-      identity.uniqueId,
+    return await setExecutorDisabled(
+      account,
+      true,
       ownerToken,
       fetcher,
-      false,
+      sleep,
+      cleanupDeadlineMs,
     );
-    if (observed === undefined) throw new Error("Disabled orphan executor disappeared before validation.");
-    requireSameServiceAccountIdentity(observed, identity, "disabled orphan executor");
-    if (!observed.disabled) {
-      throw new Error("Reserved executor became enabled after containment.");
-    }
-    return observed;
   } catch (error) {
     throw new AggregateError(
       [error],
@@ -3661,24 +3911,28 @@ function orphanPolicySurfaces(
 ): readonly OrphanPolicySurface[] {
   const contract = REPOSITORIES[provenance.repository];
   exact(contract.projectId, account.projectId, "orphan executor project");
-  const projectExpected = [
-    ...roles.flatMap((role) => {
-      const roleContract = bridgeRoleContract(role, account.projectId);
-      if (
-        roleContract.root !== provenance.root ||
-        (roleContract.phase === "mutation" && provenance.mode !== "apply")
-      ) {
-        return [];
-      }
-      return buildExecutorProjectLeases(
+  const roleLeaseGroups = roles.flatMap((role) => {
+    const roleContract = bridgeRoleContract(role, account.projectId);
+    if (
+      roleContract.root !== provenance.root ||
+      (roleContract.phase === "mutation" && provenance.mode !== "apply")
+    ) {
+      return [];
+    }
+    return [{
+      leases: buildExecutorProjectLeases(
         provenance.repository,
         provenance.runId,
         provenance.expiresAt,
         account.email,
         role.name,
         roleContract.phase,
-      );
-    }),
+      ),
+      phase: roleContract.phase,
+    }];
+  });
+  const projectExpected = [
+    ...roleLeaseGroups.flatMap(({ leases }) => leases),
     buildStorageLease(
       provenance.repository,
       provenance.root,
@@ -3733,19 +3987,34 @@ function orphanPolicySurfaces(
     expected: readonly IamBinding[],
   ): OrphanPolicySurface => {
     const project = REPOSITORIES[repository].projectId;
+    const basis = buildMarkerReadLease(
+      repository,
+      provenance.runId,
+      provenance.expiresAt,
+      contract.projectId,
+      account.email,
+    );
+    const label = `orphan ${account.uniqueId} project ${project}`;
+    const cleanupFences = repository === provenance.repository
+      ? roleLeaseGroups.flatMap(({ leases, phase }) => {
+          const first = leases[0];
+          return first === undefined
+            ? []
+            : [strandedFenceContract(
+                "cleanup",
+                `${phase === "mutation" ? "mutation " : ""}project ${project}`,
+                first,
+              )];
+        })
+      : [strandedFenceContract("cleanup", `marker project ${project}`, basis)];
     return {
-      basis: buildMarkerReadLease(
-        repository,
-        provenance.runId,
-        provenance.expiresAt,
-        contract.projectId,
-        account.email,
-      ),
+      basis,
       exclusive: false,
       expected,
       get: () => getPolicy(project, ownerToken, fetcher),
-      label: `orphan ${account.uniqueId} project ${project}`,
+      label,
       set: (policy) => setPolicy(project, ownerToken, policy, fetcher),
+      strandedFences: [strandedFenceContract("orphan", label, basis), ...cleanupFences],
     };
   };
   const surfaces: OrphanPolicySurface[] = REPOSITORY_NAMES.map((repository) =>
@@ -3783,13 +4052,20 @@ function orphanPolicySurfaces(
       members: [`serviceAccount:${account.email}`],
       role: "roles/iam.serviceAccountUser",
     };
+    const label = `orphan ${account.uniqueId} runtime ${email}`;
     surfaces.push({
       basis,
       exclusive: false,
       expected,
       get: () => getServiceAccountPolicy(email, ownerToken, fetcher),
-      label: `orphan ${account.uniqueId} runtime ${email}`,
+      label,
       set: (policy) => setServiceAccountPolicy(email, ownerToken, policy, fetcher),
+      strandedFences: [
+        strandedFenceContract("orphan", label, basis),
+        ...(expected.length === 0
+          ? []
+          : [strandedFenceContract("cleanup", `runtime service account ${email}`, basis)]),
+      ],
     });
   }
   const ownerLease = buildTokenCreatorLease(
@@ -3797,13 +4073,22 @@ function orphanPolicySurfaces(
     provenance.runId,
     provenance.expiresAt,
   );
+  const executorPolicyLabel = `orphan ${account.uniqueId} executor policy`;
   surfaces.push({
     basis: ownerLease,
     exclusive: true,
     expected: [ownerLease],
-    get: () => getServiceAccountPolicy(account.email, ownerToken, fetcher),
-    label: `orphan ${account.uniqueId} executor policy`,
-    set: (policy) => setServiceAccountPolicy(account.email, ownerToken, policy, fetcher),
+      get: () => getServiceAccountPolicy(account, ownerToken, fetcher),
+    label: executorPolicyLabel,
+      set: (policy) => setServiceAccountPolicy(account, ownerToken, policy, fetcher),
+    strandedFences: [
+      strandedFenceContract("orphan", executorPolicyLabel, ownerLease),
+      strandedFenceContract(
+        "cleanup",
+        `executor service account ${account.email}`,
+        ownerLease,
+      ),
+    ],
   });
   return surfaces;
 }
@@ -3817,7 +4102,7 @@ async function recoverOrphanPolicy(
   const suffix = randomBytes(10).toString("hex");
   const fence: IamBinding = {
     condition: {
-      description: "Expired inert binding used only to advance the orphan-recovery CAS generation.",
+      description: ORPHAN_FENCE_DESCRIPTION,
       expression: `request.time < timestamp('${IAM_FENCE_EXPIRED_AT}')`,
       title: `codex-orphan-fence-${createHash("sha256").update(surface.label).digest("hex").slice(0, 12)}-${suffix}`,
     },
@@ -3890,6 +4175,10 @@ function requireKnownOrphanBindings(
   const known: IamBinding[] = [];
   for (const binding of policy.bindings) {
     if (fence !== undefined && bindingEqualsLease(binding, fence)) continue;
+    if (surface.strandedFences.some((contract) => bindingMatchesStrandedFence(binding, contract))) {
+      known.push(binding);
+      continue;
+    }
     const relevant = surface.exclusive ||
       binding.members.includes(member) ||
       (binding.condition !== undefined && expectedTitles.has(binding.condition.title));
@@ -3902,6 +4191,27 @@ function requireKnownOrphanBindings(
     known.push(binding);
   }
   return known;
+}
+
+function bindingMatchesStrandedFence(
+  binding: IamBinding,
+  contract: StrandedFenceContract,
+): boolean {
+  const condition = binding.condition;
+  if (condition === undefined ||
+    !condition.title.startsWith(contract.titlePrefix)) return false;
+  const suffix = condition.title.slice(contract.titlePrefix.length);
+  if (!/^[0-9a-f]{20}$/.test(suffix)) return false;
+  const expected: IamBinding = {
+    condition: {
+      description: contract.description,
+      expression: `request.time < timestamp('${IAM_FENCE_EXPIRED_AT}')`,
+      title: `${contract.titlePrefix}${suffix}`,
+    },
+    members: [...contract.basis.members],
+    role: contract.basis.role,
+  };
+  return bindingEqualsLease(binding, expected);
 }
 
 function requireOrphanPolicyClean(
@@ -3927,7 +4237,7 @@ function removeKnownOrphanBindings(
     ...(policy.auditConfigs === undefined ? {} : { auditConfigs: policy.auditConfigs }),
     bindings: remaining,
     etag: policy.etag,
-    version: remaining.some((binding) => binding.condition !== undefined) ? 3 : 1,
+    version: 3,
   };
 }
 
@@ -3939,26 +4249,44 @@ async function deleteOrphanExecutor(
   cleanupDeadlineMs: number,
 ): Promise<void> {
   let lastError: unknown;
+  let deleteAccepted = false;
+  let attempt = 0;
   while (Date.now() < cleanupDeadlineMs) {
-    const observed = await getExecutor(account.projectId, account.uniqueId, ownerToken, fetcher, true);
-    if (observed === undefined) return;
-    exact(observed.uniqueId, account.uniqueId, "orphan executor deletion unique ID");
-    exact(observed.description, account.description, "orphan executor deletion provenance");
-    if (!observed.disabled) {
-      throw new Error("Orphan executor became enabled during cleanup; manual cleanup is required.");
-    }
     try {
-      await deleteExecutorByUniqueId(observed, ownerToken, fetcher);
+      const observed = await getExecutor(
+        account.projectId,
+        account.uniqueId,
+        ownerToken,
+        fetcher,
+        true,
+      );
+      if (observed === undefined) {
+        if (deleteAccepted) return;
+        const deletion = await deleteExecutorByUniqueId(account, ownerToken, fetcher);
+        deleteAccepted ||= deletion === "deleted";
+        throw new Error("Orphan executor deletion is not yet observable.");
+      }
+      exact(observed.uniqueId, account.uniqueId, "orphan executor deletion unique ID");
+      exact(observed.description, account.description, "orphan executor deletion provenance");
+      if (!observed.disabled) {
+        throw new Error("Orphan executor became enabled during cleanup; manual cleanup is required.");
+      }
+      const deletion = await deleteExecutorByUniqueId(observed, ownerToken, fetcher);
+      deleteAccepted ||= deletion === "deleted";
       lastError = undefined;
     } catch (error) {
-      if (!retryableCleanupError(error)) throw error;
+      if (!(error instanceof Error && /deletion is not yet observable/.test(error.message)) &&
+        !retryableCleanupError(error)) throw error;
       lastError = error;
     }
-    await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, cleanupDeadlineMs - Date.now()));
+    const remainingMs = cleanupDeadlineMs - Date.now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+    attempt = Math.min(attempt + 1, IAM_RETRY_MAX_ATTEMPTS - 1);
   }
   throw new AggregateError(
     lastError === undefined ? [] : [lastError],
-    "Orphan executor deletion was not observable before the recovery deadline.",
+    "Orphan executor deletion could not be proven before the recovery deadline; manual reconciliation is required.",
   );
 }
 
@@ -4006,34 +4334,60 @@ async function createEphemeralRole(
   permissions: readonly string[],
   ownerToken: string,
   fetcher: Fetcher,
+  recordCreateAttempt: (intent: EphemeralRoleIntent) => void,
+  recordCreateRejected: (name: string) => void,
+  recordCreated: (role: ProjectCustomRole) => void,
 ): Promise<ProjectCustomRole> {
   const name = `projects/${projectId}/roles/${id}`;
   if (await getProjectCustomRole(name, ownerToken, fetcher, true) !== undefined) {
     throw new Error("The random executor custom role already exists; refusing reuse.");
   }
-  const role = {
+  const role: EphemeralRoleIntent = {
     description: `Protected Terraform ${root} ${phase} single-run control role.`,
     includedPermissions: [...permissions],
+    name,
     stage: "GA",
     title: `Protected Terraform ${phase === "read" ? "Read" : "Mutation"}`,
   };
+  recordCreateAttempt(role);
   const response = await fetcher(`https://iam.googleapis.com/v1/projects/${projectId}/roles`, {
-    body: JSON.stringify({ role, roleId: id }),
+    body: JSON.stringify({
+      role: {
+        description: role.description,
+        includedPermissions: role.includedPermissions,
+        stage: role.stage,
+        title: role.title,
+      },
+      roleId: id,
+    }),
     headers: googleHeaders(ownerToken),
     method: "POST",
     redirect: "error",
   });
+  if ([400, 401, 403].includes(response.status)) recordCreateRejected(name);
   if (response.status === 409) throw new Error("The random executor custom role collided at creation.");
   if (!response.ok) throw new Error(`Ephemeral executor role creation failed with HTTP ${response.status}.`);
   const created = parseProjectCustomRole(await boundedJson(response, 512 * 1024));
-  exact(created.name, name, "created executor role name");
-  exact(created.title, role.title, "created executor role title");
-  exact(created.description, role.description, "created executor role description");
+  requireExactEphemeralRole(created, role);
   exact(created.deleted, false, "created executor role deleted state");
-  if (canonicalJson([...created.includedPermissions].toSorted()) !== canonicalJson([...permissions].toSorted())) {
-    throw new Error("Created executor role permissions drifted from the exact matrix.");
-  }
+  recordCreated(created);
   return created;
+}
+
+function requireExactEphemeralRole(
+  observed: ProjectCustomRole,
+  intent: EphemeralRoleIntent,
+): void {
+  exact(observed.name, intent.name, "executor role name");
+  exact(observed.title, intent.title, "executor role title");
+  exact(observed.description, intent.description, "executor role description");
+  exact(observed.stage, intent.stage, "executor role stage");
+  if (
+    canonicalJson([...observed.includedPermissions].toSorted()) !==
+      canonicalJson([...intent.includedPermissions].toSorted())
+  ) {
+    throw new Error("Executor role permissions drifted from the exact matrix.");
+  }
 }
 
 async function listProjectCustomRoles(
@@ -4147,8 +4501,8 @@ async function deleteEphemeralRole(
   role: ProjectCustomRole,
   ownerToken: string,
   fetcher: Fetcher,
-): Promise<void> {
-  if (role.deleted) return;
+): Promise<"deleted" | "missing"> {
+  if (role.deleted) return "deleted";
   const url = new URL(`https://iam.googleapis.com/v1/${role.name}`);
   url.searchParams.set("etag", role.etag);
   const response = await fetcher(url, {
@@ -4156,11 +4510,51 @@ async function deleteEphemeralRole(
     method: "DELETE",
     redirect: "error",
   });
-  if (response.status === 404) return;
+  if (response.status === 404) return "missing";
   if (!response.ok) throw new Error(`Ephemeral executor role deletion failed with HTTP ${response.status}.`);
   const deleted = parseProjectCustomRole(await boundedJson(response, 512 * 1024));
   exact(deleted.name, role.name, "deleted executor role name");
   exact(deleted.deleted, true, "deleted executor role state");
+  return "deleted";
+}
+
+async function deleteOrphanRole(
+  role: ProjectCustomRole,
+  ownerToken: string,
+  fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+): Promise<void> {
+  if (role.deleted) return;
+  let deleteAccepted = false;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < IAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    if (Date.now() >= cleanupDeadlineMs) break;
+    try {
+      if (!deleteAccepted) {
+        const deletion = await deleteEphemeralRole(role, ownerToken, fetcher);
+        deleteAccepted = deletion === "deleted";
+        if (!deleteAccepted) {
+          throw new Error("Orphan bridge role deletion lacks a successful write acknowledgement.");
+        }
+      }
+      const observed = await getProjectCustomRole(role.name, ownerToken, fetcher, true);
+      if (observed === undefined || observed.deleted) return;
+      throw new Error("Orphan bridge role deletion is not yet observable.");
+    } catch (error) {
+      const retryableSentinel = error instanceof Error &&
+        /(?:lacks a successful write acknowledgement|is not yet observable)/.test(error.message);
+      if (!retryableSentinel && !retryableCleanupError(error)) throw error;
+      lastError = error;
+    }
+    const remainingMs = cleanupDeadlineMs - Date.now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+  }
+  throw new AggregateError(
+    lastError === undefined ? [] : [lastError],
+    "Orphan custom-role deletion could not be proven before the recovery deadline; manual reconciliation is required.",
+  );
 }
 
 function roleId(name: string): string {
@@ -4257,6 +4651,11 @@ async function createEphemeralExecutor(
   expiresAt: Date,
   ownerToken: string,
   fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  deadlineMs: number,
+  recordCreateAttempt: () => void,
+  recordCreateRejected: () => void,
+  recordCreated: (account: ServiceAccountIdentity) => void,
 ): Promise<ServiceAccount> {
   const provenance = executorProvenance(invocation, expiresAt);
   exact(REPOSITORIES[provenance.repository].projectId, projectId, "executor provenance repository");
@@ -4265,6 +4664,7 @@ async function createEphemeralExecutor(
   if (await getExecutor(projectId, email, ownerToken, fetcher, true) !== undefined) {
     throw new Error("The random executor account already exists; refusing identity reuse.");
   }
+  recordCreateAttempt();
   const response = await fetcher(
     `https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts`,
     {
@@ -4280,20 +4680,26 @@ async function createEphemeralExecutor(
       redirect: "error",
     },
   );
+  // A 409 after the preflight 404 can still be a not-yet-visible account or a
+  // replayed create whose response was lost. Keep exact recovery armed so the
+  // deterministic email must be proven, contained, and cleaned.
+  if ([400, 401, 403].includes(response.status)) recordCreateRejected();
   if (response.status === 409) throw new Error("The random executor account collided at creation.");
   if (!response.ok) throw new Error(`Ephemeral executor creation failed with HTTP ${response.status}.`);
-  const created = verifyExecutorAccount(
-    await boundedJson(response, 256 * 1024),
-    projectId,
-    accountId,
-  );
+  const value = await boundedJson(response, 256 * 1024);
+  const identity = parseReservedServiceAccountIdentity(value, projectId);
+  exact(identity.email, email, "created executor email");
+  recordCreated(identity);
+  const created = verifyExecutorAccount(value, projectId, accountId);
   exact(created.description, description, "created executor provenance");
-  const observed = await getExecutor(projectId, email, ownerToken, fetcher, false);
-  if (observed === undefined) throw new Error("The ephemeral executor was not observable after creation.");
-  exact(observed.uniqueId, created.uniqueId, "created executor unique ID");
-  if (!observed.disabled) await setExecutorDisabled(observed, true, ownerToken, fetcher);
-  const disabled = await getExecutor(projectId, observed.uniqueId, ownerToken, fetcher, false);
-  if (disabled === undefined) throw new Error("The ephemeral executor disappeared after disable.");
+  const disabled = await setExecutorDisabled(
+    created,
+    true,
+    ownerToken,
+    fetcher,
+    sleep,
+    deadlineMs,
+  );
   verifyExactExecutor(disabled, projectId, accountId, true);
   exact(disabled.description, description, "disabled executor provenance");
   return disabled;
@@ -4330,7 +4736,9 @@ async function getExecutorIdentity(
     redirect: "error",
   });
   if (allowMissing && response.status === 404) return undefined;
-  if (!response.ok) throw new Error(`Ephemeral executor containment lookup failed with HTTP ${response.status}.`);
+  if (!response.ok) {
+    throw new Error(`Ephemeral executor identity lookup failed with HTTP ${response.status}.`);
+  }
   return parseReservedServiceAccountIdentity(
     await boundedJson(response, 256 * 1024),
     projectId,
@@ -4448,28 +4856,82 @@ function verifyExactExecutor(
 }
 
 async function setExecutorDisabled(
-  account: ServiceAccount,
+  account: ServiceAccountIdentity,
   disabled: boolean,
   token: string,
   fetcher: Fetcher,
-): Promise<void> {
+  sleep: (milliseconds: number) => Promise<void>,
+  deadlineMs: number,
+): Promise<ServiceAccount> {
   const action = disabled ? "disable" : "enable";
-  const response = await fetcher(`${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}:${action}`, {
-    body: "{}",
-    headers: googleHeaders(token),
-    method: "POST",
-    redirect: "error",
-  });
-  if (!response.ok) throw new Error(`Executor ${action} failed with HTTP ${response.status}.`);
-  await boundedJson(response, 64 * 1024);
-  const observed = await getExecutor(account.projectId, account.uniqueId, token, fetcher, false);
-  if (observed === undefined) throw new Error("Executor disappeared after lifecycle mutation.");
-  exact(observed.uniqueId, account.uniqueId, "executor unique ID");
-  verifyExactExecutor(
-    observed,
-    account.projectId,
-    account.email.slice(0, account.email.indexOf("@")),
-    disabled,
+  const consistencyDeadlineMs = Math.min(
+    deadlineMs,
+    Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS,
+  );
+  let lastRetryableError: unknown;
+  for (let attempt = 0; attempt < IAM_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    if (Date.now() >= consistencyDeadlineMs) break;
+    try {
+      // The lifecycle methods are idempotent. Issue the exact stable-ID write
+      // on every attempt before accepting any eventually-consistent readback;
+      // a stale "already disabled/enabled" read can never skip containment.
+      const response = await fetcher(
+        `${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}:${action}`,
+        {
+          body: "{}",
+          headers: googleHeaders(token),
+          method: "POST",
+          redirect: "error",
+        },
+      );
+      if (response.status === 409) {
+        const value = record(
+          await boundedJson(response, 64 * 1024),
+          `executor ${action} conflict`,
+        );
+        const conflict = record(value.error, `executor ${action} conflict error`);
+        const status = requiredString(conflict.status, `executor ${action} conflict status`);
+        if (status === "ABORTED") {
+          throw new Error(`Executor ${action} failed with HTTP 409 ABORTED.`);
+        }
+        throw new Error(`Executor ${action} failed with HTTP 409.`);
+      }
+      if (!response.ok) {
+        throw new Error(`Executor ${action} failed with HTTP ${response.status}.`);
+      }
+      await boundedJson(response, 64 * 1024);
+      const observed = await getExecutor(
+        account.projectId,
+        account.uniqueId,
+        token,
+        fetcher,
+        false,
+      );
+      if (observed === undefined) {
+        throw new Error("Executor lifecycle validation unexpectedly returned no identity.");
+      }
+      requireSameServiceAccountIdentity(observed, account, `executor ${action}`);
+      if ("description" in account) {
+        exact(observed.description, account.description, `executor ${action} provenance`);
+      }
+      if ("displayName" in account) {
+        exact(observed.displayName, account.displayName, `executor ${action} display name`);
+      }
+      if (observed.disabled === disabled) return observed;
+      lastRetryableError = new Error(
+        `Executor ${action} readback remained eventually consistent with the prior state.`,
+      );
+    } catch (error) {
+      if (!retryableIamConsistencyError(error)) throw error;
+      lastRetryableError = error;
+    }
+    const remainingMs = consistencyDeadlineMs - Date.now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(iamRetryDelayMs(attempt), remainingMs));
+  }
+  throw new AggregateError(
+    lastRetryableError === undefined ? [] : [lastRetryableError],
+    `Executor ${action} did not converge before the IAM consistency deadline.`,
   );
 }
 
@@ -4477,7 +4939,7 @@ async function deleteExecutorByUniqueId(
   account: ServiceAccount,
   token: string,
   fetcher: Fetcher,
-): Promise<void> {
+): Promise<"deleted" | "missing"> {
   const response = await fetcher(
     serviceAccountIdentifierUrl(account.projectId, account.uniqueId),
     {
@@ -4486,12 +4948,13 @@ async function deleteExecutorByUniqueId(
       redirect: "error",
     },
   );
-  if (response.status === 404) return;
+  if (response.status === 404) return "missing";
   if (!response.ok) throw new Error(`Ephemeral executor deletion failed with HTTP ${response.status}.`);
   const body = await boundedText(response, 64 * 1024);
   if (body !== "" && body !== "{}" && body !== "{}\n") {
     throw new Error("Ephemeral executor deletion returned an unexpected body.");
   }
+  return "deleted";
 }
 
 async function requireNoUserManagedKeys(
@@ -4499,7 +4962,7 @@ async function requireNoUserManagedKeys(
   token: string,
   fetcher: Fetcher,
 ): Promise<void> {
-  const url = new URL(`${serviceAccountUrl(account.email)}/keys`);
+  const url = new URL(`${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}/keys`);
   url.searchParams.set("keyTypes", "USER_MANAGED");
   const response = await fetcher(url, { headers: googleHeaders(token), redirect: "error" });
   if (!response.ok) throw new Error(`Executor key inventory failed with HTTP ${response.status}.`);
@@ -4519,7 +4982,7 @@ async function mintExecutorToken(
   fetcher: Fetcher,
 ): Promise<ExecutorSession> {
   const response = await fetcher(
-    `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${encodeURIComponent(account.email)}:generateAccessToken`,
+    `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${account.uniqueId}:generateAccessToken`,
     {
       body: JSON.stringify({
         lifetime: `${EXECUTOR_TOKEN_MINUTES * 60}s`,
@@ -4555,27 +5018,33 @@ async function mintExecutorToken(
 }
 
 async function getServiceAccountPolicy(
-  email: string,
+  account: string | ServiceAccountIdentity,
   token: string,
   fetcher: Fetcher,
 ): Promise<IamPolicy> {
-  const value = await googleJson(
-    `${serviceAccountUrl(email)}:getIamPolicy`,
-    token,
-    { options: { requestedPolicyVersion: 3 } },
-    fetcher,
-  );
-  return iamPolicy(value);
+  const url = new URL(`${serviceAccountPolicyUrl(account)}:getIamPolicy`);
+  // Unlike Resource Manager's getIamPolicy RPC, the IAM service-account
+  // method requires an empty body and carries GetPolicyOptions in the query.
+  url.searchParams.set("options.requestedPolicyVersion", "3");
+  const response = await fetcher(url, {
+    headers: googleHeaders(token),
+    method: "POST",
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
+  }
+  return iamPolicy(await boundedJson(response, 2 * 1024 * 1024));
 }
 
 async function setServiceAccountPolicy(
-  email: string,
+  account: string | ServiceAccountIdentity,
   token: string,
   policy: IamPolicy,
   fetcher: Fetcher,
 ): Promise<IamPolicy | undefined> {
-  const response = await fetcher(`${serviceAccountUrl(email)}:setIamPolicy`, {
-    body: JSON.stringify({ policy }),
+  const response = await fetcher(`${serviceAccountPolicyUrl(account)}:setIamPolicy`, {
+    body: JSON.stringify({ policy: { ...policy, version: 3 } }),
     headers: googleHeaders(token),
     method: "POST",
     redirect: "error",
@@ -4585,6 +5054,12 @@ async function setServiceAccountPolicy(
     throw new Error(`Service-account IAM setPolicy failed with HTTP ${response.status}.`);
   }
   return iamPolicy(await boundedJson(response, 2 * 1024 * 1024));
+}
+
+function serviceAccountPolicyUrl(account: string | ServiceAccountIdentity): string {
+  return typeof account === "string"
+    ? serviceAccountUrl(account)
+    : serviceAccountIdentifierUrl(account.projectId, account.uniqueId);
 }
 
 function serviceAccountUrl(email: string): string {
@@ -4802,25 +5277,30 @@ export async function waitForStatePermissions(
       headers: executorHeaders(executorToken),
       redirect: "error",
     });
-    if (!bucketResponse.ok) {
+    if (!bucketResponse.ok &&
+      !(expected === "none" && permissionDenialProvesNoUsableCredential(bucketResponse))) {
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
     }
-    const bucketValue = record(
-      await boundedJson(bucketResponse, 64 * 1024),
-      "bucket permission test",
-    );
-    exactKeys(bucketValue, new Set(["kind", "permissions"]), "bucket permission test");
-    const bucketPermissions = new Set(
-      array(bucketValue.permissions ?? [], "bucket permissions").map((entry) =>
-        requiredString(entry, "bucket permission")
-      ),
-    );
     const requiredBucketPermissions = ["storage.buckets.get", "storage.objects.list"];
-    observed.push(
-      expected !== "none"
-        ? requiredBucketPermissions.every((permission) => bucketPermissions.has(permission))
-        : requiredBucketPermissions.every((permission) => !bucketPermissions.has(permission)),
-    );
+    if (!bucketResponse.ok) {
+      observed.push(true);
+    } else {
+      const bucketValue = record(
+        await boundedJson(bucketResponse, 64 * 1024),
+        "bucket permission test",
+      );
+      exactKeys(bucketValue, new Set(["kind", "permissions"]), "bucket permission test");
+      const bucketPermissions = new Set(
+        array(bucketValue.permissions ?? [], "bucket permissions").map((entry) =>
+          requiredString(entry, "bucket permission")
+        ),
+      );
+      observed.push(
+        expected !== "none"
+          ? requiredBucketPermissions.every((permission) => bucketPermissions.has(permission))
+          : requiredBucketPermissions.every((permission) => !bucketPermissions.has(permission)),
+      );
+    }
 
     for (const object of objects) {
       const resource = `projects/_/buckets/${state.bucket}/objects/${object.name}`;
@@ -4833,8 +5313,13 @@ export async function waitForStatePermissions(
           redirect: "error",
         },
       );
-      if (!response.ok) {
+      if (!response.ok &&
+        !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
         throw new Error(`Object permission test failed with HTTP ${response.status}.`);
+      }
+      if (!response.ok) {
+        observed.push(true);
+        continue;
       }
       const value = record(await boundedJson(response, 64 * 1024), "object permission test");
       exactKeys(value, new Set(["permissions"]), "object permission test");
@@ -4889,22 +5374,26 @@ export async function waitForControlPermissions(
         redirect: "error",
       },
     );
-    if (!projectResponse.ok) {
+    if (!projectResponse.ok &&
+      !(expected === "none" && permissionDenialProvesNoUsableCredential(projectResponse))) {
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
-    const projectValue = record(
-      await boundedJson(projectResponse, 64 * 1024),
-      "project permission test",
-    );
-    exactKeys(projectValue, new Set(["permissions"]), "project permission test");
-    const granted = new Set(
-      array(projectValue.permissions ?? [], "project permissions").map((entry) =>
-        requiredString(entry, "project permission")
-      ),
-    );
-    const projectMatches = projectPermissions.every((permission) =>
-      granted.has(permission) === requiredPermissions.has(permission)
-    );
+    let projectMatches = true;
+    if (projectResponse.ok) {
+      const projectValue = record(
+        await boundedJson(projectResponse, 64 * 1024),
+        "project permission test",
+      );
+      exactKeys(projectValue, new Set(["permissions"]), "project permission test");
+      const granted = new Set(
+        array(projectValue.permissions ?? [], "project permissions").map((entry) =>
+          requiredString(entry, "project permission")
+        ),
+      );
+      projectMatches = projectPermissions.every((permission) =>
+        granted.has(permission) === requiredPermissions.has(permission)
+      );
+    }
 
     let actAsMatches = true;
     if (invocation.terraformRoot === "prod") {
@@ -4915,9 +5404,11 @@ export async function waitForControlPermissions(
           method: "POST",
           redirect: "error",
         });
-        if (!response.ok) {
+        if (!response.ok &&
+          !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
         }
+        if (!response.ok) continue;
         const value = record(await boundedJson(response, 64 * 1024), "runtime permission test");
         exactKeys(value, new Set(["permissions"]), "runtime permission test");
         const permissions = new Set(
@@ -4938,6 +5429,10 @@ export async function waitForControlPermissions(
       ? "The executor control-plane lease did not propagate before the deadline."
       : "The executor token retained control-plane or runtime actAs permissions after cleanup.",
   );
+}
+
+function permissionDenialProvesNoUsableCredential(response: Response): boolean {
+  return response.status === 401 || response.status === 403;
 }
 
 function executorHeaders(token: string): Record<string, string> {
