@@ -3125,6 +3125,11 @@ function executorLifecycleFixture(
     }
     if (url.hostname === "iam.googleapis.com" &&
       path === "/v1/projects/cdbentley/roles" && method === "GET") {
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        pageSize: "100",
+        showDeleted: "true",
+        view: "FULL",
+      });
       return Response.json({ roles: [] });
     }
     if (url.hostname === "iam.googleapis.com" &&
@@ -3139,6 +3144,7 @@ function executorLifecycleFixture(
       return Response.json(role);
     }
     if (url.hostname === "iam.googleapis.com" && path === `/v1/${role.name}`) {
+      if (method === "GET") expect(url.search).toBe("");
       if (method === "DELETE") {
         roleDeleteAttempts += 1;
         deletionStage = true;

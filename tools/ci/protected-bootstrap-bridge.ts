@@ -4438,7 +4438,6 @@ async function getProjectCustomRole(
     throw new Error("Ephemeral executor role name escaped its exact syntax.");
   }
   const url = new URL(`https://iam.googleapis.com/v1/${name}`);
-  url.searchParams.set("view", "FULL");
   const response = await fetcher(url, { headers: googleHeaders(token), redirect: "error" });
   if (allowMissing && response.status === 404) return undefined;
   if (!response.ok) throw new Error(`Ephemeral executor role lookup failed with HTTP ${response.status}.`);
