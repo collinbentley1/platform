@@ -62,8 +62,8 @@ describe("platform scaffold and doctor", () => {
     }
 
     expect(runnerJobs.length).toBeGreaterThan(0);
-    expect(protectedOwnerTimeout).toBe(43);
-    expect(protectedRecoveryTimeout).toBe(19);
+    expect(protectedOwnerTimeout).toBe(41);
+    expect(protectedRecoveryTimeout).toBe(17);
     expect(protectedRecoveryTimeout).toBeLessThanOrEqual(35);
   });
 

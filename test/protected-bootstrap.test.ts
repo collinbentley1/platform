@@ -45,6 +45,7 @@ import {
   recoveryMain,
   recoverBridgeArtifactsUntilStable,
   releaseSandboxAndExecutor,
+  requireFreshGoogleOwnerAccessToken,
   requireSameDhiTransitionCapability,
   runProtectedBootstrap,
   runProtectedRecovery,
@@ -151,10 +152,10 @@ describe("protected owner Terraform bridge", () => {
       "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
     );
     expect(workflow).toContain(
-      "bridge_budget_seconds=$((43 * 60 - elapsed_seconds - 17 * 60))",
+      "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - 15 * 60))",
     );
     expect(workflow).toContain('test "$bridge_budget_seconds" -le 1560');
-    expect(workflow.match(/timeout-minutes: 15/g)).toHaveLength(2);
+    expect(workflow.match(/timeout-minutes: 13/g)).toHaveLength(2);
     const recoveryBlocks = [
       workflow.slice(
         workflow.indexOf("- name: Recover exact IAM artifacts after bridge failure"),
@@ -165,18 +166,18 @@ describe("protected owner Terraform bridge", () => {
       ),
     ];
     for (const recoveryBlock of recoveryBlocks) {
-      expect(recoveryBlock).toContain("timeout-minutes: 15");
+      expect(recoveryBlock).toContain("timeout-minutes: 13");
       expect(recoveryBlock).toContain(
-        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \\\n" +
+        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 735s \\\n" +
           "            /usr/bin/env -i \\",
       );
       expect(recoveryBlock).not.toContain("} | \\\n          exec /usr/bin/env -i");
       expect(recoveryBlock).toContain("--no-env-file --no-orphans");
     }
-    const recoveryInternalDeadlineSeconds = (1 + 7 + 5 + 1) * 60;
-    const recoveryWrapperSeconds = 855;
+    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1) * 60;
+    const recoveryWrapperSeconds = 735;
     const recoveryKillAfterSeconds = 15;
-    const recoveryActionsStepSeconds = 15 * 60;
+    const recoveryActionsStepSeconds = 13 * 60;
     expect(recoveryWrapperSeconds).toBeGreaterThan(recoveryInternalDeadlineSeconds);
     expect(recoveryWrapperSeconds + recoveryKillAfterSeconds).toBeLessThan(
       recoveryActionsStepSeconds,
@@ -184,7 +185,7 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
         "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 19",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 17",
     );
     expect(
       workflow.match(
@@ -256,6 +257,9 @@ describe("protected owner Terraform bridge", () => {
       "each resulting `main^{tree}` equals the receipt's `consumerTreeSha`",
       "the first `S` production deploy performs the sealed DHI epoch transition",
       "never use the mixed-SHA transition path when `P` and `S` declare different DHI parity IDs",
+      "wait at least 55 minutes after the failed workflow completes",
+      "exceeding both the 54-minute conditioned lease and 30-minute executor-token lifetimes",
+      "issue a new attempt-1 owner dispatch",
     ]) {
       expect(rollout).toContain(requirement);
     }
@@ -1165,18 +1169,25 @@ describe("protected owner Terraform bridge", () => {
       return Number(match?.[1]);
     };
     expect(controller).toContain("} finally {");
-    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 43;");
+    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 41;");
     expect(controller).toContain("const LEASE_MINUTES = 54;");
     expect(controller).toContain("const INTERNAL_OPERATION_MINUTES = 24;");
     expect(controller).toContain("const MAIN_STEP_TIMEOUT_MINUTES = 26;");
     expect(controller).toContain("const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;");
-    expect(controller).toContain("const RECOVERY_STABLE_EMPTY_MINUTES = 5;");
+    expect(controller).toContain("const RECOVERY_STABLE_EMPTY_MINUTES = 3;");
     expect(controller).toContain("const RECOVERY_SCAN_INTERVAL_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_SOURCE_PROOF_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +");
     expect(controller).toContain("const MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +");
     expect(controller).toContain("const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +");
+    expect(controller).toContain(
+      "invocation.operationBudgetSeconds +\n          MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +\n          OWNER_TOKEN_EXPIRY_MARGIN_SECONDS",
+    );
+    expect(controller).not.toContain(
+      "MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +\n          FRESH_RECOVERY_JOB_TIMEOUT_MINUTES * 60",
+    );
+    expect(41 + 17).toBeLessThan(60);
     expect(minuteConstant("LEASE_MINUTES")).toBeGreaterThan(
       minuteConstant("JOB_TIMEOUT_MINUTES") + 10,
     );
@@ -1202,7 +1213,7 @@ describe("protected owner Terraform bridge", () => {
       join(root, ".github/workflows/protected-bootstrap-implementation.yml"),
       "utf8",
     );
-    expect(workflow).toContain("timeout-minutes: 43");
+    expect(workflow).toContain("timeout-minutes: 41");
   });
 
   test("Terraform sandbox kill-wait-remove contains a daemonized descendant after timeout", async () => {
@@ -1438,6 +1449,110 @@ describe("protected owner Terraform bridge", () => {
       ...validEnvironment(),
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "419",
     })).toThrow("420..1560");
+  });
+
+  test("owner token introspection requires exact cloud scope and enough recovery lifetime", async () => {
+    const accessToken = "fresh-google-owner-oauth-access-token-value";
+    const nowMs = 1_800_000_000_000;
+    let observedUrl: URL | undefined;
+    let observedInit: RequestInit | undefined;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit) => {
+      observedUrl = new URL(String(input));
+      observedInit = init;
+      return Response.json({
+        exp: String(nowMs / 1_000 + 3_000),
+        expires_in: "3000",
+        scope: "openid https://www.googleapis.com/auth/cloud-platform",
+        sub: "100549777206682928323",
+      });
+    };
+    await requireFreshGoogleOwnerAccessToken(accessToken, 2_999, fetcher, nowMs);
+    expect(observedUrl?.origin).toBe("https://oauth2.googleapis.com");
+    expect(observedUrl?.pathname).toBe("/tokeninfo");
+    expect([...observedUrl!.searchParams.keys()]).toEqual([]);
+    expect(observedInit?.method).toBe("POST");
+    expect(observedInit?.redirect).toBe("error");
+    const observedHeaders = new Headers(observedInit?.headers);
+    expect(observedHeaders.get("authorization")).toBe(`Bearer ${accessToken}`);
+    expect(observedHeaders.get("content-type")).toBe(
+      "application/x-www-form-urlencoded;charset=UTF-8",
+    );
+    expect(observedHeaders.get("content-length")).toBeNull();
+
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      3_001,
+      fetcher,
+      nowMs,
+    )).rejects.toThrow("too close to expiry");
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      60,
+      async () => Response.json({
+        exp: String(nowMs / 1_000 + 3_000),
+        expires_in: "3000",
+        scope: "openid",
+        sub: "100549777206682928323",
+      }),
+      nowMs,
+    )).rejects.toThrow("lacks the cloud-platform scope");
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      60,
+      async () => Response.json({
+        exp: String(nowMs / 1_000 + 3_000),
+        expires_in: "3000",
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+        sub: "999999999999999999999",
+      }),
+      nowMs,
+    )).rejects.toThrow("does not authenticate the exact owner");
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      60,
+      async () => Response.json({
+        exp: String(nowMs / 1_000 + 3_000),
+        expires_in: "3000",
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+      }),
+      nowMs,
+    )).rejects.toThrow("metadata was malformed");
+    await requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      2_900,
+      async () => Response.json({
+        exp: String(nowMs / 1_000 + 3_000),
+        expires_in: "2970",
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+        sub: "100549777206682928323",
+      }),
+      nowMs,
+    );
+    await requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      2_900,
+      async () => Response.json({
+        exp: String(nowMs / 1_000 + 3_700),
+        expires_in: "3000",
+        scope: "https://www.googleapis.com/auth/cloud-platform",
+        sub: "100549777206682928323",
+      }),
+      nowMs,
+    );
+    const rejected = new Response("bounded rejection", { status: 401 });
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      60,
+      async () => rejected,
+      nowMs,
+    )).rejects.toThrow("was rejected");
+    expect(rejected.bodyUsed).toBeTrue();
+    await expect(requireFreshGoogleOwnerAccessToken(
+      accessToken,
+      60,
+      async () => { throw new Error(`do not expose ${accessToken}`); },
+      nowMs,
+    )).rejects.not.toThrow(accessToken);
   });
 
   test("recovery-only entry accepts one owner token and rejects normal capabilities", async () => {
@@ -1687,7 +1802,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("target-project-policy-503")).toBe(1);
@@ -1727,24 +1842,24 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
 
-  test("an empty first scan requires seven-minute observation then five-minute proof", async () => {
+  test("an empty first scan requires seven-minute observation then three-minute proof", async () => {
     const fixture = deterministicRecoveryHarness();
     const startedAt = fixture.now();
     await recoverBridgeArtifactsUntilStable(
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
   });
 
   test("post-delete exact-email 403s require clean global scans and the full absence proof", async () => {
@@ -1754,7 +1869,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation.ownerAccessToken,
       fixture.fetcher,
       fixture.sleep,
-      fixture.now() + 13 * 60_000,
+      fixture.now() + 11 * 60_000,
       fixture.invocation,
     );
     expect(first.exactAccountAbsentOrDenied).toBeTrue();
@@ -1765,10 +1880,10 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.callCount("deterministic-email-disable-403")).toBeGreaterThan(0);
     expect(fixture.callCount("deterministic-account-403")).toBeGreaterThan(0);
     expect(fixture.callCount("executor-policy-403")).toBeGreaterThan(0);
@@ -1789,7 +1904,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      fixture.now() + 13 * 60_000,
+      fixture.now() + 11 * 60_000,
       fixture.now,
     )).rejects.toThrow("orphan containment was incomplete; manual cleanup is required");
     expect(fixture.callCount("deterministic-email-disable-403")).toBeGreaterThan(1);
@@ -1800,20 +1915,20 @@ describe("protected owner Terraform bridge", () => {
   test("a late exact-email 403 resets rather than inherits prior 404 proof time", async () => {
     const fixture = deterministicRecoveryHarness({
       postDeleteMasked403: true,
-      postDeleteMasked403StartScan: 13,
+      postDeleteMasked403StartScan: 11,
     });
     const startedAt = fixture.now();
     await expect(recoverBridgeArtifactsUntilStable(
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     )).rejects.toThrow(
       "did not observe the required stable-empty artifact inventory before its deadline",
     );
     expect(fixture.callCount("deterministic-email-disable-403")).toBe(1);
-    expect(fixture.now() - startedAt).toBe(13 * 60_000);
+    expect(fixture.now() - startedAt).toBe(11 * 60_000);
   });
 
   test("post-delete masking never relaxes global-list or policy 403s", async () => {
@@ -1830,7 +1945,7 @@ describe("protected owner Terraform bridge", () => {
         fixture.invocation,
         fixture.fetcher,
         fixture.sleep,
-        fixture.now() + 13 * 60_000,
+        fixture.now() + 11 * 60_000,
         fixture.now,
       )).rejects.toThrow(message);
       expect(fixture.callCount(tag)).toBeGreaterThan(0);
@@ -1838,7 +1953,7 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
-  test("the production recovery budget proves 300 stable seconds after a second-scan artifact", async () => {
+  test("the production recovery budget proves 180 stable seconds after a second-scan artifact", async () => {
     const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 2 });
     const startedAt = fixture.now();
     let recoveryDeadlineMs = 0;
@@ -1856,8 +1971,8 @@ describe("protected owner Terraform bridge", () => {
       },
       verifySource: async () => undefined,
     });
-    expect(recoveryDeadlineMs - startedAt).toBe(13 * 60_000);
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(recoveryDeadlineMs - startedAt).toBe(11 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
 
@@ -1876,7 +1991,7 @@ describe("protected owner Terraform bridge", () => {
         ),
       verifySource: async () => undefined,
     });
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
 
@@ -1894,7 +2009,7 @@ describe("protected owner Terraform bridge", () => {
         virtualNow += 59_000;
       },
     });
-    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 13 * 60_000);
+    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 11 * 60_000);
 
     let recoveryStarted = false;
     virtualNow = startedAt;
@@ -1912,17 +2027,17 @@ describe("protected owner Terraform bridge", () => {
     expect(recoveryStarted).toBeFalse();
   });
 
-  test("a role observed and cleaned on the nominal final scan resets the 300-second proof", async () => {
+  test("a role observed and cleaned on the nominal final scan resets the 180-second proof", async () => {
     const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 6 });
     const startedAt = fixture.now();
     await recoverBridgeArtifactsUntilStable(
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
 
@@ -1933,7 +2048,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 13 * 60_000,
+      startedAt + 11 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("account-list-503")).toBe(1);
@@ -2602,7 +2717,6 @@ describe("protected owner Terraform bridge", () => {
     session.searchParams.set("uploadType", "resumable");
     session.searchParams.set("name", objectName);
     session.searchParams.set("upload_id", "A".repeat(32));
-    session.searchParams.set("ifGenerationMatch", "0");
     const requests: Array<{
       body: BodyInit | null | undefined;
       headers: Headers;
@@ -2634,7 +2748,8 @@ describe("protected owner Terraform bridge", () => {
     expect(initiation.pathname).toBe("/upload/storage/v1/b/example-bucket/o");
     expect(initiation.searchParams.get("uploadType")).toBe("resumable");
     expect(initiation.searchParams.get("name")).toBe(objectName);
-    expect(initiation.searchParams.get("ifGenerationMatch")).toBe("0");
+    expect(initiation.searchParams.has("ifGenerationMatch")).toBeFalse();
+    expect([...initiation.searchParams.keys()].toSorted()).toEqual(["name", "uploadType"]);
     expect(requests[0]!.body).toBeUndefined();
     expect(requests[0]!.headers.get("content-length")).toBe("0");
     expect(requests[0]!.headers.get("content-type")).toBeNull();
@@ -2647,7 +2762,7 @@ describe("protected owner Terraform bridge", () => {
     expect(requests[1]!.headers.get("authorization")).toBeNull();
   });
 
-  test("create proof distinguishes authorization, precondition, absence, and cleanup failure", async () => {
+  test("create proof never treats a precondition result as authorization evidence", async () => {
     const request = {
       bucket: "example-bucket",
       executorToken: "short-lived-executor-access-token-value",
@@ -2662,11 +2777,16 @@ describe("protected owner Terraform bridge", () => {
       expect(response.bodyUsed).toBeTrue();
     }
     const precondition = new Response("bounded diagnostic", { status: 412 });
-    expect(await probeStorageObjectCreatePermission(
+    let preconditionCalls = 0;
+    await expect(probeStorageObjectCreatePermission(
       request,
-      async () => precondition,
-    )).toBeTrue();
+      async () => {
+        preconditionCalls += 1;
+        return precondition;
+      },
+    )).rejects.toThrow("HTTP 412");
     expect(precondition.bodyUsed).toBeTrue();
+    expect(preconditionCalls).toBe(1);
     const missing = new Response("bounded diagnostic", { status: 404 });
     await expect(probeStorageObjectCreatePermission(
       request,
@@ -2701,12 +2821,16 @@ describe("protected owner Terraform bridge", () => {
       },
     )).rejects.toThrow("unexpected response body");
     expect(unexpectedInitiationCalls).toBe(2);
+    const documentedCancellation = new Response("bounded-undocumented-payload", {
+      status: 499,
+    });
     await expect(probeStorageObjectCreatePermission(
       request,
       async (_input, init) => init?.method === "POST"
         ? new Response("", { headers: { location: session }, status: 200 })
-        : new Response("unexpected", { status: 499 }),
-    )).rejects.toThrow("cancellation returned an unexpected response body");
+        : documentedCancellation,
+    )).resolves.toBeTrue();
+    expect(documentedCancellation.bodyUsed).toBeTrue();
     await expect(probeStorageObjectCreatePermission(
       request,
       async () => new Response("x".repeat(16 * 1024 + 1), { status: 403 }),
@@ -2742,6 +2866,7 @@ describe("protected owner Terraform bridge", () => {
       `${valid.href}&upload_id=${"D".repeat(32)}`,
       `${valid.href}&unexpected=value`,
       valid.href.replace("name=exact%2Fobject&", ""),
+      `${valid.href}&ifGenerationMatch=0`,
       `${valid.href}&ifGenerationMatch=1`,
     ];
     for (const invalidSession of invalidSessions) {
