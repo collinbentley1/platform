@@ -259,10 +259,12 @@ jobs:
           TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
         run: |
           set -euo pipefail
+          canonical_image="${TERRAFORM_SANDBOX_IMAGE#docker.io/}"
+          test "$canonical_image" != "$TERRAFORM_SANDBOX_IMAGE"
           /usr/bin/docker pull --platform=linux/amd64 "$TERRAFORM_SANDBOX_IMAGE"
           /usr/bin/docker image inspect "$TERRAFORM_SANDBOX_IMAGE" \
             --format '{{json .RepoDigests}}' | \
-            jq -e --arg image "$TERRAFORM_SANDBOX_IMAGE" 'index($image) != null' >/dev/null
+            jq -e --arg image "$canonical_image" 'index($image) != null' >/dev/null
 
       - name: Plan or apply through a random single-run executor
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
