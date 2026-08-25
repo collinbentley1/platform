@@ -44,6 +44,12 @@ be configured as a required head-SHA pull-request check.
 
 Apps can add project-specific checks such as `Swift package check`.
 
+The two Socket GitHub App checks must be configured directly with app id
+`156372`. The `Socket Firewall` GitHub Actions wrapper is defense in depth and
+must never substitute for either external check: every repository Actions job
+shares GitHub Actions app id `15368`, so its context alone cannot authenticate
+the immutable platform workflow that produced it.
+
 The platform binds the application policy to the immutable numeric repository
 ID from the GitHub event. For the four managed apps it requires exact
 platform-reviewed `format:check`, `lint`, `typecheck`, `test`, and `build`

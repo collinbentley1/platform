@@ -11,7 +11,7 @@ jobs:
   firewall:
     name: Socket Firewall
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Reject workflow reruns before any privileged action
@@ -127,9 +127,26 @@ jobs:
           set -euo pipefail
           target_sha="$GITHUB_SHA"
           expected='["Socket Security: Project Report"]'
+          is_pull_request=false
+          pull_request_number=0
+          base_sha=''
+          repository_id=0
+          head_repository_id=0
+          fresh_after=0
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             target_sha="$(jq -er '.pull_request.head.sha | select(test("^[0-9a-f]{40}$"))' "$GITHUB_EVENT_PATH")"
+            base_sha="$(jq -er '.pull_request.base.sha | select(test("^[0-9a-f]{40}$"))' "$GITHUB_EVENT_PATH")"
+            pull_request_number="$(jq -er '.number | select(type == "number" and . > 0)' "$GITHUB_EVENT_PATH")"
+            repository_id="$(jq -er '.repository.id | select(type == "number" and . > 0)' "$GITHUB_EVENT_PATH")"
+            head_repository_id="$(jq -er '.pull_request.head.repo.id | select(type == "number" and . > 0)' "$GITHUB_EVENT_PATH")"
+            if ! jq -e '.action == "edited" and (.changes.base? == null)' "$GITHUB_EVENT_PATH" >/dev/null; then
+              fresh_after="$(jq -er '.pull_request.updated_at | fromdateiso8601' "$GITHUB_EVENT_PATH")"
+            fi
+            is_pull_request=true
             expected='["Socket Security: Project Report","Socket Security: Pull Request Alerts"]'
+          elif [ "$GITHUB_EVENT_NAME" != "push" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Socket verification accepts only pull requests or a push to refs/heads/main." >&2
+            exit 1
           fi
           response="$RUNNER_TEMP/socket-check-runs.json"
           for _ in $(seq 1 60); do
@@ -138,22 +155,79 @@ jobs:
               --header 'Accept: application/vnd.github+json' \
               --header 'X-GitHub-Api-Version: 2022-11-28' \
               --output "$response" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${target_sha}/check-runs?filter=latest&per_page=100"
-            if jq -e --argjson expected "$expected" '
-              .check_runs as $runs
-              | all($expected[] as $name;
-                  ([$runs[] | select(.name == $name and .app.id == 156372)] | length) == 1 and
-                  ([$runs[] | select(.name == $name and .app.id == 156372)][0]
-                    | .status == "completed" and .conclusion == "success"))
-            ' "$response" >/dev/null; then
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${target_sha}/check-runs?filter=latest&per_page=100&app_id=156372"
+            if ! state="$(jq -er \
+              --argjson expected "$expected" \
+              --arg head "$target_sha" \
+              --arg base "$base_sha" \
+              --argjson is_pr "$is_pull_request" \
+              --argjson pr "$pull_request_number" \
+              --argjson repo "$repository_id" \
+              --argjson head_repo "$head_repository_id" \
+              --argjson fresh_after "$fresh_after" '
+                def started_epoch($run):
+                  try ($run.started_at | fromdateiso8601) catch -1;
+                def completion_is_valid($run):
+                  $run.status == "completed" and
+                  started_epoch($run) >= 0 and
+                  ((try ($run.completed_at | fromdateiso8601) catch -1) >= started_epoch($run));
+                def has_exact_pull_request($run):
+                  any($run.pull_requests[]?;
+                    .number == $pr and
+                    .head.sha == $head and .head.repo.id == $head_repo and
+                    .base.sha == $base and .base.repo.id == $repo);
+                def has_exact_alert_title($run; $name):
+                  $name != "Socket Security: Pull Request Alerts" or
+                  (($run.output.title | type) == "string" and
+                   ($run.output.title | startswith("Pull Request #\($pr) Alerts:")));
+                def has_fork_pull_request_fallback($run; $name):
+                  $head_repo != $repo and
+                  (($run.pull_requests // []) | type) == "array" and
+                  (($run.pull_requests // []) | length) == 0;
+                def is_current($run; $name):
+                  $run.name == $name and
+                  $run.app.id == 156372 and
+                  $run.head_sha == $head and
+                  (if $is_pr then
+                    started_epoch($run) >= $fresh_after and
+                    has_exact_alert_title($run; $name) and
+                    (has_exact_pull_request($run) or has_fork_pull_request_fallback($run; $name))
+                  else true end);
+                if ((.check_runs | type) != "array" or
+                    (.total_count | type) != "number" or
+                    .total_count != (.check_runs | length) or
+                    .total_count > 100) then
+                  "wait"
+                else
+                  .check_runs as $runs
+                  | [
+                      $expected[] as $name
+                      | [$runs[] | select(is_current(.; $name))]
+                    ] as $groups
+                  | if ([
+                          $groups[]
+                          | (length == 1 and
+                             completion_is_valid(.[0]) and
+                             .[0].conclusion == "success")
+                        ] | all) then
+                      "success"
+                    elif ([
+                            $groups[]
+                            | any(.[];
+                                completion_is_valid(.) and .conclusion != "success")
+                          ] | any) then
+                      "failure"
+                    else
+                      "wait"
+                    end
+                end
+              ' "$response")"; then
+              state='wait'
+            fi
+            if [ "$state" = 'success' ]; then
               exit 0
             fi
-            if jq -e --argjson expected "$expected" '
-              any($expected[] as $name;
-                any(.check_runs[];
-                  .name == $name and .app.id == 156372 and
-                  .status == "completed" and .conclusion != "success"))
-            ' "$response" >/dev/null; then
+            if [ "$state" = 'failure' ]; then
               echo "A required Socket GitHub App check completed without success." >&2
               exit 1
             fi

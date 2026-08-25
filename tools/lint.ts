@@ -1113,6 +1113,53 @@ rejectContains(
   "secrets.",
   "Runsetta's additional pull-request workflow must remain credential-free.",
 );
+rejectContains(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "workflow_dispatch:",
+  "Runsetta's required Swift check must not be manually dispatchable on a pull-request head.",
+);
+for (const boundary of ["- edited", "- opened", "- reopened", "- synchronize"]) {
+  requireContains(
+    "templates/additional-workflows/runsetta/apple.yml",
+    runsettaAppleWorkflow,
+    boundary,
+    "Runsetta's required Swift check must rerun when a pull request opens, changes head, reopens, or changes base.",
+  );
+}
+for (const boundary of [
+  'test "$GITHUB_RUN_ATTEMPT" = "1"',
+  'if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then',
+  'test "$GITHUB_EVENT_NAME" = "push"',
+  'test "$GITHUB_REF" = "refs/heads/main"',
+]) {
+  requireContains(
+    "templates/additional-workflows/runsetta/apple.yml",
+    runsettaAppleWorkflow,
+    boundary,
+    "Runsetta's required Swift check must reject reruns and alternate event aliases.",
+  );
+}
+requireBefore(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "Reject workflow reruns before any required check",
+  "Reject alternate required-check event paths",
+  "Runsetta must reject reruns before evaluating the triggering event.",
+);
+requireBefore(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "Reject alternate required-check event paths",
+  "Checkout",
+  "Runsetta must reject alternate events before executing pull-request code.",
+);
+rejectContains(
+  "templates/additional-workflows/runsetta/apple.yml",
+  runsettaAppleWorkflow,
+  "continue-on-error:",
+  "Runsetta's required check guards must fail closed.",
+);
 requireContains(
   "templates/app/infra/terraform/bootstrap/outputs.tf",
   templateBootstrapOutputs,
@@ -1416,6 +1463,25 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
   requireContains(path, text, "@__PLATFORM_SHA__", "Template workflows must use the scaffolded platform SHA.");
   rejectContains(path, text, "secrets: inherit", "Template workflows must pass only named secrets.");
   checkActionPins(path, text, true);
+}
+
+for (const workflow of ["application.yml", "infrastructure.yml", "socket-firewall.yml"]) {
+  const path = `templates/app/.github/workflows/${workflow}`;
+  const text = await read(path);
+  rejectContains(
+    path,
+    text,
+    "workflow_dispatch:",
+    "A required check must not be manually dispatchable on a pull-request head.",
+  );
+  for (const boundary of ["- edited", "- opened", "- reopened", "- synchronize"]) {
+    requireContains(
+      path,
+      text,
+      boundary,
+      "Required checks must rerun when a pull request opens, changes head, reopens, or changes base.",
+    );
+  }
 }
 
 for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {

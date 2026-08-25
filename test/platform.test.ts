@@ -1188,6 +1188,123 @@ describe("platform scaffold and doctor", () => {
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
+  test("the reusable and platform Socket App gates cannot drift", async () => {
+    const gateContract = async (workflowName: string) => {
+      const workflow = Bun.YAML.parse(
+        await readFile(join(repoRoot, ".github/workflows", workflowName), "utf8"),
+      ) as {
+        permissions?: Record<string, string>;
+        jobs: Record<
+          string,
+          {
+            permissions?: Record<string, string>;
+            steps: Array<Record<string, unknown>>;
+            "timeout-minutes": number;
+          }
+        >;
+      };
+      const job = Object.values(workflow.jobs)[0];
+      const gate = job?.steps.find(
+        (step) => step.name === "Require successful Socket GitHub App checks",
+      );
+      expect(gate?.run).toBeString();
+      return {
+        env: gate?.env,
+        permissions: job?.permissions ?? workflow.permissions,
+        run: gate?.run as string,
+        shell: gate?.shell ?? null,
+        timeoutMinutes: job?.["timeout-minutes"],
+      };
+    };
+
+    const platformGate = await gateContract("platform.yml");
+    const reusableGate = await gateContract("socket-firewall.yml");
+    expect(reusableGate).toEqual(platformGate);
+    expect(reusableGate.run).toContain("&app_id=156372");
+
+    const caller = Bun.YAML.parse(
+      await readFile(
+        join(repoRoot, "templates/app/.github/workflows/socket-firewall.yml"),
+        "utf8",
+      ),
+    ) as { jobs: { firewall: { permissions: Record<string, string> } } };
+    expect(caller.jobs.firewall.permissions).toEqual(reusableGate.permissions);
+  });
+
+  test("required callers have no alternate event or base-retarget gap", async () => {
+    const pullRequest = {
+      types: ["edited", "opened", "reopened", "synchronize"],
+    };
+    for (const workflowName of ["application.yml", "infrastructure.yml", "socket-firewall.yml"]) {
+      const source = await readFile(
+        join(repoRoot, "templates/app/.github/workflows", workflowName),
+        "utf8",
+      );
+      const workflow = Bun.YAML.parse(source) as {
+        on: Record<string, unknown>;
+      };
+      expect(workflow.on.pull_request).toEqual(pullRequest);
+      expect(source).not.toContain("workflow_dispatch");
+      if (workflowName === "infrastructure.yml") {
+        expect(Object.keys(workflow.on)).toEqual(["pull_request"]);
+      } else {
+        expect(Object.keys(workflow.on).sort()).toEqual(["pull_request", "push"]);
+        expect(workflow.on.push).toEqual({ branches: ["main"] });
+      }
+    }
+
+    const appleSource = await readFile(
+      join(repoRoot, "templates/additional-workflows/runsetta/apple.yml"),
+      "utf8",
+    );
+    const apple = Bun.YAML.parse(appleSource) as {
+      on: Record<string, unknown>;
+      jobs: { "swift-package": { steps: Array<Record<string, unknown>> } };
+    };
+    expect(apple.on).toEqual({
+      pull_request: pullRequest,
+      push: { branches: ["main"] },
+    });
+    expect(appleSource).not.toContain("workflow_dispatch");
+    expect(apple.jobs["swift-package"].steps.slice(0, 2)).toEqual([
+      {
+        name: "Reject workflow reruns before any required check",
+        shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
+        run: 'set -euo pipefail\ntest "$GITHUB_RUN_ATTEMPT" = "1"\n',
+      },
+      {
+        name: "Reject alternate required-check event paths",
+        shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
+        run:
+          'set -euo pipefail\nif [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then\n  exit 0\nfi\ntest "$GITHUB_EVENT_NAME" = "push"\ntest "$GITHUB_REF" = "refs/heads/main"\n',
+      },
+    ]);
+  });
+
+  test("required reusable jobs reject alternate event aliases", async () => {
+    const application = Bun.YAML.parse(
+      await readFile(join(repoRoot, ".github/workflows/application.yml"), "utf8"),
+    ) as { jobs: { verify: { steps: Array<Record<string, unknown>> } } };
+    const infrastructure = Bun.YAML.parse(
+      await readFile(join(repoRoot, ".github/workflows/infrastructure.yml"), "utf8"),
+    ) as { jobs: Record<string, { steps?: Array<Record<string, unknown>> }> };
+    const jobs = [
+      application.jobs.verify,
+      infrastructure.jobs["rerun-guard"],
+      infrastructure.jobs["terraform-validate"],
+      infrastructure.jobs.checkov,
+    ];
+    const guards = jobs.map((job) =>
+      job?.steps?.find((step) => step.name === "Reject alternate required-check event paths")
+    );
+    expect(guards.every((guard) => typeof guard?.run === "string")).toBe(true);
+    expect(new Set(guards.map((guard) => guard?.run)).size).toBe(1);
+    const guard = guards[0]?.run as string;
+    expect(guard).toContain('if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then');
+    expect(guard).toContain('test "$GITHUB_EVENT_NAME" = "push"');
+    expect(guard).toContain('test "$GITHUB_REF" = "refs/heads/main"');
+  });
+
   test("Socket check gating binds success to the current pull request and commit", async () => {
     const workflowSource = await readFile(
       join(repoRoot, ".github/workflows/platform.yml"),
@@ -1287,6 +1404,7 @@ describe("platform scaffold and doctor", () => {
       eventName = "pull_request",
       expectedTargetSha = head,
       githubSha = merge,
+      githubRef = eventName === "push" ? "refs/heads/main" : "refs/pull/16/merge",
       totalCount = checkRuns.length,
     }: {
       checkRuns: Array<Record<string, unknown>>;
@@ -1294,6 +1412,7 @@ describe("platform scaffold and doctor", () => {
       eventName?: string;
       expectedTargetSha?: string;
       githubSha?: string;
+      githubRef?: string;
       totalCount?: number;
     }) => {
       await writeFile(
@@ -1311,6 +1430,7 @@ describe("platform scaffold and doctor", () => {
             GH_TOKEN: "test-token",
             GITHUB_EVENT_NAME: eventName,
             GITHUB_EVENT_PATH: event,
+            GITHUB_REF: githubRef,
             GITHUB_REPOSITORY: "collinbentley1/platform",
             GITHUB_SHA: githubSha,
             PATH: `${bin}:/usr/bin:/bin`,
@@ -1389,6 +1509,20 @@ describe("platform scaffold and doctor", () => {
       })),
     );
     await expectTimeout(
+      successes.map((check) =>
+        check.name === "Socket Security: Pull Request Alerts"
+          ? {
+              ...check,
+              output: { title: `Pull Request #${pullRequestNumber + 1} Alerts: Skipped` },
+              pull_requests: [
+                pullRequestAssociation(),
+                pullRequestAssociation(pullRequestNumber + 1),
+              ],
+            }
+          : check,
+      ),
+    );
+    await expectTimeout(
       successes.map((check) => ({
         ...check,
         pull_requests: [pullRequestAssociation(pullRequestNumber, "d".repeat(40))],
@@ -1451,6 +1585,24 @@ describe("platform scaffold and doctor", () => {
         ...pushOptions,
       }),
     ).toEqual({ exitCode: 0, stderr: "" });
+    for (const [eventName, githubRef] of [
+      ["workflow_dispatch", "refs/heads/feature"],
+      ["workflow_dispatch", "refs/heads/main"],
+      ["push", "refs/heads/feature"],
+    ] as const) {
+      const rejected = await execute({
+        checkRuns: [pushCheck],
+        eventDocument: pushOptions.eventDocument,
+        eventName,
+        expectedTargetSha: pushSha,
+        githubRef,
+        githubSha: pushSha,
+      });
+      expect(rejected.exitCode).toBe(1);
+      expect(rejected.stderr).toContain(
+        "Socket verification accepts only pull requests or a push to refs/heads/main.",
+      );
+    }
     await expectTimeout([{ ...pushCheck, completed_at: null, started_at: null }], pushOptions);
     await expectTimeout([{ ...pushCheck, started_at: null }], pushOptions);
     await expectTimeout(
