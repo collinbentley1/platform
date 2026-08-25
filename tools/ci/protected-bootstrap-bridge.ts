@@ -1,6 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, readSync } from "node:fs";
-import { appendFile, chmod, lstat, mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { closeSync, readFileSync, readSync } from "node:fs";
+import {
+  appendFile,
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 const PLATFORM_OWNER = "collinbentley1";
@@ -21,8 +29,10 @@ const GOOGLE_PROVIDER_LINUX_AMD64_ZH =
 const GOOGLE_PROVIDER_BINARY = "terraform-provider-google_v7.45.0_x5";
 const PLAN_FORMAT_VERSION = "1.2";
 const JOB_TIMEOUT_MINUTES = 35;
+const MAIN_STEP_TIMEOUT_MINUTES = 26;
 const LEASE_MINUTES = 47;
 const INTERNAL_OPERATION_MINUTES = 24;
+const RECOVERY_OPERATION_MINUTES = 6;
 const EXECUTOR_TOKEN_MINUTES = 30;
 // Reserve seven minutes for the mandatory 300s+120s post-WIF drain and eight
 // more for the bounded apply, zero-diff readback, marker proof, and receipt.
@@ -44,12 +54,23 @@ const CLEANUP_FENCE_DESCRIPTION =
 const ORPHAN_FENCE_DESCRIPTION =
   "Expired inert binding used only to advance the orphan-recovery CAS generation.";
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
+const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
+// Google documents that a newly created service account can take 60 seconds or
+// more to become visible, and its CI retry guidance allows a 300-second 404
+// convergence deadline. Six scans 60 seconds apart establish that full
+// five-minute stable-empty observation span without multiplying IAM reads.
+const RECOVERY_STABLE_EMPTY_MS = 300_000;
+const RECOVERY_STABLE_EMPTY_INTERVAL_MS = 60_000;
 const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
 const TOKEN_DRAIN_SKEW_SECONDS = 120;
 const POST_MUTATION_DRAIN_SECONDS = 300 + TOKEN_DRAIN_SKEW_SECONDS;
 const CAPABILITY_MANIFEST_PATH = "platform-capabilities/preview-deployment-parity-v1.json";
 const DEPLOYMENT_PARITY_MARKER_OBJECT = "deployment-parity-transition";
 const DEPLOYMENT_PARITY_BUCKET_SUFFIX = "-deployment-parity-state";
+const SANDBOX_OWNER_LABEL = "io.collinbentley1.platform.protected-bootstrap";
+const SANDBOX_RUN_LABEL = "io.collinbentley1.platform.github-run-id";
+const SANDBOX_PLATFORM_REPOSITORY_LABEL = "io.collinbentley1.platform.repository-id";
+const SANDBOX_TARGET_REPOSITORY_LABEL = "io.collinbentley1.platform.target-repository-id";
 const CAPABILITY_REQUIRED_FILES = [
   ".github/workflows/cleanup-preview.yml",
   ".github/workflows/deploy-preview.yml",
@@ -88,6 +109,64 @@ const FORBIDDEN_PRE_MIGRATION_WORKFLOW_SHAS = new Set([
   "33ab9b9a5f3d8a0553372980c22540cad001f776",
 ]);
 
+const BRIDGE_PHASES = [
+  "controller.start",
+  "controller.prepare",
+  "controller.acquire",
+  "controller.proof",
+  "controller.terraform-init",
+  "controller.terraform-plan",
+  "controller.plan-read",
+  "controller.plan-publish",
+  "controller.apply-authorize",
+  "controller.apply",
+  "controller.apply-audit",
+  "controller.apply-drain",
+  "controller.apply-publish",
+  "controller.cleanup",
+  "controller.complete",
+  "controller.failed",
+  "executor.inventory",
+  "executor.account-create",
+  "executor.role-create",
+  "executor.policy",
+  "executor.enable",
+  "executor.token-mint",
+  "executor.baseline-proof",
+  "executor.disable",
+  "executor.project-leases",
+  "executor.marker-leases",
+  "executor.final-enable",
+  "executor.permission-proof",
+  "executor.ready",
+  "recovery.start",
+  "recovery.source-proof",
+  "recovery.inventory",
+  "recovery.complete",
+  "recovery.failed",
+] as const;
+const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
+
+export type BridgePhase = (typeof BRIDGE_PHASES)[number];
+
+export interface BridgeTelemetry {
+  readonly phase: (phase: BridgePhase) => void;
+  readonly stop: () => void;
+}
+
+interface CgroupMemorySnapshot {
+  readonly currentBytes?: number;
+  readonly oom?: number;
+  readonly oomKill?: number;
+  readonly peakBytes?: number;
+}
+
+const NOOP_BRIDGE_TELEMETRY: BridgeTelemetry = {
+  phase: () => undefined,
+  stop: () => undefined,
+};
+
+
 if (LEASE_MINUTES <= JOB_TIMEOUT_MINUTES + 10) {
   throw new Error("The emergency IAM expiry must remain safely beyond the job timeout.");
 }
@@ -96,6 +175,9 @@ if (
   INTERNAL_OPERATION_MINUTES > JOB_TIMEOUT_MINUTES - 10
 ) {
   throw new Error("The operation and pre-apply deadlines must reserve unconditional cleanup.");
+}
+if (MAIN_STEP_TIMEOUT_MINUTES > JOB_TIMEOUT_MINUTES - 9) {
+  throw new Error("The crash-recovery deadline escaped the main job's reserved tail.");
 }
 
 export const REPOSITORY_NAMES = [
@@ -205,6 +287,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 export interface Invocation {
   readonly approvedManifestSha256: string;
   readonly approvedPlanRunId: string;
+  readonly operationBudgetSeconds: number;
   readonly consumerRoot: string;
   readonly consumerSha: string;
   readonly githubActionsToken: string;
@@ -231,6 +314,15 @@ export interface ControllerSecrets {
   readonly consumerActionsToken: string;
   readonly ownerAccessToken: string;
   readonly platformActionsToken: string;
+}
+
+export interface RecoveryInvocation {
+  readonly githubRunId: string;
+  readonly ownerAccessToken: string;
+  readonly platformRoot: string;
+  readonly platformSha: string;
+  readonly repository: RepositoryName;
+  readonly runnerTemp: string;
 }
 
 export interface StorageLease {
@@ -470,7 +562,16 @@ export interface BridgeDependencies {
   ) => Promise<void>;
 }
 
-export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Invocation {
+export interface RecoveryDependencies {
+  readonly now: () => number;
+  readonly recoverArtifacts: (
+    invocation: RecoveryInvocation,
+    recoveryDeadlineMs: number,
+  ) => Promise<void>;
+  readonly verifySource: (invocation: RecoveryInvocation) => Promise<void>;
+}
+
+function validateProtectedRoute(source: NodeJS.ProcessEnv): void {
   exact(source.GITHUB_EVENT_NAME_EXACT, "workflow_dispatch", "GitHub event");
   exact(source.GITHUB_REF_EXACT, "refs/heads/main", "GitHub ref");
   exact(source.GITHUB_REPOSITORY_EXACT, PLATFORM_REPOSITORY, "GitHub repository");
@@ -486,6 +587,50 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     `${PLATFORM_REPOSITORY}/.github/workflows/protected-bootstrap-implementation.yml@refs/heads/main`,
     "workflow ref",
   );
+}
+
+export function validateRecoveryInvocation(
+  source: NodeJS.ProcessEnv = process.env,
+): RecoveryInvocation {
+  validateProtectedRoute(source);
+  rejectRecoveryCapabilities(source);
+  return {
+    githubRunId: numeric(required(source, "GITHUB_RUN_ID_EXACT"), "GitHub run ID"),
+    ownerAccessToken: secret(source, "OWNER_OAUTH_ACCESS_TOKEN"),
+    platformRoot: safeAbsoluteDirectory(required(source, "PLATFORM_ROOT"), "platform root"),
+    platformSha: sha(required(source, "GITHUB_SHA_EXACT"), "platform SHA"),
+    repository: repositoryName(required(source, "TARGET_REPOSITORY")),
+    runnerTemp: safeAbsoluteDirectory(required(source, "RUNNER_TEMP_EXACT"), "runner temp"),
+  };
+}
+
+function rejectRecoveryCapabilities(source: NodeJS.ProcessEnv): void {
+  for (const name of [
+    "APPROVED_MANIFEST_SHA256",
+    "APPROVED_PLAN_RUN_ID",
+    "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT",
+    "CONSUMER_ACTIONS_READ_TOKEN",
+    "CONSUMER_ROOT",
+    "CONSUMER_SHA",
+    "EXECUTION_MODE",
+    "LEGACY_COMPATIBILITY_MODE",
+    "PLATFORM_ACTIONS_READ_TOKEN",
+    "TERRAFORM_BINARY",
+    "TERRAFORM_PROVIDER_ARCHIVE",
+    "TERRAFORM_PROVIDER_DIRECTORY",
+    "TERRAFORM_ROOT",
+    "TERRAFORM_SANDBOX_IMAGE",
+    "TRANSITION_PLATFORM_ROOT",
+    "TRANSITION_WORKFLOW_SHA",
+  ]) {
+    if (source[name] !== undefined) {
+      throw new Error("Recovery-only execution received a normal-operation capability.");
+    }
+  }
+}
+
+export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Invocation {
+  validateProtectedRoute(source);
 
   const repository = repositoryName(required(source, "TARGET_REPOSITORY"));
   const terraformRoot = rootName(required(source, "TERRAFORM_ROOT"));
@@ -493,6 +638,13 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
   const platformSha = sha(required(source, "GITHUB_SHA_EXACT"), "platform SHA");
   const consumerSha = sha(required(source, "CONSUMER_SHA"), "consumer SHA");
   const githubRunId = numeric(required(source, "GITHUB_RUN_ID_EXACT"), "GitHub run ID");
+  const operationBudgetSeconds = Number(numeric(
+    required(source, "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT"),
+    "bridge operation budget seconds",
+  ));
+  if (operationBudgetSeconds < 420 || operationBudgetSeconds > 26 * 60) {
+    throw new Error("Bridge operation budget escaped its reviewed 420..1560 second range.");
+  }
   const legacyCompatibilityMode = booleanString(
     required(source, "LEGACY_COMPATIBILITY_MODE"),
     "legacy compatibility mode",
@@ -544,6 +696,7 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     githubRunId,
     legacyCompatibilityMode,
     mode,
+    operationBudgetSeconds,
     ownerAccessToken,
     platformActionsToken,
     platformRoot: safeAbsoluteDirectory(required(source, "PLATFORM_ROOT"), "platform root"),
@@ -1370,13 +1523,142 @@ function freezeProofFromJson(value: unknown, expectedDrainSeconds: number): Cons
   );
 }
 
+export function formatBridgeBreadcrumb(
+  phase: BridgePhase,
+  rssBytes: number,
+  cgroup: CgroupMemorySnapshot = {},
+): string {
+  if (!BRIDGE_PHASE_SET.has(phase)) {
+    throw new Error("Protected bridge telemetry phase escaped its closed vocabulary.");
+  }
+  if (!Number.isSafeInteger(rssBytes) || rssBytes < 0) {
+    throw new Error("Protected bridge telemetry RSS escaped its integer bound.");
+  }
+  const fields = [
+    `Protected bridge telemetry phase=${phase}`,
+    `rss_kib=${Math.ceil(rssBytes / 1_024)}`,
+  ];
+  for (const [label, value] of [
+    ["cgroup_current_kib", cgroup.currentBytes === undefined
+      ? undefined
+      : Math.ceil(cgroup.currentBytes / 1_024)],
+    ["cgroup_peak_kib", cgroup.peakBytes === undefined
+      ? undefined
+      : Math.ceil(cgroup.peakBytes / 1_024)],
+    ["cgroup_oom", cgroup.oom],
+    ["cgroup_oom_kill", cgroup.oomKill],
+  ] as const) {
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Protected bridge cgroup telemetry escaped its integer bound.");
+    }
+    fields.push(`${label}=${value}`);
+  }
+  return fields.join(" ");
+}
+
+function readCgroupMemorySnapshot(): CgroupMemorySnapshot {
+  const numericFile = (path: string): number | undefined => {
+    try {
+      const value = readFileSync(path, "utf8").trim();
+      if (!/^(?:0|[1-9][0-9]*)$/.test(value)) return undefined;
+      const parsed = Number(value);
+      return Number.isSafeInteger(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  let oom: number | undefined;
+  let oomKill: number | undefined;
+  try {
+    for (const line of readFileSync("/sys/fs/cgroup/memory.events", "utf8").split("\n")) {
+      const match = /^(oom|oom_kill) (0|[1-9][0-9]*)$/.exec(line);
+      if (match === null) continue;
+      const parsed = Number(match[2]);
+      if (!Number.isSafeInteger(parsed)) continue;
+      if (match[1] === "oom") oom = parsed;
+      if (match[1] === "oom_kill") oomKill = parsed;
+    }
+  } catch {
+    // cgroup v2 is optional. Do not inspect any other process or environment state.
+  }
+  const currentBytes = numericFile("/sys/fs/cgroup/memory.current");
+  const peakBytes = numericFile("/sys/fs/cgroup/memory.peak");
+  return {
+    ...(currentBytes === undefined ? {} : { currentBytes }),
+    ...(oom === undefined ? {} : { oom }),
+    ...(oomKill === undefined ? {} : { oomKill }),
+    ...(peakBytes === undefined ? {} : { peakBytes }),
+  };
+}
+
+function bestEffortTelemetry(telemetry: BridgeTelemetry): BridgeTelemetry {
+  return {
+    phase: (phase) => {
+      try {
+        telemetry.phase(phase);
+      } catch {
+        // Breadcrumbs are diagnostic only and may never alter privileged control flow.
+      }
+    },
+    stop: () => {
+      try {
+        telemetry.stop();
+      } catch {
+        // Breadcrumbs are diagnostic only and may never alter privileged control flow.
+      }
+    },
+  };
+}
+
+function startBridgeTelemetry(
+  initialPhase: BridgePhase,
+  sink: (value: string) => void = (value) => console.error(value),
+  readRss: () => number = () => process.memoryUsage().rss,
+): BridgeTelemetry {
+  let currentPhase = initialPhase;
+  const emit = () => {
+    try {
+      sink(formatBridgeBreadcrumb(currentPhase, readRss(), readCgroupMemorySnapshot()));
+    } catch {
+      // Sink, RSS, formatting, and cgroup failures are all strictly best effort.
+    }
+  };
+  emit();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    timer = setInterval(emit, BRIDGE_TELEMETRY_INTERVAL_MS);
+    timer.unref();
+  } catch {
+    timer = undefined;
+  }
+  return {
+    phase: (phase) => {
+      currentPhase = phase;
+      emit();
+    },
+    stop: () => {
+      if (timer !== undefined) clearInterval(timer);
+    },
+  };
+}
+
 export async function runProtectedBootstrap(
   invocation: Invocation,
   dependencies: BridgeDependencies = defaultBridgeDependencies(),
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): Promise<void> {
+  telemetry = bestEffortTelemetry(telemetry);
   const startedAtMs = dependencies.now();
-  const operationDeadlineMs = startedAtMs + INTERNAL_OPERATION_MINUTES * 60_000;
-  const cleanupDeadlineMs = startedAtMs + (JOB_TIMEOUT_MINUTES - 1) * 60_000;
+  const wrapperDeadlineMs = startedAtMs + invocation.operationBudgetSeconds * 1_000;
+  const cleanupDeadlineMs = wrapperDeadlineMs - 60_000;
+  const operationDeadlineMs = Math.min(
+    startedAtMs + INTERNAL_OPERATION_MINUTES * 60_000,
+    cleanupDeadlineMs - 5 * 60_000,
+  );
+  if (operationDeadlineMs <= startedAtMs) {
+    throw new Error("Bridge operation budget cannot cover primary work plus exact cleanup.");
+  }
   const leaseExpiresAt = new Date(startedAtMs + LEASE_MINUTES * 60_000);
   const contract = REPOSITORIES[invocation.repository];
   const sandboxPath = resolve(
@@ -1394,15 +1676,18 @@ export async function runProtectedBootstrap(
   let session: ExecutorSession | undefined;
   let primaryFailure: unknown;
   try {
+    telemetry.phase("controller.prepare");
     const preparation = await dependencies.prepare(invocation, operationDeadlineMs);
     const consumerTreeSha = preparation.consumerTreeSha;
     assertBeforeDeadline(dependencies.now(), operationDeadlineMs, "protected preparation");
+    telemetry.phase("controller.acquire");
     session = await dependencies.acquireExecutor(
       invocation,
       leaseExpiresAt,
       operationDeadlineMs,
     );
     assertSession(session, dependencies.now(), operationDeadlineMs);
+    telemetry.phase("controller.proof");
     const proof: ExecutionProof = {
       ...preparation,
       freezeProof: await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds),
@@ -1418,6 +1703,7 @@ export async function runProtectedBootstrap(
       "deployments",
       invocation.terraformRoot,
     );
+    telemetry.phase("controller.terraform-init");
     await dependencies.runTerraform(
       invocation,
       session,
@@ -1433,6 +1719,7 @@ export async function runProtectedBootstrap(
       ],
       operationDeadlineMs,
     );
+    telemetry.phase("controller.terraform-plan");
     await dependencies.runTerraform(
       invocation,
       session,
@@ -1454,6 +1741,7 @@ export async function runProtectedBootstrap(
       ],
       operationDeadlineMs,
     );
+    telemetry.phase("controller.plan-read");
     await dependencies.inspectPlan(planPath);
     const planJson = await dependencies.readPlanJson(
       invocation,
@@ -1487,6 +1775,7 @@ export async function runProtectedBootstrap(
       transitionWorkflowSha: invocation.transitionWorkflowSha,
     });
     if (invocation.mode === "plan") {
+      telemetry.phase("controller.plan-publish");
       await dependencies.publishPlanReceipt(
         invocation,
         session,
@@ -1499,6 +1788,7 @@ export async function runProtectedBootstrap(
       return;
     }
 
+    telemetry.phase("controller.apply-authorize");
     if (
       approved === undefined ||
       approved.sha256 !== review.sha256 ||
@@ -1542,6 +1832,7 @@ export async function runProtectedBootstrap(
       session.tokenExpiresAtMs,
     );
     await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds);
+    telemetry.phase("controller.apply");
     await dependencies.runTerraform(
       invocation,
       session,
@@ -1553,6 +1844,7 @@ export async function runProtectedBootstrap(
     // the exact Linux provider archive is SHA-256 pinned, checked against the
     // committed readonly lock, and supplied only from /plugins. Re-read every
     // declared resource after apply and require an exact zero-diff exit code.
+    telemetry.phase("controller.apply-audit");
     await dependencies.runTerraform(
       invocation,
       session,
@@ -1575,6 +1867,7 @@ export async function runProtectedBootstrap(
       operationDeadlineMs,
     );
     const mutationCompletedAtMs = dependencies.now();
+    telemetry.phase("controller.apply-drain");
     await dependencies.waitForPostMutationDrain(
       invocation,
       mutationCompletedAtMs,
@@ -1592,6 +1885,7 @@ export async function runProtectedBootstrap(
     ) {
       throw new Error("The post-WIF freeze snapshot predates the required token-expiry barrier.");
     }
+    telemetry.phase("controller.apply-publish");
     await dependencies.publishPostApplyReceipt(
       invocation,
       session,
@@ -1607,15 +1901,22 @@ export async function runProtectedBootstrap(
     primaryFailure = error;
     throw error;
   } finally {
-    const cleanupErrors: unknown[] = [];
-    for (const path of [planPath, tfDataPath, sandboxPath]) {
-      await dependencies.removePrivatePath(path).catch((error) => cleanupErrors.push(error));
-    }
-    await dependencies.releaseExecutor(
-      invocation,
-      session,
-      cleanupDeadlineMs,
-    ).catch((error) => cleanupErrors.push(error));
+    telemetry.phase("controller.cleanup");
+    // Schedule IAM containment first and independently. A large or damaged
+    // private tree must not consume the cleanup window before the executor is
+    // disabled, and a synchronous filesystem-cleanup throw must not prevent
+    // the IAM attempt from starting.
+    const cleanupResults = await Promise.allSettled([
+      Promise.resolve().then(() =>
+        dependencies.releaseExecutor(invocation, session, cleanupDeadlineMs)
+      ),
+      ...[planPath, tfDataPath, sandboxPath].map((path) =>
+        Promise.resolve().then(() => dependencies.removePrivatePath(path))
+      ),
+    ]);
+    const cleanupErrors = cleanupResults.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []
+    );
     if (cleanupErrors.length > 0) {
       const cleanupFailure = new AggregateError(
         cleanupErrors,
@@ -1632,32 +1933,111 @@ export async function runProtectedBootstrap(
 
 export async function main(
   source: NodeJS.ProcessEnv = process.env,
-  dependencies: BridgeDependencies = defaultBridgeDependencies(),
+  dependencies: BridgeDependencies | undefined = undefined,
   readSecrets: () => ControllerSecrets = readControllerSecretsFromStdin,
+  telemetry: BridgeTelemetry | undefined = undefined,
 ): Promise<void> {
-  for (const name of [
-    "CONSUMER_ACTIONS_READ_TOKEN",
-    "OWNER_OAUTH_ACCESS_TOKEN",
-    "PLATFORM_ACTIONS_READ_TOKEN",
-  ]) {
-    if (source[name] !== undefined || process.env[name] !== undefined) {
-      delete source[name];
-      delete process.env[name];
-      throw new Error("Controller credentials must not exist in Bun's initial environment.");
+  const activeTelemetry = bestEffortTelemetry(
+    telemetry ?? startBridgeTelemetry("controller.start"),
+  );
+  try {
+    for (const name of [
+      "CONSUMER_ACTIONS_READ_TOKEN",
+      "OWNER_OAUTH_ACCESS_TOKEN",
+      "PLATFORM_ACTIONS_READ_TOKEN",
+    ]) {
+      if (source[name] !== undefined || process.env[name] !== undefined) {
+        delete source[name];
+        delete process.env[name];
+        throw new Error("Controller credentials must not exist in Bun's initial environment.");
+      }
     }
+    const secrets = readSecrets();
+    const invocationSource: NodeJS.ProcessEnv = {
+      ...source,
+      CONSUMER_ACTIONS_READ_TOKEN: secrets.consumerActionsToken,
+      OWNER_OAUTH_ACCESS_TOKEN: secrets.ownerAccessToken,
+      PLATFORM_ACTIONS_READ_TOKEN: secrets.platformActionsToken,
+    };
+    const invocation = validateInvocation(invocationSource);
+    delete invocationSource.CONSUMER_ACTIONS_READ_TOKEN;
+    delete invocationSource.OWNER_OAUTH_ACCESS_TOKEN;
+    delete invocationSource.PLATFORM_ACTIONS_READ_TOKEN;
+    await runProtectedBootstrap(
+      invocation,
+      dependencies ?? defaultBridgeDependencies(activeTelemetry),
+      activeTelemetry,
+    );
+    activeTelemetry.phase("controller.complete");
+  } catch (error) {
+    activeTelemetry.phase("controller.failed");
+    throw error;
+  } finally {
+    activeTelemetry.stop();
   }
-  const secrets = readSecrets();
-  const invocationSource: NodeJS.ProcessEnv = {
-    ...source,
-    CONSUMER_ACTIONS_READ_TOKEN: secrets.consumerActionsToken,
-    OWNER_OAUTH_ACCESS_TOKEN: secrets.ownerAccessToken,
-    PLATFORM_ACTIONS_READ_TOKEN: secrets.platformActionsToken,
-  };
-  const invocation = validateInvocation(invocationSource);
-  delete invocationSource.CONSUMER_ACTIONS_READ_TOKEN;
-  delete invocationSource.OWNER_OAUTH_ACCESS_TOKEN;
-  delete invocationSource.PLATFORM_ACTIONS_READ_TOKEN;
-  await runProtectedBootstrap(invocation, dependencies);
+}
+
+export async function runProtectedRecovery(
+  invocation: RecoveryInvocation,
+  dependencies: RecoveryDependencies = defaultRecoveryDependencies(),
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
+): Promise<void> {
+  telemetry = bestEffortTelemetry(telemetry);
+  const startedAtMs = dependencies.now();
+  const recoveryDeadlineMs = startedAtMs + RECOVERY_OPERATION_MINUTES * 60_000;
+  telemetry.phase("recovery.source-proof");
+  await dependencies.verifySource(invocation);
+  assertBeforeDeadline(dependencies.now(), recoveryDeadlineMs, "protected crash recovery");
+  telemetry.phase("recovery.inventory");
+  await dependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+}
+
+export async function recoveryMain(
+  source: NodeJS.ProcessEnv = process.env,
+  dependencies: RecoveryDependencies | undefined = undefined,
+  readOwnerAccessToken: () => string = readRecoverySecretFromStdin,
+  telemetry: BridgeTelemetry | undefined = undefined,
+): Promise<void> {
+  const activeTelemetry = bestEffortTelemetry(
+    telemetry ?? startBridgeTelemetry("recovery.start"),
+  );
+  try {
+    validateProtectedRoute(source);
+    rejectRecoveryCapabilities(source);
+    numeric(required(source, "GITHUB_RUN_ID_EXACT"), "GitHub run ID");
+    sha(required(source, "GITHUB_SHA_EXACT"), "platform SHA");
+    repositoryName(required(source, "TARGET_REPOSITORY"));
+    safeAbsoluteDirectory(required(source, "PLATFORM_ROOT"), "platform root");
+    safeAbsoluteDirectory(required(source, "RUNNER_TEMP_EXACT"), "runner temp");
+    for (const name of [
+      "CONSUMER_ACTIONS_READ_TOKEN",
+      "OWNER_OAUTH_ACCESS_TOKEN",
+      "PLATFORM_ACTIONS_READ_TOKEN",
+    ]) {
+      if (source[name] !== undefined || process.env[name] !== undefined) {
+        delete source[name];
+        delete process.env[name];
+        throw new Error("Recovery credential must not exist in Bun's initial environment.");
+      }
+    }
+    const invocationSource: NodeJS.ProcessEnv = {
+      ...source,
+      OWNER_OAUTH_ACCESS_TOKEN: readOwnerAccessToken(),
+    };
+    const invocation = validateRecoveryInvocation(invocationSource);
+    delete invocationSource.OWNER_OAUTH_ACCESS_TOKEN;
+    await runProtectedRecovery(
+      invocation,
+      dependencies ?? defaultRecoveryDependencies(),
+      activeTelemetry,
+    );
+    activeTelemetry.phase("recovery.complete");
+  } catch (error) {
+    activeTelemetry.phase("recovery.failed");
+    throw error;
+  } finally {
+    activeTelemetry.stop();
+  }
 }
 
 export function parseControllerSecretBundle(value: Uint8Array): ControllerSecrets {
@@ -1673,6 +2053,17 @@ export function parseControllerSecretBundle(value: Uint8Array): ControllerSecret
     consumerActionsToken: secretValue(parts[1]!, "consumer Actions read token"),
     platformActionsToken: secretValue(parts[2]!, "platform Actions read token"),
   };
+}
+
+export function parseRecoverySecretBundle(value: Uint8Array): string {
+  if (value.byteLength < 2 || value.byteLength > MAX_SECRET_BUNDLE_BYTES) {
+    throw new Error("Recovery secret bundle escaped its size bound.");
+  }
+  const parts = Buffer.from(value).toString("utf8").split("\0");
+  if (parts.length !== 2 || parts[1] !== "") {
+    throw new Error("Recovery secret bundle must contain exactly one NUL-terminated value.");
+  }
+  return secretValue(parts[0]!, "owner OAuth access token");
 }
 
 function readControllerSecretsFromStdin(): ControllerSecrets {
@@ -1693,6 +2084,29 @@ function readControllerSecretsFromStdin(): ControllerSecrets {
   }
   try {
     return parseControllerSecretBundle(buffer.subarray(0, offset));
+  } finally {
+    buffer.fill(0);
+  }
+}
+
+function readRecoverySecretFromStdin(): string {
+  const buffer = Buffer.alloc(MAX_SECRET_BUNDLE_BYTES + 1);
+  let offset = 0;
+  try {
+    while (offset < buffer.byteLength) {
+      const count = readSync(0, buffer, offset, buffer.byteLength - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+  } finally {
+    closeSync(0);
+  }
+  if (offset > MAX_SECRET_BUNDLE_BYTES) {
+    buffer.fill(0);
+    throw new Error("Recovery secret bundle escaped its size bound.");
+  }
+  try {
+    return parseRecoverySecretBundle(buffer.subarray(0, offset));
   } finally {
     buffer.fill(0);
   }
@@ -2141,13 +2555,13 @@ export interface TerraformSandboxDriver {
 
 export class TerraformSandboxExecutor {
   readonly #driver: TerraformSandboxDriver;
-  readonly #randomSuffix: () => string;
+  readonly #randomSuffix: (() => string) | undefined;
   #counter = 0;
   #active = new Map<string, Invocation>();
 
   constructor(
     driver: TerraformSandboxDriver = dockerTerraformSandboxDriver(),
-    randomSuffix: () => string = () => randomBytes(6).toString("hex"),
+    randomSuffix: (() => string) | undefined = undefined,
   ) {
     this.#driver = driver;
     this.#randomSuffix = randomSuffix;
@@ -2167,11 +2581,19 @@ export class TerraformSandboxExecutor {
       resolve(invocation.platformRoot, "terraform", "deployments", invocation.terraformRoot),
       "sandbox Terraform directory",
     );
-    const suffix = this.#randomSuffix();
+    const nextCounter = this.#counter + 1;
+    if (nextCounter > 5) {
+      throw new Error("Terraform sandbox escaped its finite reviewed phase count.");
+    }
+    const suffix = this.#randomSuffix?.() ?? deterministicArtifactHex(
+      invocation.repository,
+      invocation.githubRunId,
+      `container-${nextCounter as 1 | 2 | 3 | 4 | 5}`,
+    ).slice(0, 12);
     if (!/^[0-9a-f]{12}$/.test(suffix)) {
       throw new Error("Terraform sandbox suffix escaped its random syntax.");
     }
-    this.#counter += 1;
+    this.#counter = nextCounter;
     const containerName = `pbt-${invocation.githubRunId}-${this.#counter}-${suffix}`;
     const workDirectory = resolve(
       invocation.runnerTemp,
@@ -2288,6 +2710,10 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
       await runDocker(spec.invocation, [
         "create",
         `--name=${spec.containerName}`,
+        `--label=${SANDBOX_OWNER_LABEL}=true`,
+        `--label=${SANDBOX_RUN_LABEL}=${spec.invocation.githubRunId}`,
+        `--label=${SANDBOX_PLATFORM_REPOSITORY_LABEL}=${PLATFORM_REPOSITORY_ID}`,
+        `--label=${SANDBOX_TARGET_REPOSITORY_LABEL}=${REPOSITORIES[spec.invocation.repository].repositoryId}`,
         "--platform=linux/amd64",
         "--pull=never",
         "--network=bridge",
@@ -2354,9 +2780,16 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
   };
 }
 
-function defaultBridgeDependencies(): BridgeDependencies {
-  const manager = new ExecutorLeaseManager(fetch, (milliseconds) => Bun.sleep(milliseconds));
-  const sandbox = new TerraformSandboxExecutor();
+function defaultBridgeDependencies(
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
+): BridgeDependencies {
+  const manager = new ExecutorLeaseManager(
+    fetch,
+    (milliseconds) => Bun.sleep(milliseconds),
+    undefined,
+    telemetry,
+  );
+  const sandbox = new TerraformSandboxExecutor(dockerTerraformSandboxDriver());
   let apiDeadlineMs = Date.now() + 5 * 60_000;
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
   return {
@@ -2472,14 +2905,12 @@ function defaultBridgeDependencies(): BridgeDependencies {
         ["show", "-json", "/work/plan.tfplan"],
         operationDeadlineMs,
         true,
-      ),
+    ),
     releaseExecutor: async (invocation, _session, cleanupDeadlineMs) => {
-      const errors: unknown[] = [];
-      await sandbox.cleanupAll(cleanupDeadlineMs).catch((error) => errors.push(error));
-      await manager.release(invocation, cleanupDeadlineMs).catch((error) => errors.push(error));
-      if (errors.length > 0) {
-        throw new AggregateError(errors, "Sandbox and executor cleanup did not both complete.");
-      }
+      await releaseSandboxAndExecutor(
+        () => sandbox.cleanupAll(cleanupDeadlineMs),
+        () => manager.release(invocation, cleanupDeadlineMs),
+      );
     },
     removePrivatePath: (path) => rm(path, { force: true, recursive: true }),
     runTerraform: async (
@@ -2509,6 +2940,49 @@ function defaultBridgeDependencies(): BridgeDependencies {
       const remainingMs = targetMs - Date.now();
       if (remainingMs > 0) await Bun.sleep(remainingMs);
       assertBeforeDeadline(Date.now(), operationDeadlineMs, "post-WIF token drain");
+    },
+  };
+}
+
+export async function releaseSandboxAndExecutor(
+  cleanupSandbox: () => Promise<void>,
+  cleanupExecutor: () => Promise<void>,
+): Promise<void> {
+  // Invoke IAM first and isolate both callbacks behind promises so a
+  // synchronous Docker-cleanup failure cannot suppress executor containment.
+  const results = await Promise.allSettled([
+    Promise.resolve().then(cleanupExecutor),
+    Promise.resolve().then(cleanupSandbox),
+  ]);
+  const errors = results.flatMap((result) =>
+    result.status === "rejected" ? [result.reason] : []
+  );
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Sandbox and executor cleanup did not both complete.");
+  }
+}
+
+function defaultRecoveryDependencies(): RecoveryDependencies {
+  let apiDeadlineMs = Date.now() + RECOVERY_OPERATION_MINUTES * 60_000;
+  const api = deadlineFetcher(fetch, () => apiDeadlineMs);
+  return {
+    now: () => Date.now(),
+    recoverArtifacts: async (invocation, recoveryDeadlineMs) => {
+      apiDeadlineMs = recoveryDeadlineMs;
+      await recoverBridgeArtifactsUntilStable(
+        invocation,
+        api,
+        (milliseconds) => Bun.sleep(milliseconds),
+        recoveryDeadlineMs,
+        () => Date.now(),
+      );
+    },
+    verifySource: async (invocation) => {
+      await Promise.all([
+        requireRealDirectory(invocation.platformRoot, "recovery platform root"),
+        requireRealDirectory(invocation.runnerTemp, "recovery runner temp"),
+      ]);
+      await verifyLocalSource(invocation.platformRoot, invocation.platformSha, undefined);
     },
   };
 }
@@ -2683,8 +3157,9 @@ export interface PolicyMutationRecord {
 
 export class ExecutorLeaseManager {
   readonly #fetcher: Fetcher;
-  readonly #randomHex: () => string;
+  readonly #randomHex: (() => string) | undefined;
   readonly #sleep: (milliseconds: number) => Promise<void>;
+  readonly #telemetry: BridgeTelemetry;
   #accountId: string | undefined;
   #accountDescription: string | undefined;
   #accountIdentity: ServiceAccountIdentity | undefined;
@@ -2704,11 +3179,13 @@ export class ExecutorLeaseManager {
   constructor(
     fetcher: Fetcher,
     sleep: (milliseconds: number) => Promise<void>,
-    randomHex: () => string = () => randomBytes(10).toString("hex"),
+    randomHex: (() => string) | undefined = undefined,
+    telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
   ) {
     this.#fetcher = deadlineFetcher(fetcher, () => this.#apiDeadlineMs);
     this.#sleep = sleep;
     this.#randomHex = randomHex;
+    this.#telemetry = bestEffortTelemetry(telemetry);
   }
 
   async acquire(
@@ -2722,6 +3199,7 @@ export class ExecutorLeaseManager {
     const contract = REPOSITORIES[invocation.repository];
     try {
       assertBeforeDeadline(Date.now(), operationDeadlineMs, "executor setup");
+      this.#telemetry.phase("executor.inventory");
       const inventory = await inventoryBridgeArtifacts(
         contract.projectId,
         invocation.ownerAccessToken,
@@ -2729,13 +3207,21 @@ export class ExecutorLeaseManager {
         this.#sleep,
         operationDeadlineMs,
       );
-      const accountId = randomExecutorAccountId(this.#randomHex());
-      const readRoleId = randomExecutorRoleId("read", this.#randomHex());
+      const accountId = randomExecutorAccountId(
+        this.#randomHex?.() ??
+          deterministicArtifactHex(invocation.repository, invocation.githubRunId, "service-account"),
+      );
+      const readRoleId = randomExecutorRoleId(
+        "read",
+        this.#randomHex?.() ??
+          deterministicArtifactHex(invocation.repository, invocation.githubRunId, "role-read"),
+      );
       if (inventory.accountIds.has(accountId) || inventory.roleIds.has(readRoleId)) {
         throw new Error("A cryptographically random executor identifier collided; refusing reuse.");
       }
       this.#accountId = accountId;
       this.#accountDescription = executorDescription(executorProvenance(invocation, leaseExpiresAt));
+      this.#telemetry.phase("executor.account-create");
       let account = await createEphemeralExecutor(
         contract.projectId,
         accountId,
@@ -2745,7 +3231,7 @@ export class ExecutorLeaseManager {
         this.#fetcher,
         this.#sleep,
         operationDeadlineMs,
-        () => {
+        async () => {
           this.#executorLifecycleArmed = true;
         },
         () => {
@@ -2759,6 +3245,7 @@ export class ExecutorLeaseManager {
       );
       this.#account = account;
       this.#accountIdentity = account;
+      this.#telemetry.phase("executor.role-create");
       const readRole = await createEphemeralRole(
         contract.projectId,
         readRoleId,
@@ -2767,7 +3254,9 @@ export class ExecutorLeaseManager {
         executorControlPermissions(invocation.repository, invocation.terraformRoot, "read"),
         invocation.ownerAccessToken,
         this.#fetcher,
-        (intent) => this.#roleIntents.set(intent.name, intent),
+        async (intent) => {
+          this.#roleIntents.set(intent.name, intent);
+        },
         (name) => this.#roleIntents.delete(name),
         (created) => {
           this.#roleIntents.delete(created.name);
@@ -2801,6 +3290,7 @@ export class ExecutorLeaseManager {
       );
       requireNoExecutorProjectBindings(originalProjectPolicy, account.email);
 
+      this.#telemetry.phase("executor.policy");
       await this.#recordAndAdd(
         `executor service account ${account.email}`,
         [
@@ -2830,6 +3320,7 @@ export class ExecutorLeaseManager {
             ),
           ),
       );
+      this.#telemetry.phase("executor.enable");
       account = await setExecutorDisabled(
         account,
         false,
@@ -2839,6 +3330,7 @@ export class ExecutorLeaseManager {
         operationDeadlineMs,
       );
       this.#account = account;
+      this.#telemetry.phase("executor.token-mint");
       const session = await this.#retryIamConsistency(
         "post-create executor token mint",
         () => mintExecutorToken(
@@ -2857,6 +3349,7 @@ export class ExecutorLeaseManager {
       }
       assertSession(session, Date.now(), operationDeadlineMs);
       this.#session = session;
+      this.#telemetry.phase("executor.baseline-proof");
       await waitForStatePermissions(
         contract.state[invocation.terraformRoot],
         invocation,
@@ -2872,6 +3365,7 @@ export class ExecutorLeaseManager {
         this.#fetcher,
         this.#sleep,
       );
+      this.#telemetry.phase("executor.disable");
       account = await setExecutorDisabled(
         account,
         true,
@@ -2917,6 +3411,7 @@ export class ExecutorLeaseManager {
           account.email,
         ),
       ];
+      this.#telemetry.phase("executor.project-leases");
       await this.#recordAndAdd(
         `project ${contract.projectId}`,
         projectLeases,
@@ -2930,6 +3425,7 @@ export class ExecutorLeaseManager {
           ),
         account.email,
       );
+      this.#telemetry.phase("executor.marker-leases");
       for (const markerRepository of REPOSITORY_NAMES) {
         if (markerRepository === invocation.repository) continue;
         const markerProjectId = REPOSITORIES[markerRepository].projectId;
@@ -2956,6 +3452,7 @@ export class ExecutorLeaseManager {
         );
       }
 
+      this.#telemetry.phase("executor.final-enable");
       account = await setExecutorDisabled(
         account,
         false,
@@ -2966,6 +3463,7 @@ export class ExecutorLeaseManager {
       );
       this.#account = account;
       assertSession(session, Date.now(), operationDeadlineMs);
+      this.#telemetry.phase("executor.permission-proof");
       await waitForStatePermissions(
         contract.state[invocation.terraformRoot],
         invocation,
@@ -2981,6 +3479,7 @@ export class ExecutorLeaseManager {
         this.#fetcher,
         this.#sleep,
       );
+      this.#telemetry.phase("executor.ready");
       return session;
     } catch (error) {
       this.#apiDeadlineMs = Math.max(operationDeadlineMs, Date.now() + 5 * 60_000);
@@ -3011,7 +3510,11 @@ export class ExecutorLeaseManager {
     exact(session.executorEmail, this.#account.email, "executor elevation email");
     exact(session.executorUniqueId, this.#account.uniqueId, "executor elevation unique ID");
     const contract = REPOSITORIES[invocation.repository];
-    const mutationRoleId = randomExecutorRoleId("mutation", this.#randomHex());
+    const mutationRoleId = randomExecutorRoleId(
+      "mutation",
+      this.#randomHex?.() ??
+        deterministicArtifactHex(invocation.repository, invocation.githubRunId, "role-mutation"),
+    );
     const inventory = await listProjectCustomRoles(
       contract.projectId,
       invocation.ownerAccessToken,
@@ -3029,7 +3532,9 @@ export class ExecutorLeaseManager {
       executorControlPermissions(invocation.repository, invocation.terraformRoot, "mutation"),
       invocation.ownerAccessToken,
       this.#fetcher,
-      (intent) => this.#roleIntents.set(intent.name, intent),
+      async (intent) => {
+        this.#roleIntents.set(intent.name, intent);
+      },
       (name) => this.#roleIntents.delete(name),
       (created) => {
         this.#roleIntents.delete(created.name);
@@ -3181,7 +3686,7 @@ export class ExecutorLeaseManager {
         [...this.#mutations].reverse(),
         this.#sleep,
         cleanupDeadlineMs,
-        () => this.#randomHex(),
+        () => this.#randomHex?.() ?? randomBytes(10).toString("hex"),
       ).then(() => {
         fenceSucceeded = true;
       }).catch((error) => policyErrors.push(error));
@@ -3587,6 +4092,17 @@ function retryableCleanupError(error: unknown): boolean {
   );
 }
 
+class UnresolvedDeterministicIdentityError extends Error {}
+
+function recursivelyRetryableCleanupError(error: unknown): boolean {
+  if (error instanceof UnresolvedDeterministicIdentityError) return true;
+  if (error instanceof AggregateError) {
+    const errors = [...error.errors];
+    return errors.length > 0 && errors.every(recursivelyRetryableCleanupError);
+  }
+  return retryableCleanupError(error);
+}
+
 function retryableIamConsistencyError(error: unknown): boolean {
   if (error instanceof DOMException && error.name === "AbortError") return true;
   if (error instanceof TypeError && /fetch|network|socket/i.test(error.message)) return true;
@@ -3756,26 +4272,100 @@ export async function inventoryBridgeArtifacts(
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void>,
   cleanupDeadlineMs: number,
-): Promise<{ readonly accountIds: ReadonlySet<string>; readonly roleIds: ReadonlySet<string> }> {
+  recovery: RecoveryInvocation | undefined = undefined,
+): Promise<{
+  readonly accountIds: ReadonlySet<string>;
+  readonly hadActiveArtifacts: boolean;
+  readonly roleIds: ReadonlySet<string>;
+}> {
   const accountIds = new Set<string>();
-  const reservedAccounts: ServiceAccountIdentity[] = [];
   const containmentErrors: unknown[] = [];
-  for (const entry of await listServiceAccountEntries(projectId, ownerToken, fetcher)) {
-    const accountId = reservedExecutorAccountIdOrUndefined(entry.email);
-    if (accountId === undefined) continue;
-    accountIds.add(accountId);
-    try {
-      reservedAccounts.push(parseReservedServiceAccountIdentity(entry.value, projectId));
-    } catch (error) {
-      containmentErrors.push(error);
-    }
-  }
   const disabledAccounts: ServiceAccount[] = [];
-  // Start containment for every exact reserved identity before awaiting any
-  // one account's convergence. A single stuck IAM replica must never consume
-  // the shared deadline while a peer remains enabled and untouched.
-  const containmentResults = await Promise.allSettled(
-    reservedAccounts.map((account) =>
+  let directDisableObservedAuthority = false;
+  const deterministicEmail = recovery === undefined
+    ? undefined
+    : deterministicExecutorEmail(recovery);
+  const directObservation = recovery === undefined
+    ? Promise.resolve({
+        accountId: undefined,
+        disableResult: "absent" as const,
+        identity: undefined,
+      })
+    : (async () => {
+        exact(REPOSITORIES[recovery.repository].projectId, projectId, "recovery executor project");
+        const accountId = randomExecutorAccountId(
+          deterministicArtifactHex(recovery.repository, recovery.githubRunId, "service-account"),
+        );
+        const email = executorEmail(projectId, accountId);
+        const disableResult = await disableDeterministicExecutorByEmail(
+          projectId,
+          email,
+          ownerToken,
+          fetcher,
+        );
+        return {
+          accountId,
+          disableResult,
+          identity: await getExecutorIdentity(projectId, email, ownerToken, fetcher, true),
+        };
+      })();
+  // The direct disable fetch above is invoked synchronously before this
+  // detached-policy recovery starts. Keep the policy scrub independent from
+  // global list, key, role, and legacy-orphan convergence so none of those can
+  // consume its deadline. Settle the promise immediately to avoid an
+  // unhandled rejection while the independent lifecycle work proceeds.
+  const initialDetachedRecovery = recovery === undefined
+    ? Promise.resolve({ observed: false, status: "fulfilled" as const })
+    : recoverDetachedDeterministicPolicies(
+        recovery,
+        fetcher,
+        sleep,
+        cleanupDeadlineMs,
+      ).then(
+        (observed) => ({ observed, status: "fulfilled" as const }),
+        (reason: unknown) => ({ reason, status: "rejected" as const }),
+      );
+  const listedObservation = (async () => {
+    const entries = await listServiceAccountEntries(projectId, ownerToken, fetcher);
+    const identities: ServiceAccountIdentity[] = [];
+    const listedAccountIds: string[] = [];
+    const errors: unknown[] = [];
+    const seenEmails = new Set<string>();
+    for (const entry of entries) {
+      const accountId = reservedExecutorAccountIdOrUndefined(entry.email);
+      if (accountId === undefined) continue;
+      listedAccountIds.push(accountId);
+      try {
+        const account = parseReservedServiceAccountIdentity(entry.value, projectId);
+        if (!seenEmails.has(account.email)) {
+          identities.push(account);
+          seenEmails.add(account.email);
+        }
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    return { errors, identities, listedAccountIds };
+  })();
+  const directContainment = directObservation.then(async (observed) => ({
+    ...observed,
+    account: observed.identity === undefined
+      ? undefined
+      : await disableOrphanExecutor(
+          observed.identity,
+          ownerToken,
+          fetcher,
+          sleep,
+          cleanupDeadlineMs,
+        ),
+  }));
+  // Launch every listed identity's disable as soon as the list resolves. In
+  // particular, do not wait for the deterministic account's numeric-ID
+  // convergence: a stale replica must not consume the recovery window while a
+  // listed legacy peer remains enabled.
+  const listedContainment = listedObservation.then(async (observed) => {
+    const errors = [...observed.errors];
+    const results = await Promise.allSettled(observed.identities.map((account) =>
       disableOrphanExecutor(
         account,
         ownerToken,
@@ -3783,49 +4373,316 @@ export async function inventoryBridgeArtifacts(
         sleep,
         cleanupDeadlineMs,
       )
-    ),
-  );
-  for (const result of containmentResults) {
-    if (result.status === "fulfilled") {
-      disabledAccounts.push(result.value);
-    } else {
-      containmentErrors.push(result.reason);
+    ));
+    const disabled: ServiceAccount[] = [];
+    for (const result of results) {
+      if (result.status === "fulfilled") disabled.push(result.value);
+      else errors.push(result.reason);
+    }
+    return { ...observed, disabled, errors };
+  });
+  // Attach rejection handlers before awaiting either observation. A fast 4xx
+  // in one containment branch must not become a fatal unhandled rejection
+  // while the other branch is still waiting on a control-plane read.
+  const containmentResults = Promise.allSettled([
+    directContainment,
+    listedContainment,
+  ]);
+  // Identity discovery completes before lifecycle convergence. This lets an
+  // exact uniqueId-derived prior fence be authenticated and removed while the
+  // idempotent disable/readback continues independently.
+  const [directObservationResult, listObservationResult] = await Promise.allSettled([
+    directObservation,
+    listedObservation,
+  ]);
+  if (directObservationResult.status === "fulfilled") {
+    directDisableObservedAuthority = directObservationResult.value.disableResult !== "absent";
+    if (directObservationResult.value.identity !== undefined &&
+      directObservationResult.value.accountId !== undefined) {
+      accountIds.add(directObservationResult.value.accountId);
     }
   }
+  if (listObservationResult.status === "fulfilled") {
+    for (const accountId of listObservationResult.value.listedAccountIds) accountIds.add(accountId);
+  }
+  const listedDeterministicIdentity = listObservationResult.status === "fulfilled"
+    ? listObservationResult.value.identities.find((account) => account.email === deterministicEmail)
+    : undefined;
+  const observedDeterministicUniqueId = directObservationResult.status === "fulfilled"
+    ? directObservationResult.value.identity?.uniqueId ?? listedDeterministicIdentity?.uniqueId
+    : listedDeterministicIdentity?.uniqueId;
+  const detachedRecovery = initialDetachedRecovery.then(async (initial) => {
+    if (initial.status === "fulfilled" || recovery === undefined ||
+      observedDeterministicUniqueId === undefined) {
+      return initial;
+    }
+    // A prior orphan-recovery fence incorporates Google's immutable numeric
+    // identity. The early scrub cannot authenticate that title until the
+    // direct containment read observes the account, so retry once with that
+    // exact uniqueId. Every other unknown binding remains a hard failure.
+    return recoverDetachedDeterministicPolicies(
+      recovery,
+      fetcher,
+      sleep,
+      cleanupDeadlineMs,
+      observedDeterministicUniqueId,
+    ).then(
+      (observed) => ({ observed, status: "fulfilled" as const }),
+      (reason: unknown) => ({ reason, status: "rejected" as const }),
+    );
+  });
+  const [directResult, listResult] = await containmentResults;
+  if (directResult.status === "fulfilled") {
+    if (directResult.value.account !== undefined) disabledAccounts.push(directResult.value.account);
+  } else {
+    containmentErrors.push(directResult.reason);
+  }
+  if (listResult.status === "fulfilled") {
+    containmentErrors.push(...listResult.value.errors);
+    for (const account of listResult.value.disabled) {
+      if (!disabledAccounts.some((candidate) => candidate.email === account.email)) {
+        disabledAccounts.push(account);
+      }
+    }
+  } else {
+    containmentErrors.push(listResult.reason);
+  }
+  const keyResults = await Promise.allSettled(
+    disabledAccounts.map((disabled) => requireNoUserManagedKeys(disabled, ownerToken, fetcher)),
+  );
+  const policyRecoverableAccounts: ServiceAccount[] = [];
+  for (const [index, result] of keyResults.entries()) {
+    if (result.status === "rejected") {
+      containmentErrors.push(result.reason);
+    } else {
+      policyRecoverableAccounts.push(disabledAccounts[index]!);
+    }
+  }
+  const listedRoles = await listProjectCustomRoles(projectId, ownerToken, fetcher, true).catch(
+    (error) => {
+      containmentErrors.push(error);
+      return [];
+    },
+  );
+  const roles: ProjectCustomRole[] = [];
+  for (const role of listedRoles) {
+    const id = role.name.slice(role.name.lastIndexOf("/") + 1);
+    if (!id.startsWith(EXECUTOR_ROLE_PREFIX)) continue;
+    if (roleIdOrUndefined(role.name) === undefined) {
+      containmentErrors.push(new Error(
+        "An orphan bridge role has a malformed reserved ID; manual cleanup is required.",
+      ));
+      continue;
+    }
+    roles.push(role);
+  }
+  const roleNames = new Set(roles.map((role) => role.name));
+  for (const phase of ["read", "mutation"] as const) {
+    if (recovery === undefined) break;
+    const id = randomExecutorRoleId(
+      phase,
+      deterministicArtifactHex(
+        recovery.repository,
+        recovery.githubRunId,
+        phase === "read" ? "role-read" : "role-mutation",
+      ),
+    );
+    const name = `projects/${projectId}/roles/${id}`;
+    if (roleNames.has(name)) continue;
+    const observed = await getProjectCustomRole(name, ownerToken, fetcher, true).catch((error) => {
+      containmentErrors.push(error);
+      return undefined;
+    });
+    if (observed === undefined) continue;
+    roles.push(observed);
+    roleNames.add(observed.name);
+  }
+  const verifiedRoles: ProjectCustomRole[] = [];
+  for (const role of roles) {
+    try {
+      verifyBridgeRole(role, projectId);
+      verifiedRoles.push(role);
+    } catch (error) {
+      containmentErrors.push(error);
+    }
+  }
+  const roleIds = new Set(verifiedRoles.map((role) => roleId(role.name)));
+  const hadActiveArtifacts = directDisableObservedAuthority || accountIds.size > 0 ||
+    verifiedRoles.some((role) => !role.deleted);
+  const legacyAccountRecovery = Promise.allSettled(
+    policyRecoverableAccounts
+      .filter((disabled) => disabled.email !== deterministicEmail)
+      .map((disabled) =>
+        recoverOrphanExecutor(
+          disabled,
+          verifiedRoles,
+          ownerToken,
+          fetcher,
+          sleep,
+          cleanupDeadlineMs,
+        )
+      ),
+  );
+  // Detached recovery owns every policy surface for the deterministic
+  // identity. Only after it settles cleanly may that same account run the
+  // normal lifecycle proof/deletion, avoiding concurrent CAS racers on its
+  // service-account policy while still allowing legacy orphan cleanup to run.
+  const deterministicAccountRecovery = detachedRecovery.then((detached) => {
+    if (detached.status === "rejected") return [];
+    return Promise.allSettled(
+      policyRecoverableAccounts.filter((disabled) => disabled.email === deterministicEmail).map(
+        (disabled) =>
+          recoverOrphanExecutor(
+            disabled,
+            verifiedRoles,
+            ownerToken,
+            fetcher,
+            sleep,
+            cleanupDeadlineMs,
+          ),
+      ),
+    );
+  });
+  const [accountRecoveryResults, deterministicRecoveryResults, detachedResult] =
+    await Promise.all([legacyAccountRecovery, deterministicAccountRecovery, detachedRecovery]);
+  for (const result of accountRecoveryResults) {
+    if (result.status === "rejected") containmentErrors.push(result.reason);
+  }
+  for (const result of deterministicRecoveryResults) {
+    if (result.status === "rejected") containmentErrors.push(result.reason);
+  }
+  let detachedAuthorityObserved = false;
+  if (detachedResult.status === "fulfilled") {
+    detachedAuthorityObserved = detachedResult.observed;
+  } else {
+    containmentErrors.push(detachedResult.reason);
+  }
+  const roleDeletionResults = await Promise.allSettled(
+    verifiedRoles.map((role) =>
+      deleteOrphanRole(role, ownerToken, fetcher, sleep, cleanupDeadlineMs)
+    ),
+  );
+  for (const result of roleDeletionResults) {
+    if (result.status === "rejected") containmentErrors.push(result.reason);
+  }
   if (containmentErrors.length > 0) {
+    if (containmentErrors.length === 1) throw containmentErrors[0];
     throw new AggregateError(
       containmentErrors,
       "Every safely identified reserved executor was processed, but orphan containment was incomplete; manual cleanup is required.",
     );
   }
-  for (const disabled of disabledAccounts) {
-    await requireNoUserManagedKeys(disabled, ownerToken, fetcher);
+  return {
+    accountIds,
+    hadActiveArtifacts: hadActiveArtifacts || detachedAuthorityObserved,
+    roleIds,
+  };
+}
+
+async function bridgeArtifactsRemain(
+  projectId: string,
+  ownerToken: string,
+  fetcher: Fetcher,
+  recovery: RecoveryInvocation,
+): Promise<boolean> {
+  const observedAccounts = new Set<string>();
+  let active = false;
+  for (const entry of await listServiceAccountEntries(projectId, ownerToken, fetcher)) {
+    if (reservedExecutorAccountIdOrUndefined(entry.email) === undefined) continue;
+    const account = parseReservedServiceAccountIdentity(entry.value, projectId);
+    observedAccounts.add(account.email);
+    active = true;
   }
-  const roles = (await listProjectCustomRoles(projectId, ownerToken, fetcher, true))
-    .filter((role) => {
-      const id = role.name.slice(role.name.lastIndexOf("/") + 1);
-      if (!id.startsWith(EXECUTOR_ROLE_PREFIX)) return false;
-      if (roleIdOrUndefined(role.name) === undefined) {
-        throw new Error("An orphan bridge role has a malformed reserved ID; manual cleanup is required.");
-      }
-      return true;
-    });
-  for (const role of roles) verifyBridgeRole(role, projectId);
-  const roleIds = new Set(roles.map((role) => roleId(role.name)));
-  for (const disabled of disabledAccounts) {
-    await recoverOrphanExecutor(
-      disabled,
-      roles,
-      ownerToken,
-      fetcher,
-      sleep,
-      cleanupDeadlineMs,
+  {
+    exact(REPOSITORIES[recovery.repository].projectId, projectId, "recovery executor project");
+    const accountId = randomExecutorAccountId(
+      deterministicArtifactHex(recovery.repository, recovery.githubRunId, "service-account"),
     );
+    const email = executorEmail(projectId, accountId);
+    if (!observedAccounts.has(email)) {
+      const observed = await getExecutorIdentity(projectId, email, ownerToken, fetcher, true);
+      if (observed !== undefined) active = true;
+    }
   }
+
+  const roles = await listProjectCustomRoles(projectId, ownerToken, fetcher, true);
+  const observedRoles = new Set<string>();
   for (const role of roles) {
-    await deleteOrphanRole(role, ownerToken, fetcher, sleep, cleanupDeadlineMs);
+    verifyBridgeRole(role, projectId);
+    observedRoles.add(role.name);
+    if (!role.deleted) active = true;
   }
-  return { accountIds, roleIds };
+  for (const phase of ["read", "mutation"] as const) {
+    const id = randomExecutorRoleId(
+      phase,
+      deterministicArtifactHex(
+        recovery.repository,
+        recovery.githubRunId,
+        phase === "read" ? "role-read" : "role-mutation",
+      ),
+    );
+    const name = `projects/${projectId}/roles/${id}`;
+    if (observedRoles.has(name)) continue;
+    const observed = await getProjectCustomRole(name, ownerToken, fetcher, true);
+    if (observed === undefined) continue;
+    verifyBridgeRole(observed, projectId);
+    if (!observed.deleted) active = true;
+  }
+  return active || await detachedDeterministicPoliciesRemain(recovery, fetcher);
+}
+
+export async function recoverBridgeArtifactsUntilStable(
+  invocation: RecoveryInvocation,
+  fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+  now: () => number = () => Date.now(),
+): Promise<void> {
+  const projectId = REPOSITORIES[invocation.repository].projectId;
+  let emptySinceMs: number | undefined;
+  while (now() < cleanupDeadlineMs) {
+    try {
+      const inventory = await inventoryBridgeArtifacts(
+        projectId,
+        invocation.ownerAccessToken,
+        fetcher,
+        sleep,
+        cleanupDeadlineMs,
+        invocation,
+      );
+      const active = await bridgeArtifactsRemain(
+        projectId,
+        invocation.ownerAccessToken,
+        fetcher,
+        invocation,
+      );
+      if (active) {
+        emptySinceMs = undefined;
+      } else if (inventory.hadActiveArtifacts || emptySinceMs === undefined) {
+        // This scan's final proof is clean, so it may begin (or reset) the
+        // five-minute absence window even when the same scan contained an
+        // artifact. It can never reuse absence time from before that artifact.
+        emptySinceMs = now();
+      } else if (now() - emptySinceMs >= RECOVERY_STABLE_EMPTY_MS) {
+        return;
+      }
+    } catch (error) {
+      if (!recursivelyRetryableCleanupError(error)) throw error;
+      // A failed read is not negative proof. Retry the entire inventory while
+      // preserving hard failure for identity drift and malformed authority.
+      emptySinceMs = undefined;
+      const remainingMs = cleanupDeadlineMs - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, remainingMs));
+      continue;
+    }
+    const remainingMs = cleanupDeadlineMs - now();
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(RECOVERY_STABLE_EMPTY_INTERVAL_MS, remainingMs));
+  }
+  throw new Error(
+    "Protected crash recovery did not observe the required stable-empty artifact inventory before its deadline.",
+  );
 }
 
 interface OrphanPolicySurface {
@@ -3854,6 +4711,36 @@ function strandedFenceContract(
     description: kind === "cleanup" ? CLEANUP_FENCE_DESCRIPTION : ORPHAN_FENCE_DESCRIPTION,
     titlePrefix: `codex-${kind}-fence-${createHash("sha256").update(label).digest("hex").slice(0, 12)}-`,
   };
+}
+
+async function disableDeterministicExecutorByEmail(
+  projectId: string,
+  email: string,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<"absent" | "disabled" | "transient"> {
+  let response: Response;
+  try {
+    response = await fetcher(`${serviceAccountIdentifierUrl(projectId, email)}:disable`, {
+      headers: googleHeaders(ownerToken),
+      method: "POST",
+      redirect: "error",
+    });
+  } catch (error) {
+    // A lost disable response is ambiguous: the write may have committed.
+    // Continue with exact GET/list proof and make the next recovery scan issue
+    // the idempotent disable again. Authentication and validation failures are
+    // never classified as transport loss here.
+    if (retryableCleanupError(error)) return "transient";
+    throw error;
+  }
+  if (response.ok) {
+    await boundedText(response, 64 * 1024);
+    return "disabled";
+  }
+  if (response.status === 404) return "absent";
+  if ([408, 409, 429, 500, 502, 503, 504].includes(response.status)) return "transient";
+  throw new Error(`Deterministic executor disable failed with HTTP ${response.status}.`);
 }
 
 async function disableOrphanExecutor(
@@ -3911,7 +4798,21 @@ function orphanPolicySurfaces(
 ): readonly OrphanPolicySurface[] {
   const contract = REPOSITORIES[provenance.repository];
   exact(contract.projectId, account.projectId, "orphan executor project");
-  const roleLeaseGroups = roles.flatMap((role) => {
+  const expectedDeterministicAccountId = randomExecutorAccountId(
+    deterministicArtifactHex(provenance.repository, provenance.runId, "service-account"),
+  );
+  const observedAccountId = account.email.slice(0, account.email.indexOf("@"));
+  const policyRoles = [...roles];
+  if (observedAccountId === expectedDeterministicAccountId) {
+    const phases: readonly ("mutation" | "read")[] = provenance.mode === "apply"
+      ? ["read", "mutation"]
+      : ["read"];
+    for (const phase of phases) {
+      const expected = deterministicRecoveryRole(provenance, phase);
+      if (!policyRoles.some((role) => role.name === expected.name)) policyRoles.push(expected);
+    }
+  }
+  const roleLeaseGroups = policyRoles.flatMap((role) => {
     const roleContract = bridgeRoleContract(role, account.projectId);
     if (
       roleContract.root !== provenance.root ||
@@ -4093,6 +4994,437 @@ function orphanPolicySurfaces(
   return surfaces;
 }
 
+function deterministicRecoveryRole(
+  provenance: ExecutorProvenance,
+  phase: "mutation" | "read",
+): ProjectCustomRole {
+  const projectId = REPOSITORIES[provenance.repository].projectId;
+  const id = randomExecutorRoleId(
+    phase,
+    deterministicArtifactHex(
+      provenance.repository,
+      provenance.runId,
+      phase === "read" ? "role-read" : "role-mutation",
+    ),
+  );
+  return {
+    deleted: true,
+    description: `Protected Terraform ${provenance.root} ${phase} single-run control role.`,
+    etag: "recovery-only-missing-role",
+    includedPermissions: executorControlPermissions(
+      provenance.repository,
+      provenance.root,
+      phase,
+    ),
+    name: `projects/${projectId}/roles/${id}`,
+    stage: "GA",
+    title: `Protected Terraform ${phase === "read" ? "Read" : "Mutation"}`,
+  };
+}
+
+interface DetachedPolicyDescriptor {
+  readonly exclusive: boolean;
+  readonly get: () => Promise<IamPolicy | undefined>;
+  readonly kind: "executor" | "project" | "runtime";
+  readonly label: string;
+  readonly projectRepository?: RepositoryName;
+  readonly runtimeEmail?: string;
+  readonly set: (policy: IamPolicy) => Promise<IamPolicy | undefined>;
+}
+
+async function recoverDetachedDeterministicPolicies(
+  invocation: RecoveryInvocation,
+  fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+  executorUniqueId: string | undefined = undefined,
+): Promise<boolean> {
+  const loaded = await detachedDeterministicPolicySurfaces(
+    invocation,
+    fetcher,
+    executorUniqueId,
+  );
+  let observed = false;
+  const recoveryResults = await Promise.allSettled(loaded.surfaces.map(
+    async ({ current, descriptor, expected, surface }) => {
+      const relevant = detachedSurfaceHasRelevantBinding(current, descriptor, surface);
+      if (expected.length === 0 && !relevant) return;
+      observed = true;
+      if (descriptor.kind === "executor") {
+        await recoverOrphanPolicy(
+          surface,
+          deterministicExecutorEmail(invocation),
+          sleep,
+          cleanupDeadlineMs,
+        );
+      } else {
+        await recoverDetachedExecutorMembers(
+          invocation,
+          descriptor,
+          surface.basis,
+          sleep,
+          cleanupDeadlineMs,
+        );
+      }
+    }
+  ));
+  const errors = [...loaded.errors];
+  for (const result of recoveryResults) {
+    if (result.status === "rejected") errors.push(result.reason);
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Deterministic executor policy recovery was incomplete.");
+  }
+  return observed;
+}
+
+async function detachedDeterministicPoliciesRemain(
+  invocation: RecoveryInvocation,
+  fetcher: Fetcher,
+): Promise<boolean> {
+  const loaded = await detachedDeterministicPolicySurfaces(invocation, fetcher);
+  let remains = false;
+  for (const { current, descriptor, surface } of loaded.surfaces) {
+    if (detachedSurfaceHasRelevantBinding(current, descriptor, surface)) remains = true;
+  }
+  if (loaded.errors.length > 0) {
+    throw new AggregateError(loaded.errors, "Deterministic executor policy proof was incomplete.");
+  }
+  return remains;
+}
+
+async function detachedDeterministicPolicySurfaces(
+  invocation: RecoveryInvocation,
+  fetcher: Fetcher,
+  executorUniqueId: string | undefined = undefined,
+): Promise<{
+  readonly errors: readonly unknown[];
+  readonly surfaces: readonly {
+    readonly current: IamPolicy;
+    readonly descriptor: DetachedPolicyDescriptor;
+    readonly expected: readonly IamBinding[];
+    readonly surface: OrphanPolicySurface;
+  }[];
+}> {
+  const token = invocation.ownerAccessToken;
+  const executorEmail = deterministicExecutorEmail(invocation);
+  const descriptors: DetachedPolicyDescriptor[] = REPOSITORY_NAMES.map((repository) => {
+    const projectId = REPOSITORIES[repository].projectId;
+    return {
+      exclusive: false,
+      get: () => getPolicy(projectId, token, fetcher),
+      kind: "project",
+      label: `deterministic run ${invocation.githubRunId} project ${projectId}`,
+      projectRepository: repository,
+      set: (policy) => setPolicy(projectId, token, policy, fetcher),
+    };
+  });
+  for (const runtimeEmail of runtimeServiceAccountEmails(invocation.repository)) {
+    descriptors.push({
+      exclusive: false,
+      get: () => getServiceAccountPolicyIfPresent(runtimeEmail, token, fetcher),
+      kind: "runtime",
+      label: `deterministic run ${invocation.githubRunId} runtime ${runtimeEmail}`,
+      runtimeEmail,
+      set: (policy) => setServiceAccountPolicy(runtimeEmail, token, policy, fetcher),
+    });
+  }
+  descriptors.push({
+    exclusive: true,
+    get: () => getServiceAccountPolicyIfPresent(executorEmail, token, fetcher),
+    kind: "executor",
+    label: `deterministic run ${invocation.githubRunId} executor policy`,
+    set: (policy) => setServiceAccountPolicy(executorEmail, token, policy, fetcher),
+  });
+
+  const result: Array<{
+    current: IamPolicy;
+    descriptor: DetachedPolicyDescriptor;
+    expected: readonly IamBinding[];
+    surface: OrphanPolicySurface;
+  }> = [];
+  const errors: unknown[] = [];
+  const loads = await Promise.allSettled(descriptors.map(async (descriptor) => {
+    const current = await descriptor.get();
+    if (current === undefined) return undefined;
+    const basis = detachedSurfaceBasis(invocation, descriptor);
+    const strandedFences = [strandedFenceContract("orphan", descriptor.label, basis)];
+    if (descriptor.kind === "executor") {
+      strandedFences.push(strandedFenceContract(
+        "cleanup",
+        `executor service account ${executorEmail}`,
+        basis,
+      ));
+      if (executorUniqueId !== undefined) {
+        strandedFences.push(strandedFenceContract(
+          "orphan",
+          `orphan ${numeric(executorUniqueId, "detached executor unique ID")} executor policy`,
+          basis,
+        ));
+      }
+    }
+    const expected: IamBinding[] = [];
+    for (const binding of current.bindings) {
+      const relevant = descriptor.exclusive ||
+        bindingHasDeterministicExecutorMember(binding, executorEmail) ||
+        strandedFences.some((contract) => bindingMatchesStrandedFence(binding, contract));
+      if (!relevant) continue;
+      if (strandedFences.some((contract) => bindingMatchesStrandedFence(binding, contract))) {
+        continue;
+      }
+      if (descriptor.kind === "executor" &&
+        !detachedExecutorPolicyBindingIsExact(invocation, binding)) {
+        if (executorUniqueId === undefined &&
+          bindingCouldBeUniqueIdOrphanFence(binding, basis)) {
+          // The uniqueId is immutable but not derivable from the email. Keep
+          // this inert candidate untouched and retry the disable/direct GET;
+          // once identity is visible, its exact title hash is authenticated.
+          throw new UnresolvedDeterministicIdentityError(
+            `${descriptor.label} requires the exact executor unique ID before orphan-fence cleanup.`,
+          );
+        }
+        throw new Error(
+          `${descriptor.label} contains an unknown or modified binding; manual cleanup is required.`,
+        );
+      }
+      expected.push(binding);
+    }
+    return {
+      current,
+      descriptor,
+      expected,
+      surface: {
+        basis,
+        exclusive: descriptor.exclusive,
+        expected,
+        get: async () => {
+          const policy = await descriptor.get();
+          if (policy === undefined) {
+            throw new Error(`${descriptor.label} disappeared during IAM policy recovery.`);
+          }
+          return policy;
+        },
+        label: descriptor.label,
+        set: descriptor.set,
+        strandedFences,
+      },
+    };
+  }));
+  for (const load of loads) {
+    if (load.status === "rejected") errors.push(load.reason);
+    else if (load.value !== undefined) result.push(load.value);
+  }
+  return { errors, surfaces: result };
+}
+
+function detachedSurfaceHasRelevantBinding(
+  policy: IamPolicy,
+  descriptor: DetachedPolicyDescriptor,
+  surface: OrphanPolicySurface,
+): boolean {
+  const executorMemberValue = surface.basis.members[0];
+  const executorEmail = executorMemberValue?.startsWith("serviceAccount:") === true
+    ? executorMemberValue.slice("serviceAccount:".length)
+    : undefined;
+  return (descriptor.exclusive && policy.auditConfigs !== undefined) ||
+    policy.bindings.some((binding) =>
+    descriptor.exclusive ||
+    (executorEmail !== undefined && bindingHasDeterministicExecutorMember(binding, executorEmail)) ||
+    surface.strandedFences.some((contract) => bindingMatchesStrandedFence(binding, contract))
+    );
+}
+
+function detachedSurfaceBasis(
+  invocation: RecoveryInvocation,
+  descriptor: DetachedPolicyDescriptor,
+): IamBinding {
+  const executorEmail = deterministicExecutorEmail(invocation);
+  if (descriptor.kind === "executor") {
+    return buildTokenCreatorLease(
+      invocation.repository,
+      invocation.githubRunId,
+      new Date(IAM_FENCE_EXPIRED_AT),
+    );
+  }
+  if (descriptor.kind === "runtime") {
+    return {
+      condition: expiringCondition(
+        `codex-executor-actas-${invocation.githubRunId}-0`,
+        `Temporary exact-runtime actAs lease for ${invocation.repository}.`,
+        new Date(IAM_FENCE_EXPIRED_AT),
+      ),
+      members: [`serviceAccount:${executorEmail}`],
+      role: "roles/iam.serviceAccountUser",
+    };
+  }
+  const repository = descriptor.projectRepository;
+  if (repository === undefined) throw new Error("Detached project surface lost its repository.");
+  if (repository === invocation.repository) {
+    const roleIdValue = randomExecutorRoleId(
+      "read",
+      deterministicArtifactHex(invocation.repository, invocation.githubRunId, "role-read"),
+    );
+    return buildExecutorProjectLeases(
+      invocation.repository,
+      invocation.githubRunId,
+      new Date(IAM_FENCE_EXPIRED_AT),
+      executorEmail,
+      `projects/${REPOSITORIES[invocation.repository].projectId}/roles/${roleIdValue}`,
+      "read",
+    )[0]!;
+  }
+  return buildMarkerReadLease(
+    repository,
+    invocation.githubRunId,
+    new Date(IAM_FENCE_EXPIRED_AT),
+    REPOSITORIES[invocation.repository].projectId,
+    executorEmail,
+  );
+}
+
+async function recoverDetachedExecutorMembers(
+  invocation: RecoveryInvocation,
+  descriptor: DetachedPolicyDescriptor,
+  basis: IamBinding,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+): Promise<void> {
+  const executorEmail = deterministicExecutorEmail(invocation);
+  const suffix = randomBytes(10).toString("hex");
+  const fence: IamBinding = {
+    condition: {
+      description: ORPHAN_FENCE_DESCRIPTION,
+      expression: `request.time < timestamp('${IAM_FENCE_EXPIRED_AT}')`,
+      title: `codex-orphan-fence-${createHash("sha256").update(descriptor.label).digest("hex").slice(0, 12)}-${suffix}`,
+    },
+    members: [...basis.members],
+    role: basis.role,
+  };
+  let fencePredecessorEtag: string | undefined;
+  let observedFenceEtag: string | undefined;
+  let lastRetryableError: unknown;
+  while (Date.now() < cleanupDeadlineMs) {
+    try {
+      const current = await descriptor.get();
+      if (current === undefined) {
+        throw new Error(`${descriptor.label} disappeared during deterministic-member recovery.`);
+      }
+      const fenceRemains = current.bindings.some((binding) => bindingEqualsLease(binding, fence));
+      const desired = removeDeterministicExecutorMembers(current, executorEmail);
+      if (!policyPayloadEquals(current, desired)) {
+        if (fenceRemains) observedFenceEtag = current.etag;
+        const response = await descriptor.set(desired);
+        if (response !== undefined && response.etag === current.etag) {
+          throw new Error(`${descriptor.label} cleanup CAS did not advance its etag.`);
+        }
+      } else if (observedFenceEtag !== undefined) {
+        if (current.etag === observedFenceEtag) {
+          throw new Error(`${descriptor.label} recovery fence disappeared without an advancing etag.`);
+        }
+        return;
+      } else {
+        fencePredecessorEtag = current.etag;
+        const response = await descriptor.set(addExactLease(current, fence));
+        if (response !== undefined) {
+          requireContainsExactBindings(response, [fence], `${descriptor.label} recovery fence`);
+          if (response.etag === current.etag) {
+            throw new Error(`${descriptor.label} recovery fence CAS did not advance its etag.`);
+          }
+        }
+      }
+      if (fenceRemains && fencePredecessorEtag !== undefined &&
+        current.etag === fencePredecessorEtag) {
+        throw new Error(`${descriptor.label} recovery fence did not advance its predecessor etag.`);
+      }
+      lastRetryableError = undefined;
+    } catch (error) {
+      if (!retryableCleanupError(error)) throw error;
+      lastRetryableError = error;
+    }
+    await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, cleanupDeadlineMs - Date.now()));
+  }
+  throw new AggregateError(
+    lastRetryableError === undefined ? [] : [lastRetryableError],
+    `${descriptor.label} did not complete deterministic-member recovery.`,
+  );
+}
+
+function removeDeterministicExecutorMembers(
+  policy: IamPolicy,
+  executorEmail: string,
+): IamPolicy {
+  const bindings: IamBinding[] = [];
+  for (const binding of policy.bindings) {
+    const members = binding.members.filter((member) =>
+      member !== `serviceAccount:${executorEmail}` &&
+      deletedDeterministicExecutorMember(member, executorEmail) === undefined
+    );
+    if (members.length === 0) continue;
+    bindings.push({
+      ...(binding.condition === undefined ? {} : { condition: binding.condition }),
+      members,
+      role: binding.role,
+    });
+  }
+  return {
+    ...(policy.auditConfigs === undefined ? {} : { auditConfigs: policy.auditConfigs }),
+    bindings,
+    etag: policy.etag,
+    version: 3,
+  };
+}
+
+function detachedExecutorPolicyBindingIsExact(
+  invocation: RecoveryInvocation,
+  binding: IamBinding,
+): boolean {
+  const condition = binding.condition;
+  if (condition === undefined) return false;
+  const timestamps = [...condition.expression.matchAll(
+    /request\.time < timestamp\('([^']+)'\)/g,
+  )].map((match) => match[1]!);
+  if (timestamps.length !== 1) return false;
+  const expiresAt = new Date(timestamps[0]!);
+  if (!Number.isFinite(expiresAt.getTime()) || expiresAt.toISOString() !== timestamps[0]) {
+    return false;
+  }
+  return bindingEqualsLease(
+    buildTokenCreatorLease(invocation.repository, invocation.githubRunId, expiresAt),
+    binding,
+  );
+}
+
+function bindingHasDeterministicExecutorMember(
+  binding: IamBinding,
+  executorEmail: string,
+): boolean {
+  return binding.members.some((member) =>
+    member === `serviceAccount:${executorEmail}` ||
+    deletedDeterministicExecutorMember(member, executorEmail) !== undefined
+  );
+}
+
+function deletedDeterministicExecutorMember(
+  member: string,
+  executorEmail: string,
+): string | undefined {
+  const escaped = executorEmail.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(
+    `^deleted:serviceAccount:${escaped}\\?uid=([1-9][0-9]{5,30})$`,
+  ).exec(member);
+  return match?.[1];
+}
+
+function deterministicExecutorEmail(invocation: RecoveryInvocation): string {
+  const projectId = REPOSITORIES[invocation.repository].projectId;
+  return executorEmail(
+    projectId,
+    randomExecutorAccountId(
+      deterministicArtifactHex(invocation.repository, invocation.githubRunId, "service-account"),
+    ),
+  );
+}
+
 async function recoverOrphanPolicy(
   surface: OrphanPolicySurface,
   executorEmail: string,
@@ -4212,6 +5544,26 @@ function bindingMatchesStrandedFence(
     role: contract.basis.role,
   };
   return bindingEqualsLease(binding, expected);
+}
+
+function bindingCouldBeUniqueIdOrphanFence(
+  binding: IamBinding,
+  basis: IamBinding,
+): boolean {
+  const condition = binding.condition;
+  if (condition === undefined ||
+    !/^codex-orphan-fence-[0-9a-f]{12}-[0-9a-f]{20}$/.test(condition.title)) {
+    return false;
+  }
+  return bindingEqualsLease(binding, {
+    condition: {
+      description: ORPHAN_FENCE_DESCRIPTION,
+      expression: `request.time < timestamp('${IAM_FENCE_EXPIRED_AT}')`,
+      title: condition.title,
+    },
+    members: [...basis.members],
+    role: basis.role,
+  });
 }
 
 function requireOrphanPolicyClean(
@@ -4334,7 +5686,7 @@ async function createEphemeralRole(
   permissions: readonly string[],
   ownerToken: string,
   fetcher: Fetcher,
-  recordCreateAttempt: (intent: EphemeralRoleIntent) => void,
+  recordCreateAttempt: (intent: EphemeralRoleIntent) => Promise<void>,
   recordCreateRejected: (name: string) => void,
   recordCreated: (role: ProjectCustomRole) => void,
 ): Promise<ProjectCustomRole> {
@@ -4349,7 +5701,7 @@ async function createEphemeralRole(
     stage: "GA",
     title: `Protected Terraform ${phase === "read" ? "Read" : "Mutation"}`,
   };
-  recordCreateAttempt(role);
+  await recordCreateAttempt(role);
   const response = await fetcher(`https://iam.googleapis.com/v1/projects/${projectId}/roles`, {
     body: JSON.stringify({
       role: {
@@ -4581,6 +5933,40 @@ export function randomExecutorRoleId(
   return `${EXECUTOR_ROLE_PREFIX}${phase === "read" ? "r" : "m"}_${randomHexValue}`;
 }
 
+type DeterministicArtifactPhase =
+  | "service-account"
+  | "role-read"
+  | "role-mutation"
+  | `container-${1 | 2 | 3 | 4 | 5}`;
+
+export function deterministicArtifactHex(
+  repository: RepositoryName,
+  runId: string,
+  phase: DeterministicArtifactPhase,
+): string {
+  repositoryName(repository);
+  numeric(runId, "deterministic artifact run ID");
+  if (!/^(?:service-account|role-(?:read|mutation)|container-[1-5])$/.test(phase)) {
+    throw new Error("Deterministic artifact phase escaped its closed vocabulary.");
+  }
+  const fields = [
+    "protected-bootstrap-artifact-v1",
+    PLATFORM_REPOSITORY_ID,
+    REPOSITORIES[repository].repositoryId,
+    runId,
+    "1",
+    phase,
+  ];
+  const hash = createHash("sha256");
+  for (const field of fields) {
+    hash.update(String(Buffer.byteLength(field, "utf8")));
+    hash.update("\0");
+    hash.update(field);
+    hash.update("\0");
+  }
+  return hash.digest("hex").slice(0, 20);
+}
+
 function executorProvenance(
   invocation: Invocation,
   expiresAt: Date,
@@ -4652,7 +6038,7 @@ async function createEphemeralExecutor(
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void>,
   deadlineMs: number,
-  recordCreateAttempt: () => void,
+  recordCreateAttempt: () => Promise<void>,
   recordCreateRejected: () => void,
   recordCreated: (account: ServiceAccountIdentity) => void,
 ): Promise<ServiceAccount> {
@@ -4663,7 +6049,7 @@ async function createEphemeralExecutor(
   if (await getExecutor(projectId, email, ownerToken, fetcher, true) !== undefined) {
     throw new Error("The random executor account already exists; refusing identity reuse.");
   }
-  recordCreateAttempt();
+  await recordCreateAttempt();
   const response = await fetcher(
     `https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts`,
     {
@@ -5030,6 +6416,25 @@ async function getServiceAccountPolicy(
     method: "POST",
     redirect: "error",
   });
+  if (!response.ok) {
+    throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
+  }
+  return iamPolicy(await boundedJson(response, 2 * 1024 * 1024));
+}
+
+async function getServiceAccountPolicyIfPresent(
+  account: string | ServiceAccountIdentity,
+  token: string,
+  fetcher: Fetcher,
+): Promise<IamPolicy | undefined> {
+  const url = new URL(`${serviceAccountPolicyUrl(account)}:getIamPolicy`);
+  url.searchParams.set("options.requestedPolicyVersion", "3");
+  const response = await fetcher(url, {
+    headers: googleHeaders(token),
+    method: "POST",
+    redirect: "error",
+  });
+  if (response.status === 404) return undefined;
   if (!response.ok) {
     throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
   }
@@ -6581,5 +7986,15 @@ function array(value: unknown, label: string): unknown[] {
 }
 
 if (import.meta.main) {
-  await main();
+  const argumentsAfterScript = process.argv.slice(2);
+  if (argumentsAfterScript.length === 0) {
+    await main();
+  } else if (
+    argumentsAfterScript.length === 1 &&
+    argumentsAfterScript[0] === "--recover-only"
+  ) {
+    await recoveryMain();
+  } else {
+    throw new Error("Protected bridge received an unknown operation.");
+  }
 }

@@ -18,11 +18,14 @@ import {
   canonicalJson,
   consumePlanReceipt,
   deadlineFetcher,
+  deterministicArtifactHex,
   ExecutorLeaseManager,
   executorControlPermissions,
   fencePolicyMutations,
+  formatBridgeBreadcrumb,
   inventoryBridgeArtifacts,
   main,
+  parseRecoverySecretBundle,
   publishPlanReceipt,
   publishPostApplyReceipt,
   proveConsumerFreeze,
@@ -30,13 +33,18 @@ import {
   randomExecutorAccountId,
   randomExecutorRoleId,
   readConsumerWorkflowPin,
+  REPOSITORIES,
   removeExactLease,
   removeExactBindings,
   removeLeaseWithCas,
+  recoveryMain,
+  recoverBridgeArtifactsUntilStable,
+  releaseSandboxAndExecutor,
   requireSameDhiTransitionCapability,
   runProtectedBootstrap,
   TerraformSandboxExecutor,
   validateInvocation,
+  validateRecoveryInvocation,
   verifyLocalSource,
   verifyPlatformCapability,
   verifyPlanApproval,
@@ -52,6 +60,8 @@ import {
   type MarkerStateProof,
   type PlanIdentity,
   type PreparationResult,
+  type RecoveryDependencies,
+  type RecoveryInvocation,
   type TerraformSandboxDriver,
   type TerraformSandboxSpec,
 } from "../tools/ci/protected-bootstrap-bridge.ts";
@@ -107,7 +117,30 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain("PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}");
     expect(workflow).toContain("exec /usr/bin/env -i");
     expect(workflow.match(/OWNER_OAUTH_ACCESS_TOKEN: \$\{\{ secrets\.OWNER_OAUTH_ACCESS_TOKEN \}\}/g)).toHaveLength(
-      1,
+      3,
+    );
+    expect(workflow).toContain("owner-terraform:\n    name:");
+    expect(workflow).toContain("    if: ${{ always() }}\n    runs-on: ubuntu-24.04");
+    expect(workflow.match(/if: \$\{\{ success\(\) && !cancelled\(\) \}\}/g)).toHaveLength(7);
+    expect(workflow).toContain(
+      "id: protected-bridge\n        if: ${{ success() && !cancelled() }}",
+    );
+    expect(
+      workflow.match(
+        /if: \$\{\{ always\(\) && \(steps\.protected-bridge\.outcome == 'failure' \|\| steps\.protected-bridge\.outcome == 'cancelled'\) \}\}/g,
+      ),
+    ).toHaveLength(2);
+    expect(workflow).toContain(
+      "id: recovery-route\n        if: ${{ always() }}",
+    );
+    expect(workflow).toContain(
+      "id: recovery-source\n        if: ${{ always() && steps.recovery-route.outcome == 'success' }}",
+    );
+    expect(workflow).toContain(
+      "id: recovery-bun\n        if: ${{ always() && steps.recovery-source.outcome == 'success' }}",
+    );
+    expect(workflow).toContain(
+      "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
     );
     expect(
       workflow.match(
@@ -1189,12 +1222,70 @@ describe("protected owner Terraform bridge", () => {
       "show",
       "publish",
       "summary",
+      "release",
       "remove:tfplan",
       "remove:tfdata",
       "remove:sandbox",
-      "release",
     ]);
     expect(events.some((event) => event.includes("consumer/infra"))).toBeFalse();
+  });
+
+  test("normal cleanup starts IAM containment before blocked filesystem and Docker cleanup", async () => {
+    let unblockFilesystem!: () => void;
+    const filesystemBlocked = new Promise<void>((resolve) => {
+      unblockFilesystem = resolve;
+    });
+    let releaseStarted!: () => void;
+    const releaseObserved = new Promise<void>((resolve) => {
+      releaseStarted = resolve;
+    });
+    const events: string[] = [];
+    const run = runProtectedBootstrap(
+      validateInvocation(validEnvironment()),
+      fakeDependencies(events, {
+        releaseExecutor: async () => {
+          events.push("release");
+          releaseStarted();
+        },
+        removePrivatePath: async (path) => {
+          events.push(`blocked-remove:${path}`);
+          await filesystemBlocked;
+        },
+      }),
+    );
+    await releaseObserved;
+    expect(events).toContain("release");
+    expect(events.filter((event) => event.startsWith("blocked-remove:"))).toHaveLength(3);
+    unblockFilesystem();
+    await run;
+
+    let unblockSandbox!: () => void;
+    const sandboxBlocked = new Promise<void>((resolve) => {
+      unblockSandbox = resolve;
+    });
+    let executorStarted = false;
+    const release = releaseSandboxAndExecutor(
+      () => sandboxBlocked,
+      async () => {
+        executorStarted = true;
+      },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(executorStarted).toBeTrue();
+    unblockSandbox();
+    await release;
+
+    let synchronousExecutorStarted = false;
+    await expect(releaseSandboxAndExecutor(
+      () => {
+        throw new Error("synchronous sandbox failure");
+      },
+      async () => {
+        synchronousExecutorStarted = true;
+      },
+    )).rejects.toThrow("Sandbox and executor cleanup did not both complete");
+    expect(synchronousExecutorStarted).toBeTrue();
   });
 
   test("bootstrap Terraform receives every required migration variable as one validated argv", async () => {
@@ -1234,7 +1325,420 @@ describe("protected owner Terraform bridge", () => {
     expect(environment.CONSUMER_ACTIONS_READ_TOKEN).toBeUndefined();
     expect(environment.OWNER_OAUTH_ACCESS_TOKEN).toBeUndefined();
     expect(environment.PLATFORM_ACTIONS_READ_TOKEN).toBeUndefined();
-    expect(events.at(-1)).toBe("release");
+    expect(events).toContain("release");
+  });
+
+  test("deterministic crash-recovery identifiers use one stable domain-separated vector", () => {
+    expect(deterministicArtifactHex("cdbentley", "123456", "service-account")).toBe(
+      "070cdcf5fee1f39f9203",
+    );
+    expect(deterministicArtifactHex("cdbentley", "123456", "role-read")).toBe(
+      "7fd5b28cf1a5aca5483f",
+    );
+    expect(deterministicArtifactHex("cdbentley", "123456", "role-mutation")).toBe(
+      "764ee57bc43114594e6a",
+    );
+    expect(deterministicArtifactHex("cdbentley", "123456", "container-1")).toBe(
+      "1fed2c2ce4aa298e75e5",
+    );
+    expect(deterministicArtifactHex("runsetta", "123456", "service-account")).not.toBe(
+      deterministicArtifactHex("cdbentley", "123456", "service-account"),
+    );
+  });
+
+  test("normal bridge budget reserves in-process cleanup before the wrapper deadline", async () => {
+    const startedAt = 1_800_000_000_000;
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "420",
+    });
+    let acquireDeadline = 0;
+    let cleanupDeadline = 0;
+    await runProtectedBootstrap(invocation, fakeDependencies([], {
+      acquireExecutor: async (_invocation, _expiresAt, deadline) => {
+        acquireDeadline = deadline;
+        return {
+          accessToken: "short-lived-executor-access-token-value",
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          tokenExpiresAtMs: startedAt + 30 * 60_000,
+        };
+      },
+      now: () => startedAt,
+      releaseExecutor: async (_invocation, _session, deadline) => {
+        cleanupDeadline = deadline;
+      },
+    }));
+    expect(acquireDeadline).toBe(startedAt + 60_000);
+    expect(cleanupDeadline).toBe(startedAt + 360_000);
+    expect(() => validateInvocation({
+      ...validEnvironment(),
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "419",
+    })).toThrow("420..1560");
+  });
+
+  test("recovery-only entry accepts one owner token and rejects normal capabilities", async () => {
+    expect(parseRecoverySecretBundle(Buffer.from("owner-recovery-token-value\0"))).toBe(
+      "owner-recovery-token-value",
+    );
+    expect(() => parseRecoverySecretBundle(Buffer.from("one\0two\0"))).toThrow(
+      "exactly one",
+    );
+    const environment = validRecoveryEnvironment();
+    const ownerToken = environment.OWNER_OAUTH_ACCESS_TOKEN!;
+    delete environment.OWNER_OAUTH_ACCESS_TOKEN;
+    const events: string[] = [];
+    const dependencies: RecoveryDependencies = {
+      now: () => 1_800_000_000_000,
+      recoverArtifacts: async (invocation) => {
+        expect(invocation.ownerAccessToken).toBe(ownerToken);
+        events.push("recover");
+      },
+      verifySource: async () => {
+        events.push("source");
+      },
+    };
+    await recoveryMain(environment, dependencies, () => ownerToken);
+    expect(events).toEqual(["source", "recover"]);
+    expect(environment.OWNER_OAUTH_ACCESS_TOKEN).toBeUndefined();
+    expect(() => validateRecoveryInvocation({
+      ...validRecoveryEnvironment(),
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1560",
+    })).toThrow("normal-operation capability");
+  });
+
+  test("recovery retries a lost deterministic disable response and contains later visibility", async () => {
+    const fixture = deterministicRecoveryHarness({
+      firstDisableTransportLoss: true,
+      keyFailureStatus: 403,
+    });
+    const first = await inventoryBridgeArtifacts(
+      "cdbentley",
+      fixture.invocation.ownerAccessToken,
+      fixture.fetcher,
+      fixture.sleep,
+      fixture.now() + 60_000,
+      fixture.invocation,
+    );
+    expect(first.hadActiveArtifacts).toBeTrue();
+    expect(fixture.calls.some((call) => call.tag === "deterministic-account-404")).toBeTrue();
+    expect(fixture.calls.some((call) => call.tag === "empty-account-list")).toBeTrue();
+
+    fixture.revealAccount();
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        fixture.invocation.ownerAccessToken,
+        fixture.fetcher,
+        fixture.sleep,
+        fixture.now() + 60_000,
+        fixture.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain("key inventory failed with HTTP 403");
+    expect(fixture.account.disabled).toBeTrue();
+    expect(fixture.callIndex("disable-response-loss")).toBeLessThan(
+      fixture.callIndex("deterministic-account-404"),
+    );
+    expect(fixture.callIndex("deterministic-email-disable")).toBeLessThan(
+      fixture.callIndex("numeric-id-disable"),
+    );
+  });
+
+  test("detached recovery scrubs active and deleted exact members despite global inventory failure", async () => {
+    const fixture = deterministicRecoveryHarness({
+      accountListFailureStatus: 503,
+      targetProjectMembers: true,
+    });
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        fixture.invocation.ownerAccessToken,
+        fixture.fetcher,
+        fixture.sleep,
+        fixture.now() + 60_000,
+        fixture.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain("HTTP 503");
+    const target = fixture.policy("project:cdbentley");
+    expect(target.version).toBe(3);
+    expect(target.auditConfigs).toEqual([{ auditLogConfigs: [{ logType: "ADMIN_READ" }], service: "allServices" }]);
+    expect(target.bindings).toEqual([{
+      members: ["user:unrelated@example.com"],
+      role: "roles/editor",
+    }]);
+    expect(fixture.callIndex("deterministic-email-disable")).toBeLessThan(
+      fixture.callIndex("target-project-policy-get"),
+    );
+    expect(fixture.callIndex("account-list-503")).toBeLessThan(
+      fixture.callIndex("target-project-policy-set"),
+    );
+  });
+
+  test("detached executor recovery accepts exact live cleanup fences and refuses near matches", async () => {
+    const exact = deterministicRecoveryHarness({ executorCleanupFence: "exact" });
+    await inventoryBridgeArtifacts(
+      "cdbentley",
+      exact.invocation.ownerAccessToken,
+      exact.fetcher,
+      exact.sleep,
+      exact.now() + 60_000,
+      exact.invocation,
+    );
+    expect(exact.policy(`sa:${exact.email}`).bindings).toEqual([]);
+
+    const tampered = deterministicRecoveryHarness({ executorCleanupFence: "tampered" });
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        tampered.invocation.ownerAccessToken,
+        tampered.fetcher,
+        tampered.sleep,
+        tampered.now() + 60_000,
+        tampered.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain(
+      "unknown or modified binding; manual cleanup is required",
+    );
+    expect(tampered.policy(`sa:${tampered.email}`).bindings).toHaveLength(1);
+  });
+
+  test("a visible deterministic identity authenticates and removes its exact prior orphan fence", async () => {
+    const fixture = deterministicRecoveryHarness({
+      executorUniqueIdFence: true,
+      initiallyVisibleAccount: true,
+      keyFailureStatus: 403,
+    });
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        fixture.invocation.ownerAccessToken,
+        fixture.fetcher,
+        fixture.sleep,
+        fixture.now() + 60_000,
+        fixture.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain("key inventory failed with HTTP 403");
+    expect(fixture.account.disabled).toBeTrue();
+    expect(fixture.policy(`sa:${fixture.email}`).bindings).toEqual([]);
+  });
+
+  test("a nonconverging deterministic readback cannot starve a listed peer disable", async () => {
+    const fixture = deterministicRecoveryHarness({
+      directReadbackNeverConverges: true,
+      initiallyVisibleAccount: true,
+      listedLegacyPeer: true,
+    });
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        fixture.invocation.ownerAccessToken,
+        fixture.fetcher,
+        fixture.sleep,
+        fixture.now() + 60_000,
+        fixture.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain("manual cleanup is required");
+    expect(fixture.callIndex("peer-numeric-id-disable")).toBeGreaterThanOrEqual(0);
+    expect(fixture.callIndex("peer-numeric-id-disable")).toBeLessThan(
+      fixture.callIndex("sleep"),
+    );
+  });
+
+  test("a fast listed 403 is handled while direct identity observation is still pending", async () => {
+    const fixture = deterministicRecoveryHarness({
+      delayDeterministicDirectGet: true,
+      initiallyVisibleAccount: true,
+      listedLegacyPeer: true,
+      peerDisableStatus: 403,
+    });
+    const outcome = inventoryBridgeArtifacts(
+      "cdbentley",
+      fixture.invocation.ownerAccessToken,
+      fixture.fetcher,
+      fixture.sleep,
+      fixture.now() + 60_000,
+      fixture.invocation,
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await Bun.sleep(0);
+    expect(fixture.callIndex("deterministic-direct-get-delayed")).toBeGreaterThanOrEqual(0);
+    expect(fixture.callIndex("peer-numeric-id-disable")).toBeGreaterThanOrEqual(0);
+    fixture.releaseDirectGet();
+    const failure = await outcome;
+    expect(errorMessages(failure).join("\n")).toContain("HTTP 403");
+
+    // A list-level rejection exercises the child-promise handler itself (the
+    // per-identity branch above is intentionally all-settled internally).
+    const listFailure = deterministicRecoveryHarness({
+      accountListFailureStatus: 403,
+      delayDeterministicDirectGet: true,
+      initiallyVisibleAccount: true,
+    });
+    const listOutcome = inventoryBridgeArtifacts(
+      "cdbentley",
+      listFailure.invocation.ownerAccessToken,
+      listFailure.fetcher,
+      listFailure.sleep,
+      listFailure.now() + 60_000,
+      listFailure.invocation,
+    ).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await Bun.sleep(0);
+    expect(listFailure.callIndex("account-list-403")).toBeGreaterThanOrEqual(0);
+    listFailure.releaseDirectGet();
+    expect(errorMessages(await listOutcome).join("\n")).toContain("HTTP 403");
+  });
+
+  test("unresolved uniqueId fence recovery retries 404 and transient policy reads until exact identity", async () => {
+    const fixture = deterministicRecoveryHarness({
+      executorUniqueIdFence: true,
+      revealAccountOnScan: 2,
+      transientTargetPolicyFailures: 1,
+    });
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 700_000,
+      fixture.now,
+    );
+    expect(fixture.callCount("target-project-policy-503")).toBe(1);
+    expect(fixture.callCount("deterministic-account-404")).toBeGreaterThan(0);
+    expect(fixture.callCount("numeric-id-disable")).toBeGreaterThan(0);
+    expect(fixture.policy(`sa:${fixture.email}`).bindings).toEqual([]);
+    expect(fixture.callCount("deterministic-account-delete")).toBe(1);
+
+    const tampered = deterministicRecoveryHarness({
+      executorUniqueIdFenceTampered: true,
+      initiallyVisibleAccount: true,
+      keyFailureStatus: 403,
+    });
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        tampered.invocation.ownerAccessToken,
+        tampered.fetcher,
+        tampered.sleep,
+        tampered.now() + 60_000,
+        tampered.invocation,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain(
+      "unknown or modified binding; manual cleanup is required",
+    );
+    expect(tampered.policy(`sa:${tampered.email}`).bindings).toHaveLength(1);
+  });
+
+  test("stable-empty recovery starts a full 300-second proof after first-scan cleanup", async () => {
+    const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 1 });
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 700_000,
+      fixture.now,
+    );
+    expect(fixture.now() - startedAt).toBe(300_000);
+    expect(fixture.role.deleted).toBeTrue();
+  });
+
+  test("a role observed and cleaned on the nominal final scan resets the 300-second proof", async () => {
+    const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 6 });
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 700_000,
+      fixture.now,
+    );
+    expect(fixture.now() - startedAt).toBe(600_000);
+    expect(fixture.role.deleted).toBeTrue();
+  });
+
+  test("a fully retryable failed scan resets proof and retries without weakening hard failures", async () => {
+    const fixture = deterministicRecoveryHarness({ transientAccountListFailures: 1 });
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 700_000,
+      fixture.now,
+    );
+    expect(fixture.callCount("account-list-503")).toBe(1);
+    expect(fixture.now() - startedAt).toBeGreaterThanOrEqual(302_000);
+
+    const hard = deterministicRecoveryHarness({ executorCleanupFence: "tampered" });
+    let sleeps = 0;
+    await expect(recoverBridgeArtifactsUntilStable(
+      hard.invocation,
+      hard.fetcher,
+      async (milliseconds) => {
+        sleeps += 1;
+        await hard.sleep(milliseconds);
+      },
+      hard.now() + 700_000,
+      hard.now,
+    )).rejects.toThrow("Deterministic executor policy recovery was incomplete");
+    expect(sleeps).toBe(0);
+  });
+
+  test("telemetry failures and formatting never alter the protected outcome or expose values", async () => {
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation(validEnvironment()),
+      fakeDependencies(events),
+      {
+        phase: () => {
+          throw new Error("telemetry sink failed with secret-value");
+        },
+        stop: () => {
+          throw new Error("telemetry stop failed with secret-value");
+        },
+      },
+    );
+    expect(events).toContain("release");
+    const breadcrumb = formatBridgeBreadcrumb("executor.permission-proof", 2_049, {
+      currentBytes: 4_097,
+      oom: 2,
+      oomKill: 1,
+      peakBytes: 8_193,
+    });
+    expect(breadcrumb).toBe(
+      "Protected bridge telemetry phase=executor.permission-proof rss_kib=3 " +
+        "cgroup_current_kib=5 cgroup_peak_kib=9 cgroup_oom=2 cgroup_oom_kill=1",
+    );
+    expect(breadcrumb).not.toContain("secret");
   });
 
   test("executable apply consumes the fresh receipt once immediately before apply", async () => {
@@ -1265,7 +1769,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("markers:post")).toBeGreaterThan(events.indexOf("terraform:audit"));
     expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("markers:post"));
     expect(events.filter((event) => event === "consume")).toHaveLength(1);
-    expect(events.at(-1)).toBe("release");
+    expect(events).toContain("release");
   });
 
   test("Terraform crash and malformed plan both execute finally cleanup", async () => {
@@ -1286,7 +1790,7 @@ describe("protected owner Terraform bridge", () => {
         .rejects.toThrow();
       expect(events).toContain("remove:tfplan");
       expect(events).toContain("remove:tfdata");
-      expect(events.at(-1)).toBe("release");
+      expect(events).toContain("release");
     }
   });
 
@@ -1305,7 +1809,7 @@ describe("protected owner Terraform bridge", () => {
     await expect(runProtectedBootstrap(validateInvocation(validEnvironment()), dependencies))
       .rejects.toThrow("deadline");
     expect(events).not.toContain("acquire");
-    expect(events.at(-1)).toBe("release");
+    expect(events).toContain("release");
   });
 
   test("apply refuses before mutation when the full post-WIF drain reserve cannot fit", async () => {
@@ -1338,7 +1842,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events).not.toContain("consume");
     expect(events).not.toContain("elevate");
     expect(events).not.toContain("terraform:apply");
-    expect(events.at(-1)).toBe("release");
+    expect(events).toContain("release");
   });
 
   test("cleanup failure is surfaced and never converted into success", async () => {
@@ -1377,7 +1881,7 @@ describe("protected owner Terraform bridge", () => {
     await expect(runProtectedBootstrap(validateInvocation(validEnvironment()), dependencies))
       .rejects.toThrow("timed out");
     expect(aborted).toBeTrue();
-    expect(events.at(-1)).toBe("release");
+    expect(events).toContain("release");
   });
 
   test("API deadline remains active after headers while the response body hangs", async () => {
@@ -2278,14 +2782,22 @@ describe("protected owner Terraform bridge", () => {
 
   test("orphan custom-role deletion fails fast on HTTP 403 without retry backoff", async () => {
     const fixture = abruptLossFixture({ roleDeleteForbidden: true });
-    await expect(inventoryBridgeArtifacts(
-      "cdbentley",
-      "google-owner-access-token-value",
-      fixture.fetcher,
-      fixture.sleep,
-      Date.now() + 60_000,
-    )).rejects.toThrow("Ephemeral executor role deletion failed with HTTP 403");
-    expect(fixture.orphanRoleDeleteAttempts()).toBe(1);
+    let failure: unknown;
+    try {
+      await inventoryBridgeArtifacts(
+        "cdbentley",
+        "google-owner-access-token-value",
+        fixture.fetcher,
+        fixture.sleep,
+        Date.now() + 60_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(errorMessages(failure).join("\n")).toContain(
+      "Ephemeral executor role deletion failed with HTTP 403",
+    );
+    expect(fixture.orphanRoleDeleteAttempts()).toBe(fixture.roles.length);
     expect(fixture.postForbiddenRoleDeleteSleeps()).toBe(0);
     expect(fixture.roles.some((role) => !role.deleted)).toBeTrue();
   });
@@ -2646,6 +3158,7 @@ function validEnvironment(): NodeJS.ProcessEnv {
   return {
     APPROVED_MANIFEST_SHA256: "",
     APPROVED_PLAN_RUN_ID: "",
+    BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1560",
     CONSUMER_ACTIONS_READ_TOKEN: "github-actions-read-token-value",
     CONSUMER_ROOT: "/tmp/consumer",
     CONSUMER_SHA: consumerSha,
@@ -2679,6 +3192,380 @@ function validEnvironment(): NodeJS.ProcessEnv {
       "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b",
     TRANSITION_PLATFORM_ROOT: "/tmp/transition-platform",
     TRANSITION_WORKFLOW_SHA: "",
+  };
+}
+
+function validRecoveryEnvironment(): NodeJS.ProcessEnv {
+  return {
+    GITHUB_ACTOR_ID_EXACT: "16823277",
+    GITHUB_EVENT_NAME_EXACT: "workflow_dispatch",
+    GITHUB_REF_EXACT: "refs/heads/main",
+    GITHUB_REPOSITORY_EXACT: "collinbentley1/platform",
+    GITHUB_REPOSITORY_ID_EXACT: "1255856466",
+    GITHUB_REPOSITORY_OWNER_ID_EXACT: "16823277",
+    GITHUB_RUN_ATTEMPT_EXACT: "1",
+    GITHUB_RUN_ID_EXACT: "123456",
+    GITHUB_SHA_EXACT: platformSha,
+    GITHUB_WORKFLOW_REF_EXACT:
+      "collinbentley1/platform/.github/workflows/protected-bootstrap-implementation.yml@refs/heads/main",
+    OWNER_OAUTH_ACCESS_TOKEN: "google-owner-access-token-value",
+    PLATFORM_ROOT: "/tmp/platform",
+    RUNNER_ARCH_EXACT: "X64",
+    RUNNER_ENVIRONMENT_EXACT: "github-hosted",
+    RUNNER_OS_EXACT: "Linux",
+    RUNNER_TEMP_EXACT: "/tmp",
+    TARGET_REPOSITORY: "cdbentley",
+  };
+}
+
+function deterministicRecoveryHarness(options: {
+  readonly accountListFailureStatus?: number;
+  readonly delayDeterministicDirectGet?: boolean;
+  readonly directReadbackNeverConverges?: boolean;
+  readonly executorCleanupFence?: "exact" | "tampered";
+  readonly executorUniqueIdFence?: boolean;
+  readonly executorUniqueIdFenceTampered?: boolean;
+  readonly firstDisableTransportLoss?: boolean;
+  readonly initiallyVisibleAccount?: boolean;
+  readonly keyFailureStatus?: number;
+  readonly listedLegacyPeer?: boolean;
+  readonly peerDisableStatus?: number;
+  readonly revealAccountOnScan?: number;
+  readonly roleAppearanceScan?: number;
+  readonly targetProjectMembers?: boolean;
+  readonly transientAccountListFailures?: number;
+  readonly transientTargetPolicyFailures?: number;
+} = {}) {
+  const invocation = validateRecoveryInvocation(validRecoveryEnvironment());
+  const projectId = REPOSITORIES[invocation.repository].projectId;
+  const accountId = randomExecutorAccountId(
+    deterministicArtifactHex(invocation.repository, invocation.githubRunId, "service-account"),
+  );
+  const email = `${accountId}@${projectId}.iam.gserviceaccount.com`;
+  const account = {
+    description:
+      `pbt-v1;repository=${invocation.repository};run=${invocation.githubRunId};root=bootstrap;mode=plan;approved=none;expires=2026-08-25T23:00:00.000Z`,
+    disabled: false,
+    displayName: "Protected Terraform Executor",
+    email,
+    etag: "deterministic-account-etag-1",
+    name: `projects/${projectId}/serviceAccounts/${email}`,
+    oauth2ClientId: "123456789",
+    projectId,
+    uniqueId: "123456789012345678901",
+  };
+  const peerAccountId = "gha-pbt-fedcba9876543210abcd";
+  const peerEmail = `${peerAccountId}@${projectId}.iam.gserviceaccount.com`;
+  const peerAccount = {
+    description:
+      `pbt-v1;repository=${invocation.repository};run=654321;root=bootstrap;mode=plan;approved=none;expires=2026-08-25T23:00:00.000Z`,
+    disabled: false,
+    displayName: "Protected Terraform Executor",
+    email: peerEmail,
+    etag: "peer-account-etag-1",
+    name: `projects/${projectId}/serviceAccounts/${peerEmail}`,
+    oauth2ClientId: "987654321",
+    projectId,
+    uniqueId: "987654321098765432109",
+  };
+  const roleId = randomExecutorRoleId(
+    "read",
+    deterministicArtifactHex(invocation.repository, invocation.githubRunId, "role-read"),
+  );
+  const role = {
+    deleted: false,
+    description: "Protected Terraform bootstrap read single-run control role.",
+    etag: "deterministic-role-etag-1",
+    includedPermissions: executorControlPermissions(invocation.repository, "bootstrap", "read"),
+    name: `projects/${projectId}/roles/${roleId}`,
+    stage: "GA",
+    title: "Protected Terraform Read",
+  };
+  const projectIds = Object.values(REPOSITORIES).map((contract) => contract.projectId);
+  const runtimeEmails = [
+    `cloud-run-bootstrap@${projectId}.iam.gserviceaccount.com`,
+    `cloud-run-preview@${projectId}.iam.gserviceaccount.com`,
+    `cloud-run-runtime@${projectId}.iam.gserviceaccount.com`,
+  ];
+  const policies = new Map<string, IamPolicy>();
+  for (const id of projectIds) {
+    policies.set(`project:${id}`, {
+      bindings: [],
+      etag: `project-${id}-etag-1`,
+      version: 3,
+    });
+  }
+  for (const runtimeEmail of runtimeEmails) {
+    policies.set(`sa:${runtimeEmail}`, {
+      bindings: [],
+      etag: `runtime-${runtimeEmail.split("@")[0]}-etag-1`,
+      version: 3,
+    });
+  }
+  if (options.targetProjectMembers === true) {
+    policies.set(`project:${projectId}`, {
+      auditConfigs: [{
+        auditLogConfigs: [{ logType: "ADMIN_READ" }],
+        service: "allServices",
+      }],
+      bindings: [{
+        members: [
+          `serviceAccount:${email}`,
+          `deleted:serviceAccount:${email}?uid=${account.uniqueId}`,
+          "user:unrelated@example.com",
+        ],
+        role: "roles/editor",
+      }],
+      etag: "target-project-etag-1",
+      version: 3,
+    });
+  }
+  const fenceSuffix = "0123456789abcdefabcd";
+  if (options.executorCleanupFence !== undefined) {
+    const label = `executor service account ${email}`;
+    policies.set(`sa:${email}`, {
+      bindings: [{
+        condition: {
+          description: "Expired inert binding used only to advance the cleanup CAS generation.",
+          expression: options.executorCleanupFence === "exact"
+            ? "request.time < timestamp('2000-01-01T00:00:00.000Z')"
+            : "request.time < timestamp('2001-01-01T00:00:00.000Z')",
+          title: `codex-cleanup-fence-${createHash("sha256").update(label).digest("hex").slice(0, 12)}-${fenceSuffix}`,
+        },
+        members: ["user:CollinBentley1@gmail.com"],
+        role: "roles/iam.serviceAccountTokenCreator",
+      }],
+      etag: "executor-policy-etag-1",
+      version: 3,
+    });
+  }
+  if (options.executorUniqueIdFence === true || options.executorUniqueIdFenceTampered === true) {
+    const label = `orphan ${account.uniqueId} executor policy`;
+    policies.set(`sa:${email}`, {
+      bindings: [{
+        condition: {
+          description:
+            "Expired inert binding used only to advance the orphan-recovery CAS generation.",
+          expression: options.executorUniqueIdFenceTampered === true
+            ? "request.time < timestamp('2001-01-01T00:00:00.000Z')"
+            : "request.time < timestamp('2000-01-01T00:00:00.000Z')",
+          title: `codex-orphan-fence-${createHash("sha256").update(label).digest("hex").slice(0, 12)}-${fenceSuffix}`,
+        },
+        members: ["user:CollinBentley1@gmail.com"],
+        role: "roles/iam.serviceAccountTokenCreator",
+      }],
+      etag: "executor-policy-etag-1",
+      version: 3,
+    });
+  }
+
+  const calls: Array<{ method: string; tag: string; url: string }> = [];
+  let accountVisible = options.initiallyVisibleAccount === true;
+  let disableAttempts = 0;
+  let generation = 1;
+  let roleExists = false;
+  let roleAppearanceObserved = false;
+  let scan = 0;
+  let transientAccountListFailures = options.transientAccountListFailures ?? 0;
+  let transientTargetPolicyFailures = options.transientTargetPolicyFailures ?? 0;
+  let fakeNow = Date.now();
+  let releaseDirectGet!: () => void;
+  const directGetGate = new Promise<void>((resolve) => {
+    releaseDirectGet = resolve;
+  });
+  let directGetReleased = false;
+  const recordCall = (method: string, tag: string, url: string): void => {
+    calls.push({ method, tag, url });
+  };
+  const updatePolicy = (key: string, init: RequestInit | undefined): Response => {
+    const current = policies.get(key);
+    if (current === undefined) return new Response("", { status: 404 });
+    const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
+    if (requested.version !== 3) return new Response("", { status: 400 });
+    if (requested.etag !== current.etag) return new Response("", { status: 412 });
+    generation += 1;
+    const updated: IamPolicy = {
+      ...requested,
+      etag: `recovery-policy-etag-${generation}`,
+      version: 3,
+    };
+    policies.set(key, updated);
+    return Response.json(updated);
+  };
+  const fetcher = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const rawUrl = String(input);
+    const url = new URL(rawUrl);
+    const path = decodeURIComponent(url.pathname);
+    const method = init?.method ?? "GET";
+
+    if (path.endsWith(`/serviceAccounts/${email}:disable`) && method === "POST") {
+      scan += 1;
+      disableAttempts += 1;
+      if (options.revealAccountOnScan === scan) accountVisible = true;
+      if (!roleAppearanceObserved && options.roleAppearanceScan === scan) {
+        roleAppearanceObserved = true;
+        roleExists = true;
+        role.deleted = false;
+      }
+      if (options.firstDisableTransportLoss === true && disableAttempts === 1) {
+        recordCall(method, "disable-response-loss", rawUrl);
+        throw new TypeError("fetch failed after deterministic disable committed");
+      }
+      recordCall(method, "deterministic-email-disable", rawUrl);
+      if (!accountVisible) return new Response("", { status: 404 });
+      if (options.directReadbackNeverConverges !== true) account.disabled = true;
+      return Response.json({});
+    }
+
+    const projectPolicy = /^\/v1\/projects\/([^/:]+):(get|set)IamPolicy$/.exec(path);
+    if (projectPolicy !== null) {
+      const key = `project:${projectPolicy[1]}`;
+      const target = projectPolicy[1] === projectId;
+      if (projectPolicy[2] === "get") {
+        if (target && transientTargetPolicyFailures > 0) {
+          transientTargetPolicyFailures -= 1;
+          recordCall(method, "target-project-policy-503", rawUrl);
+          return new Response("", { status: 503 });
+        }
+        recordCall(method, target ? "target-project-policy-get" : "project-policy-get", rawUrl);
+        return Response.json(policies.get(key));
+      }
+      recordCall(method, target ? "target-project-policy-set" : "project-policy-set", rawUrl);
+      return updatePolicy(key, init);
+    }
+
+    const serviceAccountPolicy =
+      /^\/v1\/projects\/[^/]+\/serviceAccounts\/(.+):(get|set)IamPolicy$/.exec(path);
+    if (serviceAccountPolicy !== null) {
+      const identifier = serviceAccountPolicy[1]!;
+      const policyEmail = identifier === account.uniqueId ? email : identifier;
+      const key = `sa:${policyEmail}`;
+      if (serviceAccountPolicy[2] === "get") {
+        recordCall(method, policyEmail === email ? "executor-policy-get" : "runtime-policy-get", rawUrl);
+        const current = policies.get(key);
+        return current === undefined ? new Response("", { status: 404 }) : Response.json(current);
+      }
+      recordCall(method, policyEmail === email ? "executor-policy-set" : "runtime-policy-set", rawUrl);
+      return updatePolicy(key, init);
+    }
+
+    if (path === `/v1/projects/${projectId}/serviceAccounts` && method === "GET") {
+      if (transientAccountListFailures > 0) {
+        transientAccountListFailures -= 1;
+        recordCall(method, "account-list-503", rawUrl);
+        return new Response("", { status: 503 });
+      }
+      if (options.accountListFailureStatus !== undefined) {
+        recordCall(method, `account-list-${options.accountListFailureStatus}`, rawUrl);
+        return new Response("", { status: options.accountListFailureStatus });
+      }
+      recordCall(method, accountVisible ? "visible-account-list" : "empty-account-list", rawUrl);
+      return Response.json({
+        accounts: options.listedLegacyPeer === true
+          ? [peerAccount]
+          : accountVisible ? [account] : [],
+      });
+    }
+
+    if (path === `/v1/projects/${projectId}/roles` && method === "GET") {
+      recordCall(method, "role-list", rawUrl);
+      return Response.json({ roles: roleExists ? [role] : [] });
+    }
+    if (path === `/v1/${role.name}`) {
+      if (method === "DELETE") {
+        recordCall(method, "role-delete", rawUrl);
+        role.deleted = true;
+        role.etag = `deterministic-role-etag-${scan + 1}`;
+        return Response.json(role);
+      }
+      recordCall(method, roleExists ? "role-get" : "role-404", rawUrl);
+      return roleExists ? Response.json(role) : new Response("", { status: 404 });
+    }
+    if (/^\/v1\/projects\/cdbentley\/roles\/pbt_[rm]_[0-9a-f]{20}$/.test(path)) {
+      recordCall(method, "other-role-404", rawUrl);
+      return new Response("", { status: 404 });
+    }
+
+    if (path.endsWith(`/serviceAccounts/${account.uniqueId}/keys`) && method === "GET") {
+      recordCall(method, "key-inventory", rawUrl);
+      if (options.keyFailureStatus !== undefined) {
+        return new Response("", { status: options.keyFailureStatus });
+      }
+      return Response.json({ keys: [] });
+    }
+    if (path.endsWith(`/serviceAccounts/${account.uniqueId}:disable`) && method === "POST") {
+      recordCall(method, "numeric-id-disable", rawUrl);
+      if (options.directReadbackNeverConverges !== true) account.disabled = true;
+      return Response.json({});
+    }
+    if (path.endsWith(`/serviceAccounts/${peerAccount.uniqueId}/keys`) && method === "GET") {
+      recordCall(method, "peer-key-inventory", rawUrl);
+      return new Response("", { status: 403 });
+    }
+    if (path.endsWith(`/serviceAccounts/${peerAccount.uniqueId}:disable`) && method === "POST") {
+      recordCall(method, "peer-numeric-id-disable", rawUrl);
+      if (options.peerDisableStatus !== undefined) {
+        return new Response("", { status: options.peerDisableStatus });
+      }
+      peerAccount.disabled = true;
+      return Response.json({});
+    }
+    if (
+      path.endsWith(`/serviceAccounts/${peerAccount.uniqueId}`) ||
+      path.endsWith(`/serviceAccounts/${peerEmail}`)
+    ) {
+      recordCall(method, "peer-account-get", rawUrl);
+      return Response.json(peerAccount);
+    }
+    if (
+      path.endsWith(`/serviceAccounts/${account.uniqueId}`) ||
+      path.endsWith(`/serviceAccounts/${email}`)
+    ) {
+      if (!accountVisible) {
+        recordCall(method, "deterministic-account-404", rawUrl);
+        return new Response("", { status: 404 });
+      }
+      if (path.endsWith(`/serviceAccounts/${email}`) &&
+        options.delayDeterministicDirectGet === true && !directGetReleased) {
+        recordCall(method, "deterministic-direct-get-delayed", rawUrl);
+        await directGetGate;
+        directGetReleased = true;
+      }
+      if (method === "DELETE") {
+        recordCall(method, "deterministic-account-delete", rawUrl);
+        accountVisible = false;
+        return Response.json({});
+      }
+      recordCall(method, "deterministic-account-get", rawUrl);
+      return Response.json(account);
+    }
+
+    recordCall(method, "unhandled", rawUrl);
+    return new Response("", { status: 500 });
+  };
+
+  return {
+    account,
+    callCount: (tag: string) => calls.filter((call) => call.tag === tag).length,
+    callIndex: (tag: string) => calls.findIndex((call) => call.tag === tag),
+    calls,
+    email,
+    fetcher,
+    invocation,
+    now: () => fakeNow,
+    policy: (key: string) => policies.get(key)!,
+    releaseDirectGet,
+    revealAccount: () => {
+      accountVisible = true;
+    },
+    role,
+    sleep: async (milliseconds: number) => {
+      recordCall("SLEEP", "sleep", String(milliseconds));
+      fakeNow += milliseconds;
+    },
   };
 }
 
