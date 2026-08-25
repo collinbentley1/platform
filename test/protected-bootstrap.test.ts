@@ -247,15 +247,67 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("DHI-changing rollout keeps Actions disabled through four result receipts and merges", async () => {
-    const rollout = (await readFile(join(root, "docs/security-rollout.md"), "utf8"))
-      .replace(/\s+/g, " ");
+    const [
+      rolloutSource,
+      deployPreview,
+      productionCaller,
+      reusableDeployProduction,
+      infrastructureWorkflow,
+      cleanupPreview,
+      reconcilePreviews,
+      cloudRunModule,
+      exposureReadme,
+      dockerignore,
+      packageSource,
+      readme,
+    ] = await Promise.all([
+      readFile(join(root, "docs/security-rollout.md"), "utf8"),
+      readFile(join(root, "templates/app/.github/workflows/deploy-preview.yml"), "utf8"),
+      readFile(join(root, "templates/app/.github/workflows/deploy-prod.yml"), "utf8"),
+      readFile(join(root, ".github/workflows/deploy-prod.yml"), "utf8"),
+      readFile(join(root, ".github/workflows/infrastructure.yml"), "utf8"),
+      readFile(join(root, "templates/app/.github/workflows/cleanup-preview.yml"), "utf8"),
+      readFile(join(root, "templates/app/.github/workflows/reconcile-previews.yml"), "utf8"),
+      readFile(join(root, "terraform/modules/cloud-run-service/main.tf"), "utf8"),
+      readFile(join(root, "terraform/deployments/exposure/README.md"), "utf8"),
+      readFile(join(root, "templates/app/.dockerignore"), "utf8"),
+      readFile(join(root, "package.json"), "utf8"),
+      readFile(join(root, "README.md"), "utf8"),
+    ]);
+    const rollout = rolloutSource.replace(/\s+/g, " ");
     for (const requirement of [
       "current head of an open, unmerged public consumer PR",
       "deliberately imposes no consumer-`main` ancestry requirement",
       "Do not merge any PR until four immutable result receipts exist",
-      "With Actions still disabled, merge the four unchanged prepared heads",
+      "mark that exact draft ready while Actions remains globally disabled",
+      "exactly the one expected `ready_for_review` lifecycle event was created",
+      "zero workflow runs were created after the baseline",
+      "using the receipt-bound head SHA as the exact `sha` precondition",
       "each resulting `main^{tree}` equals the receipt's `consumerTreeSha`",
-      "the first `S` production deploy performs the sealed DHI epoch transition",
+      "Any platform-`main` advance after that freeze therefore invalidates every prepared pin",
+      "current v0.4 initial adoption must use `legacy_compatibility_mode=true`",
+      "generic later active-only DHI cutover",
+      "must use `legacy_compatibility_mode=false`",
+      "Never enable a marker-unaware legacy PR-triggered privileged deployment",
+      "Permit only the credentialless exact-head Application, Infrastructure validation, and Socket checks",
+      "GitHub does not replay the merge's disabled `push`",
+      "the production workflow intentionally has no manual-dispatch trust path",
+      "selected-actions GET returns 409",
+      "sha_pinning_required:true",
+      "github_owned_allowed:false",
+      "verified_allowed:false",
+      "each exact reusable caller path suffixed by `@S`",
+      "PUT the exact general policy and then immediately PUT the exact selected policy",
+      "immediately PUT `{enabled:false}`",
+      "sole permitted PR lifecycle event is this initial `opened` event",
+      "A draft does not make `synchronize` harmless",
+      "All three preview lifecycle workflows are now individually disabled",
+      "using the exact frozen head SHA as its `sha` precondition",
+      "resulting `main^{tree}` to equal the frozen activation-head tree",
+      "no replay of the missed closed, push, ready, or scheduled events",
+      "Do not rerun the failed workflow",
+      "branch-protection weakening",
+      "the first `S` production deploy to complete the sealed DHI epoch transition",
       "never use the mixed-SHA transition path when `P` and `S` declare different DHI parity IDs",
       "wait at least 55 minutes after the failed workflow completes",
       "exceeding both the 54-minute conditioned lease and 30-minute executor-token lifetimes",
@@ -263,6 +315,200 @@ describe("protected owner Terraform bridge", () => {
     ]) {
       expect(rollout).toContain(requirement);
     }
+
+    const activationSource = rolloutSource.slice(
+      rolloutSource.indexOf("6. Recheck disabled Actions"),
+      rolloutSource.indexOf("The active-only apply removes"),
+    );
+    const activation = activationSource.replace(/\s+/g, " ");
+    let previousIndex = -1;
+    for (const orderedRequirement of [
+      "prepare the complete activation branch before opening a PR",
+      "platform-production-activation-v1",
+      "canonical `.dockerignore` excludes `README.md`",
+      "Derive an exact normalized Actions allowlist",
+      "With Actions still globally disabled",
+      "disable the `Cleanup preview`, `Reconcile previews`, and `Deploy production` workflow files",
+      "explicitly enable `Deploy preview`",
+      "inventory every open PR and its exact head repository and SHA",
+      "Outside the conservative UTC minute `:12` through `:22`",
+      "this enable sequence replayed no event",
+      "sole PR lifecycle event repository-wide",
+      "Open the already-frozen activation PR as a draft",
+      "Wait only until that event's `Deploy preview` run materializes",
+      "Immediately disable `Deploy preview`",
+      "only then wait for and require all normal exact-head checks",
+      "A draft does not make `synchronize` harmless",
+      "globally disable Actions and drain all runs",
+      "mark the unchanged PR ready while globally disabled",
+      "exactly the one expected `ready_for_review` event occurred",
+      "suppresses the workflow response to the ready event",
+      "While still globally disabled, explicitly enable only `Deploy production`",
+      "Re-enable with the same two-PUT general-then-selected sequence",
+      "using the exact frozen head SHA as its `sha` precondition",
+      "resulting `main^{tree}` to equal the frozen activation-head tree",
+      "only cloud mutation admitted by the activation merge is the push-only `Deploy production`",
+      "complete the sealed DHI epoch transition",
+      "enable `Cleanup preview`, `Reconcile previews`, and `Deploy preview`",
+      "no replay of the missed closed, push, ready, or scheduled events",
+      "If the activation production run fails",
+      "Do not rerun the failed workflow",
+      "fresh immutable activation PR with a new attempt number",
+    ]) {
+      const currentIndex = activation.indexOf(orderedRequirement);
+      expect(currentIndex, orderedRequirement).toBeGreaterThan(previousIndex);
+      previousIndex = currentIndex;
+    }
+
+    expect(activation).toContain(
+      "<!-- platform-production-activation-v1 platform-sha=<40hex> cutover-tree=<40hex> phase=<phase-a-or-phase-b> attempt=<positive-decimal> -->",
+    );
+    expect(activation).toContain("with no other content, path, or mode change");
+    expect(activation).toContain("This active-only section selects the literal `phase-a`");
+    expect(activation).toContain("Phase B step 4 selects the literal `phase-b`");
+    expect(activation).toContain("that phase's protected-result receipt `consumerTreeSha`");
+    expect(activation).toContain("every Dockerfile, build input, and effective image context");
+    expect(activation).toContain(
+      '{enabled:true,allowed_actions:"selected",sha_pinning_required:true}',
+    );
+    expect(activation).toContain(
+      "forbid `synchronize`, `reopened`, `ready_for_review`, and `converted_to_draft`",
+    );
+
+    expect(productionCaller).toContain("on:\n  push:");
+    expect(productionCaller).not.toContain("workflow_dispatch:");
+    expect(productionCaller).toContain("  deploy:\n    needs: infrastructure");
+    for (const event of [
+      "opened",
+      "synchronize",
+      "reopened",
+      "ready_for_review",
+      "converted_to_draft",
+    ]) {
+      expect(deployPreview).toContain(`      - ${event}`);
+    }
+    const invalidateJob = deployPreview.slice(
+      deployPreview.indexOf("  invalidate:"),
+      deployPreview.indexOf("  deploy:"),
+    );
+    expect(invalidateJob).toContain("github.event.action == 'synchronize'");
+    expect(invalidateJob).toContain("github.event.action == 'converted_to_draft'");
+    expect(invalidateJob).toContain("id-token: write");
+    expect(deployPreview).toContain("github.event.pull_request.draft == false");
+    expect(cleanupPreview).toContain("pull_request_target:");
+    expect(cleanupPreview).toContain("      - closed");
+    expect(reconcilePreviews).toContain("  push:");
+    expect(reconcilePreviews).toContain("schedule:");
+    expect(reconcilePreviews).toContain("cron: '17 * * * *'");
+    expect(dockerignore.split("\n")).toContain("README.md");
+
+    const convergence = infrastructureWorkflow.slice(
+      infrastructureWorkflow.indexOf("- name: Require production infrastructure to be converged"),
+      infrastructureWorkflow.indexOf("- name: Require coherent controller-owned preview exposure"),
+    );
+    expect(convergence).toContain("-detailed-exitcode");
+    expect(convergence).toContain("Production infrastructure drift or a requested change exists.");
+    expect(convergence).toContain("exit 1");
+
+    const exposureGate = infrastructureWorkflow.slice(
+      infrastructureWorkflow.indexOf("- name: Require coherent controller-owned preview exposure"),
+    );
+    expect(exposureGate).toContain("def exact_public_terraform_bootstrap:");
+    expect(exposureGate).toContain(
+      "us-docker.pkg.dev/cloudrun/container/hello@sha256:9a0e9a5c7a19281e7617991d2fc61809de4973e6e75a10b2f07df3719ffda33c",
+    );
+    expect(exposureGate).toContain('"managed-by":"terraform"');
+    expect(exposureGate).toContain(
+      'serviceAccount:"cloud-run-preview@\\($project).iam.gserviceaccount.com"',
+    );
+    expect(exposureGate).toContain(
+      '.traffic == [{type:"TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST",percent:100}]',
+    );
+    expect(exposureGate).toContain("if ($tags | length) == 0 then");
+    expect(exposureGate).toContain("exact_public_terraform_bootstrap)");
+
+    const parityIndex = reusableDeployProduction.indexOf(
+      "- name: Refuse production if any live preview has different or unknown DHI lineage",
+    );
+    const epochPrepareIndex = reusableDeployProduction.indexOf(
+      "- name: Use the same-DHI fast path or durably seal and prune the preview epoch",
+    );
+    const productionDeployIndex = reusableDeployProduction.indexOf(
+      "- name: Deploy production to Cloud Run",
+    );
+    expect(parityIndex).toBeGreaterThan(-1);
+    expect(
+      reusableDeployProduction.slice(
+        parityIndex,
+        reusableDeployProduction.indexOf("- name:", parityIndex + 8),
+      ),
+    ).toContain("continue-on-error: true");
+    expect(epochPrepareIndex).toBeGreaterThan(parityIndex);
+    expect(productionDeployIndex).toBeGreaterThan(epochPrepareIndex);
+
+    const previewResource = cloudRunModule.slice(
+      cloudRunModule.indexOf('resource "google_cloud_run_v2_service" "preview"'),
+      cloudRunModule.indexOf('resource "google_cloud_run_v2_service_iam_member" "preview_deploy"'),
+    );
+    expect(previewResource).toContain('ingress              = "INGRESS_TRAFFIC_INTERNAL_ONLY"');
+    expect(previewResource).toContain("# The serialized preview controller owns these two top-level fields.");
+    expect(previewResource).toContain("      ingress,");
+    expect(previewResource).toContain("      invoker_iam_disabled,");
+    const normalizedExposureReadme = exposureReadme.replace(/\s+/g, " ");
+    expect(normalizedExposureReadme).toContain(
+      "existing public preview ingress through the protected production apply",
+    );
+    expect(normalizedExposureReadme).toContain(
+      "durably seal the zero-tag bootstrap to internal-only before deployment",
+    );
+
+    const criticalSequence = rolloutSource
+      .slice(
+        rolloutSource.indexOf("10. Keep consumer Actions disabled"),
+        rolloutSource.indexOf("11. Reconciliation must continue"),
+      )
+      .replace(/\s+/g, " ");
+    previousIndex = -1;
+    for (const orderedRequirement of [
+      "all four bootstrap result receipts exist",
+      "protected production plans for cdbentley, Runsetta, and Health/Medlock",
+      "protected exposure/load-balancer apply and missing-tag 404 proof",
+      "plan and apply its protected production root before activation",
+      "leave the existing public, zero-tag bootstrap exposure byte-for-byte unchanged",
+      "production convergence plan is empty",
+      "prerequisite infrastructure exposure proof may admit the public zero-tag state only",
+      "immutable Google hello-image digest exactly equal the Terraform bootstrap object",
+      "immediately following epoch-prepare controller",
+      "push-only new-SHA production run to finish",
+      "replace the sealed bootstrap with the sanitized production-DHI baseline",
+      "create the live preview canary",
+      "stable tagged URL healthy",
+      "globally disable and drain Critical History again",
+      "protected production plan to remain empty",
+      "no second apply is expected",
+      "Re-enable Critical only with the exact two-PUT selected/SHA-only policy",
+      "one reviewed synchronization of the still-open canary",
+      "invalidation and redeploy to succeed through the restricted frontend",
+      "fresh activation PRs for cdbentley, Runsetta, and Health/Medlock",
+    ]) {
+      const currentIndex = criticalSequence.indexOf(orderedRequirement);
+      expect(currentIndex, orderedRequirement).toBeGreaterThan(previousIndex);
+      previousIndex = currentIndex;
+    }
+
+    const phaseB = rolloutSource
+      .slice(rolloutSource.indexOf("## Phase B"))
+      .replace(/\s+/g, " ");
+    expect(phaseB).toContain("phase=phase-b");
+    expect(phaseB).toContain("new phase-B production push");
+    expect(phaseB).toContain("never rerun a phase-A run or add a dispatch trigger");
+    expect(phaseB).toContain("four immutable successful phase-B result receipts");
+    expect(phaseB).toContain("Activate all four consumers serially");
+    expect(phaseB).toContain("Globally disable and drain that repository");
+
+    const packageVersion = (JSON.parse(packageSource) as { version: string }).version;
+    expect(readme).toContain(`Release \`${packageVersion}\``);
+    expect(readme).toContain(`gh release create v${packageVersion} --target`);
   });
 
   test("invocation requires exact immutable owner and repository identities", () => {
