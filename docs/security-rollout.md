@@ -30,7 +30,22 @@ use a two-SHA transition at all and follows the disabled-Actions active-only
 protocol below. Production forbids both
 migration controls. Its protected environment contains one
 fresh Google user OAuth access token, never a refresh token or service-account
-key, plus a fine-grained GitHub token with repository **Actions: read** and
+key. Before creating any temporary IAM artifact, the controller introspects
+Google's documented subject, `exp`, `expires_in`, and scope metadata, requires
+the exact owner subject, and rejects a token that cannot cover the bounded
+bridge, same-job reserve, and one-minute margin;
+replace the protected-environment secret immediately before every dispatch.
+GitHub queue delay is not bounded by job timeouts, so each recovery entry
+independently requires fourteen minutes of remaining token lifetime. A delayed
+fallback fails closed before mutation; the temporary leases independently
+expire on their bound. If automatic fresh-runner recovery rejects a stale
+token, do not immediately start a normal dispatch: wait at least 55 minutes
+after the failed workflow completes, exceeding both the 54-minute conditioned
+lease and 30-minute executor-token lifetimes, then replace the environment
+secret and issue a new attempt-1 owner dispatch. Any unseen residue is inert by
+then, and startup removes visible reserved artifacts before creating new
+authority.
+The environment also contains a fine-grained GitHub token with repository **Actions: read** and
 **Administration: read** for the four consumers. Keep all four consumers'
 Actions disabled: the bridge verifies
 that setting, their numeric repository identities, and the absence of active
@@ -133,7 +148,7 @@ malicious provider. The exact verified provider binary is therefore an explicit
 cryptographic trust boundary, followed by a zero-diff post-apply plan and live
 policy/permission cleanup proofs.
 
-The executor receives a 47-minute conditioned lease, safely beyond the 35-minute
+The executor receives a 54-minute conditioned lease, safely beyond the 41-minute
 job timeout, while a 24-minute internal deadline leaves a reserved cleanup
 window. Apply refuses before consuming/elevating unless at least 15 minutes
 remain, reserving seven minutes for the post-WIF drain and eight for bounded

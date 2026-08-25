@@ -33,12 +33,12 @@ const GOOGLE_PROVIDER_LINUX_AMD64_ZH =
   "fb1b9d1ea7bc79b7409f02aa7c19ba39afa22dbead69e83ae7eb2691ac5c2426";
 const GOOGLE_PROVIDER_BINARY = "terraform-provider-google_v7.45.0_x5";
 const PLAN_FORMAT_VERSION = "1.2";
-const JOB_TIMEOUT_MINUTES = 43;
+const JOB_TIMEOUT_MINUTES = 41;
 const MAIN_STEP_TIMEOUT_MINUTES = 26;
 const LEASE_MINUTES = 54;
 const INTERNAL_OPERATION_MINUTES = 24;
 const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;
-const RECOVERY_STABLE_EMPTY_MINUTES = 5;
+const RECOVERY_STABLE_EMPTY_MINUTES = 3;
 const RECOVERY_SCAN_INTERVAL_MINUTES = 1;
 const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
   RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_INTERVAL_MINUTES;
@@ -77,13 +77,20 @@ const ORPHAN_FENCE_DESCRIPTION =
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
 const MAX_STORAGE_PERMISSION_RPC_BYTES = 64 * 1024;
 const STORAGE_PERMISSION_RPC_TIMEOUT_MS = 15_000;
+const GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
+const GOOGLE_OWNER_TOKENINFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo";
+const GOOGLE_OWNER_SUBJECT_ID = "100549777206682928323";
+const GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS = 3_600;
+const OWNER_TOKEN_EXPIRY_MARGIN_SECONDS = 60;
 const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
 // Google documents that a newly created service account can take 60 seconds or
 // more to become visible, policy changes can take 7 minutes or longer to
 // propagate, and its CI retry guidance allows a 300-second 404 convergence
-// deadline. Recovery reserves the documented seven-minute horizon, then a full
-// five-minute stable-empty proof, plus one scan interval so the boundary scan
-// can run before the operation deadline.
+// example. No finite interval is an absence guarantee. This bounded recovery
+// policy observes seven minutes, then requires four clean inventories spanning
+// three additional minutes; every artifact, failed read, or masking transition
+// resets that corroborating proof. Token checks also reserve the reviewed job
+// envelopes, while each recovery entry independently fails closed on freshness.
 const RECOVERY_STABLE_EMPTY_MS = RECOVERY_STABLE_EMPTY_MINUTES * 60_000;
 const RECOVERY_STABLE_EMPTY_INTERVAL_MS = RECOVERY_SCAN_INTERVAL_MINUTES * 60_000;
 const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
@@ -2865,6 +2872,13 @@ function defaultBridgeDependencies(
     prepare: async (invocation, operationDeadlineMs) => {
       apiDeadlineMs = operationDeadlineMs;
       assertBeforeDeadline(Date.now(), operationDeadlineMs, "source preparation");
+      await requireFreshGoogleOwnerAccessToken(
+        invocation.ownerAccessToken,
+        invocation.operationBudgetSeconds +
+          MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +
+          OWNER_TOKEN_EXPIRY_MARGIN_SECONDS,
+        api,
+      );
       const contract = REPOSITORIES[invocation.repository];
       await Promise.all([
         requireRealDirectory(invocation.platformRoot, "platform root"),
@@ -3031,6 +3045,11 @@ function defaultRecoveryDependencies(): RecoveryDependencies {
       );
     },
     verifySource: async (invocation) => {
+      await requireFreshGoogleOwnerAccessToken(
+        invocation.ownerAccessToken,
+        RECOVERY_STEP_TIMEOUT_MINUTES * 60 + OWNER_TOKEN_EXPIRY_MARGIN_SECONDS,
+        api,
+      );
       await Promise.all([
         requireRealDirectory(invocation.platformRoot, "recovery platform root"),
         requireRealDirectory(invocation.runnerTemp, "recovery runner temp"),
@@ -4776,7 +4795,7 @@ export async function recoverBridgeArtifactsUntilStable(
         emptySinceMs === undefined
       ) {
         // This scan's final proof is clean, so it may begin (or reset) the
-        // five-minute absence window even when the same scan contained an
+        // three-minute absence window even when the same scan contained an
         // artifact or first lost exact-resource visibility. It can never reuse
         // absence time from before either observation.
         emptySinceMs = scanCompletedAtMs;
@@ -7210,16 +7229,11 @@ function validateResumableSessionUri(
     throw new Error("Storage create probe returned an invalid session URI.");
   }
   const keys = [...url.searchParams.keys()];
-  if ((keys.length !== 3 && keys.length !== 4) || new Set(keys).size !== keys.length ||
+  if (keys.length !== 3 || new Set(keys).size !== keys.length ||
     !keys.includes("uploadType") || !keys.includes("name") || !keys.includes("upload_id") ||
-    keys.some((key) =>
-      key !== "uploadType" && key !== "name" && key !== "upload_id" &&
-      key !== "ifGenerationMatch"
-    ) ||
+    keys.some((key) => key !== "uploadType" && key !== "name" && key !== "upload_id") ||
     url.searchParams.get("uploadType") !== "resumable" ||
-    url.searchParams.get("name") !== objectName ||
-    (url.searchParams.has("ifGenerationMatch") &&
-      url.searchParams.get("ifGenerationMatch") !== "0")) {
+    url.searchParams.get("name") !== objectName) {
     throw new Error("Storage create probe returned an invalid session URI.");
   }
   const uploadId = url.searchParams.get("upload_id") ?? "";
@@ -7242,7 +7256,6 @@ export async function probeStorageObjectCreatePermission(
   const url = new URL(
     `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(request.bucket)}/o`,
   );
-  url.searchParams.set("ifGenerationMatch", "0");
   url.searchParams.set("name", request.objectName);
   url.searchParams.set("uploadType", "resumable");
   let response: Response;
@@ -7272,10 +7285,6 @@ export async function probeStorageObjectCreatePermission(
     throw initiationBodyError;
   }
   if (response.status === 401 || response.status === 403) return false;
-  // Cloud Storage checks authorization before its generation precondition. A
-  // 412 therefore proves create authorization while guaranteeing no object or
-  // resumable session was created.
-  if (response.status === 412) return true;
   if (response.status !== 200) {
     throw new Error(`Storage create probe failed with HTTP ${response.status}.`);
   }
@@ -7292,9 +7301,12 @@ export async function probeStorageObjectCreatePermission(
   } catch {
     throw new Error("Storage create probe cancellation transport failed.");
   }
-  let cancellationBody: string;
+  // Google's status reference says 499 has no body, but the live JSON endpoint
+  // returned one in the protected canary. Treat the exact validated-session
+  // status as authoritative, consume the compatibility payload, and reject it
+  // above the accepted size bound without depending on undocumented bytes.
   try {
-    cancellationBody = await boundedText(cancellation, 16 * 1024);
+    await boundedText(cancellation, 16 * 1024);
   } catch (error) {
     throw error instanceof Error && error.message === "API response exceeded its bound."
       ? new Error("Storage create probe cancellation response body exceeded its bound.")
@@ -7305,9 +7317,6 @@ export async function probeStorageObjectCreatePermission(
     throw new Error(
       `Storage create probe cancellation failed with HTTP ${cancellation.status}.`,
     );
-  }
-  if (cancellationBody !== "") {
-    throw new Error("Storage create probe cancellation returned an unexpected response body.");
   }
   if (initiationBodyError !== undefined) throw initiationBodyError;
   if (initiationBody !== "") {
@@ -8022,6 +8031,97 @@ async function boundedText(response: Response, maximumBytes: number): Promise<st
   const value = await response.text();
   if (Buffer.byteLength(value) > maximumBytes) throw new Error("API response exceeded its bound.");
   return value;
+}
+
+export async function requireFreshGoogleOwnerAccessToken(
+  accessToken: string,
+  minimumRemainingSeconds: number,
+  fetcher: Fetcher,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  secretValue(accessToken, "owner OAuth access token");
+  if (
+    !Number.isSafeInteger(minimumRemainingSeconds) ||
+    minimumRemainingSeconds < 1 ||
+    minimumRemainingSeconds > GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS
+  ) {
+    throw new Error("Owner OAuth access-token lifetime requirement escaped its bound.");
+  }
+  if (!Number.isFinite(nowMs) || nowMs < 0) {
+    throw new Error("Owner OAuth access-token validation time was invalid.");
+  }
+
+  // Google documents user access tokens as opaque and introspectable at this
+  // endpoint. Its official Node auth library sends the token in a Bearer
+  // header on a POST, avoiding a bearer-bearing URL that intermediaries can
+  // retain. Fail before creating any temporary IAM artifact when the token
+  // cannot cover the protected and recovery job envelopes.
+  let response: Response;
+  try {
+    response = await fetcher(GOOGLE_OWNER_TOKENINFO_ENDPOINT, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+      },
+    });
+  } catch {
+    throw new Error("Google owner OAuth access-token introspection failed.");
+  }
+  let raw: string;
+  try {
+    raw = await boundedText(response, 16 * 1024);
+  } catch {
+    throw new Error("Google owner OAuth access-token metadata exceeded its bound.");
+  }
+  if (!response.ok) {
+    throw new Error("Google owner OAuth access token was rejected.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error("Google owner OAuth access-token metadata was malformed.");
+  }
+  const metadata = record(parsed, "Google owner OAuth access-token metadata");
+  const exp = metadata.exp;
+  const expiresIn = metadata.expires_in;
+  const scope = metadata.scope;
+  const subject = metadata.sub;
+  if (
+    typeof exp !== "string" || !/^[1-9][0-9]*$/.test(exp) ||
+    typeof expiresIn !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(expiresIn) ||
+    typeof scope !== "string" || typeof subject !== "string" ||
+    !/^[1-9][0-9]*$/.test(subject)
+  ) {
+    throw new Error("Google owner OAuth access-token metadata was malformed.");
+  }
+  if (subject !== GOOGLE_OWNER_SUBJECT_ID) {
+    throw new Error("Google owner OAuth access token does not authenticate the exact owner.");
+  }
+  const expiryEpochSeconds = Number(exp);
+  const reportedRemainingSeconds = Number(expiresIn);
+  const observedRemainingSeconds = expiryEpochSeconds - Math.floor(nowMs / 1_000);
+  if (
+    !Number.isSafeInteger(expiryEpochSeconds) ||
+    !Number.isSafeInteger(reportedRemainingSeconds) ||
+    reportedRemainingSeconds > GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS
+  ) {
+    throw new Error("Google owner OAuth access-token metadata was inconsistent.");
+  }
+  const scopes = scope.split(" ").filter((value) => value !== "");
+  if (new Set(scopes).size !== scopes.length || !scopes.includes(GOOGLE_CLOUD_PLATFORM_SCOPE)) {
+    throw new Error("Google owner OAuth access token lacks the cloud-platform scope.");
+  }
+  if (
+    observedRemainingSeconds < minimumRemainingSeconds ||
+    reportedRemainingSeconds < minimumRemainingSeconds
+  ) {
+    throw new Error(
+      "Google owner OAuth access token is too close to expiry; replace the protected-environment secret immediately before dispatch.",
+    );
+  }
 }
 
 export function deadlineFetcher(
