@@ -646,13 +646,17 @@ jobs:
           owner_token="$OWNER_OAUTH_ACCESS_TOKEN"
           unset OWNER_OAUTH_ACCESS_TOKEN
           export -n owner_token
+          # Bun's Linux parent-death guard follows the thread that forked it.
+          # Keep a dedicated single-threaded parent alive instead of binding it
+          # directly to a transient GitHub Runner.Worker launch thread.
           shopt -s lastpipe
           {
             printf '%s\0' "$owner_token"
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/env -i \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \
+            /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \
             GITHUB_REF_EXACT="$GITHUB_REF_EXACT" \
@@ -800,13 +804,17 @@ jobs:
           owner_token="$OWNER_OAUTH_ACCESS_TOKEN"
           unset OWNER_OAUTH_ACCESS_TOKEN
           export -n owner_token
+          # Bun's Linux parent-death guard follows the thread that forked it.
+          # Keep a dedicated single-threaded parent alive instead of binding it
+          # directly to a transient GitHub Runner.Worker launch thread.
           shopt -s lastpipe
           {
             printf '%s\0' "$owner_token"
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/env -i \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \
+            /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \
             GITHUB_REF_EXACT="$GITHUB_REF_EXACT" \

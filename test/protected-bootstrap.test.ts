@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { connect as connectHttp2, createServer as createHttp2Server } from "node:http2";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -18,7 +19,9 @@ import {
   canonicalJson,
   consumePlanReceipt,
   deadlineFetcher,
+  decodeStorageTestIamPermissionsResponse,
   deterministicArtifactHex,
+  encodeStorageTestIamPermissionsRequest,
   ExecutorLeaseManager,
   executorControlPermissions,
   fencePolicyMutations,
@@ -30,6 +33,8 @@ import {
   publishPostApplyReceipt,
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
+  probeStorageObjectCreatePermission,
+  probeStorageObjectPermissions,
   randomExecutorAccountId,
   randomExecutorRoleId,
   readConsumerWorkflowPin,
@@ -43,6 +48,7 @@ import {
   requireSameDhiTransitionCapability,
   runProtectedBootstrap,
   runProtectedRecovery,
+  storageV2TestIamPermissions,
   TerraformSandboxExecutor,
   validateInvocation,
   validateRecoveryInvocation,
@@ -63,6 +69,7 @@ import {
   type PreparationResult,
   type RecoveryDependencies,
   type RecoveryInvocation,
+  type StateStoragePermissionProbes,
   type TerraformSandboxDriver,
   type TerraformSandboxSpec,
 } from "../tools/ci/protected-bootstrap-bridge.ts";
@@ -116,7 +123,7 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(workflow).toContain("TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}");
     expect(workflow).toContain("PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}");
-    expect(workflow).toContain("exec /usr/bin/env -i");
+    expect(workflow).toContain("/usr/bin/env -i");
     expect(workflow.match(/OWNER_OAUTH_ACCESS_TOKEN: \$\{\{ secrets\.OWNER_OAUTH_ACCESS_TOKEN \}\}/g)).toHaveLength(
       3,
     );
@@ -148,6 +155,32 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(workflow).toContain('test "$bridge_budget_seconds" -le 1560');
     expect(workflow.match(/timeout-minutes: 15/g)).toHaveLength(2);
+    const recoveryBlocks = [
+      workflow.slice(
+        workflow.indexOf("- name: Recover exact IAM artifacts after bridge failure"),
+        workflow.indexOf("  owner-terraform-recovery:"),
+      ),
+      workflow.slice(
+        workflow.indexOf("- name: Recover exact IAM artifacts on a fresh runner"),
+      ),
+    ];
+    for (const recoveryBlock of recoveryBlocks) {
+      expect(recoveryBlock).toContain("timeout-minutes: 15");
+      expect(recoveryBlock).toContain(
+        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \\\n" +
+          "            /usr/bin/env -i \\",
+      );
+      expect(recoveryBlock).not.toContain("} | \\\n          exec /usr/bin/env -i");
+      expect(recoveryBlock).toContain("--no-env-file --no-orphans");
+    }
+    const recoveryInternalDeadlineSeconds = (1 + 7 + 5 + 1) * 60;
+    const recoveryWrapperSeconds = 855;
+    const recoveryKillAfterSeconds = 15;
+    const recoveryActionsStepSeconds = 15 * 60;
+    expect(recoveryWrapperSeconds).toBeGreaterThan(recoveryInternalDeadlineSeconds);
+    expect(recoveryWrapperSeconds + recoveryKillAfterSeconds).toBeLessThan(
+      recoveryActionsStepSeconds,
+    );
     expect(workflow).toContain(
       "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
         "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
@@ -1714,6 +1747,97 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.now() - startedAt).toBe(12 * 60_000);
   });
 
+  test("post-delete exact-email 403s require clean global scans and the full absence proof", async () => {
+    const fixture = deterministicRecoveryHarness({ postDeleteMasked403: true });
+    const first = await inventoryBridgeArtifacts(
+      "cdbentley",
+      fixture.invocation.ownerAccessToken,
+      fixture.fetcher,
+      fixture.sleep,
+      fixture.now() + 13 * 60_000,
+      fixture.invocation,
+    );
+    expect(first.exactAccountAbsentOrDenied).toBeTrue();
+    expect(first.hadActiveArtifacts).toBeFalse();
+
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 13 * 60_000,
+      fixture.now,
+    );
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.callCount("deterministic-email-disable-403")).toBeGreaterThan(0);
+    expect(fixture.callCount("deterministic-account-403")).toBeGreaterThan(0);
+    expect(fixture.callCount("executor-policy-403")).toBeGreaterThan(0);
+    expect(fixture.callCount("empty-account-list")).toBeGreaterThan(0);
+    expect(fixture.callCount("target-project-policy-get")).toBeGreaterThan(0);
+    expect(fixture.callCount("project-policy-get")).toBeGreaterThan(0);
+    expect(fixture.callCount("runtime-policy-get")).toBeGreaterThan(0);
+  });
+
+  test("a delayed live identity cannot turn an exact-email 403 into successful containment", async () => {
+    const fixture = deterministicRecoveryHarness({
+      emailDisableFailureStatus: 403,
+      numericDisableFailureStatus: 403,
+      postDeleteMasked403: true,
+      revealAccountOnScan: 2,
+    });
+    await expect(recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      fixture.now() + 13 * 60_000,
+      fixture.now,
+    )).rejects.toThrow("orphan containment was incomplete; manual cleanup is required");
+    expect(fixture.callCount("deterministic-email-disable-403")).toBeGreaterThan(1);
+    expect(fixture.callCount("numeric-id-disable")).toBeGreaterThan(0);
+    expect(fixture.account.disabled).toBeFalse();
+  });
+
+  test("a late exact-email 403 resets rather than inherits prior 404 proof time", async () => {
+    const fixture = deterministicRecoveryHarness({
+      postDeleteMasked403: true,
+      postDeleteMasked403StartScan: 13,
+    });
+    const startedAt = fixture.now();
+    await expect(recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 13 * 60_000,
+      fixture.now,
+    )).rejects.toThrow(
+      "did not observe the required stable-empty artifact inventory before its deadline",
+    );
+    expect(fixture.callCount("deterministic-email-disable-403")).toBe(1);
+    expect(fixture.now() - startedAt).toBe(13 * 60_000);
+  });
+
+  test("post-delete masking never relaxes global-list or policy 403s", async () => {
+    for (const [options, tag, message] of [
+      [{ accountListFailureStatus: 403 }, "account-list-403", "Executor inventory failed with HTTP 403"],
+      [{ runtimePolicyFailureStatus: 403 }, "runtime-policy-403", "Deterministic executor policy recovery was incomplete"],
+      [{ targetProjectPolicyFailureStatus: 403 }, "target-project-policy-403", "Deterministic executor policy recovery was incomplete"],
+    ] as const) {
+      const fixture = deterministicRecoveryHarness({
+        postDeleteMasked403: true,
+        ...options,
+      });
+      await expect(recoverBridgeArtifactsUntilStable(
+        fixture.invocation,
+        fixture.fetcher,
+        fixture.sleep,
+        fixture.now() + 13 * 60_000,
+        fixture.now,
+      )).rejects.toThrow(message);
+      expect(fixture.callCount(tag)).toBeGreaterThan(0);
+      expect(fixture.callCount("sleep")).toBe(0);
+    }
+  });
+
   test("the production recovery budget proves 300 stable seconds after a second-scan artifact", async () => {
     const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 2 });
     const startedAt = fixture.now();
@@ -2168,34 +2292,37 @@ describe("protected owner Terraform bridge", () => {
     expect(requestedPages).toEqual([1, 2]);
   });
 
-  test("state validation uses only testIamPermissions and never reads or writes state objects", async () => {
+  test("state validation uses the exact gRPC/create probes and never reads or writes object bytes", async () => {
     const invocation = validateInvocation(validEnvironment());
     const requests: Array<{ method: string; url: string }> = [];
-    const returnedPermissions = new Map<string, readonly string[]>();
+    const objectRequests: Array<{
+      create: boolean;
+      permissions: readonly string[];
+      resource: string;
+    }> = [];
     let granted = true;
     const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input);
       requests.push({ method: init?.method ?? "GET", url });
-      if (!url.includes("testIamPermissions") && !url.includes("iam/testPermissions")) {
-        return new Response("", { status: 500 });
-      }
-      const requested = url.includes("storage/v2/")
-        ? (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions
-        : new URL(url).searchParams.getAll("permissions");
-      const decoded = decodeURIComponent(url);
-      const permissions = !granted
-        ? []
-        : decoded.includes("/.protected-bootstrap/plans/")
-        ? requested.filter((permission) =>
-            permission === "storage.objects.create" || permission === "storage.objects.get"
-          )
-        : decoded.includes("default.tfstate")
-        ? requested.filter((permission) => permission === "storage.objects.get")
-        : decoded.includes("default.tflock")
-        ? []
-        : requested;
-      if (granted) returnedPermissions.set(decoded, permissions);
-      return Response.json({ permissions });
+      expect(url).toContain("iam/testPermissions");
+      return Response.json({ permissions: granted ? new URL(url).searchParams.getAll("permissions") : [] });
+    };
+    const probes: StateStoragePermissionProbes = {
+      testObjectCreate: async ({ objectName }) => {
+        const allowed = granted && objectName.includes("/.protected-bootstrap/plans/");
+        objectRequests.push({ create: allowed, permissions: [], resource: objectName });
+        return allowed;
+      },
+      testObjectPermissions: async ({ permissions, resource }) => {
+        const returned = !granted
+          ? []
+          : resource.includes("/.protected-bootstrap/plans/") ||
+              resource.endsWith("default.tfstate")
+          ? permissions.filter((permission) => permission === "storage.objects.get")
+          : [];
+        objectRequests.push({ create: false, permissions: returned, resource });
+        return { denied: false, permissions: returned };
+      },
     };
     const state = {
       bucket: "cdbentley-tfstate-882468538648-bootstrap",
@@ -2208,6 +2335,7 @@ describe("protected owner Terraform bridge", () => {
       "read",
       fetcher,
       async () => undefined,
+      probes,
     );
     granted = false;
     await waitForStatePermissions(
@@ -2217,21 +2345,417 @@ describe("protected owner Terraform bridge", () => {
       "none",
       fetcher,
       async () => undefined,
+      probes,
     );
-    expect(
-      requests.every((request) =>
-        request.url.includes("testIamPermissions") || request.url.includes("iam/testPermissions")
-      ),
-    ).toBeTrue();
+    expect(requests.every((request) => request.url.includes("iam/testPermissions"))).toBeTrue();
+    expect(requests.every((request) => request.method === "GET")).toBeTrue();
     expect(requests.some((request) => request.url.includes("alt=media"))).toBeFalse();
-    expect(requests.some((request) => request.url.includes("default.tfstate"))).toBeTrue();
-    const planGrant = [...returnedPermissions.entries()].find(([url]) =>
-      url.includes("/.protected-bootstrap/plans/")
-    )?.[1];
-    expect(planGrant).toContain("storage.objects.create");
-    expect(planGrant).toContain("storage.objects.get");
-    expect(planGrant).not.toContain("storage.objects.delete");
-    expect(planGrant).not.toContain("storage.objects.update");
+    expect(requests.some((request) => request.url.includes("storage/v2"))).toBeFalse();
+    const planPermissionGrant = objectRequests.find((request) =>
+      request.resource.includes("/.protected-bootstrap/plans/") &&
+      request.permissions.length > 0
+    );
+    const planCreateGrant = objectRequests.find((request) =>
+      request.resource.includes("/.protected-bootstrap/plans/") && request.create
+    );
+    expect(planPermissionGrant?.permissions).toEqual(["storage.objects.get"]);
+    expect(planCreateGrant?.create).toBeTrue();
+  });
+
+  test("state validation treats gRPC credential denial as absence only for the no-access proof", async () => {
+    const invocation = validateInvocation(validEnvironment());
+    const state = {
+      bucket: "cdbentley-tfstate-882468538648-bootstrap",
+      prefix: "cdbentley/bootstrap",
+    };
+    const grantedBucketFetcher = async (input: string | URL | Request): Promise<Response> => {
+      const requested = new URL(String(input)).searchParams.getAll("permissions");
+      return Response.json({ kind: "storage#testIamPermissionsResponse", permissions: requested });
+    };
+    const deniedBucketFetcher = async (): Promise<Response> => new Response("", { status: 403 });
+    const denied: StateStoragePermissionProbes = {
+      testObjectCreate: async () => false,
+      testObjectPermissions: async () => ({ denied: true, permissions: [] }),
+    };
+    await waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "none",
+      deniedBucketFetcher,
+      async () => undefined,
+      denied,
+    );
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      grantedBucketFetcher,
+      async () => undefined,
+      denied,
+    )).rejects.toThrow("denied the executor credential");
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "none",
+      deniedBucketFetcher,
+      async () => undefined,
+      {
+        ...denied,
+        testObjectPermissions: async () => ({
+          denied: true,
+          permissions: ["storage.objects.get"],
+        }),
+      },
+    )).rejects.toThrow("Denied storage object permission RPC returned permissions");
+  });
+
+  test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
+    expect(Buffer.from(encodeStorageTestIamPermissionsRequest("r", ["p"])).toString("hex"))
+      .toBe("0a0172120170");
+    const permission = Buffer.from("storage.objects.get", "utf8");
+    const valid = Buffer.concat([Buffer.from([0x0a, permission.length]), permission]);
+    expect(decodeStorageTestIamPermissionsResponse(valid)).toEqual(["storage.objects.get"]);
+    expect(() => decodeStorageTestIamPermissionsResponse(Buffer.from([0x12, 0x00])))
+      .toThrow("unexpected field");
+    expect(() => decodeStorageTestIamPermissionsResponse(Buffer.alloc(64 * 1024 + 1)))
+      .toThrow("bounded size");
+    expect(() => decodeStorageTestIamPermissionsResponse(Buffer.from([0x0a, 0x01, 0xff])))
+      .toThrow("invalid UTF-8");
+  });
+
+  test("Storage v2 permission RPC uses exact gRPC routing, framing, and trailers", async () => {
+    const server = createHttp2Server();
+    let observedHeaders: Record<string, unknown> | undefined;
+    let observedBody = Buffer.alloc(0);
+    server.on("stream", (stream, headers) => {
+      observedHeaders = headers;
+      const chunks: Buffer[] = [];
+      stream.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      stream.on("end", () => {
+        observedBody = Buffer.concat(chunks);
+        const permission = Buffer.from("storage.objects.get", "utf8");
+        const protobuf = Buffer.concat([Buffer.from([0x0a, permission.length]), permission]);
+        const frame = Buffer.alloc(5 + protobuf.length);
+        frame.writeUInt32BE(protobuf.length, 1);
+        frame.set(protobuf, 5);
+        stream.respond(
+          { ":status": 200, "content-type": "application/grpc" },
+          { waitForTrailers: true },
+        );
+        stream.on("wantTrailers", () => stream.sendTrailers({ "grpc-status": "0" }));
+        stream.end(frame);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    try {
+      const result = await storageV2TestIamPermissions(
+        {
+          bucketResource: "projects/_/buckets/example-bucket",
+          executorToken: "short-lived-executor-access-token-value",
+          permissions: ["storage.objects.get"],
+          resource: "projects/_/buckets/example-bucket/objects/exact/object",
+        },
+        {
+          connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+          timeoutMs: 1_000,
+        },
+      );
+      expect(result).toEqual(["storage.objects.get"]);
+      expect(observedHeaders?.[":path"]).toBe(
+        "/google.storage.v2.Storage/TestIamPermissions",
+      );
+      expect(observedHeaders?.["content-type"]).toBe("application/grpc");
+      expect(observedHeaders?.["te"]).toBe("trailers");
+      expect(observedHeaders?.["x-goog-request-params"]).toBe(
+        "bucket=projects%2F_%2Fbuckets%2Fexample-bucket",
+      );
+      expect(observedBody[0]).toBe(0);
+      expect(observedBody.readUInt32BE(1)).toBe(observedBody.length - 5);
+      expect(observedBody.toString("utf8", 5)).toContain(
+        "projects/_/buckets/example-bucket/objects/exact/object",
+      );
+      expect(observedBody.toString("utf8", 5)).toContain("storage.objects.get");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error === undefined ? resolve() : reject(error))
+      );
+    }
+  });
+
+  test("Storage v2 permission RPC bounds time and rejects malformed protocol without leaking causes", async () => {
+    const server = createHttp2Server();
+    server.on("stream", () => undefined);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    try {
+      await expect(storageV2TestIamPermissions(
+        {
+          bucketResource: "projects/_/buckets/example-bucket",
+          executorToken: "short-lived-executor-access-token-value",
+          permissions: ["storage.objects.get"],
+          resource: "projects/_/buckets/example-bucket/objects/exact/object",
+        },
+        {
+          connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+          timeoutMs: 20,
+        },
+      )).rejects.toThrow("timed out");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error === undefined ? resolve() : reject(error))
+      );
+    }
+    await expect(storageV2TestIamPermissions(
+      {
+        bucketResource: "projects/_/buckets/example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        permissions: ["storage.objects.get"],
+        resource: "projects/_/buckets/example-bucket/objects/exact/object",
+      },
+      { connect: () => { throw new Error("secret transport detail"); }, timeoutMs: 20 },
+    )).rejects.toThrow("transport failed");
+    await expect(storageV2TestIamPermissions(
+      {
+        bucketResource: "projects/_/buckets/example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        permissions: ["storage.objects.get"],
+        resource: "projects/_/buckets/example-bucket/objects/exact/object",
+      },
+      { connect: () => { throw new Error("secret transport detail"); }, timeoutMs: 20 },
+    )).rejects.not.toThrow("secret transport detail");
+  });
+
+  test("Storage v2 permission probing distinguishes credential denial from missing objects and malformed frames", async () => {
+    const server = createHttp2Server();
+    let mode: "compressed" | "not-found" | "oversized" | "permission-denied" | "unauthenticated" =
+      "permission-denied";
+    server.on("stream", (stream) => {
+      const status = mode === "permission-denied"
+        ? "7"
+        : mode === "unauthenticated"
+        ? "16"
+        : mode === "not-found"
+        ? "5"
+        : "0";
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+        "grpc-status": status,
+      });
+      if (mode === "compressed") stream.end(Buffer.from([1, 0, 0, 0, 0]));
+      else if (mode === "oversized") stream.end(Buffer.alloc(64 * 1024 + 6));
+      else stream.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    const request = {
+      bucketResource: "projects/_/buckets/example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      permissions: ["storage.objects.get"],
+      resource: "projects/_/buckets/example-bucket/objects/exact/object",
+    } as const;
+    const options = {
+      connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+      timeoutMs: 1_000,
+    } as const;
+    try {
+      expect(await probeStorageObjectPermissions(request, options)).toEqual({
+        denied: true,
+        permissions: [],
+      });
+      mode = "unauthenticated";
+      expect(await probeStorageObjectPermissions(request, options)).toEqual({
+        denied: true,
+        permissions: [],
+      });
+      mode = "not-found";
+      await expect(probeStorageObjectPermissions(request, options)).rejects.toThrow(
+        "gRPC status 5",
+      );
+      mode = "compressed";
+      await expect(storageV2TestIamPermissions(request, options)).rejects.toThrow(
+        "compression is not supported",
+      );
+      mode = "oversized";
+      await expect(storageV2TestIamPermissions(request, options)).rejects.toThrow(
+        "exceeded its bounded size",
+      );
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => error === undefined ? resolve() : reject(error))
+      );
+    }
+  });
+
+  test("exact create proof only initiates and cancels a validated resumable session", async () => {
+    const objectName = "cdbentley/bootstrap/.protected-bootstrap/plans/32894958492.json";
+    const session = new URL(
+      "https://storage.googleapis.com/upload/storage/v1/b/example-bucket/o",
+    );
+    session.searchParams.set("uploadType", "resumable");
+    session.searchParams.set("name", objectName);
+    session.searchParams.set("upload_id", "A".repeat(32));
+    session.searchParams.set("ifGenerationMatch", "0");
+    const requests: Array<{
+      body: BodyInit | null | undefined;
+      headers: Headers;
+      method: string;
+      url: string;
+    }> = [];
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      requests.push({
+        body: init?.body,
+        headers: new Headers(init?.headers),
+        method: init?.method ?? "GET",
+        url: String(input),
+      });
+      if (init?.method === "POST") {
+        return new Response("", { headers: { location: session.href }, status: 200 });
+      }
+      return new Response("", { status: 499 });
+    };
+    expect(await probeStorageObjectCreatePermission(
+      {
+        bucket: "example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        objectName,
+      },
+      fetcher,
+    )).toBeTrue();
+    expect(requests.map(({ method }) => method)).toEqual(["POST", "DELETE"]);
+    const initiation = new URL(requests[0]!.url);
+    expect(initiation.pathname).toBe("/upload/storage/v1/b/example-bucket/o");
+    expect(initiation.searchParams.get("uploadType")).toBe("resumable");
+    expect(initiation.searchParams.get("name")).toBe(objectName);
+    expect(initiation.searchParams.get("ifGenerationMatch")).toBe("0");
+    expect(requests[0]!.body).toBeUndefined();
+    expect(requests[0]!.headers.get("content-length")).toBe("0");
+    expect(requests[0]!.headers.get("content-type")).toBeNull();
+    expect(requests[0]!.headers.get("authorization")).toBe(
+      "Bearer short-lived-executor-access-token-value",
+    );
+    expect([...requests[0]!.headers.keys()]).toEqual(["authorization", "content-length"]);
+    expect(requests[1]!.body).toBeUndefined();
+    expect(requests[1]!.headers.get("content-length")).toBe("0");
+    expect(requests[1]!.headers.get("authorization")).toBeNull();
+  });
+
+  test("create proof distinguishes authorization, precondition, absence, and cleanup failure", async () => {
+    const request = {
+      bucket: "example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      objectName: "exact/object",
+    } as const;
+    for (const status of [401, 403]) {
+      const response = new Response("bounded diagnostic", { status });
+      expect(await probeStorageObjectCreatePermission(
+        request,
+        async () => response,
+      )).toBeFalse();
+      expect(response.bodyUsed).toBeTrue();
+    }
+    const precondition = new Response("bounded diagnostic", { status: 412 });
+    expect(await probeStorageObjectCreatePermission(
+      request,
+      async () => precondition,
+    )).toBeTrue();
+    expect(precondition.bodyUsed).toBeTrue();
+    const missing = new Response("bounded diagnostic", { status: 404 });
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async () => missing,
+    )).rejects.toThrow("HTTP 404");
+    expect(missing.bodyUsed).toBeTrue();
+    const session =
+      "https://storage.googleapis.com/upload/storage/v1/b/example-bucket/o" +
+      "?uploadType=resumable&name=exact%2Fobject&upload_id=" + "B".repeat(32);
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async (_input, init) => init?.method === "POST"
+        ? new Response("", { headers: { location: session }, status: 200 })
+        : new Response("", { status: 500 }),
+    )).rejects.toThrow("cancellation failed with HTTP 500");
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async () => { throw new Error(`secret ${session}`); },
+    )).rejects.toThrow("transport failed");
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async () => { throw new Error(`secret ${session}`); },
+    )).rejects.not.toThrow(session);
+    let unexpectedInitiationCalls = 0;
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async (_input, init) => {
+        unexpectedInitiationCalls += 1;
+        return init?.method === "POST"
+          ? new Response("unexpected", { headers: { location: session }, status: 200 })
+          : new Response("", { status: 499 });
+      },
+    )).rejects.toThrow("unexpected response body");
+    expect(unexpectedInitiationCalls).toBe(2);
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async (_input, init) => init?.method === "POST"
+        ? new Response("", { headers: { location: session }, status: 200 })
+        : new Response("unexpected", { status: 499 }),
+    )).rejects.toThrow("cancellation returned an unexpected response body");
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async () => new Response("x".repeat(16 * 1024 + 1), { status: 403 }),
+    )).rejects.toThrow("exceeded its bound");
+    let oversizedInitiationCalls = 0;
+    await expect(probeStorageObjectCreatePermission(
+      request,
+      async (_input, init) => {
+        oversizedInitiationCalls += 1;
+        return init?.method === "POST"
+          ? new Response("x".repeat(16 * 1024 + 1), {
+              headers: { location: session },
+              status: 200,
+            })
+          : new Response("", { status: 499 });
+      },
+    )).rejects.toThrow("exceeded its bound");
+    expect(oversizedInitiationCalls).toBe(2);
+  });
+
+  test("create proof rejects every session URI that is not exactly target-bound", async () => {
+    const request = {
+      bucket: "example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      objectName: "exact/object",
+    } as const;
+    const valid = new URL("https://storage.googleapis.com/upload/storage/v1/b/example-bucket/o");
+    valid.searchParams.set("uploadType", "resumable");
+    valid.searchParams.set("name", request.objectName);
+    valid.searchParams.set("upload_id", "C".repeat(32));
+    const invalidSessions = [
+      valid.href.replace("storage.googleapis.com", "attacker.example"),
+      `${valid.href}&upload_id=${"D".repeat(32)}`,
+      `${valid.href}&unexpected=value`,
+      valid.href.replace("name=exact%2Fobject&", ""),
+      `${valid.href}&ifGenerationMatch=1`,
+    ];
+    for (const invalidSession of invalidSessions) {
+      let calls = 0;
+      const result = probeStorageObjectCreatePermission(request, async () => {
+        calls += 1;
+        return new Response("", { headers: { location: invalidSession }, status: 200 });
+      });
+      await expect(result).rejects.toThrow("invalid session URI");
+      await expect(probeStorageObjectCreatePermission(request, async () => {
+        throw new Error(`secret ${invalidSession}`);
+      })).rejects.not.toThrow(invalidSession);
+      expect(calls).toBe(1);
+    }
   });
 
   test("control permission proof covers deny/API mutation and exactly three prod actAs targets", async () => {
@@ -3342,13 +3866,19 @@ function deterministicRecoveryHarness(options: {
   readonly executorCleanupFence?: "exact" | "tampered";
   readonly executorUniqueIdFence?: boolean;
   readonly executorUniqueIdFenceTampered?: boolean;
+  readonly emailDisableFailureStatus?: number;
   readonly firstDisableTransportLoss?: boolean;
   readonly initiallyVisibleAccount?: boolean;
   readonly keyFailureStatus?: number;
   readonly listedLegacyPeer?: boolean;
+  readonly numericDisableFailureStatus?: number;
   readonly peerDisableStatus?: number;
+  readonly postDeleteMasked403?: boolean;
+  readonly postDeleteMasked403StartScan?: number;
   readonly revealAccountOnScan?: number;
   readonly roleAppearanceScan?: number;
+  readonly runtimePolicyFailureStatus?: number;
+  readonly targetProjectPolicyFailureStatus?: number;
   readonly targetProjectMembers?: boolean;
   readonly transientAccountListFailures?: number;
   readonly transientTargetPolicyFailures?: number;
@@ -3491,6 +4021,8 @@ function deterministicRecoveryHarness(options: {
     releaseDirectGet = resolve;
   });
   let directGetReleased = false;
+  const postDeleteMaskingActive = (): boolean => options.postDeleteMasked403 === true &&
+    scan >= (options.postDeleteMasked403StartScan ?? 1);
   const recordCall = (method: string, tag: string, url: string): void => {
     calls.push({ method, tag, url });
   };
@@ -3532,7 +4064,17 @@ function deterministicRecoveryHarness(options: {
         throw new TypeError("fetch failed after deterministic disable committed");
       }
       recordCall(method, "deterministic-email-disable", rawUrl);
-      if (!accountVisible) return new Response("", { status: 404 });
+      if (options.emailDisableFailureStatus !== undefined) {
+        recordCall(method, `deterministic-email-disable-${options.emailDisableFailureStatus}`, rawUrl);
+        return new Response("", { status: options.emailDisableFailureStatus });
+      }
+      if (!accountVisible) {
+        if (postDeleteMaskingActive()) {
+          recordCall(method, "deterministic-email-disable-403", rawUrl);
+          return new Response("", { status: 403 });
+        }
+        return new Response("", { status: 404 });
+      }
       if (options.directReadbackNeverConverges !== true) account.disabled = true;
       return Response.json({});
     }
@@ -3546,6 +4088,10 @@ function deterministicRecoveryHarness(options: {
           transientTargetPolicyFailures -= 1;
           recordCall(method, "target-project-policy-503", rawUrl);
           return new Response("", { status: 503 });
+        }
+        if (target && options.targetProjectPolicyFailureStatus !== undefined) {
+          recordCall(method, `target-project-policy-${options.targetProjectPolicyFailureStatus}`, rawUrl);
+          return new Response("", { status: options.targetProjectPolicyFailureStatus });
         }
         recordCall(method, target ? "target-project-policy-get" : "project-policy-get", rawUrl);
         return Response.json(policies.get(key));
@@ -3563,6 +4109,15 @@ function deterministicRecoveryHarness(options: {
       if (serviceAccountPolicy[2] === "get") {
         recordCall(method, policyEmail === email ? "executor-policy-get" : "runtime-policy-get", rawUrl);
         const current = policies.get(key);
+        if (policyEmail !== email && options.runtimePolicyFailureStatus !== undefined) {
+          recordCall(method, `runtime-policy-${options.runtimePolicyFailureStatus}`, rawUrl);
+          return new Response("", { status: options.runtimePolicyFailureStatus });
+        }
+        if (policyEmail === email && identifier === email && current === undefined &&
+          !accountVisible && postDeleteMaskingActive()) {
+          recordCall(method, "executor-policy-403", rawUrl);
+          return new Response("", { status: 403 });
+        }
         return current === undefined ? new Response("", { status: 404 }) : Response.json(current);
       }
       recordCall(method, policyEmail === email ? "executor-policy-set" : "runtime-policy-set", rawUrl);
@@ -3615,6 +4170,9 @@ function deterministicRecoveryHarness(options: {
     }
     if (path.endsWith(`/serviceAccounts/${account.uniqueId}:disable`) && method === "POST") {
       recordCall(method, "numeric-id-disable", rawUrl);
+      if (options.numericDisableFailureStatus !== undefined) {
+        return new Response("", { status: options.numericDisableFailureStatus });
+      }
       if (options.directReadbackNeverConverges !== true) account.disabled = true;
       return Response.json({});
     }
@@ -3642,6 +4200,10 @@ function deterministicRecoveryHarness(options: {
       path.endsWith(`/serviceAccounts/${email}`)
     ) {
       if (!accountVisible) {
+        if (postDeleteMaskingActive() && path.endsWith(`/serviceAccounts/${email}`)) {
+          recordCall(method, "deterministic-account-403", rawUrl);
+          return new Response("", { status: 403 });
+        }
         recordCall(method, "deterministic-account-404", rawUrl);
         return new Response("", { status: 404 });
       }
