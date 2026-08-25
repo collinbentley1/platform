@@ -705,7 +705,7 @@ describe("protected owner Terraform bridge", () => {
     expect(() => removeExactLease(policy, lease)).toThrow("changed and cannot be safely removed");
   });
 
-  test("multi-binding cleanup restores v1 payload and audit config without v3 residue", () => {
+  test("multi-binding cleanup retains a v3 request payload and preserves audit config", () => {
     const original: IamPolicy = {
       auditConfigs: [{ service: "allServices" }],
       bindings: [{ members: ["user:reader@example.com"], role: "roles/viewer" }],
@@ -723,7 +723,7 @@ describe("protected owner Terraform bridge", () => {
     const added = addExactBindings(original, leases);
     expect(added.version).toBe(3);
     const cleaned = removeExactBindings({ ...added, etag: "latest" }, leases, original);
-    expect(cleaned).toEqual({ ...original, etag: "latest" });
+    expect(cleaned).toEqual({ ...original, etag: "latest", version: 3 });
   });
 
   test("IAM API writes use the fetched etag, retry CAS conflicts, and clean the latest policy", async () => {
@@ -742,11 +742,12 @@ describe("protected owner Terraform bridge", () => {
     };
     let setAttempts = 0;
     const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const url = String(input);
-      if (url.endsWith(":getIamPolicy")) {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith(":getIamPolicy")) {
+        expectProjectIamPolicyRead(input, init);
         return Response.json(current);
       }
-      expect(url).toEndWith(":setIamPolicy");
+      expect(url.pathname).toEndWith(":setIamPolicy");
       const request = JSON.parse(String(init?.body)) as { policy: IamPolicy };
       expect(request.policy.etag).toBe(current.etag);
       setAttempts += 1;
@@ -829,7 +830,7 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(current.bindings).toEqual([unrelated]);
     expect(current.auditConfigs).toEqual(original.auditConfigs);
-    expect(current.version).toBe(1);
+    expect(current.version).toBe(3);
     expect(current.etag).not.toBe(original.etag);
     expect(sleeps).toBeGreaterThanOrEqual(4);
   });
@@ -1655,7 +1656,571 @@ describe("protected owner Terraform bridge", () => {
     ]);
   });
 
-  test("abrupt-loss recovery disables first, fences late writes, deletes exact leases, and is retryable", async () => {
+  test("new executor visibility retries 404s and lifecycle writes use the stable unique ID", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const fixture = executorLifecycleFixture("delayed-create", leaseExpiresAt);
+    const manager = new ExecutorLeaseManager(
+      fixture.fetcher,
+      fixture.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(manager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("Ephemeral executor role lookup failed with HTTP 403");
+
+    expect(fixture.accountDeleted()).toBeTrue();
+    expect(fixture.createCalls()).toBe(1);
+    expect(fixture.setupVisibility404s()).toBe(2);
+    expect(fixture.setupDisableWrites()).toBeGreaterThanOrEqual(1);
+    expect(fixture.staleDisableReads()).toBe(1);
+    expect(fixture.setupLifecycleUrls().length).toBeGreaterThan(0);
+    for (const url of fixture.setupLifecycleUrls()) {
+      expect(url).toEndWith(`/${fixture.account.uniqueId}:disable`);
+      expect(url).not.toContain(encodeURIComponent(fixture.account.email));
+    }
+    expect(fixture.setupSleeps()).toHaveLength(3);
+    const backoffRanges = [
+      [1_000, 1_999],
+      [2_000, 2_999],
+      [4_000, 4_999],
+    ] as const;
+    for (const [index, delay] of fixture.setupSleeps().entries()) {
+      const [minimum, maximum] = backoffRanges[index]!;
+      expect(delay).toBeGreaterThanOrEqual(minimum);
+      expect(delay).toBeLessThanOrEqual(maximum);
+    }
+  });
+
+  test("executor lifecycle retries only a bounded HTTP 409 ABORTED conflict", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const aborted = executorLifecycleFixture("lifecycle-aborted", leaseExpiresAt);
+    const abortedManager = new ExecutorLeaseManager(
+      aborted.fetcher,
+      aborted.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(abortedManager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("Ephemeral executor role lookup failed with HTTP 403");
+
+    expect(aborted.accountDeleted()).toBeTrue();
+    expect(aborted.setupDisableWrites()).toBe(2);
+    expect(aborted.setupLifecycleUrls()).toHaveLength(2);
+    for (const url of aborted.setupLifecycleUrls()) {
+      expect(url).toEndWith(`/${aborted.account.uniqueId}:disable`);
+    }
+    expect(aborted.setupSleeps()).toHaveLength(1);
+    expect(aborted.setupSleeps()[0]!).toBeGreaterThanOrEqual(1_000);
+    expect(aborted.setupSleeps()[0]!).toBeLessThanOrEqual(1_999);
+
+    const terminal = executorLifecycleFixture("lifecycle-conflict-terminal", leaseExpiresAt);
+    const terminalManager = new ExecutorLeaseManager(
+      terminal.fetcher,
+      terminal.sleep,
+      () => "0123456789abcdefabcd",
+    );
+    await expect(terminalManager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("Executor disable failed with HTTP 409");
+
+    expect(terminal.setupDisableWrites()).toBe(1);
+    expect(terminal.setupSleeps()).toEqual([]);
+    expect(terminal.accountDeleted()).toBeTrue();
+    const terminalIndex = terminal.callIndex("disable-409-non-aborted");
+    expect(terminalIndex).toBeGreaterThanOrEqual(0);
+    expect(terminal.calls[terminalIndex]!.url).toEndWith(
+      `/${terminal.account.uniqueId}:disable`,
+    );
+  });
+
+  test("cleanup contains before IAM fencing and never accepts a pre-delete 404 as absence", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const fixture = executorLifecycleFixture("cleanup-order", leaseExpiresAt);
+    const manager = new ExecutorLeaseManager(
+      fixture.fetcher,
+      fixture.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(manager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("Executor token mint failed with HTTP 400");
+
+    expect(fixture.accountDeleted()).toBeTrue();
+    const mintIndex = fixture.callIndex("mint-400");
+    const containment404Index = fixture.callIndex("cleanup-containment-404");
+    const disableIndex = fixture.callIndex("cleanup-disable");
+    const cleanupPolicyReadIndex = fixture.callIndex("cleanup-policy-read");
+    const cleanupFenceIndex = fixture.callIndex("cleanup-fence-write");
+    const preDelete404Index = fixture.callIndex("pre-delete-404");
+    const deleteIndex = fixture.callIndex("delete-executor");
+    const postDelete404Index = fixture.callIndex("post-delete-404");
+    expect(mintIndex).toBeGreaterThanOrEqual(0);
+    expect(disableIndex).toBeGreaterThan(mintIndex);
+    expect(containment404Index).toBeGreaterThan(disableIndex);
+    expect(cleanupPolicyReadIndex).toBeGreaterThan(disableIndex);
+    expect(cleanupFenceIndex).toBeGreaterThan(disableIndex);
+    expect(preDelete404Index).toBeGreaterThan(cleanupFenceIndex);
+    expect(deleteIndex).toBeGreaterThan(preDelete404Index);
+    expect(postDelete404Index).toBeGreaterThan(deleteIndex);
+    expect(fixture.calls[disableIndex]!.url).toEndWith(`/${fixture.account.uniqueId}:disable`);
+    expect(new Set(fixture.policyReadHosts())).toEqual(new Set([
+      "cloudresourcemanager.googleapis.com",
+      "iam.googleapis.com",
+    ]));
+    for (const body of fixture.policyReadBodies()) {
+      expect(body).toEqual({ options: { requestedPolicyVersion: 3 } });
+    }
+    expect(fixture.serviceAccountPolicyReadUrls().length).toBeGreaterThan(0);
+    for (const value of fixture.serviceAccountPolicyReadUrls()) {
+      expect([...new URL(value).searchParams.entries()]).toEqual([
+        ["options.requestedPolicyVersion", "3"],
+      ]);
+    }
+  });
+
+  test("IAM consistency retry fails fast on authorization errors and still cleans the created identity", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const fixture = executorLifecycleFixture("fail-fast", leaseExpiresAt);
+    const manager = new ExecutorLeaseManager(
+      fixture.fetcher,
+      fixture.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(manager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("Ephemeral executor lookup failed with HTTP 403");
+
+    expect(fixture.setupContainmentReads()).toBe(1);
+    expect(fixture.setupSleeps()).toEqual([]);
+    expect(fixture.accountDeleted()).toBeTrue();
+    expect(fixture.callIndex("cleanup-disable")).toBeGreaterThan(
+      fixture.callIndex("setup-403"),
+    );
+  });
+
+  test("executor policy and token mint retry only their documented post-create propagation window", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const fixture = executorLifecycleFixture("policy-mint-propagation", leaseExpiresAt);
+    const manager = new ExecutorLeaseManager(
+      fixture.fetcher,
+      fixture.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(manager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("minted executor token collided with a controller credential");
+
+    expect(fixture.accountDeleted()).toBeTrue();
+    const fullGetIndex = fixture.callIndex("setup-full-get");
+    const policy404Index = fixture.callIndex("executor-policy-404");
+    const policyConfirmedIndex = fixture.callIndex("token-policy-confirmed");
+    const mint404Index = fixture.callIndex("mint-404");
+    const mint403Index = fixture.callIndex("mint-propagation-403");
+    const mint200Index = fixture.callIndex("mint-200");
+    expect(fullGetIndex).toBeGreaterThanOrEqual(0);
+    expect(policy404Index).toBeGreaterThan(fullGetIndex);
+    expect(policyConfirmedIndex).toBeGreaterThan(policy404Index);
+    expect(mint404Index).toBeGreaterThan(policyConfirmedIndex);
+    expect(mint403Index).toBeGreaterThan(mint404Index);
+    expect(mint200Index).toBeGreaterThan(mint403Index);
+    const policy404Url = new URL(fixture.calls[policy404Index]!.url);
+    expect(policy404Url.pathname).toEndWith(
+      `/${fixture.account.uniqueId}:getIamPolicy`,
+    );
+    expect([...policy404Url.searchParams.entries()]).toEqual([
+      ["options.requestedPolicyVersion", "3"],
+    ]);
+    expect(fixture.mintAttempts()).toBe(3);
+    expect(fixture.policyPropagationSleeps()).toHaveLength(1);
+    expect(fixture.policyPropagationSleeps()[0]!).toBeGreaterThanOrEqual(1_000);
+    expect(fixture.policyPropagationSleeps()[0]!).toBeLessThanOrEqual(1_999);
+    expect(fixture.mintPropagationSleeps()).toHaveLength(2);
+    expect(fixture.mintPropagationSleeps()[0]!).toBeGreaterThanOrEqual(1_000);
+    expect(fixture.mintPropagationSleeps()[0]!).toBeLessThanOrEqual(1_999);
+    expect(fixture.mintPropagationSleeps()[1]!).toBeGreaterThanOrEqual(2_000);
+    expect(fixture.mintPropagationSleeps()[1]!).toBeLessThanOrEqual(2_999);
+  });
+
+  test("terminal IAM statuses remain fail-fast outside the confirmed token-mint 403 window", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    for (const status of [400, 401, 403] as const) {
+      const fixture = executorLifecycleFixture("policy-terminal", leaseExpiresAt, status);
+      const manager = new ExecutorLeaseManager(
+        fixture.fetcher,
+        fixture.sleep,
+        () => "0123456789abcdefabcd",
+      );
+      let failure: unknown;
+      try {
+        await manager.acquire(
+          validateInvocation(validEnvironment()),
+          leaseExpiresAt,
+          Date.now() + 24 * 60_000,
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(errorMessages(failure).join("\n")).toContain(`HTTP ${status}`);
+      expect(fixture.calls.filter((call) =>
+        call.tag === `executor-policy-${status}`
+      )).toHaveLength(1);
+      expect(fixture.terminalSleeps()).toEqual([]);
+      expect(fixture.accountDeleted()).toBeTrue();
+    }
+
+    for (const status of [400, 401] as const) {
+      const fixture = executorLifecycleFixture("mint-terminal", leaseExpiresAt, status);
+      const manager = new ExecutorLeaseManager(
+        fixture.fetcher,
+        fixture.sleep,
+        () => "0123456789abcdefabcd",
+      );
+      let failure: unknown;
+      try {
+        await manager.acquire(
+          validateInvocation(validEnvironment()),
+          leaseExpiresAt,
+          Date.now() + 24 * 60_000,
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(errorMessages(failure).join("\n")).toContain(`HTTP ${status}`);
+      expect(fixture.mintAttempts()).toBe(1);
+      expect(fixture.terminalSleeps()).toEqual([]);
+      expect(fixture.accountDeleted()).toBeTrue();
+    }
+  });
+
+  test("deletion requires a 2xx acknowledgement after 404 or ambiguous transport outcomes", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    for (const scenario of ["delete-404s", "delete-ambiguous"] as const) {
+      const fixture = executorLifecycleFixture(scenario, leaseExpiresAt);
+      const manager = new ExecutorLeaseManager(
+        fixture.fetcher,
+        fixture.sleep,
+        () => "0123456789abcdefabcd",
+      );
+      await expect(manager.acquire(
+        validateInvocation(validEnvironment()),
+        leaseExpiresAt,
+        Date.now() + 24 * 60_000,
+      )).rejects.toThrow("Executor token mint failed with HTTP 400");
+
+      expect(fixture.accountDeleted()).toBeTrue();
+      expect(fixture.callIndex("role-delete-404")).toBeGreaterThanOrEqual(0);
+      expect(fixture.callIndex("role-delete-2xx")).toBeGreaterThan(
+        fixture.callIndex("role-delete-404"),
+      );
+      if (scenario === "delete-404s") {
+        expect(fixture.callIndex("executor-delete-404")).toBeGreaterThanOrEqual(0);
+        expect(fixture.callIndex("executor-delete-2xx")).toBeGreaterThan(
+          fixture.callIndex("executor-delete-404"),
+        );
+      } else {
+        expect(fixture.callIndex("executor-delete-ambiguous")).toBeGreaterThanOrEqual(0);
+        expect(fixture.callIndex("stale-get-404-after-ambiguous-delete")).toBeGreaterThan(
+          fixture.callIndex("executor-delete-ambiguous"),
+        );
+        expect(fixture.callIndex("executor-delete-2xx")).toBeGreaterThan(
+          fixture.callIndex("stale-get-404-after-ambiguous-delete"),
+        );
+      }
+      expect(fixture.callIndex("post-delete-404")).toBeGreaterThan(
+        fixture.callIndex("executor-delete-2xx"),
+      );
+    }
+  });
+
+  test("a committed DELETE with a lost response fails closed without a false acknowledgement", async () => {
+    const realDateNow = Date.now;
+    let virtualNow = realDateNow();
+    Date.now = () => virtualNow;
+    try {
+      const leaseExpiresAt = new Date(virtualNow + 47 * 60_000);
+      const fixture = executorLifecycleFixture("delete-committed-loss", leaseExpiresAt);
+      const manager = new ExecutorLeaseManager(
+        fixture.fetcher,
+        async (milliseconds) => {
+          await fixture.sleep(milliseconds);
+          virtualNow += milliseconds;
+        },
+        () => "0123456789abcdefabcd",
+      );
+      let failure: unknown;
+      try {
+        await manager.acquire(
+          validateInvocation(validEnvironment()),
+          leaseExpiresAt,
+          virtualNow + 60_000,
+        );
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(errorMessages(failure).join("\n")).toContain(
+        "deletion could not be proven before the cleanup deadline; manual reconciliation is required",
+      );
+      expect(fixture.callIndex("executor-delete-committed-loss")).toBeGreaterThanOrEqual(0);
+      expect(fixture.callIndex("executor-get-404-after-loss")).toBeGreaterThan(
+        fixture.callIndex("executor-delete-committed-loss"),
+      );
+      expect(fixture.callIndex("executor-delete-404-after-loss")).toBeGreaterThan(
+        fixture.callIndex("executor-get-404-after-loss"),
+      );
+      expect(fixture.accountDeleted()).toBeTrue();
+      expect(fixture.roleDeleted()).toBeTrue();
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  test("successful deletion acknowledgements persist across a later cleanup call", async () => {
+    const realDateNow = Date.now;
+    let virtualNow = realDateNow();
+    Date.now = () => virtualNow;
+    try {
+      const leaseExpiresAt = new Date(virtualNow + 47 * 60_000);
+      const fixture = executorLifecycleFixture("delete-acked-retry", leaseExpiresAt);
+      const invocation = validateInvocation(validEnvironment());
+      let firstCleanupTimedOut = false;
+      const manager = new ExecutorLeaseManager(
+        fixture.fetcher,
+        async (milliseconds) => {
+          await fixture.sleep(milliseconds);
+          if (fixture.accountDeleted() && !firstCleanupTimedOut) {
+            firstCleanupTimedOut = true;
+            virtualNow += 10 * 60_000;
+          } else {
+            virtualNow += milliseconds;
+          }
+        },
+        () => "0123456789abcdefabcd",
+      );
+      let setupFailure: unknown;
+      try {
+        await manager.acquire(
+          invocation,
+          leaseExpiresAt,
+          virtualNow + 60_000,
+        );
+      } catch (error) {
+        setupFailure = error;
+      }
+
+      expect(setupFailure).toBeInstanceOf(AggregateError);
+      expect(errorMessages(setupFailure).join("\n")).toContain(
+        "deletion could not be proven before the cleanup deadline; manual reconciliation is required",
+      );
+      expect(fixture.roleDeleted()).toBeTrue();
+      expect(fixture.accountDeleted()).toBeTrue();
+      expect(fixture.roleDeleteAttempts()).toBe(1);
+      expect(fixture.executorDeleteAttempts()).toBe(1);
+      expect(fixture.callIndex("token-policy-confirmed")).toBeGreaterThanOrEqual(0);
+
+      const retryBoundary = fixture.calls.length;
+      await manager.release(invocation, virtualNow + 60_000);
+
+      expect(fixture.roleDeleteAttempts()).toBe(1);
+      expect(fixture.executorDeleteAttempts()).toBe(1);
+      const retryCalls = fixture.calls.slice(retryBoundary);
+      expect(retryCalls.some((call) => call.method === "DELETE")).toBeFalse();
+      expect(retryCalls.some((call) => {
+        const url = new URL(call.url);
+        return url.hostname === "iam.googleapis.com" &&
+          url.pathname.endsWith(":getIamPolicy");
+      })).toBeFalse();
+      expect(fixture.calls.findIndex((call, index) =>
+        index >= retryBoundary && call.tag === "acked-account-get-404"
+      )).toBeGreaterThanOrEqual(retryBoundary);
+      expect(fixture.calls.findIndex((call, index) =>
+        index >= retryBoundary && call.tag === "acked-role-get-404"
+      )).toBeGreaterThanOrEqual(retryBoundary);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  test("a create 409 recovers and deletes only the exact deterministic executor", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const exact = executorLifecycleFixture("create-conflict-exact", leaseExpiresAt);
+    const exactManager = new ExecutorLeaseManager(
+      exact.fetcher,
+      exact.sleep,
+      () => "0123456789abcdefabcd",
+    );
+
+    await expect(exactManager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("random executor account collided at creation");
+
+    expect(exact.callIndex("preflight-404")).toBeGreaterThanOrEqual(0);
+    expect(exact.callIndex("create-409")).toBeGreaterThan(exact.callIndex("preflight-404"));
+    expect(exact.callIndex("conflict-recovery-read")).toBeGreaterThan(
+      exact.callIndex("create-409"),
+    );
+    expect(exact.callIndex("cleanup-disable")).toBeGreaterThan(
+      exact.callIndex("conflict-recovery-read"),
+    );
+    expect(exact.callIndex("executor-delete-2xx")).toBeGreaterThan(
+      exact.callIndex("cleanup-disable"),
+    );
+    expect(exact.accountDeleted()).toBeTrue();
+    expect(exact.calls[exact.callIndex("cleanup-disable")]!.url).toEndWith(
+      `/${exact.account.uniqueId}:disable`,
+    );
+    expect(exact.calls[exact.callIndex("executor-delete-2xx")]!.url).toContain(
+      `/serviceAccounts/${exact.account.uniqueId}`,
+    );
+
+    const foreign = executorLifecycleFixture("create-conflict-foreign", leaseExpiresAt);
+    const foreignManager = new ExecutorLeaseManager(
+      foreign.fetcher,
+      foreign.sleep,
+      () => "0123456789abcdefabcd",
+    );
+    let failure: unknown;
+    try {
+      await foreignManager.acquire(
+        validateInvocation(validEnvironment()),
+        leaseExpiresAt,
+        Date.now() + 24 * 60_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(errorMessages(failure).join("\n")).toContain(
+      "ambiguous executor identity has foreign provenance; manual cleanup is required",
+    );
+    expect(foreign.callIndex("foreign-conflict-email-read")).toBeGreaterThan(
+      foreign.callIndex("create-409"),
+    );
+    expect(foreign.callIndex("cleanup-disable")).toBeGreaterThan(
+      foreign.callIndex("foreign-conflict-email-read"),
+    );
+    expect(foreign.callIndex("foreign-conflict-numeric-read")).toBeGreaterThan(
+      foreign.callIndex("cleanup-disable"),
+    );
+    expect(foreign.calls.some((call) => call.method === "DELETE" &&
+      call.url.includes("/serviceAccounts/"))).toBeFalse();
+    expect(foreign.calls.some((call) =>
+      call.method === "POST" && call.url.endsWith(`/${foreign.account.uniqueId}:disable`)
+    )).toBeTrue();
+    expect(foreign.accountDisabled()).toBeTrue();
+    expect(foreign.accountDeleted()).toBeFalse();
+  });
+
+  test("a malformed successful create response is contained by immutable identity before rejection", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const fixture = executorLifecycleFixture("create-response-mutable-drift", leaseExpiresAt);
+    const manager = new ExecutorLeaseManager(
+      fixture.fetcher,
+      fixture.sleep,
+      () => "0123456789abcdefabcd",
+    );
+    let failure: unknown;
+    try {
+      await manager.acquire(
+        validateInvocation(validEnvironment()),
+        leaseExpiresAt,
+        Date.now() + 24 * 60_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(errorMessages(failure).join("\n")).toContain(
+      "ambiguous executor was targeted for containment but its full provenance could not be verified; manual cleanup is required",
+    );
+    expect(fixture.callIndex("cleanup-disable")).toBeGreaterThan(
+      fixture.callIndex("create-2xx-mutable-drift"),
+    );
+    expect(fixture.callIndex("mutable-drift-read")).toBeGreaterThan(
+      fixture.callIndex("cleanup-disable"),
+    );
+    expect(fixture.calls.some((call) => call.method === "DELETE" &&
+      call.url.includes("/serviceAccounts/"))).toBeFalse();
+    expect(fixture.accountDisabled()).toBeTrue();
+    expect(fixture.accountDeleted()).toBeFalse();
+  });
+
+  test("a lost custom-role create response recovers only the exact intended role", async () => {
+    const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
+    const exact = executorLifecycleFixture("role-create-loss-exact", leaseExpiresAt);
+    const exactManager = new ExecutorLeaseManager(
+      exact.fetcher,
+      exact.sleep,
+      () => "0123456789abcdefabcd",
+    );
+    await expect(exactManager.acquire(
+      validateInvocation(validEnvironment()),
+      leaseExpiresAt,
+      Date.now() + 24 * 60_000,
+    )).rejects.toThrow("fetch failed after the custom-role POST committed");
+
+    expect(exact.callIndex("recovered-role-read")).toBeGreaterThan(
+      exact.callIndex("role-create-committed-loss"),
+    );
+    expect(exact.callIndex("recovered-role-delete")).toBeGreaterThan(
+      exact.callIndex("recovered-role-read"),
+    );
+    expect(exact.roleDeleted()).toBeTrue();
+    expect(exact.accountDeleted()).toBeTrue();
+
+    const foreign = executorLifecycleFixture("role-create-loss-foreign", leaseExpiresAt);
+    const foreignManager = new ExecutorLeaseManager(
+      foreign.fetcher,
+      foreign.sleep,
+      () => "0123456789abcdefabcd",
+    );
+    let failure: unknown;
+    try {
+      await foreignManager.acquire(
+        validateInvocation(validEnvironment()),
+        leaseExpiresAt,
+        Date.now() + 24 * 60_000,
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect(errorMessages(failure).join("\n")).toContain(
+      "ambiguous executor role has foreign provenance; manual cleanup is required",
+    );
+    expect(foreign.callIndex("foreign-role-read")).toBeGreaterThan(
+      foreign.callIndex("role-create-committed-loss"),
+    );
+    expect(foreign.calls.some((call) => call.method === "DELETE")).toBeFalse();
+    expect(foreign.roleDeleted()).toBeFalse();
+    expect(foreign.accountDisabled()).toBeTrue();
+    expect(foreign.accountDeleted()).toBeFalse();
+  });
+
+  test("abrupt-loss recovery preserves unrelated v3 conditions while fencing and deleting exact leases", async () => {
     const fixture = abruptLossFixture();
     await inventoryBridgeArtifacts(
       "cdbentley",
@@ -1672,7 +2237,9 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.lateWriteRejected()).toBeTrue();
     expect(fixture.roles.every((role) => role.deleted)).toBeTrue();
     const disableIndex = fixture.calls.findIndex(({ url }) => url.endsWith(":disable"));
-    const authorityReadIndex = fixture.calls.findIndex(({ url }) => url.endsWith(":getIamPolicy"));
+    const authorityReadIndex = fixture.calls.findIndex(({ url }) =>
+      new URL(url).pathname.endsWith(":getIamPolicy")
+    );
     expect(disableIndex).toBeGreaterThanOrEqual(0);
     expect(disableIndex).toBeLessThan(authorityReadIndex);
     for (const policy of fixture.policies.values()) {
@@ -1688,6 +2255,13 @@ describe("protected owner Terraform bridge", () => {
       role: "roles/viewer",
     });
     expect(fixture.policies.get(`sa:${fixture.account.email}`)?.bindings).toEqual([]);
+    const preservedRuntimePolicy = [...fixture.policies.values()].find((policy) =>
+      policy.bindings.some((binding) =>
+        canonicalJson(binding) === canonicalJson(fixture.preservedRuntimeCondition)
+      )
+    );
+    expect(preservedRuntimePolicy?.version).toBe(3);
+    expect(preservedRuntimePolicy?.bindings).toContainEqual(fixture.preservedRuntimeCondition);
 
     await inventoryBridgeArtifacts(
       "cdbentley",
@@ -1697,6 +2271,50 @@ describe("protected owner Terraform bridge", () => {
       Date.now() + 60_000,
     );
     expect(fixture.accountDeleted()).toBeTrue();
+  });
+
+  test("orphan custom-role deletion fails fast on HTTP 403 without retry backoff", async () => {
+    const fixture = abruptLossFixture({ roleDeleteForbidden: true });
+    await expect(inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      fixture.fetcher,
+      fixture.sleep,
+      Date.now() + 60_000,
+    )).rejects.toThrow("Ephemeral executor role deletion failed with HTTP 403");
+    expect(fixture.orphanRoleDeleteAttempts()).toBe(1);
+    expect(fixture.postForbiddenRoleDeleteSleeps()).toBe(0);
+    expect(fixture.roles.some((role) => !role.deleted)).toBeTrue();
+  });
+
+  test("orphan recovery accepts only an exact stranded fence contract on restart", async () => {
+    const exact = abruptLossFixture({ strandedFence: "exact" });
+    await inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      exact.fetcher,
+      exact.sleep,
+      Date.now() + 60_000,
+    );
+    expect(exact.accountDeleted()).toBeTrue();
+    expect(exact.strandedFence).toBeDefined();
+    expect([...exact.policies.values()].some((policy) =>
+      policy.bindings.includes(exact.strandedFence!)
+    )).toBeFalse();
+
+    const tampered = abruptLossFixture({ strandedFence: "tampered" });
+    await expect(inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      tampered.fetcher,
+      tampered.sleep,
+      Date.now() + 60_000,
+    )).rejects.toThrow("unknown or modified binding; manual cleanup is required");
+    expect(tampered.account.disabled).toBeTrue();
+    expect(tampered.accountDeleted()).toBeFalse();
+    expect(tampered.policies.get("project:cdbentley")?.bindings).toContainEqual(
+      tampered.strandedFence!,
+    );
   });
 
   test("orphan recovery disables but refuses an altered lease with manual-cleanup guidance", async () => {
@@ -1711,7 +2329,9 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.account.disabled).toBeTrue();
     expect(fixture.accountDeleted()).toBeFalse();
     const disableIndex = fixture.calls.findIndex(({ url }) => url.endsWith(":disable"));
-    const authorityReadIndex = fixture.calls.findIndex(({ url }) => url.endsWith(":getIamPolicy"));
+    const authorityReadIndex = fixture.calls.findIndex(({ url }) =>
+      new URL(url).pathname.endsWith(":getIamPolicy")
+    );
     expect(disableIndex).toBeGreaterThanOrEqual(0);
     expect(disableIndex).toBeLessThan(authorityReadIndex);
   });
@@ -1761,15 +2381,44 @@ describe("protected owner Terraform bridge", () => {
         ) ? [index] : []
       );
       const lastDisable = fixture.calls.findLastIndex(({ url }) => url.endsWith(":disable"));
-      expect(executorLookupIndexes).toHaveLength(6);
-      expect(lastDisable).toBeLessThan(executorLookupIndexes[4]!);
+      expect(executorLookupIndexes).toHaveLength(2);
+      expect(lastDisable).toBeLessThan(executorLookupIndexes[1]!);
       for (const account of fixture.accounts) {
         const disableIndex = fixture.calls.findIndex(({ url }) =>
           url.endsWith(`/serviceAccounts/${account.uniqueId}:disable`)
         );
+        const lookupIndex = fixture.calls.findIndex(({ method, url }) =>
+          method === "GET" && url.endsWith(`/serviceAccounts/${account.uniqueId}`)
+        );
         expect(disableIndex).toBeGreaterThanOrEqual(0);
+        expect(lookupIndex).toBeGreaterThan(disableIndex);
       }
     }
+  });
+
+  test("a nonconverging orphan cannot delay the peer's stable-ID disable write", async () => {
+    const fixture = orphanPeerConvergenceFixture();
+    await expect(inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      fixture.fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+    )).rejects.toThrow("orphan containment was incomplete; manual cleanup is required");
+
+    const firstDisableIndex = fixture.calls.findIndex(({ method, url }) =>
+      method === "POST" && url.endsWith(`/${fixture.accounts[0]!.uniqueId}:disable`)
+    );
+    const peerDisableIndex = fixture.calls.findIndex(({ method, url }) =>
+      method === "POST" && url.endsWith(`/${fixture.accounts[1]!.uniqueId}:disable`)
+    );
+    const firstReadIndex = fixture.calls.findIndex(({ method, url }) =>
+      method === "GET" && url.endsWith(`/${fixture.accounts[0]!.uniqueId}`)
+    );
+    expect(firstDisableIndex).toBeGreaterThanOrEqual(0);
+    expect(peerDisableIndex).toBeGreaterThan(firstDisableIndex);
+    expect(peerDisableIndex).toBeLessThan(firstReadIndex);
+    expect(fixture.accounts[1]!.disabled).toBeTrue();
   });
 
   test("preexisting executor project authority aborts before enable, mint, or policy mutation", async () => {
@@ -1804,9 +2453,12 @@ describe("protected owner Terraform bridge", () => {
     let roleDeleted = false;
     const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const url = String(input);
+      const parsedUrl = new URL(url);
       const method = init?.method ?? "GET";
       calls.push({ method, url });
-      if (url.includes("cloudresourcemanager") && url.endsWith(":getIamPolicy")) {
+      if (parsedUrl.hostname === "cloudresourcemanager.googleapis.com" &&
+        parsedUrl.pathname.endsWith(":getIamPolicy")) {
+        expectProjectIamPolicyRead(input, init);
         return Response.json({
           bindings: [{ members: [`serviceAccount:${randomEmail}`], role: "roles/owner" }],
           etag: "project-policy",
@@ -1829,7 +2481,8 @@ describe("protected owner Terraform bridge", () => {
           return new Response("{}");
         }
         if (url.includes("/keys?")) return Response.json({ keys: [] });
-        if (url.endsWith(":getIamPolicy")) {
+        if (parsedUrl.pathname.endsWith(":getIamPolicy")) {
+          expectServiceAccountIamPolicyRead(input, init);
           return Response.json({ bindings: [], etag: "sa-policy", version: 1 });
         }
         return Response.json(account);
@@ -2082,6 +2735,30 @@ function errorMessages(error: unknown): string[] {
   return error instanceof Error ? [error.message] : [String(error)];
 }
 
+function expectProjectIamPolicyRead(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+): void {
+  const url = new URL(String(input));
+  expect(init?.method).toBe("POST");
+  expect([...url.searchParams.entries()]).toEqual([]);
+  expect(JSON.parse(String(init?.body))).toEqual({
+    options: { requestedPolicyVersion: 3 },
+  });
+}
+
+function expectServiceAccountIamPolicyRead(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+): void {
+  const url = new URL(String(input));
+  expect(init?.method).toBe("POST");
+  expect(init?.body).toBeUndefined();
+  expect([...url.searchParams.entries()]).toEqual([
+    ["options.requestedPolicyVersion", "3"],
+  ]);
+}
+
 function plan(resourceChanges: unknown[]): Record<string, unknown> {
   return {
     applyable: true,
@@ -2160,9 +2837,514 @@ async function runGit(cwd: string, args: readonly string[]): Promise<string> {
   return stdout.trim();
 }
 
+type ExecutorLifecycleScenario =
+  | "cleanup-order"
+  | "create-conflict-exact"
+  | "create-conflict-foreign"
+  | "create-response-mutable-drift"
+  | "delayed-create"
+  | "delete-404s"
+  | "delete-acked-retry"
+  | "delete-ambiguous"
+  | "delete-committed-loss"
+  | "fail-fast"
+  | "lifecycle-aborted"
+  | "lifecycle-conflict-terminal"
+  | "mint-terminal"
+  | "policy-mint-propagation"
+  | "policy-terminal"
+  | "role-create-loss-exact"
+  | "role-create-loss-foreign";
+
+function executorLifecycleFixture(
+  scenario: ExecutorLifecycleScenario,
+  leaseExpiresAt: Date,
+  terminalStatus: 400 | 401 | 403 = 403,
+) {
+  const accountId = "gha-pbt-0123456789abcdefabcd";
+  const email = `${accountId}@cdbentley.iam.gserviceaccount.com`;
+  const account = {
+    description: `pbt-v1;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;expires=${leaseExpiresAt.toISOString()}`,
+    disabled: false,
+    displayName: "Protected Terraform Executor",
+    email,
+    etag: "account-etag-1",
+    name: `projects/cdbentley/serviceAccounts/${email}`,
+    oauth2ClientId: "123456789",
+    projectId: "cdbentley",
+    uniqueId: "123456789012345678901",
+  };
+  const role = {
+    deleted: false,
+    description: "Protected Terraform bootstrap read single-run control role.",
+    etag: "role-etag-1",
+    includedPermissions: executorControlPermissions("cdbentley", "bootstrap", "read"),
+    name: "projects/cdbentley/roles/pbt_r_0123456789abcdefabcd",
+    stage: "GA",
+    title: "Protected Terraform Read",
+  };
+  const calls: Array<{ body: string; method: string; tag?: string; url: string }> = [];
+  const setupSleeps: number[] = [];
+  const mintPropagationSleeps: number[] = [];
+  const policyPropagationSleeps: number[] = [];
+  const terminalSleeps: number[] = [];
+  const policyReadBodies: Array<Record<string, unknown>> = [];
+  const policyReadHosts: string[] = [];
+  const serviceAccountPolicyReadUrls: string[] = [];
+  let phase: "cleanup" | "setup" = "setup";
+  let accountCreated = false;
+  let accountExists = false;
+  let accountDisabled = false;
+  let accountDeleted = false;
+  let roleCreated = false;
+  let roleDeleted = false;
+  let createCalls = 0;
+  let setupContainmentReads = 0;
+  let setupVisibility404s = 0;
+  let setupDisableWrites = 0;
+  let staleDisableReads = 0;
+  let staleDisablePending = false;
+  let cleanupContainment404Served = false;
+  let deletionStage = false;
+  let preDelete404Served = false;
+  let serviceAccountPolicy: IamPolicy = {
+    bindings: [],
+    etag: "sa-policy-etag-1",
+    version: 1,
+  };
+  let projectPolicy: IamPolicy = {
+    bindings: [],
+    etag: "project-policy-etag-1",
+    version: 1,
+  };
+  let policyGeneration = 1;
+  let executorPolicy404s = 0;
+  let executorPolicyTerminalAttempts = 0;
+  let mintAttempts = 0;
+  let pendingSleep: "mint" | "policy" | "terminal" | undefined;
+  let roleDeleteAttempts = 0;
+  let executorDeleteAttempts = 0;
+  let ambiguousDeleteThrown = false;
+  let ambiguousStaleGetServed = false;
+
+  const accountResponse = (disabled = accountDisabled) => ({
+    ...account,
+    disabled,
+    etag: `account-etag-${disabled ? "disabled" : "enabled"}`,
+  });
+  const capturePolicyRead = (url: URL, init: RequestInit | undefined) => {
+    policyReadHosts.push(url.hostname);
+    if (url.hostname === "cloudresourcemanager.googleapis.com") {
+      expectProjectIamPolicyRead(url, init);
+      policyReadBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return;
+    }
+    expectServiceAccountIamPolicyRead(url, init);
+    serviceAccountPolicyReadUrls.push(String(url));
+  };
+  const updatePolicy = (
+    current: IamPolicy,
+    init: RequestInit | undefined,
+    prefix: string,
+  ): IamPolicy => {
+    const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
+    expect(requested.version).toBe(3);
+    expect(requested.etag).toBe(current.etag);
+    policyGeneration += 1;
+    return { ...requested, etag: `${prefix}-policy-etag-${policyGeneration}` };
+  };
+
+  const fetcher = async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ): Promise<Response> => {
+    const url = new URL(String(input));
+    const path = decodeURIComponent(url.pathname);
+    const method = init?.method ?? "GET";
+    const call = { body: String(init?.body ?? ""), method, url: String(input) } as {
+      body: string;
+      method: string;
+      tag?: string;
+      url: string;
+    };
+    // A retry delay is immediate. If another API call starts first, the prior
+    // terminal response was not retried and a later cleanup delay must not be
+    // misclassified as IAM propagation backoff.
+    pendingSleep = undefined;
+    calls.push(call);
+
+    if (url.hostname === "cloudresourcemanager.googleapis.com" &&
+      path === "/v1/projects/cdbentley:getIamPolicy") {
+      capturePolicyRead(url, init);
+      if (phase === "cleanup" && calls.every((candidate) =>
+        candidate === call || candidate.tag !== "cleanup-policy-read"
+      )) call.tag = "cleanup-policy-read";
+      return Response.json(projectPolicy);
+    }
+    if (url.hostname === "cloudresourcemanager.googleapis.com" &&
+      path === "/v1/projects/cdbentley:setIamPolicy") {
+      projectPolicy = updatePolicy(projectPolicy, init, "project");
+      if (phase === "cleanup" && call.body.includes("codex-cleanup-fence-")) {
+        call.tag = "cleanup-fence-write";
+      }
+      return Response.json(projectPolicy);
+    }
+    const executorPolicyGet = url.hostname === "iam.googleapis.com" && (
+      path === `/v1/projects/cdbentley/serviceAccounts/${email}:getIamPolicy` ||
+      path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}:getIamPolicy`
+    );
+    if (executorPolicyGet) {
+      capturePolicyRead(url, init);
+      if (scenario === "policy-mint-propagation" && phase === "setup" &&
+        executorPolicy404s === 0) {
+        executorPolicy404s += 1;
+        pendingSleep = "policy";
+        call.tag = "executor-policy-404";
+        return new Response("", { status: 404 });
+      }
+      if (scenario === "policy-terminal" && phase === "setup" &&
+        executorPolicyTerminalAttempts === 0) {
+        executorPolicyTerminalAttempts += 1;
+        pendingSleep = "terminal";
+        phase = "cleanup";
+        call.tag = `executor-policy-${terminalStatus}`;
+        return new Response("", { status: terminalStatus });
+      }
+      if (phase === "cleanup" && calls.every((candidate) =>
+        candidate === call || candidate.tag !== "cleanup-policy-read"
+      )) call.tag = "cleanup-policy-read";
+      return Response.json(serviceAccountPolicy);
+    }
+    const executorPolicySet = url.hostname === "iam.googleapis.com" && (
+      path === `/v1/projects/cdbentley/serviceAccounts/${email}:setIamPolicy` ||
+      path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}:setIamPolicy`
+    );
+    if (executorPolicySet) {
+      serviceAccountPolicy = updatePolicy(serviceAccountPolicy, init, "sa");
+      if (serviceAccountPolicy.bindings.some((binding) =>
+        binding.condition?.title === "codex-owner-mint-123456"
+      )) call.tag = "token-policy-confirmed";
+      if (phase === "cleanup" && call.body.includes("codex-cleanup-fence-")) {
+        call.tag = "cleanup-fence-write";
+      }
+      return Response.json(serviceAccountPolicy);
+    }
+
+    if (url.hostname === "iamcredentials.googleapis.com" &&
+      path.endsWith(`/${account.uniqueId}:generateAccessToken`)) {
+      mintAttempts += 1;
+      if (scenario === "policy-mint-propagation") {
+        expect(serviceAccountPolicy.bindings.some((binding) =>
+          binding.condition?.title === "codex-owner-mint-123456"
+        )).toBeTrue();
+        if (mintAttempts === 1) {
+          pendingSleep = "mint";
+          call.tag = "mint-404";
+          return new Response("", { status: 404 });
+        }
+        if (mintAttempts === 2) {
+          pendingSleep = "mint";
+          call.tag = "mint-propagation-403";
+          return new Response("", { status: 403 });
+        }
+        phase = "cleanup";
+        call.tag = "mint-200";
+        return Response.json({
+          accessToken: "google-owner-access-token-value",
+          expireTime: new Date(Date.now() + 30 * 60_000).toISOString(),
+        });
+      }
+      phase = "cleanup";
+      const status = scenario === "mint-terminal"
+        ? terminalStatus
+        : scenario === "cleanup-order" || scenario.startsWith("delete-") ? 400 : 403;
+      if (scenario === "mint-terminal") pendingSleep = "terminal";
+      call.tag = `mint-${status}`;
+      return new Response("", { status });
+    }
+
+    if (url.hostname === "iam.googleapis.com" &&
+      path === "/v1/projects/cdbentley/serviceAccounts" && method === "GET") {
+      return Response.json({ accounts: [] });
+    }
+    if (url.hostname === "iam.googleapis.com" &&
+      path === "/v1/projects/cdbentley/serviceAccounts" && method === "POST") {
+      createCalls += 1;
+      accountCreated = true;
+      accountExists = true;
+      accountDisabled = false;
+      if (scenario.startsWith("create-conflict-")) {
+        phase = "cleanup";
+        call.tag = "create-409";
+        return new Response("", { status: 409 });
+      }
+      if (scenario === "create-response-mutable-drift") {
+        phase = "cleanup";
+        call.tag = "create-2xx-mutable-drift";
+        return Response.json({
+          ...accountResponse(false),
+          description: account.description.replace("run=123456", "run=654321"),
+          displayName: "Drifted executor display",
+          futureMutableField: { drifted: true },
+        });
+      }
+      return Response.json(accountResponse(false));
+    }
+    if (url.hostname === "iam.googleapis.com" &&
+      path === "/v1/projects/cdbentley/roles" && method === "GET") {
+      return Response.json({ roles: [] });
+    }
+    if (url.hostname === "iam.googleapis.com" &&
+      path === "/v1/projects/cdbentley/roles" && method === "POST") {
+      roleCreated = true;
+      if (scenario === "role-create-loss-exact" ||
+        scenario === "role-create-loss-foreign") {
+        phase = "cleanup";
+        call.tag = "role-create-committed-loss";
+        throw new TypeError("fetch failed after the custom-role POST committed");
+      }
+      return Response.json(role);
+    }
+    if (url.hostname === "iam.googleapis.com" && path === `/v1/${role.name}`) {
+      if (method === "DELETE") {
+        roleDeleteAttempts += 1;
+        deletionStage = true;
+        if ((scenario === "delete-404s" || scenario === "delete-ambiguous") &&
+          roleDeleteAttempts === 1) {
+          call.tag = "role-delete-404";
+          return new Response("", { status: 404 });
+        }
+        roleDeleted = true;
+        if (scenario === "role-create-loss-exact") call.tag = "recovered-role-delete";
+        if (scenario === "delete-acked-retry") call.tag = "role-delete-acked";
+        if (scenario.startsWith("delete-") && calls.every((candidate) =>
+          candidate === call || candidate.tag !== "role-delete-2xx"
+        )) call.tag = "role-delete-2xx";
+        return Response.json({ ...role, deleted: true });
+      }
+      if ((scenario === "delayed-create" || scenario === "lifecycle-aborted") &&
+        !roleCreated) {
+        phase = "cleanup";
+        call.tag = "role-403";
+        return new Response("", { status: 403 });
+      }
+      if (roleCreated && scenario === "role-create-loss-exact") {
+        call.tag = "recovered-role-read";
+      }
+      if (roleCreated && scenario === "role-create-loss-foreign") {
+        call.tag = "foreign-role-read";
+        return Response.json({ ...role, title: "Foreign role collision" });
+      }
+      if (roleDeleted && scenario === "delete-acked-retry") {
+        call.tag = "acked-role-get-404";
+        return new Response("", { status: 404 });
+      }
+      return roleCreated
+        ? Response.json({ ...role, deleted: roleDeleted })
+        : new Response("", { status: 404 });
+    }
+
+    if (url.hostname === "iam.googleapis.com" &&
+      path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}:disable` &&
+      method === "POST") {
+      if (phase === "setup") {
+        setupDisableWrites += 1;
+        if (scenario === "lifecycle-aborted" && setupDisableWrites === 1) {
+          call.tag = "disable-409-aborted";
+          return Response.json({
+            error: { code: 409, message: "concurrent IAM lifecycle update", status: "ABORTED" },
+          }, { status: 409 });
+        }
+        if (scenario === "lifecycle-conflict-terminal" && setupDisableWrites === 1) {
+          phase = "cleanup";
+          call.tag = "disable-409-non-aborted";
+          return Response.json({
+            error: { code: 409, message: "not an aborted transaction", status: "ALREADY_EXISTS" },
+          }, { status: 409 });
+        }
+        if (scenario === "delayed-create" && setupDisableWrites === 1) {
+          staleDisablePending = true;
+        }
+      } else if (calls.every((candidate) =>
+        candidate === call || candidate.tag !== "cleanup-disable"
+      )) {
+        call.tag = "cleanup-disable";
+      }
+      accountDisabled = true;
+      return Response.json({});
+    }
+    if (url.hostname === "iam.googleapis.com" &&
+      path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}:enable` &&
+      method === "POST") {
+      accountDisabled = false;
+      return Response.json({});
+    }
+    if (url.hostname === "iam.googleapis.com" &&
+      path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}/keys` &&
+      method === "GET") {
+      return Response.json({ keys: [] });
+    }
+
+    const byUniqueId = path === `/v1/projects/cdbentley/serviceAccounts/${account.uniqueId}`;
+    const byEmail = path === `/v1/projects/cdbentley/serviceAccounts/${email}`;
+    if (url.hostname === "iam.googleapis.com" && (byUniqueId || byEmail)) {
+      if (method === "DELETE") {
+        executorDeleteAttempts += 1;
+        if (scenario === "delete-committed-loss") {
+          if (executorDeleteAttempts === 1) {
+            accountExists = false;
+            accountDeleted = true;
+            call.tag = "executor-delete-committed-loss";
+            throw new TypeError("fetch failed after the executor DELETE committed");
+          }
+          call.tag = "executor-delete-404-after-loss";
+          return new Response("", { status: 404 });
+        }
+        if (scenario === "delete-404s" && executorDeleteAttempts === 1) {
+          call.tag = "executor-delete-404";
+          return new Response("", { status: 404 });
+        }
+        if (scenario === "delete-ambiguous" && executorDeleteAttempts === 1) {
+          ambiguousDeleteThrown = true;
+          call.tag = "executor-delete-ambiguous";
+          throw new TypeError("fetch failed after the executor DELETE may have committed");
+        }
+        call.tag = "delete-executor";
+        if (scenario.startsWith("delete-") || scenario === "create-conflict-exact") {
+          call.tag = "executor-delete-2xx";
+        }
+        accountExists = false;
+        accountDeleted = true;
+        return new Response("{}");
+      }
+      if (!accountCreated || !accountExists) {
+        if (byEmail && !accountCreated && scenario.startsWith("create-conflict-")) {
+          call.tag = "preflight-404";
+        }
+        if (accountDeleted) {
+          call.tag = scenario === "delete-committed-loss"
+            ? "executor-get-404-after-loss"
+            : scenario === "delete-acked-retry"
+            ? "acked-account-get-404"
+            : "post-delete-404";
+        }
+        return new Response("", { status: 404 });
+      }
+      if (byEmail && scenario === "create-conflict-exact") {
+        if (calls.every((candidate) =>
+          candidate === call || candidate.tag !== "conflict-recovery-read"
+        )) call.tag = "conflict-recovery-read";
+      }
+      if ((byEmail || byUniqueId) && scenario === "create-conflict-foreign") {
+        call.tag = byEmail ? "foreign-conflict-email-read" : "foreign-conflict-numeric-read";
+        return Response.json({
+          ...accountResponse(),
+          description: account.description.replace("run=123456", "run=654321"),
+        });
+      }
+      if (byUniqueId && scenario === "create-response-mutable-drift") {
+        call.tag = "mutable-drift-read";
+        return Response.json({
+          ...accountResponse(),
+          description: account.description.replace("run=123456", "run=654321"),
+          displayName: "Drifted executor display",
+        });
+      }
+      if (byUniqueId && phase === "setup") {
+        setupContainmentReads += 1;
+        if (scenario === "fail-fast") {
+          phase = "cleanup";
+          call.tag = "setup-403";
+          return new Response("", { status: 403 });
+        }
+        if (scenario === "delayed-create") {
+          if (setupVisibility404s < 2) {
+            setupVisibility404s += 1;
+            return new Response("", { status: 404 });
+          }
+          if (setupDisableWrites === 0) {
+            // A stale desired-state read must never replace the idempotent
+            // lifecycle write required to establish a happens-before edge.
+            return Response.json(accountResponse(true));
+          }
+          if (staleDisablePending) {
+            staleDisablePending = false;
+            staleDisableReads += 1;
+            return Response.json(accountResponse(false));
+          }
+          return Response.json(accountResponse(true));
+        }
+      }
+      if (scenario === "cleanup-order" && phase === "cleanup" && !deletionStage &&
+        !cleanupContainment404Served) {
+        cleanupContainment404Served = true;
+        call.tag = "cleanup-containment-404";
+        return new Response("", { status: 404 });
+      }
+      if (scenario === "cleanup-order" && deletionStage && !preDelete404Served) {
+        preDelete404Served = true;
+        call.tag = "pre-delete-404";
+        return new Response("", { status: 404 });
+      }
+      if (scenario === "delete-ambiguous" && phase === "cleanup" &&
+        ambiguousDeleteThrown && !ambiguousStaleGetServed) {
+        ambiguousStaleGetServed = true;
+        call.tag = "stale-get-404-after-ambiguous-delete";
+        return new Response("", { status: 404 });
+      }
+      if (byUniqueId && phase === "setup" && calls.every((candidate) =>
+        candidate === call || candidate.tag !== "setup-full-get"
+      )) call.tag = "setup-full-get";
+      return Response.json(accountResponse());
+    }
+
+    return new Response("", { status: 500 });
+  };
+
+  const sleep = async (milliseconds: number) => {
+    if (pendingSleep === "mint") mintPropagationSleeps.push(milliseconds);
+    else if (pendingSleep === "policy") policyPropagationSleeps.push(milliseconds);
+    else if (pendingSleep === "terminal") terminalSleeps.push(milliseconds);
+    else if (phase === "setup") setupSleeps.push(milliseconds);
+    pendingSleep = undefined;
+  };
+
+  return {
+    account,
+    accountDeleted: () => accountDeleted,
+    accountDisabled: () => accountDisabled,
+    callIndex: (tag: string) => calls.findIndex((call) => call.tag === tag),
+    calls,
+    createCalls: () => createCalls,
+    fetcher,
+    mintAttempts: () => mintAttempts,
+    mintPropagationSleeps: () => mintPropagationSleeps,
+    policyReadBodies: () => policyReadBodies,
+    policyReadHosts: () => policyReadHosts,
+    policyPropagationSleeps: () => policyPropagationSleeps,
+    roleDeleted: () => roleDeleted,
+    roleDeleteAttempts: () => roleDeleteAttempts,
+    serviceAccountPolicyReadUrls: () => serviceAccountPolicyReadUrls,
+    setupContainmentReads: () => setupContainmentReads,
+    setupDisableWrites: () => setupDisableWrites,
+    setupLifecycleUrls: () => calls.filter((call) =>
+      call.method === "POST" && call.url.endsWith(`/${account.uniqueId}:disable`) &&
+      calls.indexOf(call) < calls.findIndex((candidate) => candidate.tag === "role-403")
+    ).map((call) => call.url),
+    setupSleeps: () => setupSleeps,
+    setupVisibility404s: () => setupVisibility404s,
+    sleep,
+    staleDisableReads: () => staleDisableReads,
+    terminalSleeps: () => terminalSleeps,
+    executorDeleteAttempts: () => executorDeleteAttempts,
+  };
+}
+
 function abruptLossFixture(options: {
   readonly alterTargetLease?: boolean;
   readonly keyInventoryFailure?: boolean;
+  readonly roleDeleteForbidden?: boolean;
+  readonly strandedFence?: "exact" | "tampered";
   readonly userManagedKey?: boolean;
 } = {}) {
   const runId = "7654321";
@@ -2262,12 +3444,38 @@ function abruptLossFixture(options: {
       },
     };
   }
+  const strandedFenceBasis = buildMarkerReadLease(
+    "cdbentley",
+    runId,
+    expiresAt,
+    "cdbentley",
+    email,
+  );
+  const strandedFence: IamBinding | undefined = options.strandedFence === undefined
+    ? undefined
+    : {
+        condition: {
+          description:
+            "Expired inert binding used only to advance the orphan-recovery CAS generation.",
+          expression: options.strandedFence === "exact"
+            ? "request.time < timestamp('2000-01-01T00:00:00.000Z')"
+            : "request.time < timestamp('2099-01-01T00:00:00.000Z')",
+          title: `codex-orphan-fence-${createHash("sha256")
+            .update(`orphan ${account.uniqueId} project cdbentley`)
+            .digest("hex").slice(0, 12)}-0123456789abcdefabcd`,
+        },
+        members: [...strandedFenceBasis.members],
+        role: strandedFenceBasis.role,
+      };
   const policies = new Map<string, IamPolicy>();
   policies.set("project:cdbentley", addExactBindings({
     bindings: [{ members: ["user:unrelated@example.com"], role: "roles/viewer" }],
     etag: "project-cdb-etag-1",
     version: 1,
-  }, targetLeases));
+  }, [
+    ...targetLeases,
+    ...(strandedFence === undefined ? [] : [strandedFence]),
+  ]));
   for (const repository of ["runsetta", "healthmcp"] as const) {
     const projectId = repository === "healthmcp" ? "medlock-1025243085" : repository;
     policies.set(`project:${projectId}`, addExactBindings({
@@ -2291,12 +3499,26 @@ function abruptLossFixture(options: {
     version: 1,
   });
   const runtimeLeases = buildRuntimeActAsLeases("cdbentley", runId, expiresAt, email);
+  const preservedRuntimeCondition: IamBinding = {
+    condition: {
+      description: "Unrelated conditional runtime binding that recovery must preserve.",
+      expression: "request.time < timestamp('2027-01-01T00:00:00.000Z')",
+      title: "preserved-unrelated-runtime-condition",
+    },
+    members: ["serviceAccount:unrelated@example.iam.gserviceaccount.com"],
+    role: "roles/iam.serviceAccountTokenCreator",
+  };
+  let preservedConditionAdded = false;
   for (const [runtimeEmail, lease] of Object.entries(runtimeLeases)) {
     policies.set(`sa:${runtimeEmail}`, addExactBindings({
       bindings: [],
       etag: `runtime-${runtimeEmail.split("@")[0]}-etag-1`,
       version: 1,
-    }, [lease]));
+    }, [
+      lease,
+      ...(preservedConditionAdded ? [] : [preservedRuntimeCondition]),
+    ]));
+    preservedConditionAdded = true;
   }
   policies.set(`sa:${email}`, addExactBindings({
     bindings: [],
@@ -2309,6 +3531,9 @@ function abruptLossFixture(options: {
   let generation = 1;
   let lostResponseObserved = false;
   let lateWriteReconciled = false;
+  let orphanRoleDeleteAttempts = 0;
+  let roleDeleteForbiddenObserved = false;
+  let postForbiddenRoleDeleteSleeps = 0;
   const setPolicy = (
     key: string,
     requested: IamPolicy,
@@ -2351,7 +3576,10 @@ function abruptLossFixture(options: {
     const projectPolicy = /^\/v1\/projects\/([^/:]+):(get|set)IamPolicy$/.exec(path);
     if (projectPolicy !== null) {
       const key = `project:${projectPolicy[1]}`;
-      if (projectPolicy[2] === "get") return Response.json(policies.get(key));
+      if (projectPolicy[2] === "get") {
+        expectProjectIamPolicyRead(input, init);
+        return Response.json(policies.get(key));
+      }
       const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
       return setPolicy(key, requested);
     }
@@ -2359,8 +3587,12 @@ function abruptLossFixture(options: {
       path,
     );
     if (serviceAccountPolicy !== null) {
-      const key = `sa:${serviceAccountPolicy[1]}`;
-      if (serviceAccountPolicy[2] === "get") return Response.json(policies.get(key));
+      const identifier = serviceAccountPolicy[1]!;
+      const key = `sa:${identifier === account.uniqueId ? email : identifier}`;
+      if (serviceAccountPolicy[2] === "get") {
+        expectServiceAccountIamPolicyRead(input, init);
+        return Response.json(policies.get(key));
+      }
       const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
       return setPolicy(key, requested);
     }
@@ -2372,6 +3604,11 @@ function abruptLossFixture(options: {
       const role = roles.find((candidate) => candidate.name === roleMatch[1]);
       if (role === undefined) return new Response("", { status: 404 });
       if (method === "DELETE") {
+        orphanRoleDeleteAttempts += 1;
+        if (options.roleDeleteForbidden === true) {
+          roleDeleteForbiddenObserved = true;
+          return new Response("", { status: 403 });
+        }
         role.deleted = true;
         return Response.json(role);
       }
@@ -2380,7 +3617,7 @@ function abruptLossFixture(options: {
     if (path === "/v1/projects/cdbentley/serviceAccounts" && method === "GET") {
       return Response.json({ accounts: accountExists ? [account, foreignAccount] : [foreignAccount] });
     }
-    if (path.endsWith(`/serviceAccounts/${email}/keys`) && method === "GET") {
+    if (path.endsWith(`/serviceAccounts/${account.uniqueId}/keys`) && method === "GET") {
       if (options.keyInventoryFailure === true) return new Response("", { status: 503 });
       return Response.json({ keys: options.userManagedKey === true ? [{}] : [] });
     }
@@ -2410,9 +3647,15 @@ function abruptLossFixture(options: {
     foreignRole,
     lateWriteRejected: () => lateWriteReconciled,
     lostResponseObserved: () => lostResponseObserved,
+    orphanRoleDeleteAttempts: () => orphanRoleDeleteAttempts,
     policies,
+    postForbiddenRoleDeleteSleeps: () => postForbiddenRoleDeleteSleeps,
+    preservedRuntimeCondition,
     roles,
-    sleep: async () => undefined,
+    sleep: async () => {
+      if (roleDeleteForbiddenObserved) postForbiddenRoleDeleteSleeps += 1;
+    },
+    strandedFence,
   };
 }
 
@@ -2465,6 +3708,54 @@ function mutableOrphanContainmentFixture(
         path.endsWith(`/serviceAccounts/${account.email}`)
       ) {
         return Response.json(account);
+      }
+    }
+    return new Response("", { status: 500 });
+  };
+  return { accounts, calls, fetcher, foreignAccount };
+}
+
+function orphanPeerConvergenceFixture() {
+  const accounts = ["88888888888888888888", "99999999999999999999"].map(
+    (random, index) => {
+      const accountId = `gha-pbt-${random}`;
+      const email = `${accountId}@cdbentley.iam.gserviceaccount.com`;
+      return {
+        description:
+          `pbt-v1;repository=cdbentley;run=${9100000 + index};root=bootstrap;mode=plan;approved=none;expires=2026-08-25T20:00:00.000Z`,
+        disabled: false,
+        displayName: "Protected Terraform Executor",
+        email,
+        etag: `account-etag-${index}`,
+        name: `projects/cdbentley/serviceAccounts/${email}`,
+        oauth2ClientId: `${9200000 + index}`,
+        projectId: "cdbentley",
+        uniqueId: `${index + 8}`.repeat(21),
+      };
+    },
+  );
+  const foreignAccount = {
+    email: "882468538648-compute@developer.gserviceaccount.com",
+    name: "projects/cdbentley/serviceAccounts/882468538648-compute@developer.gserviceaccount.com",
+    projectId: "cdbentley",
+    uniqueId: "777777777777777777777",
+  };
+  const calls: Array<{ method: string; url: string }> = [];
+  const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = new URL(String(input));
+    const path = decodeURIComponent(url.pathname);
+    const method = init?.method ?? "GET";
+    calls.push({ method, url: String(input) });
+    if (path === "/v1/projects/cdbentley/serviceAccounts" && method === "GET") {
+      return Response.json({ accounts: [...accounts, foreignAccount] });
+    }
+    for (const [index, account] of accounts.entries()) {
+      if (path.endsWith(`/serviceAccounts/${account.uniqueId}:disable`) && method === "POST") {
+        account.disabled = true;
+        return Response.json({});
+      }
+      if (path.endsWith(`/serviceAccounts/${account.uniqueId}`) && method === "GET") {
+        return index === 0 ? new Response("", { status: 404 }) : Response.json(account);
       }
     }
     return new Response("", { status: 500 });
