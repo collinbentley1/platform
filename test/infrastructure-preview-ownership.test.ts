@@ -47,6 +47,9 @@ describe("preview exposure controller ownership", () => {
       "template.containers // []",
       "generation == .observedGeneration",
       'terminalCondition.state == "CONDITION_SUCCEEDED"',
+      "exact_public_terraform_bootstrap",
+      "9a0e9a5c7a19281e7617991d2fc61809de4973e6e75a10b2f07df3719ffda33c",
+      '"managed-by":"terraform"',
     ]) {
       expect(run).toContain(boundary);
     }
@@ -113,8 +116,87 @@ cp -- "$FIXTURE_SERVICE_JSON" "$destination"
           },
         ],
       };
+      const publicTerraformBootstrap = {
+        ...base,
+        labels: {
+          app: "cdbentley",
+          environment: "preview",
+          "goog-terraform-provisioned": "true",
+          "managed-by": "terraform",
+        },
+        ingress: "INGRESS_TRAFFIC_ALL",
+        invokerIamDisabled: true,
+        traffic: [{ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", percent: 100 }],
+        trafficStatuses: [{ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST", percent: 100 }],
+        latestReadyRevision:
+          "projects/cdbentley/locations/us-east4/services/cdbentley-preview/revisions/cdbentley-preview-00001-abc",
+        template: {
+          scaling: { maxInstanceCount: 2 },
+          timeout: "300s",
+          serviceAccount: "cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+          containers: [{
+            name: "site",
+            image:
+              "us-docker.pkg.dev/cloudrun/container/hello@sha256:9a0e9a5c7a19281e7617991d2fc61809de4973e6e75a10b2f07df3719ffda33c",
+            env: [{ name: "PLATFORM_DEPLOY_ENVIRONMENT", value: "preview" }],
+            resources: {
+              limits: { cpu: "1", memory: "512Mi" },
+              cpuIdle: true,
+              startupCpuBoost: true,
+            },
+            ports: [{ name: "http1", containerPort: 8080 }],
+            startupProbe: {
+              timeoutSeconds: 240,
+              periodSeconds: 240,
+              failureThreshold: 1,
+              tcpSocket: { port: 8080 },
+            },
+          }],
+          maxInstanceRequestConcurrency: 80,
+        },
+      };
       const cases = [
         ["sealed bootstrap", base, true],
+        ["exact public Terraform bootstrap", publicTerraformBootstrap, true],
+        [
+          "public bootstrap wrong image",
+          {
+            ...publicTerraformBootstrap,
+            template: {
+              ...publicTerraformBootstrap.template,
+              containers: [{
+                ...publicTerraformBootstrap.template.containers[0],
+                image: "us-docker.pkg.dev/cloudrun/container/hello@sha256:" + "0".repeat(64),
+              }],
+            },
+          },
+          false,
+        ],
+        [
+          "public bootstrap extra environment",
+          {
+            ...publicTerraformBootstrap,
+            template: {
+              ...publicTerraformBootstrap.template,
+              containers: [{
+                ...publicTerraformBootstrap.template.containers[0],
+                env: [
+                  ...publicTerraformBootstrap.template.containers[0].env,
+                  { name: "FOREIGN", value: "1" },
+                ],
+              }],
+            },
+          },
+          false,
+        ],
+        [
+          "public bootstrap controller label",
+          {
+            ...publicTerraformBootstrap,
+            labels: { ...publicTerraformBootstrap.labels, "managed-by": "github-actions" },
+          },
+          false,
+        ],
         ["admitted graph", validOpen, true],
         [
           "automatic base URI",

@@ -107,30 +107,174 @@ legacy=true, transition-empty initial bootstrap, whose reviewed plan must create
 the exact object and whose post-apply proof must observe it clear.
 
 For a DHI tuple change from `P` to `S`, use this active-only cutover; never put
-both parity IDs in the trusted set:
+both parity IDs in the trusted set. Finish all platform review, merge, and
+release work first, and freeze final `S` before preparing a consumer head. The
+protected bridge runs only from platform `main`, and its own commit is the
+active workflow SHA. Any platform-`main` advance after that freeze therefore
+invalidates every prepared pin, head check, plan, approval, and result receipt;
+stop, designate and release the new final `S`, repin all four consumers, and
+repeat every check before another protected plan. Never dispatch the bridge
+from a tag or pretend an older receipt authorizes a different platform commit.
 
-1. Open one public PR per consumer whose exact head `C_repo` pins every reusable
-   workflow to `S`. Record each full head SHA and do not merge, rebase, amend, or
-   force-push it.
+1. Prepare one complete branch per consumer whose exact head `C_repo` pins every
+   reusable workflow to `S`, then freeze it before opening a draft PR. Never
+   enable a marker-unaware legacy PR-triggered privileged deployment merely to
+   manufacture a required status. While repository Actions is still globally
+   disabled, first disable the base branch's `Deploy preview`, `Cleanup preview`,
+   and `Deploy production` workflow files and prove `disabled_manually`.
+   `Reconcile previews` must likewise be disabled when registered; the current
+   legacy main may return an exact proven absent workflow until the hardened
+   caller is merged. Only then, during one bounded monitored check window,
+   restore and read back the exact selected/SHA-only `S` Actions policy. Permit
+   only the credentialless exact-head
+   Application, Infrastructure validation, and Socket checks. No cloud job,
+   environment, DHI credential, or OIDC exchange may run; any missing privileged
+   branch-protection status remains missing rather than being synthesized.
+   Immediately disable and drain Actions after those safe checks. A failed check
+   requires a fresh branch and draft attempt assembled while disabled, never a
+   synchronize, rebase, amend, or force-push. Record each full checked head SHA
+   and keep all four heads immutable through the protected plans and merges.
 2. Keep Actions disabled in all four consumers. Require no active run, drain all
-   possible old-`P` tokens, and prove all four markers exactly clear.
+   possible old-`P` tokens, and reject any non-clear marker. In the current
+   marker-unaware v0.4 initial adoption, an as-yet-unmigrated repository's marker
+   is expected to be absent; a marker created by an earlier serial apply must be
+   exactly clear. A later DHI cutover requires all four markers exactly clear
+   before its first plan.
 3. For each repository, run protected bootstrap plan then apply with
-   `consumer_sha=C_repo`, `active=S`, `transition=""`, and
-   `legacy_compatibility_mode=false`. The bridge fetches the unmerged public
-   head by exact SHA and refuses a tree whose workflow pins are not all `S`.
+   `consumer_sha=C_repo`, `active=S`, and `transition=""`. The current v0.4
+   initial adoption must use `legacy_compatibility_mode=true`; its reviewed plan
+   creates that repository's previously absent marker, and its result must prove
+   the marker clear. This is the only exception. A generic later active-only DHI
+   cutover starts with existing clear markers and must use
+   `legacy_compatibility_mode=false`. Never mix those modes across one adoption
+   or infer `false` merely because old and new DHI parity IDs differ. The bridge
+   fetches the unmerged public head by exact SHA and refuses a tree whose workflow
+   pins are not all `S`.
 4. Do not merge any PR until four immutable result receipts exist—one for each
    repository—and each binds `platformSha=S`, its recorded `consumerSha` and
    `consumerTreeSha`, `terraformRoot=bootstrap`, an empty transition, the
    reviewed active-only manifest digest, and the post-300-second-plus-skew
    Actions/run/marker proofs. A missing, stale, failed, or mismatched receipt
    stops all four merges.
-5. With Actions still disabled, merge the four unchanged prepared heads. Verify
-   each resulting `main^{tree}` equals the receipt's `consumerTreeSha`; a rebase,
-   conflict resolution, squash-content change, or follow-up commit requires a
-   fresh protected plan/apply and four-receipt gate.
-6. Recheck disabled Actions, zero runs, and exact-clear markers. Then re-enable
-   consumers in the rollout order; the first `S` production deploy performs the
-   sealed DHI epoch transition before any preview may use the new tuple.
+5. With Actions still disabled, prepare each of the four unchanged draft PRs for
+   merge one at a time. Establish a run-list baseline, mark that exact draft
+   ready while Actions remains globally disabled, and prove exactly the one
+   expected `ready_for_review` lifecycle event was created, zero workflow runs
+   were created after the baseline, and no other event occurred; all privileged
+   workflow files remain `disabled_manually` (or the
+   pre-hardened reconcile file remains exactly absent); the head SHA, head tree,
+   receipt, required checks, and clear-marker snapshot are unchanged. Then merge
+   through the pull-request REST endpoint in squash mode using the receipt-bound
+   head SHA as the exact `sha` precondition. Repeat for the other three without
+   enabling Actions. Verify each resulting `main^{tree}` equals the receipt's
+   `consumerTreeSha`; a rebase, conflict resolution, squash-content change, or
+   follow-up commit requires a fresh protected plan/apply and four-receipt gate.
+6. Recheck disabled Actions, zero runs, and exact-clear markers. Do not merely
+   re-enable Actions: GitHub does not replay the merge's disabled `push`, and the
+   production workflow intentionally has no manual-dispatch trust path. Use the
+   following ordered activation protocol for one consumer at a time; any failed
+   proof returns that repository to globally disabled Actions and stops:
+
+   a. From the resulting exact `main`, prepare the complete activation branch
+      before opening a PR. It may add exactly one fixed-format line to the
+      regular-file `README.md`, with no other content, path, or mode change:
+      `<!-- platform-production-activation-v1 platform-sha=<40hex> cutover-tree=<40hex> phase=<phase-a-or-phase-b> attempt=<positive-decimal> -->`.
+      The SHA must be `S`. This active-only section selects the literal
+      `phase-a`; Phase B step 4 selects the literal `phase-b`. `cutover-tree`
+      must equal that phase's protected-result receipt `consumerTreeSha`. Prove
+      the canonical `.dockerignore` excludes `README.md`, and prove every
+      Dockerfile, build input, and effective image context is byte-identical to
+      the cutover tree. Record the activation head SHA and tree, then freeze them
+      before the PR is opened.
+   b. Derive an exact normalized Actions allowlist from that frozen `S` caller
+      graph. The general policy must be
+      `{enabled:true,allowed_actions:"selected",sha_pinning_required:true}`.
+      The selected policy must set `github_owned_allowed:false` and
+      `verified_allowed:false`; `patterns_allowed` may contain only the pinned
+      direct actions actually reachable from the frozen graph and each exact
+      reusable caller path suffixed by `@S`. Broad owners, wildcards, tags,
+      branches, predecessor SHAs, and unused actions are forbidden. Save this
+      expected normalized policy before enabling: while Actions is globally
+      disabled the selected-actions GET returns 409 and the general GET does not
+      expose enough fields to prove it.
+   c. With Actions still globally disabled, require unchanged `main` and
+      activation head, clear markers, and zero queued or in-progress runs. First
+      disable the `Cleanup preview`, `Reconcile previews`, and `Deploy
+      production` workflow files and prove all three report `disabled_manually`.
+      Then explicitly enable `Deploy
+      preview` and require it to report `active`, including on a recovery attempt
+      that inherited three disabled workflows; global disablement makes this
+      workflow-state preparation non-triggering. Establish a run-list baseline,
+      inventory every open PR and its exact head repository and SHA, freeze every
+      other same-repository lifecycle source, and begin monitoring the repository
+      event and run feeds. Outside the conservative UTC minute `:12` through
+      `:22` reconciliation window, PUT the exact general policy and then
+      immediately PUT the exact selected policy. Immediately GET both surfaces
+      and require an exact normalized readback, then re-read all four workflow
+      states. On any write or readback mismatch, immediately PUT
+      `{enabled:false}`, drain, and stop. Prove this enable sequence replayed no
+      event, created no run, and left none active. The activation draft's
+      `opened` event must be the sole PR lifecycle event repository-wide during
+      the following bounded window.
+   d. Open the already-frozen activation PR as a draft. The sole permitted PR
+      lifecycle event is this initial `opened` event. Wait only until that
+      event's `Deploy preview` run materializes both `invalidate` and `deploy` as
+      skipped before every credential-bearing environment, DHI, or OIDC entry.
+      Immediately disable `Deploy preview`, require `disabled_manually`, and
+      prove the bounded run/event feed contains no other lifecycle event or
+      unexpected run. All three preview lifecycle workflows are now individually
+      disabled; only then wait for and require all normal exact-head checks. A
+      draft does not make `synchronize` harmless: it enters the credentialed
+      invalidation path. Therefore forbid `synchronize`, `reopened`,
+      `ready_for_review`, and `converted_to_draft`, plus any amend, rebase,
+      update-branch, force-push, close, or reopen, while Actions is enabled. If a
+      new commit is needed, globally disable Actions, drain, close the abandoned
+      PR while disabled, and begin again with a fresh immutable branch and
+      attempt number.
+   e. With all three preview lifecycle workflows still individually disabled,
+      globally disable Actions and drain all runs. Establish run-list and event
+      baselines, mark the unchanged PR ready while globally disabled, and then
+      prove exactly the one expected `ready_for_review` event occurred, zero
+      workflow runs and no other event were created after the baselines, Actions
+      is still disabled, all three workflow files remain `disabled_manually`, the
+      exact head and tree are unchanged, and all four markers remain clear. This
+      intentionally suppresses the workflow response to the ready event rather
+      than relying on draft semantics.
+   f. While still globally disabled, explicitly enable only `Deploy production`,
+      require its workflow state `active`, and reprove that all three preview
+      lifecycle workflows remain `disabled_manually`. Re-enable with the same
+      two-PUT general-then-selected sequence and exact normalized readback from
+      step b. Prove GitHub did not replay the missed ready event or any production
+      run, re-read the exact `S`-only policy, and repeat the unchanged
+      main/head/tree, zero-active-run, exact-check, and clear-marker proofs.
+      Merge through the pull-request REST endpoint using the exact frozen head SHA as its `sha`
+      precondition and squash mode. A stale or rejected SHA is a stop, never a
+      reason to retry against a moved head.
+   g. Require the resulting `main^{tree}` to equal the frozen activation-head
+      tree. Because `Cleanup preview` remains disabled, no
+      `pull_request_target: closed` cleanup may exist for this merge; because
+      `Reconcile previews` remains disabled, neither its `push` trigger nor its
+      schedule may run. The only cloud mutation admitted by the activation merge
+      is the push-only `Deploy production` workflow. Require that exact run to
+      succeed and the first `S` production deploy to complete the sealed DHI
+      epoch transition before enabling any preview lifecycle workflow.
+   h. Outside the UTC minute `:12` through `:22` window, enable `Cleanup
+      preview`, `Reconcile previews`, and `Deploy preview`, read back each active
+      state, and prove there was no replay of the missed closed, push, ready, or
+      scheduled events and no unexpected run before creating the reviewed live
+      preview canary. Require the production DHI tuple for that canary; no
+      preview may race or precede the production epoch.
+   i. If the activation production run fails, immediately globally disable
+      Actions, drain, keep all three preview lifecycle workflows individually
+      disabled, and freeze every preview event. Do not rerun the failed workflow.
+      Inspect and recover the durable deployment-parity marker and production
+      state through the reviewed recovery path. Only after all original gates
+      are restored may a fresh immutable activation PR with a new attempt number
+      create one new push-only production run.
+
+   Never replace this sequence with a direct push, ref rewrite, synthetic check,
+   privileged rerun, branch-protection weakening, or a new `workflow_dispatch`
+   WIF route.
 
 The active-only apply removes `P` trust and adds only `S`; the bridge waits 300
 seconds plus skew before its second freeze/marker proof. Never merge an `S` pin
@@ -298,6 +442,13 @@ the recovery object and stop; never rerun from empty state.
    and production so exact base parity is structural rather than two separately
    managed credential copies.
 
+   Repository Actions must also use the exact general selected-actions policy
+   and frozen-SHA allowlist defined by the activation protocol. A bare enable,
+   GitHub-owned or verified-publisher blanket, tag or branch pattern, and a
+   configuration that omits `sha_pinning_required:true` are all stop
+   conditions. Every re-enable repeats the two writes and exact readback; an
+   earlier successful read does not authorize later drift.
+
    Create the DHI environment with no secrets or variables first. Prove a
    default-branch, exact-SHA `pull_request_target` caller can enter it without a
    credential and fails only at the explicit missing-DHI-credential check. Then
@@ -461,7 +612,9 @@ the recovery object and stop; never rerun from empty state.
    `consumerTreeSha`. The normal production Terraform job now executes only
    `terraform/deployments/prod` from the exact platform SHA; checked-out
    consumer Terraform is validation/documentation and is never executed after
-   Google authentication.
+   Google authentication. Re-enabling after these merges cannot activate
+   production because their `push` events occurred while Actions was disabled;
+   use only the reviewed draft-to-ready activation-PR sequence above.
 6. Review the immutable runtime map in the platform commit. Confirm Runsetta has
    `RUNSETTA_OFFLINE=1`, no deployed secret mappings, and no runtime secret
    accessor grants; confirm Medlock preview uses memory and production uses only
@@ -522,20 +675,59 @@ the recovery object and stop; never rerun from empty state.
    present.
 10. Keep consumer Actions disabled until the no-data preview runtime, shared
    preview service, service-scoped IAM, and exact-WIF bindings are independently
-   verified from the protected pipeline. After the required Critical History
-   environment values are present, activate Critical History first. Its first
-   reviewed new-SHA preview deploy sets the shared preview service ingress to
-   `internal-and-cloud-load-balancing` and must nonce-verify a live tagged
-   revision through `https://pr-N.preview.ycriticalhistory.org`. The preview
-   controller, not Terraform, owns the post-bootstrap ingress and invoker fields;
-   the infrastructure workflow shares its deployment-parity lock and must prove
-   the live OPEN/tagged or SEALED/zero-tag state instead of converging exposure.
-   Require the stable tagged URL to remain healthy and the generated `run.app`
-   URL to be denied. Then enable each remaining consumer one at a time and run
-   fresh production, Terraform, preview build/publish/deploy, cleanup, and
-   reconciliation jobs at the new SHA. Require every unconditional canary and
-   operation to succeed. Disable that consumer again and stop on any unexpected
-   claim or permission; no broad project role remains during this proof.
+   verified from the protected pipeline. The ordering now forks explicitly for
+   Critical History. After all four bootstrap result receipts exist and all four
+   receipt-bound cutover trees are merged with Actions disabled, run and apply
+   the protected production plans for cdbentley, Runsetta, and Health/Medlock.
+   For Critical History, first complete the protected exposure/load-balancer
+   apply and missing-tag 404 proof from step 9, then plan and apply its protected
+   production root before activation. The push-only production caller requires
+   infrastructure convergence before its deploy job, so a nonempty deferred
+   production plan is a hard stop, not a staging mechanism. The production root
+   records the controller's expected open ingress and installs IAM/resources,
+   but the preview-service lifecycle deliberately ignores controller-owned
+   `ingress` and `invoker_iam_disabled`; this pre-activation apply must therefore
+   leave the existing public, zero-tag bootstrap exposure byte-for-byte unchanged.
+
+   After the required Critical History environment values are present and the
+   production convergence plan is empty, run the exact ordered activation
+   protocol above with all three preview lifecycle workflows disabled across its
+   merge. The prerequisite infrastructure exposure proof may admit the public
+   zero-tag state only when its labels, service account, traffic, template,
+   resources, environment, and immutable Google hello-image digest exactly equal
+   the Terraform bootstrap object; it rejects every near match. The reusable
+   parity inspection then rejects that non-DHI bootstrap only because that step
+   is explicitly `continue-on-error`; the immediately
+   following epoch-prepare controller must acquire the durable marker and
+   atomically prune traffic, set internal-only ingress, disable public invocation,
+   and sanitize IAM before production deployment. Require the push-only new-SHA
+   production run to finish, replace the sealed bootstrap with the sanitized
+   production-DHI baseline, and clear the epoch marker. Only then re-enable the lifecycle
+   workflows under the exact selected/SHA-only policy and create the live preview
+   canary. That reviewed new-SHA preview deploy sets the shared preview service
+   ingress to `internal-and-cloud-load-balancing` and must nonce-verify a live
+   tagged revision through `https://pr-N.preview.ycriticalhistory.org`. The
+   preview controller, not Terraform, owns the post-bootstrap ingress and invoker
+   fields; the infrastructure workflow shares its deployment-parity lock and
+   must prove the live OPEN/tagged or SEALED/zero-tag state instead of converging
+   exposure. Require the stable tagged URL healthy and the generated `run.app`
+   URL denied.
+
+   With that Critical canary still open, globally disable and drain Critical
+   History again under the protocol and require its protected production plan to
+   remain empty; no second apply is expected. Reverify the same tagged stable
+   URL, the `run.app` denial, and the OPEN/tagged marker projection. Re-enable
+   Critical only with the exact two-PUT selected/SHA-only policy and readback,
+   then make one reviewed synchronization of the still-open canary.
+   Require its invalidation and redeploy to succeed through the restricted
+   frontend, nonce-verify the stable tagged URL again, and require the `run.app`
+   URL to remain denied. Only then execute fresh activation PRs for cdbentley,
+   Runsetta, and Health/Medlock one at a time. For each, require the activation
+   production run before its preview, then exercise Terraform convergence,
+   preview build/publish/deploy, cleanup, and reconciliation at the new SHA.
+   Require every unconditional canary and operation to succeed. Disable that
+   consumer again and stop on any unexpected claim or permission; no broad
+   project role remains during this proof.
 11. Reconciliation must continue to report zero legacy `${SERVICE}-pr-*`
     services. Re-deploy any needed preview onto the shared service only after
     phase B.
@@ -625,20 +817,42 @@ deployments.
 
 ## Phase B: remove the old path
 
-1. Set `legacy_compatibility_mode = false` in the protected bootstrap pipeline.
-2. Apply the exact platform bootstrap root. This removes path-specific legacy
-   Workload Identity User bindings. Broad project roles,
-   Token Creator, and cross-boundary `actAs` were already removed by the first
-   phase-A apply. Routine Terraform retains only metadata reads and read-only
-   state. Each
-   consumer must separately remove any consumer-owned preview IAM grant.
-3. Confirm each service-account policy contains only the expected
-   `attribute.*_workflow_sha/<approved-sha>` principal sets.
-4. Run a new production deploy; create two preview tags; close one PR; confirm
-   cleanup removes only its tag and its stable URL converges to an exact 404
-   without redirects while the other stable preview remains healthy. Run
-   reconciliation and repeat the 404 proof for an invalidated tag. Confirm the
-   direct generated `run.app` URL remains denied throughout.
+1. Keep all four consumers' Actions disabled and drained, require every marker
+   exactly clear, and freeze each current consumer head/tree. Set
+   `legacy_compatibility_mode=false` and an empty transition SHA for every
+   repository-scoped protected bootstrap plan; this is a four-repository phase,
+   not one shared apply.
+2. Plan, review, and apply the exact platform bootstrap root separately for
+   cdbentley, Runsetta, Health/Medlock, and Critical History. Each apply removes
+   that repository's path-specific legacy Workload Identity User bindings.
+   Broad project roles, Token Creator, and cross-boundary `actAs` were already
+   removed by phase A. Routine Terraform retains only metadata reads and
+   read-only state, and each consumer must separately remove any consumer-owned
+   preview IAM grant.
+3. Do not activate any repository until four immutable successful phase-B result
+   receipts exist and bind the four exact pre-activation consumer trees. Confirm
+   each service-account policy contains only the expected
+   `attribute.*_workflow_sha/<approved-sha>` principal sets, with no legacy or
+   transition fallback, and repeat the all-four clear-marker and disabled-run
+   proof.
+4. Activate all four consumers serially, one complete repository proof at a
+   time. A re-enable cannot supply the required new production deploy because
+   the production caller is intentionally push-only and GitHub does not replay a
+   disabled push. For the selected repository, prepare a new exact one-line
+   README activation record using `phase=phase-b`, that repository's phase-B
+   receipt tree, and a fresh attempt number. Execute the complete immutable
+   draft, three-workflow-disable, exact-policy-readback, exact-SHA merge, tree
+   equality, production-success, and no-replay activation protocol above. This
+   creates its required new phase-B production push; never rerun a phase-A run or
+   add a dispatch trigger. Require that production run and Terraform convergence
+   to succeed, then create two preview tags; close one PR; confirm cleanup removes
+   only its tag and its stable URL converges to an exact 404 without redirects
+   while the other stable preview remains healthy. Run reconciliation and repeat
+   the 404 proof for an invalidated tag. Confirm the direct generated `run.app`
+   URL remains denied throughout. Globally disable and drain that repository and
+   reprove clear markers before starting the next one. After all four serial
+   proofs, restore each repository only with the exact selected/SHA-only policy
+   and workflow-state readbacks, and prove no missed event was replayed.
    The production deploy must precede the first preview after every platform
    pin or DHI-contract change. Confirm each admitted preview independently
    proves the exact DHI development/runtime top-level and linux/amd64 child
