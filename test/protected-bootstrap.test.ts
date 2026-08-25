@@ -639,6 +639,9 @@ describe("protected owner Terraform bridge", () => {
         `serviceAccount:${healthExecutor}`,
       ]);
     }
+    expect(buildTokenCreatorLease("cdbentley", "89", expiration).members).toEqual([
+      "user:CollinBentley1@gmail.com",
+    ]);
   });
 
   test("IAM transformations preserve latest policy data and remove only the exact lease", () => {
@@ -2317,6 +2320,36 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
+  test("orphan recovery accepts only the canonical owner on an executor-policy fence", async () => {
+    const exact = abruptLossFixture({ executorStrandedFence: "exact" });
+    await inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      exact.fetcher,
+      exact.sleep,
+      Date.now() + 60_000,
+    );
+    expect(exact.accountDeleted()).toBeTrue();
+    expect(exact.executorStrandedFence).toBeDefined();
+    expect(exact.policies.get(`sa:${exact.account.email}`)?.bindings).not.toContainEqual(
+      exact.executorStrandedFence!,
+    );
+
+    const attacker = abruptLossFixture({ executorStrandedFence: "attacker" });
+    await expect(inventoryBridgeArtifacts(
+      "cdbentley",
+      "google-owner-access-token-value",
+      attacker.fetcher,
+      attacker.sleep,
+      Date.now() + 60_000,
+    )).rejects.toThrow("unknown or modified binding; manual cleanup is required");
+    expect(attacker.account.disabled).toBeTrue();
+    expect(attacker.accountDeleted()).toBeFalse();
+    expect(attacker.policies.get(`sa:${attacker.account.email}`)?.bindings).toContainEqual(
+      attacker.executorStrandedFence!,
+    );
+  });
+
   test("orphan recovery disables but refuses an altered lease with manual-cleanup guidance", async () => {
     const fixture = abruptLossFixture({ alterTargetLease: true });
     await expect(inventoryBridgeArtifacts(
@@ -3342,6 +3375,7 @@ function executorLifecycleFixture(
 
 function abruptLossFixture(options: {
   readonly alterTargetLease?: boolean;
+  readonly executorStrandedFence?: "attacker" | "exact";
   readonly keyInventoryFailure?: boolean;
   readonly roleDeleteForbidden?: boolean;
   readonly strandedFence?: "exact" | "tampered";
@@ -3467,6 +3501,23 @@ function abruptLossFixture(options: {
         members: [...strandedFenceBasis.members],
         role: strandedFenceBasis.role,
       };
+  const executorStrandedFence: IamBinding | undefined =
+    options.executorStrandedFence === undefined
+      ? undefined
+      : {
+          condition: {
+            description:
+              "Expired inert binding used only to advance the orphan-recovery CAS generation.",
+            expression: "request.time < timestamp('2000-01-01T00:00:00.000Z')",
+            title: `codex-orphan-fence-${createHash("sha256")
+              .update(`orphan ${account.uniqueId} executor policy`)
+              .digest("hex").slice(0, 12)}-5a5e027fc51b61baf2e4`,
+          },
+          members: [options.executorStrandedFence === "exact"
+            ? "user:CollinBentley1@gmail.com"
+            : "user:attacker@example.com"],
+          role: "roles/iam.serviceAccountTokenCreator",
+        };
   const policies = new Map<string, IamPolicy>();
   policies.set("project:cdbentley", addExactBindings({
     bindings: [{ members: ["user:unrelated@example.com"], role: "roles/viewer" }],
@@ -3520,11 +3571,17 @@ function abruptLossFixture(options: {
     ]));
     preservedConditionAdded = true;
   }
-  policies.set(`sa:${email}`, addExactBindings({
-    bindings: [],
-    etag: "executor-policy-etag-1",
-    version: 1,
-  }, [buildTokenCreatorLease("cdbentley", runId, expiresAt)]));
+  policies.set(`sa:${email}`, executorStrandedFence === undefined
+    ? addExactBindings({
+        bindings: [],
+        etag: "executor-policy-etag-1",
+        version: 1,
+      }, [buildTokenCreatorLease("cdbentley", runId, expiresAt)])
+    : {
+        bindings: [executorStrandedFence],
+        etag: "executor-policy-etag-1",
+        version: 3,
+      });
 
   const calls: Array<{ method: string; url: string }> = [];
   let accountExists = true;
@@ -3642,6 +3699,7 @@ function abruptLossFixture(options: {
     account,
     accountDeleted: () => !accountExists,
     calls,
+    executorStrandedFence,
     fetcher,
     foreignAccount,
     foreignRole,
