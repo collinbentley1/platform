@@ -1,6 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, readFileSync, readSync } from "node:fs";
 import {
+  connect as connectHttp2,
+  constants as http2Constants,
+  type ClientHttp2Session,
+} from "node:http2";
+import {
   appendFile,
   chmod,
   lstat,
@@ -70,6 +75,8 @@ const CLEANUP_FENCE_DESCRIPTION =
 const ORPHAN_FENCE_DESCRIPTION =
   "Expired inert binding used only to advance the orphan-recovery CAS generation.";
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
+const MAX_STORAGE_PERMISSION_RPC_BYTES = 64 * 1024;
+const STORAGE_PERMISSION_RPC_TIMEOUT_MS = 15_000;
 const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
 // Google documents that a newly created service account can take 60 seconds or
 // more to become visible, policy changes can take 7 minutes or longer to
@@ -4140,6 +4147,18 @@ function retryableCleanupError(error: unknown): boolean {
 
 class UnresolvedDeterministicIdentityError extends Error {}
 
+class ExactDeterministicAccountAbsentOrDeniedError extends Error {}
+
+type DeterministicDisableObservation =
+  | "absent"
+  | "absent-or-denied"
+  | "disabled"
+  | "transient";
+
+type DeterministicIdentityObservation =
+  | { readonly identity: ServiceAccountIdentity; readonly state: "present" }
+  | { readonly identity: undefined; readonly state: "absent" | "absent-or-denied" };
+
 function recursivelyRetryableCleanupError(error: unknown): boolean {
   if (error instanceof UnresolvedDeterministicIdentityError) return true;
   if (error instanceof AggregateError) {
@@ -4321,6 +4340,7 @@ export async function inventoryBridgeArtifacts(
   recovery: RecoveryInvocation | undefined = undefined,
 ): Promise<{
   readonly accountIds: ReadonlySet<string>;
+  readonly exactAccountAbsentOrDenied: boolean;
   readonly hadActiveArtifacts: boolean;
   readonly roleIds: ReadonlySet<string>;
 }> {
@@ -4336,23 +4356,28 @@ export async function inventoryBridgeArtifacts(
         accountId: undefined,
         disableResult: "absent" as const,
         identity: undefined,
+        identityState: "absent" as const,
       })
     : (async () => {
         exact(REPOSITORIES[recovery.repository].projectId, projectId, "recovery executor project");
         const accountId = randomExecutorAccountId(
           deterministicArtifactHex(recovery.repository, recovery.githubRunId, "service-account"),
         );
-        const email = executorEmail(projectId, accountId);
         const disableResult = await disableDeterministicExecutorByEmail(
-          projectId,
-          email,
+          recovery,
+          ownerToken,
+          fetcher,
+        );
+        const identityObservation = await observeDeterministicExecutorIdentityByEmail(
+          recovery,
           ownerToken,
           fetcher,
         );
         return {
           accountId,
           disableResult,
-          identity: await getExecutorIdentity(projectId, email, ownerToken, fetcher, true),
+          identity: identityObservation.identity,
+          identityState: identityObservation.state,
         };
       })();
   // The direct disable fetch above is invoked synchronously before this
@@ -4361,14 +4386,18 @@ export async function inventoryBridgeArtifacts(
   // consume its deadline. Settle the promise immediately to avoid an
   // unhandled rejection while the independent lifecycle work proceeds.
   const initialDetachedRecovery = recovery === undefined
-    ? Promise.resolve({ observed: false, status: "fulfilled" as const })
+    ? Promise.resolve({
+        exactAccountAbsentOrDenied: false,
+        observed: false,
+        status: "fulfilled" as const,
+      })
     : recoverDetachedDeterministicPolicies(
         recovery,
         fetcher,
         sleep,
         cleanupDeadlineMs,
       ).then(
-        (observed) => ({ observed, status: "fulfilled" as const }),
+        (observed) => ({ ...observed, status: "fulfilled" as const }),
         (reason: unknown) => ({ reason, status: "rejected" as const }),
       );
   const listedObservation = (async () => {
@@ -4442,7 +4471,9 @@ export async function inventoryBridgeArtifacts(
     listedObservation,
   ]);
   if (directObservationResult.status === "fulfilled") {
-    directDisableObservedAuthority = directObservationResult.value.disableResult !== "absent";
+    directDisableObservedAuthority = ["disabled", "transient"].includes(
+      directObservationResult.value.disableResult,
+    );
     if (directObservationResult.value.identity !== undefined &&
       directObservationResult.value.accountId !== undefined) {
       accountIds.add(directObservationResult.value.accountId);
@@ -4473,7 +4504,7 @@ export async function inventoryBridgeArtifacts(
       cleanupDeadlineMs,
       observedDeterministicUniqueId,
     ).then(
-      (observed) => ({ observed, status: "fulfilled" as const }),
+      (observed) => ({ ...observed, status: "fulfilled" as const }),
       (reason: unknown) => ({ reason, status: "rejected" as const }),
     );
   });
@@ -4598,8 +4629,10 @@ export async function inventoryBridgeArtifacts(
     if (result.status === "rejected") containmentErrors.push(result.reason);
   }
   let detachedAuthorityObserved = false;
+  let detachedExactAccountAbsentOrDenied = false;
   if (detachedResult.status === "fulfilled") {
     detachedAuthorityObserved = detachedResult.observed;
+    detachedExactAccountAbsentOrDenied = detachedResult.exactAccountAbsentOrDenied;
   } else {
     containmentErrors.push(detachedResult.reason);
   }
@@ -4620,6 +4653,10 @@ export async function inventoryBridgeArtifacts(
   }
   return {
     accountIds,
+    exactAccountAbsentOrDenied: detachedExactAccountAbsentOrDenied ||
+      (directObservationResult.status === "fulfilled" &&
+        (directObservationResult.value.disableResult === "absent-or-denied" ||
+          directObservationResult.value.identityState === "absent-or-denied")),
     hadActiveArtifacts: hadActiveArtifacts || detachedAuthorityObserved,
     roleIds,
   };
@@ -4630,9 +4667,13 @@ async function bridgeArtifactsRemain(
   ownerToken: string,
   fetcher: Fetcher,
   recovery: RecoveryInvocation,
-): Promise<boolean> {
+): Promise<{
+  readonly active: boolean;
+  readonly exactAccountAbsentOrDenied: boolean;
+}> {
   const observedAccounts = new Set<string>();
   let active = false;
+  let exactAccountAbsentOrDenied = false;
   for (const entry of await listServiceAccountEntries(projectId, ownerToken, fetcher)) {
     if (reservedExecutorAccountIdOrUndefined(entry.email) === undefined) continue;
     const account = parseReservedServiceAccountIdentity(entry.value, projectId);
@@ -4646,8 +4687,13 @@ async function bridgeArtifactsRemain(
     );
     const email = executorEmail(projectId, accountId);
     if (!observedAccounts.has(email)) {
-      const observed = await getExecutorIdentity(projectId, email, ownerToken, fetcher, true);
-      if (observed !== undefined) active = true;
+      const observed = await observeDeterministicExecutorIdentityByEmail(
+        recovery,
+        ownerToken,
+        fetcher,
+      );
+      if (observed.state === "present") active = true;
+      else if (observed.state === "absent-or-denied") exactAccountAbsentOrDenied = true;
     }
   }
 
@@ -4674,7 +4720,12 @@ async function bridgeArtifactsRemain(
     verifyBridgeRole(observed, projectId);
     if (!observed.deleted) active = true;
   }
-  return active || await detachedDeterministicPoliciesRemain(recovery, fetcher);
+  const detached = await detachedDeterministicPoliciesRemain(recovery, fetcher);
+  return {
+    active: active || detached.active,
+    exactAccountAbsentOrDenied: exactAccountAbsentOrDenied ||
+      detached.exactAccountAbsentOrDenied,
+  };
 }
 
 export async function recoverBridgeArtifactsUntilStable(
@@ -4687,6 +4738,7 @@ export async function recoverBridgeArtifactsUntilStable(
   const projectId = REPOSITORIES[invocation.repository].projectId;
   const observationStartedAtMs = now();
   let emptySinceMs: number | undefined;
+  let exactAccountWasAbsentOrDenied = false;
   while (now() < cleanupDeadlineMs) {
     try {
       const inventory = await inventoryBridgeArtifacts(
@@ -4697,25 +4749,36 @@ export async function recoverBridgeArtifactsUntilStable(
         cleanupDeadlineMs,
         invocation,
       );
-      const active = await bridgeArtifactsRemain(
+      const remaining = await bridgeArtifactsRemain(
         projectId,
         invocation.ownerAccessToken,
         fetcher,
         invocation,
       );
       const scanCompletedAtMs = now();
+      const propagationHorizonComplete = scanCompletedAtMs - observationStartedAtMs >=
+        RECOVERY_DOCUMENTED_PROPAGATION_MINUTES * 60_000;
+      const exactAccountAbsentOrDenied = inventory.exactAccountAbsentOrDenied ||
+        remaining.exactAccountAbsentOrDenied;
+      const newlyMaskedExactAccount = exactAccountAbsentOrDenied &&
+        !exactAccountWasAbsentOrDenied;
+      exactAccountWasAbsentOrDenied = exactAccountAbsentOrDenied;
       if (
-        active ||
-        scanCompletedAtMs - observationStartedAtMs <
-          RECOVERY_DOCUMENTED_PROPAGATION_MINUTES * 60_000
+        remaining.active ||
+        !propagationHorizonComplete
       ) {
         // The stable-empty proof begins only after the complete propagation
         // horizon. Clean scans inside that horizon are observation, not proof.
         emptySinceMs = undefined;
-      } else if (inventory.hadActiveArtifacts || emptySinceMs === undefined) {
+      } else if (
+        newlyMaskedExactAccount ||
+        inventory.hadActiveArtifacts ||
+        emptySinceMs === undefined
+      ) {
         // This scan's final proof is clean, so it may begin (or reset) the
         // five-minute absence window even when the same scan contained an
-        // artifact. It can never reuse absence time from before that artifact.
+        // artifact or first lost exact-resource visibility. It can never reuse
+        // absence time from before either observation.
         emptySinceMs = scanCompletedAtMs;
       } else if (scanCompletedAtMs - emptySinceMs >= RECOVERY_STABLE_EMPTY_MS) {
         return;
@@ -4725,6 +4788,7 @@ export async function recoverBridgeArtifactsUntilStable(
       // A failed read is not negative proof. Retry the entire inventory while
       // preserving hard failure for identity drift and malformed authority.
       emptySinceMs = undefined;
+      exactAccountWasAbsentOrDenied = false;
       const remainingMs = cleanupDeadlineMs - now();
       if (remainingMs <= 0) break;
       await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, remainingMs));
@@ -4768,11 +4832,12 @@ function strandedFenceContract(
 }
 
 async function disableDeterministicExecutorByEmail(
-  projectId: string,
-  email: string,
+  invocation: RecoveryInvocation,
   ownerToken: string,
   fetcher: Fetcher,
-): Promise<"absent" | "disabled" | "transient"> {
+): Promise<DeterministicDisableObservation> {
+  const projectId = REPOSITORIES[invocation.repository].projectId;
+  const email = deterministicExecutorEmail(invocation);
   let response: Response;
   try {
     response = await fetcher(`${serviceAccountIdentifierUrl(projectId, email)}:disable`, {
@@ -4792,9 +4857,56 @@ async function disableDeterministicExecutorByEmail(
     await boundedText(response, 64 * 1024);
     return "disabled";
   }
-  if (response.status === 404) return "absent";
-  if ([408, 409, 429, 500, 502, 503, 504].includes(response.status)) return "transient";
+  if (response.status === 404) {
+    await boundedText(response, 64 * 1024);
+    return "absent";
+  }
+  if (response.status === 403) {
+    // IAM deliberately masks some nonexistent service accounts as forbidden.
+    // This is not success: only the exact deterministic email may enter this
+    // state, and the independent global list/policy scans plus the complete
+    // propagation and stable-empty windows must still prove absence.
+    await boundedText(response, 64 * 1024);
+    return "absent-or-denied";
+  }
+  if ([408, 409, 429, 500, 502, 503, 504].includes(response.status)) {
+    await boundedText(response, 64 * 1024);
+    return "transient";
+  }
+  await boundedText(response, 64 * 1024);
   throw new Error(`Deterministic executor disable failed with HTTP ${response.status}.`);
+}
+
+async function observeDeterministicExecutorIdentityByEmail(
+  invocation: RecoveryInvocation,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<DeterministicIdentityObservation> {
+  const projectId = REPOSITORIES[invocation.repository].projectId;
+  const email = deterministicExecutorEmail(invocation);
+  const response = await fetcher(serviceAccountIdentifierUrl(projectId, email), {
+    headers: googleHeaders(ownerToken),
+    redirect: "error",
+  });
+  if (response.status === 404) {
+    await boundedText(response, 64 * 1024);
+    return { identity: undefined, state: "absent" };
+  }
+  if (response.status === 403) {
+    await boundedText(response, 64 * 1024);
+    return { identity: undefined, state: "absent-or-denied" };
+  }
+  if (!response.ok) {
+    await boundedText(response, 64 * 1024);
+    throw new Error(`Deterministic executor identity lookup failed with HTTP ${response.status}.`);
+  }
+  return {
+    identity: parseReservedServiceAccountIdentity(
+      await boundedJson(response, 256 * 1024),
+      projectId,
+    ),
+    state: "present",
+  };
 }
 
 async function disableOrphanExecutor(
@@ -5092,7 +5204,10 @@ async function recoverDetachedDeterministicPolicies(
   sleep: (milliseconds: number) => Promise<void>,
   cleanupDeadlineMs: number,
   executorUniqueId: string | undefined = undefined,
-): Promise<boolean> {
+): Promise<{
+  readonly exactAccountAbsentOrDenied: boolean;
+  readonly observed: boolean;
+}> {
   const loaded = await detachedDeterministicPolicySurfaces(
     invocation,
     fetcher,
@@ -5129,13 +5244,19 @@ async function recoverDetachedDeterministicPolicies(
   if (errors.length > 0) {
     throw new AggregateError(errors, "Deterministic executor policy recovery was incomplete.");
   }
-  return observed;
+  return {
+    exactAccountAbsentOrDenied: loaded.exactAccountAbsentOrDenied,
+    observed,
+  };
 }
 
 async function detachedDeterministicPoliciesRemain(
   invocation: RecoveryInvocation,
   fetcher: Fetcher,
-): Promise<boolean> {
+): Promise<{
+  readonly active: boolean;
+  readonly exactAccountAbsentOrDenied: boolean;
+}> {
   const loaded = await detachedDeterministicPolicySurfaces(invocation, fetcher);
   let remains = false;
   for (const { current, descriptor, surface } of loaded.surfaces) {
@@ -5144,7 +5265,10 @@ async function detachedDeterministicPoliciesRemain(
   if (loaded.errors.length > 0) {
     throw new AggregateError(loaded.errors, "Deterministic executor policy proof was incomplete.");
   }
-  return remains;
+  return {
+    active: remains,
+    exactAccountAbsentOrDenied: loaded.exactAccountAbsentOrDenied,
+  };
 }
 
 async function detachedDeterministicPolicySurfaces(
@@ -5153,6 +5277,7 @@ async function detachedDeterministicPolicySurfaces(
   executorUniqueId: string | undefined = undefined,
 ): Promise<{
   readonly errors: readonly unknown[];
+  readonly exactAccountAbsentOrDenied: boolean;
   readonly surfaces: readonly {
     readonly current: IamPolicy;
     readonly descriptor: DetachedPolicyDescriptor;
@@ -5185,7 +5310,7 @@ async function detachedDeterministicPolicySurfaces(
   }
   descriptors.push({
     exclusive: true,
-    get: () => getServiceAccountPolicyIfPresent(executorEmail, token, fetcher),
+    get: () => getDeterministicExecutorPolicyIfPresent(invocation, token, fetcher),
     kind: "executor",
     label: `deterministic run ${invocation.githubRunId} executor policy`,
     set: (policy) => setServiceAccountPolicy(executorEmail, token, policy, fetcher),
@@ -5198,6 +5323,7 @@ async function detachedDeterministicPolicySurfaces(
     surface: OrphanPolicySurface;
   }> = [];
   const errors: unknown[] = [];
+  let exactAccountAbsentOrDenied = false;
   const loads = await Promise.allSettled(descriptors.map(async (descriptor) => {
     const current = await descriptor.get();
     if (current === undefined) return undefined;
@@ -5265,10 +5391,16 @@ async function detachedDeterministicPolicySurfaces(
     };
   }));
   for (const load of loads) {
-    if (load.status === "rejected") errors.push(load.reason);
+    if (load.status === "rejected") {
+      if (load.reason instanceof ExactDeterministicAccountAbsentOrDeniedError) {
+        exactAccountAbsentOrDenied = true;
+      } else {
+        errors.push(load.reason);
+      }
+    }
     else if (load.value !== undefined) result.push(load.value);
   }
-  return { errors, surfaces: result };
+  return { errors, exactAccountAbsentOrDenied, surfaces: result };
 }
 
 function detachedSurfaceHasRelevantBinding(
@@ -6495,6 +6627,36 @@ async function getServiceAccountPolicyIfPresent(
   return iamPolicy(await boundedJson(response, 2 * 1024 * 1024));
 }
 
+async function getDeterministicExecutorPolicyIfPresent(
+  invocation: RecoveryInvocation,
+  token: string,
+  fetcher: Fetcher,
+): Promise<IamPolicy | undefined> {
+  const email = deterministicExecutorEmail(invocation);
+  const url = new URL(`${serviceAccountUrl(email)}:getIamPolicy`);
+  url.searchParams.set("options.requestedPolicyVersion", "3");
+  const response = await fetcher(url, {
+    headers: googleHeaders(token),
+    method: "POST",
+    redirect: "error",
+  });
+  if (response.status === 404) {
+    await boundedText(response, 64 * 1024);
+    return undefined;
+  }
+  if (response.status === 403) {
+    await boundedText(response, 64 * 1024);
+    throw new ExactDeterministicAccountAbsentOrDeniedError(
+      "Exact deterministic executor policy is absent or authorization-masked.",
+    );
+  }
+  if (!response.ok) {
+    await boundedText(response, 64 * 1024);
+    throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
+  }
+  return iamPolicy(await boundedJson(response, 2 * 1024 * 1024));
+}
+
 async function setServiceAccountPolicy(
   account: string | ServiceAccountIdentity,
   token: string,
@@ -6672,6 +6834,493 @@ export async function proveDeploymentParityMarkers(
   return result;
 }
 
+const STORAGE_OBJECT_PERMISSION_RPC_PATH =
+  "/google.storage.v2.Storage/TestIamPermissions";
+const STORAGE_OBJECT_PERMISSION_RPC_AUTHORITY = "https://storage.googleapis.com";
+const STORAGE_OBJECT_RPC_PERMISSIONS = [
+  "storage.objects.delete",
+  "storage.objects.get",
+  "storage.objects.update",
+] as const;
+
+export interface StorageObjectPermissionProbeRequest {
+  readonly bucketResource: string;
+  readonly executorToken: string;
+  readonly permissions: readonly string[];
+  readonly resource: string;
+}
+
+export interface StorageObjectPermissionProbeResult {
+  readonly denied: boolean;
+  readonly permissions: readonly string[];
+}
+
+export interface StorageObjectCreateProbeRequest {
+  readonly bucket: string;
+  readonly executorToken: string;
+  readonly objectName: string;
+}
+
+export interface StateStoragePermissionProbes {
+  readonly testObjectPermissions: (
+    request: StorageObjectPermissionProbeRequest,
+  ) => Promise<StorageObjectPermissionProbeResult>;
+  readonly testObjectCreate: (
+    request: StorageObjectCreateProbeRequest,
+    fetcher: Fetcher,
+  ) => Promise<boolean>;
+}
+
+export interface StoragePermissionRpcOptions {
+  readonly connect?: (authority: string) => ClientHttp2Session;
+  readonly timeoutMs?: number;
+}
+
+class StoragePermissionGrpcStatusError extends Error {
+  constructor(readonly status: number) {
+    super(`Storage object permission RPC failed with gRPC status ${status}.`);
+    this.name = "StoragePermissionGrpcStatusError";
+  }
+}
+
+function encodeUnsignedVarint(value: number): Uint8Array {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new Error("Storage permission protobuf length escaped its bounded range.");
+  }
+  const result: number[] = [];
+  let remaining = value;
+  do {
+    const next = remaining % 128;
+    remaining = Math.floor(remaining / 128);
+    result.push(next | (remaining === 0 ? 0 : 0x80));
+  } while (remaining !== 0);
+  return Uint8Array.from(result);
+}
+
+function encodeLengthDelimitedField(field: number, value: string): Uint8Array {
+  const bytes = new TextEncoder().encode(value);
+  const length = encodeUnsignedVarint(bytes.byteLength);
+  return Buffer.concat([Uint8Array.of((field << 3) | 2), length, bytes]);
+}
+
+export function encodeStorageTestIamPermissionsRequest(
+  resource: string,
+  permissions: readonly string[],
+): Uint8Array {
+  const fields = [
+    encodeLengthDelimitedField(1, resource),
+    ...permissions.map((permission) => encodeLengthDelimitedField(2, permission)),
+  ];
+  const payload = Buffer.concat(fields);
+  if (payload.byteLength > MAX_STORAGE_PERMISSION_RPC_BYTES) {
+    throw new Error("Storage permission RPC request exceeded its bounded size.");
+  }
+  return payload;
+}
+
+function decodeUnsignedVarint(
+  bytes: Uint8Array,
+  offset: number,
+): { readonly next: number; readonly value: number } {
+  let value = 0;
+  let multiplier = 1;
+  for (let index = 0; index < 5; index += 1) {
+    const byte = bytes[offset + index];
+    if (byte === undefined) throw new Error("Storage permission protobuf was truncated.");
+    value += (byte & 0x7f) * multiplier;
+    if ((byte & 0x80) === 0) {
+      if (!Number.isSafeInteger(value)) {
+        throw new Error("Storage permission protobuf length was invalid.");
+      }
+      return { next: offset + index + 1, value };
+    }
+    multiplier *= 128;
+  }
+  throw new Error("Storage permission protobuf varint exceeded its bounded width.");
+}
+
+export function decodeStorageTestIamPermissionsResponse(
+  payload: Uint8Array,
+): readonly string[] {
+  if (payload.byteLength > MAX_STORAGE_PERMISSION_RPC_BYTES) {
+    throw new Error("Storage permission RPC response exceeded its bounded size.");
+  }
+  const permissions: string[] = [];
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let offset = 0;
+  while (offset < payload.byteLength) {
+    const tag = decodeUnsignedVarint(payload, offset);
+    offset = tag.next;
+    if (tag.value !== 10) {
+      throw new Error("Storage permission protobuf contained an unexpected field.");
+    }
+    const length = decodeUnsignedVarint(payload, offset);
+    offset = length.next;
+    if (length.value > payload.byteLength - offset) {
+      throw new Error("Storage permission protobuf field was truncated.");
+    }
+    let permission: string;
+    try {
+      permission = decoder.decode(payload.subarray(offset, offset + length.value));
+    } catch {
+      throw new Error("Storage permission protobuf contained invalid UTF-8.");
+    }
+    if (!/^storage\.objects\.(delete|get|update)$/.test(permission)) {
+      throw new Error("Storage permission protobuf returned an unrequested permission.");
+    }
+    permissions.push(permission);
+    offset += length.value;
+  }
+  if (new Set(permissions).size !== permissions.length) {
+    throw new Error("Storage permission protobuf repeated a permission.");
+  }
+  return permissions;
+}
+
+function grpcFrame(payload: Uint8Array): Uint8Array {
+  const result = Buffer.alloc(5 + payload.byteLength);
+  result[0] = 0;
+  result.writeUInt32BE(payload.byteLength, 1);
+  result.set(payload, 5);
+  return result;
+}
+
+function decodeGrpcFrame(bytes: Uint8Array): readonly string[] {
+  if (bytes.byteLength < 5) throw new Error("Storage permission gRPC frame was truncated.");
+  if (bytes[0] !== 0) throw new Error("Storage permission gRPC compression is not supported.");
+  const length = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).readUInt32BE(1);
+  if (length !== bytes.byteLength - 5) {
+    throw new Error("Storage permission gRPC response was not exactly one bounded frame.");
+  }
+  return decodeStorageTestIamPermissionsResponse(bytes.subarray(5));
+}
+
+function singleHttp2Header(
+  value: string | string[] | number | undefined,
+  label: string,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) throw new Error(`${label} was repeated.`);
+  return String(value);
+}
+
+export async function storageV2TestIamPermissions(
+  request: StorageObjectPermissionProbeRequest,
+  options: StoragePermissionRpcOptions = {},
+): Promise<readonly string[]> {
+  if (!/^projects\/_\/buckets\/[a-z0-9][a-z0-9._-]{1,221}[a-z0-9]$/.test(
+    request.bucketResource,
+  )) {
+    throw new Error("Storage permission RPC bucket escaped its exact resource syntax.");
+  }
+  if (!request.resource.startsWith(`${request.bucketResource}/objects/`) ||
+    request.resource.length > 4_096 || request.resource.includes("\0")) {
+    throw new Error("Storage permission RPC object escaped its exact resource syntax.");
+  }
+  if (request.executorToken.includes("\r") || request.executorToken.includes("\n")) {
+    throw new Error("Storage permission RPC credential escaped its header syntax.");
+  }
+  if (request.permissions.length === 0 ||
+    new Set(request.permissions).size !== request.permissions.length ||
+    request.permissions.some((permission) =>
+      !STORAGE_OBJECT_RPC_PERMISSIONS.includes(
+        permission as typeof STORAGE_OBJECT_RPC_PERMISSIONS[number],
+      ))) {
+    throw new Error("Storage permission RPC request escaped its permission allowlist.");
+  }
+  const timeoutMs = options.timeoutMs ?? STORAGE_PERMISSION_RPC_TIMEOUT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 ||
+    timeoutMs > STORAGE_PERMISSION_RPC_TIMEOUT_MS) {
+    throw new Error("Storage permission RPC timeout escaped its bounded range.");
+  }
+  const payload = encodeStorageTestIamPermissionsRequest(
+    request.resource,
+    request.permissions,
+  );
+  const body = grpcFrame(payload);
+  const connector = options.connect ?? connectHttp2;
+
+  return await new Promise<readonly string[]>((resolve, reject) => {
+    let session: ClientHttp2Session | undefined;
+    let stream: ReturnType<ClientHttp2Session["request"]> | undefined;
+    let settled = false;
+    let responseStatus: string | undefined;
+    let responseContentType: string | undefined;
+    let headerGrpcStatus: string | undefined;
+    let trailerGrpcStatus: string | undefined;
+    const chunks: Uint8Array[] = [];
+    let receivedBytes = 0;
+    const timer = setTimeout(() => {
+      fail(new Error("Storage permission RPC timed out."));
+    }, timeoutMs);
+
+    const close = (destroy: boolean): void => {
+      clearTimeout(timer);
+      try {
+        if (destroy) stream?.close(http2Constants.NGHTTP2_CANCEL);
+      } catch {
+        // The outcome is already fixed; transport shutdown is best effort.
+      }
+      try {
+        if (destroy) session?.destroy();
+        else session?.close();
+      } catch {
+        // The outcome is already fixed; transport shutdown is best effort.
+      }
+    };
+    function fail(error: Error): void {
+      if (settled) return;
+      settled = true;
+      close(true);
+      reject(error);
+    }
+    function succeed(value: readonly string[]): void {
+      if (settled) return;
+      settled = true;
+      close(false);
+      resolve(value);
+    }
+
+    try {
+      session = connector(STORAGE_OBJECT_PERMISSION_RPC_AUTHORITY);
+      session.once("error", () => {
+        fail(new Error("Storage permission RPC transport failed."));
+      });
+      stream = session.request({
+        ":method": "POST",
+        ":path": STORAGE_OBJECT_PERMISSION_RPC_PATH,
+        authorization: `Bearer ${request.executorToken}`,
+        "content-type": "application/grpc",
+        te: "trailers",
+        "x-goog-request-params": `bucket=${encodeURIComponent(request.bucketResource)}`,
+      });
+      stream.once("response", (headers) => {
+        try {
+          responseStatus = singleHttp2Header(headers[":status"], "Storage permission HTTP status");
+          responseContentType = singleHttp2Header(
+            headers["content-type"],
+            "Storage permission content type",
+          );
+          headerGrpcStatus = singleHttp2Header(
+            headers["grpc-status"],
+            "Storage permission header gRPC status",
+          );
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error("Storage permission RPC headers failed."));
+        }
+      });
+      stream.once("trailers", (headers) => {
+        try {
+          trailerGrpcStatus = singleHttp2Header(
+            headers["grpc-status"],
+            "Storage permission trailer gRPC status",
+          );
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error("Storage permission RPC trailers failed."));
+        }
+      });
+      stream.on("data", (chunk: Uint8Array) => {
+        if (settled) return;
+        receivedBytes += chunk.byteLength;
+        if (receivedBytes > MAX_STORAGE_PERMISSION_RPC_BYTES + 5) {
+          fail(new Error("Storage permission RPC response exceeded its bounded size."));
+          return;
+        }
+        chunks.push(Uint8Array.from(chunk));
+      });
+      stream.once("aborted", () => {
+        fail(new Error("Storage permission RPC transport was aborted."));
+      });
+      stream.once("error", () => {
+        fail(new Error("Storage permission RPC transport failed."));
+      });
+      stream.once("end", () => {
+        if (settled) return;
+        try {
+          if (responseStatus !== "200") {
+            throw new Error(
+              `Storage permission RPC failed with HTTP ${responseStatus ?? "missing"}.`,
+            );
+          }
+          if (responseContentType === undefined ||
+            !/^application\/grpc(?:\+proto)?(?:;|$)/.test(responseContentType)) {
+            throw new Error("Storage permission RPC returned an unexpected content type.");
+          }
+          if (headerGrpcStatus !== undefined && trailerGrpcStatus !== undefined) {
+            throw new Error("Storage permission RPC repeated its gRPC status.");
+          }
+          const grpcStatus = trailerGrpcStatus ?? headerGrpcStatus;
+          if (grpcStatus === undefined || !/^(?:0|[1-9]|1[0-6])$/.test(grpcStatus)) {
+            throw new Error("Storage permission RPC omitted a valid gRPC status.");
+          }
+          const numericStatus = Number(grpcStatus);
+          if (numericStatus !== 0) throw new StoragePermissionGrpcStatusError(numericStatus);
+          const permissions = decodeGrpcFrame(Buffer.concat(chunks));
+          const requested = new Set(request.permissions);
+          if (permissions.some((permission) => !requested.has(permission))) {
+            throw new Error("Storage permission RPC returned an unrequested permission.");
+          }
+          succeed(permissions);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error("Storage permission RPC parse failed."));
+        }
+      });
+      stream.end(body);
+    } catch {
+      fail(new Error("Storage permission RPC transport failed."));
+    }
+  });
+}
+
+export async function probeStorageObjectPermissions(
+  request: StorageObjectPermissionProbeRequest,
+  options: StoragePermissionRpcOptions = {},
+): Promise<StorageObjectPermissionProbeResult> {
+  try {
+    return {
+      denied: false,
+      permissions: await storageV2TestIamPermissions(request, options),
+    };
+  } catch (error) {
+    if (error instanceof StoragePermissionGrpcStatusError &&
+      (error.status === 7 || error.status === 16)) {
+      return { denied: true, permissions: [] };
+    }
+    throw error;
+  }
+}
+
+function validateResumableSessionUri(
+  value: string,
+  bucket: string,
+  objectName: string,
+): URL {
+  if (value !== value.trim() || value.length > 8_192) {
+    throw new Error("Storage create probe returned an invalid session URI.");
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Storage create probe returned an invalid session URI.");
+  }
+  if (url.protocol !== "https:" || url.hostname !== "storage.googleapis.com" ||
+    url.port !== "" || url.username !== "" || url.password !== "" || url.hash !== "" ||
+    url.pathname !== `/upload/storage/v1/b/${encodeURIComponent(bucket)}/o`) {
+    throw new Error("Storage create probe returned an invalid session URI.");
+  }
+  const keys = [...url.searchParams.keys()];
+  if ((keys.length !== 3 && keys.length !== 4) || new Set(keys).size !== keys.length ||
+    !keys.includes("uploadType") || !keys.includes("name") || !keys.includes("upload_id") ||
+    keys.some((key) =>
+      key !== "uploadType" && key !== "name" && key !== "upload_id" &&
+      key !== "ifGenerationMatch"
+    ) ||
+    url.searchParams.get("uploadType") !== "resumable" ||
+    url.searchParams.get("name") !== objectName ||
+    (url.searchParams.has("ifGenerationMatch") &&
+      url.searchParams.get("ifGenerationMatch") !== "0")) {
+    throw new Error("Storage create probe returned an invalid session URI.");
+  }
+  const uploadId = url.searchParams.get("upload_id") ?? "";
+  if (!/^[A-Za-z0-9._~-]{20,4096}$/.test(uploadId)) {
+    throw new Error("Storage create probe returned an invalid session URI.");
+  }
+  return url;
+}
+
+export async function probeStorageObjectCreatePermission(
+  request: StorageObjectCreateProbeRequest,
+  fetcher: Fetcher,
+): Promise<boolean> {
+  if (!/^[a-z0-9][a-z0-9._-]{1,221}[a-z0-9]$/.test(request.bucket) ||
+    request.objectName.length === 0 || request.objectName.length > 1_024 ||
+    request.objectName.includes("\0") || request.executorToken.includes("\r") ||
+    request.executorToken.includes("\n")) {
+    throw new Error("Storage create probe target escaped its exact syntax.");
+  }
+  const url = new URL(
+    `https://storage.googleapis.com/upload/storage/v1/b/${encodeURIComponent(request.bucket)}/o`,
+  );
+  url.searchParams.set("ifGenerationMatch", "0");
+  url.searchParams.set("name", request.objectName);
+  url.searchParams.set("uploadType", "resumable");
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      headers: {
+        Authorization: `Bearer ${request.executorToken}`,
+        "Content-Length": "0",
+      },
+      method: "POST",
+      redirect: "error",
+    });
+  } catch {
+    throw new Error("Storage create probe transport failed.");
+  }
+  let initiationBody = "";
+  let initiationBodyError: Error | undefined;
+  try {
+    initiationBody = await boundedText(response, 16 * 1024);
+  } catch (error) {
+    initiationBodyError = error instanceof Error &&
+        error.message === "API response exceeded its bound."
+      ? new Error("Storage create probe response body exceeded its bound.")
+      : new Error("Storage create probe response body failed.");
+  }
+  if (initiationBodyError !== undefined && response.status !== 200) {
+    throw initiationBodyError;
+  }
+  if (response.status === 401 || response.status === 403) return false;
+  // Cloud Storage checks authorization before its generation precondition. A
+  // 412 therefore proves create authorization while guaranteeing no object or
+  // resumable session was created.
+  if (response.status === 412) return true;
+  if (response.status !== 200) {
+    throw new Error(`Storage create probe failed with HTTP ${response.status}.`);
+  }
+  const location = response.headers.get("location");
+  if (location === null) throw new Error("Storage create probe omitted its session URI.");
+  const session = validateResumableSessionUri(location, request.bucket, request.objectName);
+  let cancellation: Response;
+  try {
+    cancellation = await fetcher(session, {
+      headers: { "Content-Length": "0" },
+      method: "DELETE",
+      redirect: "error",
+    });
+  } catch {
+    throw new Error("Storage create probe cancellation transport failed.");
+  }
+  let cancellationBody: string;
+  try {
+    cancellationBody = await boundedText(cancellation, 16 * 1024);
+  } catch (error) {
+    throw error instanceof Error && error.message === "API response exceeded its bound."
+      ? new Error("Storage create probe cancellation response body exceeded its bound.")
+      : new Error("Storage create probe cancellation response body failed.");
+  }
+  // JSON resumable-upload cancellation deliberately uses nonstandard 499.
+  if (cancellation.status !== 499) {
+    throw new Error(
+      `Storage create probe cancellation failed with HTTP ${cancellation.status}.`,
+    );
+  }
+  if (cancellationBody !== "") {
+    throw new Error("Storage create probe cancellation returned an unexpected response body.");
+  }
+  if (initiationBodyError !== undefined) throw initiationBodyError;
+  if (initiationBody !== "") {
+    throw new Error("Storage create probe returned an unexpected response body.");
+  }
+  return true;
+}
+
+const DEFAULT_STATE_STORAGE_PERMISSION_PROBES: StateStoragePermissionProbes = {
+  testObjectCreate: probeStorageObjectCreatePermission,
+  testObjectPermissions: probeStorageObjectPermissions,
+};
+
 export async function waitForStatePermissions(
   state: { readonly bucket: string; readonly prefix: string },
   invocation: Invocation,
@@ -6679,6 +7328,7 @@ export async function waitForStatePermissions(
   expected: "mutation" | "none" | "read",
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void> = (milliseconds) => Bun.sleep(milliseconds),
+  probes: StateStoragePermissionProbes = DEFAULT_STATE_STORAGE_PERMISSION_PROBES,
 ): Promise<void> {
   const allObjectPermissions = [
     "storage.objects.create",
@@ -6762,30 +7412,31 @@ export async function waitForStatePermissions(
 
     for (const object of objects) {
       const resource = `projects/_/buckets/${state.bucket}/objects/${object.name}`;
-      const response = await fetcher(
-        `https://storage.googleapis.com/storage/v2/${encodeResourcePath(resource)}:testIamPermissions`,
-        {
-          body: JSON.stringify({ permissions: allObjectPermissions }),
-          headers: { ...executorHeaders(executorToken), "Content-Type": "application/json" },
-          method: "POST",
-          redirect: "error",
-        },
-      );
-      if (!response.ok &&
-        !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
-        throw new Error(`Object permission test failed with HTTP ${response.status}.`);
+      const objectResult = await probes.testObjectPermissions({
+        bucketResource: `projects/_/buckets/${state.bucket}`,
+        executorToken,
+        permissions: STORAGE_OBJECT_RPC_PERMISSIONS,
+        resource,
+      });
+      if (objectResult.denied && expected !== "none") {
+        throw new Error("Storage object permission RPC denied the executor credential.");
       }
-      if (!response.ok) {
-        observed.push(true);
-        continue;
+      if (objectResult.denied && objectResult.permissions.length !== 0) {
+        throw new Error("Denied storage object permission RPC returned permissions.");
       }
-      const value = record(await boundedJson(response, 64 * 1024), "object permission test");
-      exactKeys(value, new Set(["permissions"]), "object permission test");
-      const permissions = new Set(
-        array(value.permissions ?? [], "object permissions").map((entry) =>
-          requiredString(entry, "object permission")
-        ),
+      const permissions = new Set(objectResult.permissions);
+      for (const permission of permissions) {
+        if (!STORAGE_OBJECT_RPC_PERMISSIONS.includes(
+          permission as typeof STORAGE_OBJECT_RPC_PERMISSIONS[number],
+        )) {
+          throw new Error("Storage object permission probe escaped its permission allowlist.");
+        }
+      }
+      const create = await probes.testObjectCreate(
+        { bucket: state.bucket, executorToken, objectName: object.name },
+        fetcher,
       );
+      if (create) permissions.add("storage.objects.create");
       const forbidden = allObjectPermissions.filter((permission) => !object.required.has(permission));
       observed.push(
         expected !== "none"
@@ -6895,10 +7546,6 @@ function permissionDenialProvesNoUsableCredential(response: Response): boolean {
 
 function executorHeaders(token: string): Record<string, string> {
   return { Accept: "application/json", Authorization: `Bearer ${token}` };
-}
-
-function encodeResourcePath(value: string): string {
-  return value.split("/").map((part) => encodeURIComponent(part)).join("/");
 }
 
 interface PlanReceipt {
