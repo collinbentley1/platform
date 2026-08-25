@@ -42,6 +42,7 @@ import {
   releaseSandboxAndExecutor,
   requireSameDhiTransitionCapability,
   runProtectedBootstrap,
+  runProtectedRecovery,
   TerraformSandboxExecutor,
   validateInvocation,
   validateRecoveryInvocation,
@@ -141,6 +142,16 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(workflow).toContain(
       "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
+    );
+    expect(workflow).toContain(
+      "bridge_budget_seconds=$((43 * 60 - elapsed_seconds - 17 * 60))",
+    );
+    expect(workflow).toContain('test "$bridge_budget_seconds" -le 1560');
+    expect(workflow.match(/timeout-minutes: 15/g)).toHaveLength(2);
+    expect(workflow).toContain(
+      "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
+        "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 19",
     );
     expect(
       workflow.match(
@@ -1115,9 +1126,28 @@ describe("protected owner Terraform bridge", () => {
       join(root, "tools/ci/protected-bootstrap-bridge.ts"),
       "utf8",
     );
+    const minuteConstant = (name: string): number => {
+      const match = new RegExp(`const ${name} = ([0-9]+);`).exec(controller);
+      expect(match).not.toBeNull();
+      return Number(match?.[1]);
+    };
     expect(controller).toContain("} finally {");
-    expect(controller).toContain("const LEASE_MINUTES = 47;");
+    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 43;");
+    expect(controller).toContain("const LEASE_MINUTES = 54;");
     expect(controller).toContain("const INTERNAL_OPERATION_MINUTES = 24;");
+    expect(controller).toContain("const MAIN_STEP_TIMEOUT_MINUTES = 26;");
+    expect(controller).toContain("const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;");
+    expect(controller).toContain("const RECOVERY_STABLE_EMPTY_MINUTES = 5;");
+    expect(controller).toContain("const RECOVERY_SCAN_INTERVAL_MINUTES = 1;");
+    expect(controller).toContain("const RECOVERY_SOURCE_PROOF_MINUTES = 1;");
+    expect(controller).toContain("const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;");
+    expect(controller).toContain("const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +");
+    expect(controller).toContain("const MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +");
+    expect(controller).toContain("const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +");
+    expect(minuteConstant("LEASE_MINUTES")).toBeGreaterThan(
+      minuteConstant("JOB_TIMEOUT_MINUTES") + 10,
+    );
+    expect(minuteConstant("MAIN_STEP_TIMEOUT_MINUTES")).toBe(26);
     expect(controller).toContain("fencePolicyMutations(");
     expect(controller).toContain("codex-cleanup-fence-");
     expect(controller).toContain("await waitForStatePermissions(");
@@ -1139,7 +1169,7 @@ describe("protected owner Terraform bridge", () => {
       join(root, ".github/workflows/protected-bootstrap-implementation.yml"),
       "utf8",
     );
-    expect(workflow).toContain("timeout-minutes: 35");
+    expect(workflow).toContain("timeout-minutes: 43");
   });
 
   test("Terraform sandbox kill-wait-remove contains a daemonized descendant after timeout", async () => {
@@ -1624,7 +1654,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 700_000,
+      startedAt + 13 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("target-project-policy-503")).toBe(1);
@@ -1657,18 +1687,105 @@ describe("protected owner Terraform bridge", () => {
     expect(tampered.policy(`sa:${tampered.email}`).bindings).toHaveLength(1);
   });
 
-  test("stable-empty recovery starts a full 300-second proof after first-scan cleanup", async () => {
+  test("stable-empty recovery starts proof after the horizon even after first-scan cleanup", async () => {
     const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 1 });
     const startedAt = fixture.now();
     await recoverBridgeArtifactsUntilStable(
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 700_000,
+      startedAt + 13 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(300_000);
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
+  });
+
+  test("an empty first scan requires seven-minute observation then five-minute proof", async () => {
+    const fixture = deterministicRecoveryHarness();
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 13 * 60_000,
+      fixture.now,
+    );
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+  });
+
+  test("the production recovery budget proves 300 stable seconds after a second-scan artifact", async () => {
+    const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 2 });
+    const startedAt = fixture.now();
+    let recoveryDeadlineMs = 0;
+    await runProtectedRecovery(fixture.invocation, {
+      now: fixture.now,
+      recoverArtifacts: async (invocation, deadlineMs) => {
+        recoveryDeadlineMs = deadlineMs;
+        await recoverBridgeArtifactsUntilStable(
+          invocation,
+          fixture.fetcher,
+          fixture.sleep,
+          deadlineMs,
+          fixture.now,
+        );
+      },
+      verifySource: async () => undefined,
+    });
+    expect(recoveryDeadlineMs - startedAt).toBe(13 * 60_000);
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.role.deleted).toBeTrue();
+  });
+
+  test("the production recovery budget covers seven-minute propagation plus the full proof", async () => {
+    const fixture = deterministicRecoveryHarness({ roleAppearanceScan: 8 });
+    const startedAt = fixture.now();
+    await runProtectedRecovery(fixture.invocation, {
+      now: fixture.now,
+      recoverArtifacts: (invocation, deadlineMs) =>
+        recoverBridgeArtifactsUntilStable(
+          invocation,
+          fixture.fetcher,
+          fixture.sleep,
+          deadlineMs,
+          fixture.now,
+        ),
+      verifySource: async () => undefined,
+    });
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
+    expect(fixture.role.deleted).toBeTrue();
+  });
+
+  test("source proof has its own bound and cannot consume the IAM recovery horizon", async () => {
+    const fixture = deterministicRecoveryHarness();
+    const startedAt = fixture.now();
+    let virtualNow = startedAt;
+    let recoveryDeadlineMs = 0;
+    await runProtectedRecovery(fixture.invocation, {
+      now: () => virtualNow,
+      recoverArtifacts: async (_invocation, deadlineMs) => {
+        recoveryDeadlineMs = deadlineMs;
+      },
+      verifySource: async () => {
+        virtualNow += 59_000;
+      },
+    });
+    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 13 * 60_000);
+
+    let recoveryStarted = false;
+    virtualNow = startedAt;
+    await expect(runProtectedRecovery(fixture.invocation, {
+      now: () => virtualNow,
+      recoverArtifacts: async () => {
+        recoveryStarted = true;
+      },
+      verifySource: async () => {
+        virtualNow += 60_000;
+      },
+    })).rejects.toThrow(
+      "protected crash recovery source proof reached the hard protected-operation deadline",
+    );
+    expect(recoveryStarted).toBeFalse();
   });
 
   test("a role observed and cleaned on the nominal final scan resets the 300-second proof", async () => {
@@ -1678,10 +1795,10 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 700_000,
+      startedAt + 13 * 60_000,
       fixture.now,
     );
-    expect(fixture.now() - startedAt).toBe(600_000);
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
 
@@ -1692,7 +1809,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 700_000,
+      startedAt + 13 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("account-list-503")).toBe(1);

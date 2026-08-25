@@ -28,11 +28,27 @@ const GOOGLE_PROVIDER_LINUX_AMD64_ZH =
   "fb1b9d1ea7bc79b7409f02aa7c19ba39afa22dbead69e83ae7eb2691ac5c2426";
 const GOOGLE_PROVIDER_BINARY = "terraform-provider-google_v7.45.0_x5";
 const PLAN_FORMAT_VERSION = "1.2";
-const JOB_TIMEOUT_MINUTES = 35;
+const JOB_TIMEOUT_MINUTES = 43;
 const MAIN_STEP_TIMEOUT_MINUTES = 26;
-const LEASE_MINUTES = 47;
+const LEASE_MINUTES = 54;
 const INTERNAL_OPERATION_MINUTES = 24;
-const RECOVERY_OPERATION_MINUTES = 6;
+const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;
+const RECOVERY_STABLE_EMPTY_MINUTES = 5;
+const RECOVERY_SCAN_INTERVAL_MINUTES = 1;
+const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
+  RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_INTERVAL_MINUTES;
+const RECOVERY_SOURCE_PROOF_MINUTES = 1;
+const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;
+const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +
+  RECOVERY_OPERATION_MINUTES + RECOVERY_WATCHDOG_MARGIN_MINUTES;
+const SAME_JOB_DOCKER_CLEANUP_MINUTES = 1;
+const SAME_JOB_TRANSITION_MARGIN_MINUTES = 1;
+const MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +
+  RECOVERY_STEP_TIMEOUT_MINUTES + SAME_JOB_TRANSITION_MARGIN_MINUTES;
+const FRESH_RECOVERY_SETUP_STEP_COUNT = 3;
+const FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES = 1;
+const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +
+  RECOVERY_STEP_TIMEOUT_MINUTES + FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES;
 const EXECUTOR_TOKEN_MINUTES = 30;
 // Reserve seven minutes for the mandatory 300s+120s post-WIF drain and eight
 // more for the bounded apply, zero-diff readback, marker proof, and receipt.
@@ -56,11 +72,13 @@ const ORPHAN_FENCE_DESCRIPTION =
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
 const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
 // Google documents that a newly created service account can take 60 seconds or
-// more to become visible, and its CI retry guidance allows a 300-second 404
-// convergence deadline. Six scans 60 seconds apart establish that full
-// five-minute stable-empty observation span without multiplying IAM reads.
-const RECOVERY_STABLE_EMPTY_MS = 300_000;
-const RECOVERY_STABLE_EMPTY_INTERVAL_MS = 60_000;
+// more to become visible, policy changes can take 7 minutes or longer to
+// propagate, and its CI retry guidance allows a 300-second 404 convergence
+// deadline. Recovery reserves the documented seven-minute horizon, then a full
+// five-minute stable-empty proof, plus one scan interval so the boundary scan
+// can run before the operation deadline.
+const RECOVERY_STABLE_EMPTY_MS = RECOVERY_STABLE_EMPTY_MINUTES * 60_000;
+const RECOVERY_STABLE_EMPTY_INTERVAL_MS = RECOVERY_SCAN_INTERVAL_MINUTES * 60_000;
 const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
 const TOKEN_DRAIN_SKEW_SECONDS = 120;
 const POST_MUTATION_DRAIN_SECONDS = 300 + TOKEN_DRAIN_SKEW_SECONDS;
@@ -172,12 +190,28 @@ if (LEASE_MINUTES <= JOB_TIMEOUT_MINUTES + 10) {
 }
 if (
   MINIMUM_PRE_APPLY_MINUTES >= INTERNAL_OPERATION_MINUTES ||
-  INTERNAL_OPERATION_MINUTES > JOB_TIMEOUT_MINUTES - 10
+  INTERNAL_OPERATION_MINUTES > JOB_TIMEOUT_MINUTES - MAIN_JOB_RECOVERY_RESERVE_MINUTES
 ) {
   throw new Error("The operation and pre-apply deadlines must reserve unconditional cleanup.");
 }
-if (MAIN_STEP_TIMEOUT_MINUTES > JOB_TIMEOUT_MINUTES - 9) {
+if (
+  MAIN_STEP_TIMEOUT_MINUTES !==
+    JOB_TIMEOUT_MINUTES - MAIN_JOB_RECOVERY_RESERVE_MINUTES
+) {
   throw new Error("The crash-recovery deadline escaped the main job's reserved tail.");
+}
+if (
+  RECOVERY_OPERATION_MINUTES !==
+    RECOVERY_DOCUMENTED_PROPAGATION_MINUTES + RECOVERY_STABLE_EMPTY_MINUTES +
+      RECOVERY_SCAN_INTERVAL_MINUTES ||
+  RECOVERY_STEP_TIMEOUT_MINUTES !==
+    RECOVERY_SOURCE_PROOF_MINUTES + RECOVERY_OPERATION_MINUTES +
+      RECOVERY_WATCHDOG_MARGIN_MINUTES ||
+  FRESH_RECOVERY_JOB_TIMEOUT_MINUTES !==
+    FRESH_RECOVERY_SETUP_STEP_COUNT + RECOVERY_STEP_TIMEOUT_MINUTES +
+      FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES
+) {
+  throw new Error("The crash-recovery operation escaped its reviewed timing envelope.");
 }
 
 export const REPOSITORY_NAMES = [
@@ -642,8 +676,13 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     required(source, "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT"),
     "bridge operation budget seconds",
   ));
-  if (operationBudgetSeconds < 420 || operationBudgetSeconds > 26 * 60) {
-    throw new Error("Bridge operation budget escaped its reviewed 420..1560 second range.");
+  if (
+    operationBudgetSeconds < 420 ||
+    operationBudgetSeconds > MAIN_STEP_TIMEOUT_MINUTES * 60
+  ) {
+    throw new Error(
+      `Bridge operation budget escaped its reviewed 420..${MAIN_STEP_TIMEOUT_MINUTES * 60} second range.`,
+    );
   }
   const legacyCompatibilityMode = booleanString(
     required(source, "LEGACY_COMPATIBILITY_MODE"),
@@ -1984,10 +2023,17 @@ export async function runProtectedRecovery(
 ): Promise<void> {
   telemetry = bestEffortTelemetry(telemetry);
   const startedAtMs = dependencies.now();
-  const recoveryDeadlineMs = startedAtMs + RECOVERY_OPERATION_MINUTES * 60_000;
+  const sourceProofDeadlineMs = startedAtMs + RECOVERY_SOURCE_PROOF_MINUTES * 60_000;
   telemetry.phase("recovery.source-proof");
   await dependencies.verifySource(invocation);
-  assertBeforeDeadline(dependencies.now(), recoveryDeadlineMs, "protected crash recovery");
+  const sourceProofCompletedAtMs = dependencies.now();
+  assertBeforeDeadline(
+    sourceProofCompletedAtMs,
+    sourceProofDeadlineMs,
+    "protected crash recovery source proof",
+  );
+  const recoveryDeadlineMs = sourceProofCompletedAtMs +
+    RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
   await dependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
 }
@@ -4639,6 +4685,7 @@ export async function recoverBridgeArtifactsUntilStable(
   now: () => number = () => Date.now(),
 ): Promise<void> {
   const projectId = REPOSITORIES[invocation.repository].projectId;
+  const observationStartedAtMs = now();
   let emptySinceMs: number | undefined;
   while (now() < cleanupDeadlineMs) {
     try {
@@ -4656,14 +4703,21 @@ export async function recoverBridgeArtifactsUntilStable(
         fetcher,
         invocation,
       );
-      if (active) {
+      const scanCompletedAtMs = now();
+      if (
+        active ||
+        scanCompletedAtMs - observationStartedAtMs <
+          RECOVERY_DOCUMENTED_PROPAGATION_MINUTES * 60_000
+      ) {
+        // The stable-empty proof begins only after the complete propagation
+        // horizon. Clean scans inside that horizon are observation, not proof.
         emptySinceMs = undefined;
       } else if (inventory.hadActiveArtifacts || emptySinceMs === undefined) {
         // This scan's final proof is clean, so it may begin (or reset) the
         // five-minute absence window even when the same scan contained an
         // artifact. It can never reuse absence time from before that artifact.
-        emptySinceMs = now();
-      } else if (now() - emptySinceMs >= RECOVERY_STABLE_EMPTY_MS) {
+        emptySinceMs = scanCompletedAtMs;
+      } else if (scanCompletedAtMs - emptySinceMs >= RECOVERY_STABLE_EMPTY_MS) {
         return;
       }
     } catch (error) {

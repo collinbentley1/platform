@@ -24,6 +24,8 @@ describe("platform scaffold and doctor", () => {
       join(repoRoot, "templates/app/.github/workflows"),
     ];
     const runnerJobs: string[] = [];
+    let protectedOwnerTimeout: number | undefined;
+    let protectedRecoveryTimeout: number | undefined;
 
     for (const directory of workflowDirectories) {
       for (const entry of (await readdir(directory)).sort()) {
@@ -39,7 +41,18 @@ describe("platform scaffold and doctor", () => {
             true,
           );
           expect(timeout as number, `${entry}:${jobName} timeout must be positive`).toBeGreaterThan(0);
-          const maximumTimeout = entry === "deploy-prod.yml" && jobName === "deploy" ? 60 : 35;
+          const protectedOwner = entry === "protected-bootstrap-implementation.yml" &&
+            jobName === "owner-terraform";
+          if (protectedOwner) protectedOwnerTimeout = timeout as number;
+          if (
+            entry === "protected-bootstrap-implementation.yml" &&
+            jobName === "owner-terraform-recovery"
+          ) {
+            protectedRecoveryTimeout = timeout as number;
+          }
+          const maximumTimeout = entry === "deploy-prod.yml" && jobName === "deploy"
+            ? 60
+            : protectedOwner ? 43 : 35;
           expect(
             timeout as number,
             `${entry}:${jobName} timeout must not exceed ${maximumTimeout} minutes`,
@@ -49,6 +62,9 @@ describe("platform scaffold and doctor", () => {
     }
 
     expect(runnerJobs.length).toBeGreaterThan(0);
+    expect(protectedOwnerTimeout).toBe(43);
+    expect(protectedRecoveryTimeout).toBe(19);
+    expect(protectedRecoveryTimeout).toBeLessThanOrEqual(35);
   });
 
   test("scaffold replaces identity and pins every consumer", async () => {

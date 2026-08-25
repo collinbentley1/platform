@@ -59,7 +59,7 @@ jobs:
     name: ${{ inputs.target_repository }} ${{ inputs.terraform_root }} ${{ inputs.mode }}
     if: ${{ always() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 43
     environment: protected-bootstrap-owner-token
     permissions:
       actions: read
@@ -389,9 +389,10 @@ jobs:
           [[ "$current_epoch" =~ ^[1-9][0-9]*$ ]]
           elapsed_seconds=$((current_epoch - job_start_epoch))
           test "$elapsed_seconds" -ge 0
-          # Keep nine minutes outside the bridge: the required hard seven-minute
-          # recovery tail plus two minutes for Docker cleanup and step transitions.
-          bridge_budget_seconds=$((35 * 60 - elapsed_seconds - 9 * 60))
+          # Keep seventeen minutes outside the bridge: a fifteen-minute step
+          # for source proof, the thirteen-minute IAM operation, and its
+          # watchdog margin, plus one minute each for Docker and transitions.
+          bridge_budget_seconds=$((43 * 60 - elapsed_seconds - 17 * 60))
           test "$bridge_budget_seconds" -ge 420
           test "$bridge_budget_seconds" -le 1560
           shopt -s lastpipe
@@ -620,7 +621,7 @@ jobs:
 
       - name: Recover exact IAM artifacts after bridge failure
         if: ${{ always() && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}
-        timeout-minutes: 7
+        timeout-minutes: 15
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
@@ -678,7 +679,7 @@ jobs:
     needs: owner-terraform
     if: ${{ always() && needs.owner-terraform.result != 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 19
     environment: protected-bootstrap-owner-token
     permissions: {}
 
@@ -774,7 +775,7 @@ jobs:
 
       - name: Recover exact IAM artifacts on a fresh runner
         if: ${{ always() && steps.recovery-bun.outcome == 'success' }}
-        timeout-minutes: 7
+        timeout-minutes: 15
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
