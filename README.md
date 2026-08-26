@@ -245,7 +245,7 @@ variable/override files, CLI config, and crash logs.
 
 ## Release
 
-Release `0.5.10` only after required checks and adversarial review. Create a
+Release `0.5.11` only after required checks and adversarial review. Create a
 protected GitHub release tag for discovery, then copy the release commit SHA into
 consumer workflow and Terraform references. Never move an existing release tag.
 Refresh and review `tools/ci/grype-db.json` immediately before the release. After
@@ -260,5 +260,5 @@ mechanism; do not release once the snapshot is stale or if the complete repin
 cannot finish inside its validity window.
 
 ```sh
-gh release create v0.5.10 --target <reviewed-commit-sha> --generate-notes
+gh release create v0.5.11 --target <reviewed-commit-sha> --generate-notes
 ```
