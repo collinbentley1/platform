@@ -66,6 +66,7 @@ import {
   runProtectedBootstrap,
   runProtectedRecovery,
   storageV2TestIamPermissions,
+  terraformSandboxCreateArguments,
   TerraformSandboxExecutor,
   validateInvocation,
   validateRecoveryInvocation,
@@ -584,7 +585,7 @@ describe("protected owner Terraform bridge", () => {
       "all four protected production results exist",
       "merge the four receipt-bound cutover trees",
       "read-only edge continuity proof from step 9",
-      "there is no v0.5.11 exposure apply",
+      "there is no v0.5.12 exposure apply",
       "leave the existing public, zero-tag bootstrap exposure byte-for-byte unchanged",
       "production convergence plan is empty",
       "prerequisite infrastructure exposure proof may admit the public zero-tag state only",
@@ -2247,7 +2248,7 @@ describe("protected owner Terraform bridge", () => {
     expect(controller).toContain('delete process.env[name]');
     expect(controller).toContain("deadlineFetcher(fetch");
     expect(controller).toContain('"-plugin-dir=/plugins"');
-    expect(controller).toContain("--pid=private");
+    expect(controller).not.toContain('"--pid=');
     expect(controller).toContain("--read-only");
     expect(controller).toContain("--cap-drop=ALL");
     expect(controller).toContain("--security-opt=no-new-privileges=true");
@@ -2260,6 +2261,40 @@ describe("protected owner Terraform bridge", () => {
       "utf8",
     );
     expect(workflow).toContain("timeout-minutes: 41");
+  });
+
+  test("Terraform sandbox create argv keeps only its work bind writable", () => {
+    const invocation = validateInvocation(validEnvironment());
+    const workDirectory = "/tmp/protected-bootstrap-123456.sandbox";
+    const argv = terraformSandboxCreateArguments({
+      args: ["init", "-input=false"],
+      containerName: "platform-pbt-123456-init-0123456789abcdef",
+      invocation,
+      terraformDirectory: "/tmp/platform/terraform/deployments/bootstrap",
+      workDirectory,
+    }, 1001, 1002);
+
+    expect(argv).toContain("--read-only");
+    expect(argv).toContain("--interactive");
+    expect(argv).not.toContain("--tty");
+    expect(argv.some((argument) => argument.startsWith("--pid="))).toBeFalse();
+    const mounts = argv.filter((argument) => argument.startsWith("--mount="));
+    expect(mounts).toEqual([
+      "--mount=type=bind,src=/tmp/platform,dst=/platform,readonly",
+      "--mount=type=bind,src=/tmp/terraform,dst=/opt/terraform,readonly",
+      "--mount=type=bind,src=/tmp/terraform-provider-google,dst=/plugins,readonly",
+      `--mount=type=bind,src=${workDirectory},dst=/work,readonly=false`,
+    ]);
+    expect(mounts.filter((mount) => mount.endsWith(",readonly"))).toHaveLength(3);
+    expect(mounts.filter((mount) => mount.endsWith(",readonly=false"))).toEqual([
+      `--mount=type=bind,src=${workDirectory},dst=/work,readonly=false`,
+    ]);
+    expect(mounts.some((mount) => mount.includes(",rw"))).toBeFalse();
+    for (const mount of mounts) {
+      for (const field of mount.slice("--mount=".length).split(",")) {
+        expect(field === "readonly" || /^[a-z][a-z-]*=.+$/.test(field)).toBeTrue();
+      }
+    }
   });
 
   test("Terraform sandbox kill-wait-remove contains a daemonized descendant after timeout", async () => {

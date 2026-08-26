@@ -3,7 +3,7 @@
 Only the owner-controlled protected pipeline may inspect this directory from an
 exact reviewed `platform` commit. Routine GitHub Terraform has no access to its
 state. Google Cloud exposes no no-data IAM viewer permission for the legacy
-Domain Mapping API, so v0.5.11 implements one narrow exception: a confirmed,
+Domain Mapping API, so v0.5.12 implements one narrow exception: a confirmed,
 Runsetta-only, controller-side state adoption. It has no Terraform exposure
 apply route.
 
@@ -21,7 +21,7 @@ production-prerequisite, and rollout-order contracts are in
 
 Critical History's stable wildcard preview load balancer, serverless NEG,
 certificate, DNS authorization, and outputs remain represented here but cannot
-be changed by the v0.5.11 Runsetta route. Existing cdbentley, Health/Medlock, and
+be changed by the v0.5.12 Runsetta route. Existing cdbentley, Health/Medlock, and
 Critical History exposure states must remain unchanged. Any exposure create,
 update, delete, import, provider-state migration, or recovery requires a new
 separately reviewed workflow expansion. Resource-level `prevent_destroy`, the

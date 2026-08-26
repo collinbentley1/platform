@@ -3950,6 +3950,72 @@ export class TerraformSandboxExecutor {
   }
 }
 
+export function terraformSandboxCreateArguments(
+  spec: TerraformSandboxSpec,
+  uid: number,
+  gid: number,
+): readonly string[] {
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid <= 0 || gid <= 0) {
+    throw new Error("Terraform sandbox requires one non-root numeric runner identity.");
+  }
+  for (const value of [
+    spec.invocation.platformRoot,
+    spec.invocation.terraformBinary,
+    spec.invocation.terraformProviderDirectory,
+    spec.workDirectory,
+  ]) {
+    if (value.includes(",") || value.includes("\n") || value.includes("\r")) {
+      throw new Error("A Terraform sandbox bind source escaped Docker mount syntax.");
+    }
+  }
+  const relativeDirectory = spec.terraformDirectory.slice(spec.invocation.platformRoot.length);
+  if (relativeDirectory !== `/terraform/deployments/${spec.invocation.terraformRoot}`) {
+    throw new Error("Terraform sandbox working directory escaped the reviewed root.");
+  }
+  return [
+    "create",
+    `--name=${spec.containerName}`,
+    `--label=${SANDBOX_OWNER_LABEL}=true`,
+    `--label=${SANDBOX_RUN_LABEL}=${spec.invocation.githubRunId}`,
+    `--label=${SANDBOX_PLATFORM_REPOSITORY_LABEL}=${PLATFORM_REPOSITORY_ID}`,
+    `--label=${SANDBOX_TARGET_REPOSITORY_LABEL}=${REPOSITORIES[spec.invocation.repository].repositoryId}`,
+    "--platform=linux/amd64",
+    "--pull=never",
+    "--network=bridge",
+    // Docker's omitted PID mode is a private namespace. Its accepted explicit
+    // modes are host or container:<id>; the superficially symmetric
+    // --pid=private spelling is rejected by the daemon.
+    "--ipc=private",
+    // docker start --interactive can attach stdin only when the container was
+    // created with OpenStdin. The executor token travels on that one attached
+    // stream and never enters the container configuration.
+    "--interactive",
+    "--read-only",
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges=true",
+    `--user=${uid}:${gid}`,
+    "--pids-limit=256",
+    "--memory=2g",
+    "--cpus=2",
+    "--ulimit=nofile=1024:1024",
+    "--stop-timeout=1",
+    "--init",
+    "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",
+    `--mount=type=bind,src=${spec.invocation.platformRoot},dst=/platform,readonly`,
+    `--mount=type=bind,src=${spec.invocation.terraformBinary},dst=/opt/terraform,readonly`,
+    `--mount=type=bind,src=${spec.invocation.terraformProviderDirectory},dst=/plugins,readonly`,
+    `--mount=type=bind,src=${spec.workDirectory},dst=/work,readonly=false`,
+    `--workdir=/platform${relativeDirectory}`,
+    "--env=CHECKPOINT_DISABLE=1",
+    "--env=TF_DATA_DIR=/work/tfdata",
+    "--env=TF_IN_AUTOMATION=1",
+    "--entrypoint=/bin/sh",
+    spec.invocation.terraformSandboxImage,
+    "/platform/tools/ci/terraform-sandbox-entrypoint.sh",
+    ...spec.args,
+  ];
+}
+
 function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
   const hostEnvironment = (invocation: Invocation): Readonly<Record<string, string>> => ({
     HOME: invocation.runnerTemp,
@@ -3970,59 +4036,15 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
     create: async (spec, deadlineMs) => {
       const uid = process.getuid?.();
       const gid = process.getgid?.();
-      if (uid === undefined || gid === undefined || uid <= 0 || gid <= 0) {
+      if (uid === undefined || gid === undefined) {
         throw new Error("Terraform sandbox requires one non-root numeric runner identity.");
       }
-      for (const value of [
-        spec.invocation.platformRoot,
-        spec.invocation.terraformBinary,
-        spec.invocation.terraformProviderDirectory,
-        spec.workDirectory,
-      ]) {
-        if (value.includes(",") || value.includes("\n") || value.includes("\r")) {
-          throw new Error("A Terraform sandbox bind source escaped Docker mount syntax.");
-        }
-      }
-      const relativeDirectory = spec.terraformDirectory.slice(spec.invocation.platformRoot.length);
-      if (relativeDirectory !== `/terraform/deployments/${spec.invocation.terraformRoot}`) {
-        throw new Error("Terraform sandbox working directory escaped the reviewed root.");
-      }
-      await runDocker(spec.invocation, [
-        "create",
-        `--name=${spec.containerName}`,
-        `--label=${SANDBOX_OWNER_LABEL}=true`,
-        `--label=${SANDBOX_RUN_LABEL}=${spec.invocation.githubRunId}`,
-        `--label=${SANDBOX_PLATFORM_REPOSITORY_LABEL}=${PLATFORM_REPOSITORY_ID}`,
-        `--label=${SANDBOX_TARGET_REPOSITORY_LABEL}=${REPOSITORIES[spec.invocation.repository].repositoryId}`,
-        "--platform=linux/amd64",
-        "--pull=never",
-        "--network=bridge",
-        "--pid=private",
-        "--ipc=private",
-        "--read-only",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges=true",
-        `--user=${uid}:${gid}`,
-        "--pids-limit=256",
-        "--memory=2g",
-        "--cpus=2",
-        "--ulimit=nofile=1024:1024",
-        "--stop-timeout=1",
-        "--init",
-        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",
-        `--mount=type=bind,src=${spec.invocation.platformRoot},dst=/platform,readonly`,
-        `--mount=type=bind,src=${spec.invocation.terraformBinary},dst=/opt/terraform,readonly`,
-        `--mount=type=bind,src=${spec.invocation.terraformProviderDirectory},dst=/plugins,readonly`,
-        `--mount=type=bind,src=${spec.workDirectory},dst=/work,rw`,
-        `--workdir=/platform${relativeDirectory}`,
-        "--env=CHECKPOINT_DISABLE=1",
-        "--env=TF_DATA_DIR=/work/tfdata",
-        "--env=TF_IN_AUTOMATION=1",
-        "--entrypoint=/bin/sh",
-        spec.invocation.terraformSandboxImage,
-        "/platform/tools/ci/terraform-sandbox-entrypoint.sh",
-        ...spec.args,
-      ], deadlineMs, { label: "create Terraform sandbox" });
+      await runDocker(
+        spec.invocation,
+        terraformSandboxCreateArguments(spec, uid, gid),
+        deadlineMs,
+        { label: "create Terraform sandbox" },
+      );
     },
     start: (containerName, invocation, executorToken, deadlineMs, capture) =>
       runDocker(invocation, ["start", "--attach", "--interactive", containerName], deadlineMs, {
