@@ -20,7 +20,7 @@ that it can.
 The migration bridge is
 `.github/workflows/protected-bootstrap-implementation.yml`. It accepts only an
 owner `workflow_dispatch` from the platform `main` ref, one repository, and
-one exact `bootstrap`, `prod`, or `exposure` root. The v0.5.11 exposure path is
+one exact `bootstrap`, `prod`, or `exposure` root. The v0.5.12 exposure path is
 locked in both shell and controller validation to Runsetta's one reviewed
 two-mapping adoption; it is not a general exposure mutator. The active workflow SHA is always the
 immutable platform commit running the bridge. Initial adoption requires
@@ -413,7 +413,7 @@ waits 300 seconds plus skew from the completed WIF mutation, then rechecks all
 four markers and every consumer before publishing the immutable result receipt.
 No raw plan, state, token, or Actions artifact is uploaded. Delete the temporary
 OAuth environment secret after the protected runs. Exposure is deliberately
-different: v0.5.11 permits only one confirmed Runsetta state adoption, publishes
+different: v0.5.12 permits only one confirmed Runsetta state adoption, publishes
 one terminal `adoption-complete` receipt, and has no plan receipt, approval,
 consume marker, Terraform apply, or post-apply result. Any future exposure
 mutation requires a separate workflow expansion and adversarial review.
@@ -463,7 +463,7 @@ routine production root. Its backend is the protected bootstrap-state bucket at
 the fixed `<app>/exposure` prefix. Routine `gha-terraform` must be unable to list,
 read, lock, overwrite, or delete that state.
 
-v0.5.11 exposes only the following one-shot Runsetta adoption. It is a state
+v0.5.12 exposes only the following one-shot Runsetta adoption. It is a state
 mutation performed by the trusted controller, not a Terraform apply:
 
 1. Dispatch the protected workflow at exact platform SHA `S` with
@@ -515,13 +515,13 @@ state addresses. The temporary cross-state overlap is intentional; the Cloud
 Run resources are never destroyed or recreated. Bucket versioning remains a
 recovery backstop, not permission to accept unexplained state bytes.
 
-The provider state remains `deletion_policy = "DELETE"` in v0.5.11 because
+The provider state remains `deletion_policy = "DELETE"` in v0.5.12 because
 changing it produces a state update. Resource-level `prevent_destroy`, the
 bridge's rejection of every non-no-op adoption plan, and the executor's lack of
 Domain Mapping mutation authority are the current protections. A provider
 `PREVENT` migration, a fresh-app exposure create, any mapping addition/removal,
 or any Critical History load-balancer change requires a new separately reviewed
-workflow design; the v0.5.11 route cannot perform it. Existing cdbentley,
+workflow design; the v0.5.12 route cannot perform it. Existing cdbentley,
 Health/Medlock, and Critical History exposure state must remain unchanged.
 
 A fresh scaffold is different: its configured GCS backend cannot exist before
@@ -769,11 +769,11 @@ the recovery object and stop; never rerun from empty state.
    `preview-operations` environment/event claims, immutable project/service
    selection, fixed CLI arguments, and no PR checkout or PR-controlled code
    after authentication. No credential may reach PR-controlled code.
-   No subsequent exposure apply exists in v0.5.11. A fresh-app exposure create
+   No subsequent exposure apply exists in v0.5.12. A fresh-app exposure create
    is outside this release and must not be approximated by this adoption route.
 9. Critical History's existing load balancer, serverless NEG, TLS policy,
    global address, Certificate Manager authorization/certificate/map, and DNS
-   must remain byte-for-byte unchanged during v0.5.11. Verify their already
+   must remain byte-for-byte unchanged during v0.5.12. Verify their already
    established live continuity read-only, including the fixed
    `critical-history-preview` service and missing-tag 404 behavior, but do not
    dispatch the Runsetta-only exposure route for Critical History. Any create,
@@ -787,7 +787,7 @@ the recovery object and stop; never rerun from empty state.
    adoption receipt, and all four protected production results exist, merge the
    four receipt-bound cutover trees with Actions still disabled. For Critical
    History, the read-only edge continuity proof from step 9 is a prerequisite to
-   its production plan; there is no v0.5.11 exposure apply. The push-only production caller requires
+   its production plan; there is no v0.5.12 exposure apply. The push-only production caller requires
    infrastructure convergence before its deploy job, so a nonempty deferred
    production plan is a hard stop, not a staging mechanism. The production root
    records the controller's expected open ingress and installs IAM/resources,
@@ -884,7 +884,7 @@ the recovery object and stop; never rerun from empty state.
   preview ingress map and production preview-ingress value back to public
   ingress while retaining the current exposure resources. Review fresh
   bootstrap, production, and exposure plans from live state through a separately
-  reviewed workflow expansion; the v0.5.11 Runsetta adoption lane cannot execute
+  reviewed workflow expansion; the v0.5.12 Runsetta adoption lane cannot execute
   this recovery. The recovery plans
   must contain no deletion or replacement of DNS, certificate, load balancer,
   NEG, or URL-map resources. Only after no `P` workflow can run may the protected

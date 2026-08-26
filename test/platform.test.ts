@@ -1188,6 +1188,42 @@ describe("platform scaffold and doctor", () => {
     expect(workflow).not.toContain("workflow_dispatch:");
   });
 
+  test("platform verification mandates the exact live Docker sandbox contract", async () => {
+    const source = await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8");
+    const workflow = Bun.YAML.parse(source) as {
+      jobs: { verify: { steps: Array<Record<string, unknown>> } };
+    };
+    const gates = workflow.jobs.verify.steps.filter(
+      (step) => step.name === "Verify platform",
+    );
+    expect(gates).toHaveLength(1);
+    const [gate] = gates;
+    expect(gate?.env).toEqual({
+      PROTECTED_BOOTSTRAP_DOCKER_BINARY: "/usr/bin/docker",
+      PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1",
+      TERRAFORM_SANDBOX_IMAGE:
+        "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b",
+    });
+    expect(gate?.run).toBeString();
+    const run = gate?.run as string;
+    const pull = run.indexOf('"$PROTECTED_BOOTSTRAP_DOCKER_BINARY" pull');
+    const inspect = run.indexOf('"$PROTECTED_BOOTSTRAP_DOCKER_BINARY" image inspect');
+    const verify = run.indexOf("tools/ci/verify-platform.ts");
+    const integration = run.indexOf("./test/integration/protected-bootstrap-docker.ts");
+    expect(pull).toBeGreaterThan(-1);
+    expect(pull).toBeLessThan(inspect);
+    expect(inspect).toBeLessThan(verify);
+    expect(verify).toBeLessThan(integration);
+
+    const integrationSource = await readFile(
+      join(repoRoot, "test/integration/protected-bootstrap-docker.ts"),
+      "utf8",
+    );
+    expect(integrationSource).toContain(
+      `"${(gate?.env as Record<string, string>).TERRAFORM_SANDBOX_IMAGE}"`,
+    );
+  });
+
   test("the reusable and platform Socket App gates cannot drift", async () => {
     const gateContract = async (workflowName: string) => {
       const workflow = Bun.YAML.parse(

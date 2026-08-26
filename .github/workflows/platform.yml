@@ -306,9 +306,22 @@ jobs:
           fi
 
       - name: Verify platform
+        env:
+          PROTECTED_BOOTSTRAP_DOCKER_BINARY: /usr/bin/docker
+          PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1"
+          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
         run: |
           set -euo pipefail
+          canonical_image="${TERRAFORM_SANDBOX_IMAGE#docker.io/}"
+          test "$canonical_image" != "$TERRAFORM_SANDBOX_IMAGE"
+          "$PROTECTED_BOOTSTRAP_DOCKER_BINARY" pull --platform=linux/amd64 \
+            "$TERRAFORM_SANDBOX_IMAGE"
+          "$PROTECTED_BOOTSTRAP_DOCKER_BINARY" image inspect \
+            "$TERRAFORM_SANDBOX_IMAGE" --format '{{json .RepoDigests}}' | \
+            jq -e --arg image "$canonical_image" 'index($image) != null' >/dev/null
           "$PLATFORM_BUN" --no-env-file --no-orphans tools/ci/verify-platform.ts "$GITHUB_WORKSPACE"
+          "$PLATFORM_BUN" --no-env-file --no-orphans test \
+            ./test/integration/protected-bootstrap-docker.ts
 
       - name: Install checksum-pinned actionlint 1.7.12
         env:

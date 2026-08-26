@@ -2,6 +2,7 @@
 node_modules
 *.tsbuildinfo
 .terraform
+.terraform.d/
 gha-creds-*.json
 .env
 .env.*
