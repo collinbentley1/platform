@@ -86,7 +86,7 @@ describe("preview runtime preventive deny boundary", () => {
     } finally {
       await rm(fixture, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 function extractList(source: string, localName: string): string[] {

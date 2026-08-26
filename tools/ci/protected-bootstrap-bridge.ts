@@ -34,27 +34,33 @@ const GOOGLE_PROVIDER_LINUX_AMD64_ZH =
 const GOOGLE_PROVIDER_BINARY = "terraform-provider-google_v7.45.0_x5";
 const PLAN_FORMAT_VERSION = "1.2";
 const JOB_TIMEOUT_MINUTES = 41;
-const MAIN_STEP_TIMEOUT_MINUTES = 26;
+const PLAN_MAIN_STEP_TIMEOUT_MINUTES = 25;
+const APPLY_MAIN_STEP_TIMEOUT_MINUTES = 39;
 const LEASE_MINUTES = 54;
-const INTERNAL_OPERATION_MINUTES = 24;
+const PLAN_INTERNAL_OPERATION_MINUTES = 24;
+const APPLY_INTERNAL_OPERATION_MINUTES = 33;
 const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;
 const RECOVERY_STABLE_EMPTY_MINUTES = 3;
 const RECOVERY_SCAN_INTERVAL_MINUTES = 1;
+const RECOVERY_SCAN_LATENCY_MARGIN_MINUTES = 1;
+const RECOVERY_LATE_RETRY_MARGIN_MINUTES = 1;
 const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
-  RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_INTERVAL_MINUTES;
+  RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_LATENCY_MARGIN_MINUTES +
+  RECOVERY_LATE_RETRY_MARGIN_MINUTES;
 const RECOVERY_SOURCE_PROOF_MINUTES = 1;
 const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;
 const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +
   RECOVERY_OPERATION_MINUTES + RECOVERY_WATCHDOG_MARGIN_MINUTES;
 const SAME_JOB_DOCKER_CLEANUP_MINUTES = 1;
 const SAME_JOB_TRANSITION_MARGIN_MINUTES = 1;
-const MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +
+const PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +
   RECOVERY_STEP_TIMEOUT_MINUTES + SAME_JOB_TRANSITION_MARGIN_MINUTES;
+const APPLY_MAIN_JOB_TAIL_MINUTES = 2;
 const FRESH_RECOVERY_SETUP_STEP_COUNT = 3;
 const FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES = 1;
 const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +
   RECOVERY_STEP_TIMEOUT_MINUTES + FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES;
-const EXECUTOR_TOKEN_MINUTES = 30;
+const EXECUTOR_TOKEN_MINUTES = 35;
 // Reserve seven minutes for the mandatory 300s+120s post-WIF drain and eight
 // more for the bounded apply, zero-diff readback, marker proof, and receipt.
 const MINIMUM_PRE_APPLY_MINUTES = 15;
@@ -66,6 +72,15 @@ const MAX_GITHUB_RUNS_PER_STATUS = 10_000;
 const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CLEANUP_RETRY_INTERVAL_MS = 2_000;
 const IAM_CONSISTENCY_MAX_WAIT_MS = 5 * 60_000;
+const PRE_ELEVATION_CONVERGENCE_MINUTES = IAM_CONSISTENCY_MAX_WAIT_MS / 60_000;
+const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
+// A minimum accepted apply has 28 primary-work minutes after the wrapper's
+// one-minute cleanup lead and the controller's five-minute exact-cleanup
+// reserve: 15 minutes after WIF mutation, five minutes for that mutation to
+// converge, five minutes for read-permission convergence, and three minutes
+// for bounded non-IAM preparation. The 39-minute maximum raises the latter to
+// eight minutes when setup consumed none of the job envelope.
+const MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS = 34 * 60;
 const IAM_RETRY_INITIAL_MS = 1_000;
 const IAM_RETRY_MAX_MS = 32_000;
 const IAM_RETRY_MAX_ATTEMPTS = 16;
@@ -89,8 +104,11 @@ const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
 // example. No finite interval is an absence guarantee. This bounded recovery
 // policy observes seven minutes, then requires four clean inventories spanning
 // three additional minutes; every artifact, failed read, or masking transition
-// resets that corroborating proof. Token checks also reserve the reviewed job
-// envelopes, while each recovery entry independently fails closed on freshness.
+// resets that corroborating proof. The operation also reserves one minute for
+// accumulated scan latency and one minute for a bounded late retry. Later or
+// repeated uncertainty still fails closed. Token checks reserve the reviewed
+// job envelopes, while each recovery entry independently fails closed on
+// freshness.
 const RECOVERY_STABLE_EMPTY_MS = RECOVERY_STABLE_EMPTY_MINUTES * 60_000;
 const RECOVERY_STABLE_EMPTY_INTERVAL_MS = RECOVERY_SCAN_INTERVAL_MINUTES * 60_000;
 const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
@@ -181,8 +199,30 @@ const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
 
 export type BridgePhase = (typeof BRIDGE_PHASES)[number];
 
+const RECOVERY_SCAN_OUTCOMES = [
+  "reset-active-artifact",
+  "reset-propagation-horizon",
+  "reset-masked-account",
+  "reset-observed-artifact",
+  "reset-retryable-read",
+  "proof-start",
+  "proof-continue",
+  "proof-complete",
+] as const;
+const RECOVERY_SCAN_OUTCOME_SET = new Set<string>(RECOVERY_SCAN_OUTCOMES);
+
+export type RecoveryScanOutcome = (typeof RECOVERY_SCAN_OUTCOMES)[number];
+
+export interface RecoveryScanTelemetry {
+  readonly elapsedMs: number;
+  readonly outcome: RecoveryScanOutcome;
+  readonly proofMs: number;
+  readonly scanMs: number;
+}
+
 export interface BridgeTelemetry {
   readonly phase: (phase: BridgePhase) => void;
+  readonly recoveryScan: (scan: RecoveryScanTelemetry) => void;
   readonly stop: () => void;
 }
 
@@ -195,6 +235,7 @@ interface CgroupMemorySnapshot {
 
 const NOOP_BRIDGE_TELEMETRY: BridgeTelemetry = {
   phase: () => undefined,
+  recoveryScan: () => undefined,
   stop: () => undefined,
 };
 
@@ -203,21 +244,26 @@ if (LEASE_MINUTES <= JOB_TIMEOUT_MINUTES + 10) {
   throw new Error("The emergency IAM expiry must remain safely beyond the job timeout.");
 }
 if (
-  MINIMUM_PRE_APPLY_MINUTES >= INTERNAL_OPERATION_MINUTES ||
-  INTERNAL_OPERATION_MINUTES > JOB_TIMEOUT_MINUTES - MAIN_JOB_RECOVERY_RESERVE_MINUTES
+  MINIMUM_PRE_APPLY_MINUTES + PRE_ELEVATION_CONVERGENCE_MINUTES >=
+      APPLY_INTERNAL_OPERATION_MINUTES ||
+  PLAN_INTERNAL_OPERATION_MINUTES > PLAN_MAIN_STEP_TIMEOUT_MINUTES ||
+  APPLY_INTERNAL_OPERATION_MINUTES > APPLY_MAIN_STEP_TIMEOUT_MINUTES
 ) {
   throw new Error("The operation and pre-apply deadlines must reserve unconditional cleanup.");
 }
 if (
-  MAIN_STEP_TIMEOUT_MINUTES !==
-    JOB_TIMEOUT_MINUTES - MAIN_JOB_RECOVERY_RESERVE_MINUTES
+  PLAN_MAIN_STEP_TIMEOUT_MINUTES !==
+      JOB_TIMEOUT_MINUTES - PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES ||
+  APPLY_MAIN_STEP_TIMEOUT_MINUTES !== JOB_TIMEOUT_MINUTES - APPLY_MAIN_JOB_TAIL_MINUTES
 ) {
   throw new Error("The crash-recovery deadline escaped the main job's reserved tail.");
 }
 if (
   RECOVERY_OPERATION_MINUTES !==
     RECOVERY_DOCUMENTED_PROPAGATION_MINUTES + RECOVERY_STABLE_EMPTY_MINUTES +
-      RECOVERY_SCAN_INTERVAL_MINUTES ||
+      RECOVERY_SCAN_LATENCY_MARGIN_MINUTES + RECOVERY_LATE_RETRY_MARGIN_MINUTES ||
+  RECOVERY_SCAN_LATENCY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
+  RECOVERY_LATE_RETRY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
   RECOVERY_STEP_TIMEOUT_MINUTES !==
     RECOVERY_SOURCE_PROOF_MINUTES + RECOVERY_OPERATION_MINUTES +
       RECOVERY_WATCHDOG_MARGIN_MINUTES ||
@@ -226,6 +272,14 @@ if (
       FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES
 ) {
   throw new Error("The crash-recovery operation escaped its reviewed timing envelope.");
+}
+if (
+  APPLY_MAIN_STEP_TIMEOUT_MINUTES + APPLY_MAIN_JOB_TAIL_MINUTES +
+      FRESH_RECOVERY_JOB_TIMEOUT_MINUTES >= GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS / 60 ||
+  FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES * 60 < OWNER_TOKEN_EXPIRY_MARGIN_SECONDS ||
+  EXECUTOR_TOKEN_MINUTES < APPLY_INTERNAL_OPERATION_MINUTES + 1
+) {
+  throw new Error("The apply token or fresh-recovery envelope escaped its reviewed bound.");
 }
 
 export const REPOSITORY_NAMES = [
@@ -690,12 +744,18 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     required(source, "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT"),
     "bridge operation budget seconds",
   ));
+  const minimumOperationBudgetSeconds = mode === "plan"
+    ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS
+    : MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS;
+  const maximumOperationBudgetSeconds = (
+    mode === "plan" ? PLAN_MAIN_STEP_TIMEOUT_MINUTES : APPLY_MAIN_STEP_TIMEOUT_MINUTES
+  ) * 60;
   if (
-    operationBudgetSeconds < 420 ||
-    operationBudgetSeconds > MAIN_STEP_TIMEOUT_MINUTES * 60
+    operationBudgetSeconds < minimumOperationBudgetSeconds ||
+    operationBudgetSeconds > maximumOperationBudgetSeconds
   ) {
     throw new Error(
-      `Bridge operation budget escaped its reviewed 420..${MAIN_STEP_TIMEOUT_MINUTES * 60} second range.`,
+      `Bridge operation budget escaped its reviewed ${minimumOperationBudgetSeconds}..${maximumOperationBudgetSeconds} second ${mode} range.`,
     );
   }
   const legacyCompatibilityMode = booleanString(
@@ -1610,6 +1670,26 @@ export function formatBridgeBreadcrumb(
   return fields.join(" ");
 }
 
+export function formatRecoveryScanBreadcrumb(scan: RecoveryScanTelemetry): string {
+  if (!RECOVERY_SCAN_OUTCOME_SET.has(scan.outcome)) {
+    throw new Error("Protected recovery scan outcome escaped its closed vocabulary.");
+  }
+  const fields = [
+    ["elapsed_ms", scan.elapsedMs],
+    ["scan_ms", scan.scanMs],
+    ["proof_ms", scan.proofMs],
+  ] as const;
+  for (const [, value] of fields) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Protected recovery scan timing escaped its integer bound.");
+    }
+  }
+  return [
+    `Protected bridge recovery scan outcome=${scan.outcome}`,
+    ...fields.map(([label, value]) => `${label}=${value}`),
+  ].join(" ");
+}
+
 function readCgroupMemorySnapshot(): CgroupMemorySnapshot {
   const numericFile = (path: string): number | undefined => {
     try {
@@ -1654,6 +1734,13 @@ function bestEffortTelemetry(telemetry: BridgeTelemetry): BridgeTelemetry {
         // Breadcrumbs are diagnostic only and may never alter privileged control flow.
       }
     },
+    recoveryScan: (scan) => {
+      try {
+        telemetry.recoveryScan(scan);
+      } catch {
+        // Sanitized recovery diagnostics are best effort and never weaken cleanup.
+      }
+    },
     stop: () => {
       try {
         telemetry.stop();
@@ -1690,6 +1777,13 @@ function startBridgeTelemetry(
       currentPhase = phase;
       emit();
     },
+    recoveryScan: (scan) => {
+      try {
+        sink(formatRecoveryScanBreadcrumb(scan));
+      } catch {
+        // Scan formatting and sink failures are strictly diagnostic.
+      }
+    },
     stop: () => {
       if (timer !== undefined) clearInterval(timer);
     },
@@ -1705,8 +1799,11 @@ export async function runProtectedBootstrap(
   const startedAtMs = dependencies.now();
   const wrapperDeadlineMs = startedAtMs + invocation.operationBudgetSeconds * 1_000;
   const cleanupDeadlineMs = wrapperDeadlineMs - 60_000;
+  const internalOperationMinutes = invocation.mode === "plan"
+    ? PLAN_INTERNAL_OPERATION_MINUTES
+    : APPLY_INTERNAL_OPERATION_MINUTES;
   const operationDeadlineMs = Math.min(
-    startedAtMs + INTERNAL_OPERATION_MINUTES * 60_000,
+    startedAtMs + internalOperationMinutes * 60_000,
     cleanupDeadlineMs - 5 * 60_000,
   );
   if (operationDeadlineMs <= startedAtMs) {
@@ -1849,7 +1946,7 @@ export async function runProtectedBootstrap(
     ) {
       throw new Error("The recomputed plan does not match the fresh approved plan receipt.");
     }
-    assertPreApplyTime(
+    assertPreElevationTime(
       dependencies.now(),
       operationDeadlineMs,
       leaseExpiresAt.getTime(),
@@ -1865,12 +1962,24 @@ export async function runProtectedBootstrap(
       canonicalJson(json(proof.markerProof, "approved pre-apply markers")),
       "fresh pre-apply marker proof",
     );
+    assertPreElevationTime(
+      dependencies.now(),
+      operationDeadlineMs,
+      leaseExpiresAt.getTime(),
+      session.tokenExpiresAtMs,
+    );
     await dependencies.consumeApproval(
       invocation,
       session,
       review,
       preApplyProof,
       dependencies.now(),
+    );
+    assertPreElevationTime(
+      dependencies.now(),
+      operationDeadlineMs,
+      leaseExpiresAt.getTime(),
+      session.tokenExpiresAtMs,
     );
     await dependencies.elevateExecutor(
       invocation,
@@ -2032,15 +2141,16 @@ export async function main(
 
 export async function runProtectedRecovery(
   invocation: RecoveryInvocation,
-  dependencies: RecoveryDependencies = defaultRecoveryDependencies(),
+  dependencies: RecoveryDependencies | undefined = undefined,
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): Promise<void> {
   telemetry = bestEffortTelemetry(telemetry);
-  const startedAtMs = dependencies.now();
+  const activeDependencies = dependencies ?? defaultRecoveryDependencies(telemetry);
+  const startedAtMs = activeDependencies.now();
   const sourceProofDeadlineMs = startedAtMs + RECOVERY_SOURCE_PROOF_MINUTES * 60_000;
   telemetry.phase("recovery.source-proof");
-  await dependencies.verifySource(invocation);
-  const sourceProofCompletedAtMs = dependencies.now();
+  await activeDependencies.verifySource(invocation);
+  const sourceProofCompletedAtMs = activeDependencies.now();
   assertBeforeDeadline(
     sourceProofCompletedAtMs,
     sourceProofDeadlineMs,
@@ -2049,7 +2159,7 @@ export async function runProtectedRecovery(
   const recoveryDeadlineMs = sourceProofCompletedAtMs +
     RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
-  await dependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+  await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
 }
 
 export async function recoveryMain(
@@ -2088,7 +2198,7 @@ export async function recoveryMain(
     delete invocationSource.OWNER_OAUTH_ACCESS_TOKEN;
     await runProtectedRecovery(
       invocation,
-      dependencies ?? defaultRecoveryDependencies(),
+      dependencies,
       activeTelemetry,
     );
     activeTelemetry.phase("recovery.complete");
@@ -2840,6 +2950,19 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
   };
 }
 
+export function requiredOwnerTokenRemainingSeconds(
+  invocation: Pick<Invocation, "mode" | "operationBudgetSeconds">,
+): number {
+  if (invocation.mode === "apply") {
+    // Apply's late-failure authority is the fresh-runner recovery job. Its
+    // eighteen-minute envelope already ends with the one-minute expiry margin.
+    return invocation.operationBudgetSeconds + APPLY_MAIN_JOB_TAIL_MINUTES * 60 +
+      FRESH_RECOVERY_JOB_TIMEOUT_MINUTES * 60;
+  }
+  return invocation.operationBudgetSeconds + PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +
+    OWNER_TOKEN_EXPIRY_MARGIN_SECONDS;
+}
+
 function defaultBridgeDependencies(
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): BridgeDependencies {
@@ -2874,9 +2997,7 @@ function defaultBridgeDependencies(
       assertBeforeDeadline(Date.now(), operationDeadlineMs, "source preparation");
       await requireFreshGoogleOwnerAccessToken(
         invocation.ownerAccessToken,
-        invocation.operationBudgetSeconds +
-          MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +
-          OWNER_TOKEN_EXPIRY_MARGIN_SECONDS,
+        requiredOwnerTokenRemainingSeconds(invocation),
         api,
       );
       const contract = REPOSITORIES[invocation.repository];
@@ -3029,7 +3150,9 @@ export async function releaseSandboxAndExecutor(
   }
 }
 
-function defaultRecoveryDependencies(): RecoveryDependencies {
+function defaultRecoveryDependencies(
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
+): RecoveryDependencies {
   let apiDeadlineMs = Date.now() + RECOVERY_OPERATION_MINUTES * 60_000;
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
   return {
@@ -3042,6 +3165,7 @@ function defaultRecoveryDependencies(): RecoveryDependencies {
         (milliseconds) => Bun.sleep(milliseconds),
         recoveryDeadlineMs,
         () => Date.now(),
+        telemetry,
       );
     },
     verifySource: async (invocation) => {
@@ -3260,6 +3384,35 @@ export class ExecutorLeaseManager {
     this.#telemetry = bestEffortTelemetry(telemetry);
   }
 
+  async #waitForPermissionProjection(
+    invocation: Invocation,
+    executorToken: string,
+    expected: "mutation" | "none" | "read",
+  ): Promise<void> {
+    // State and control probes prove one IAM transition and therefore consume
+    // one absolute consistency window. A slow state proof cannot silently
+    // obtain a second five-minute window before control-plane validation.
+    const consistencyDeadlineMs = permissionConsistencyDeadlineMs(this.#apiDeadlineMs);
+    await waitForStatePermissions(
+      REPOSITORIES[invocation.repository].state[invocation.terraformRoot],
+      invocation,
+      executorToken,
+      expected,
+      this.#fetcher,
+      this.#sleep,
+      DEFAULT_STATE_STORAGE_PERMISSION_PROBES,
+      consistencyDeadlineMs,
+    );
+    await waitForControlPermissions(
+      invocation,
+      executorToken,
+      expected,
+      this.#fetcher,
+      this.#sleep,
+      consistencyDeadlineMs,
+    );
+  }
+
   async acquire(
     invocation: Invocation,
     leaseExpiresAt: Date,
@@ -3422,21 +3575,7 @@ export class ExecutorLeaseManager {
       assertSession(session, Date.now(), operationDeadlineMs);
       this.#session = session;
       this.#telemetry.phase("executor.baseline-proof");
-      await waitForStatePermissions(
-        contract.state[invocation.terraformRoot],
-        invocation,
-        session.accessToken,
-        "none",
-        this.#fetcher,
-        this.#sleep,
-      );
-      await waitForControlPermissions(
-        invocation,
-        session.accessToken,
-        "none",
-        this.#fetcher,
-        this.#sleep,
-      );
+      await this.#waitForPermissionProjection(invocation, session.accessToken, "none");
       this.#telemetry.phase("executor.disable");
       account = await setExecutorDisabled(
         account,
@@ -3536,21 +3675,7 @@ export class ExecutorLeaseManager {
       this.#account = account;
       assertSession(session, Date.now(), operationDeadlineMs);
       this.#telemetry.phase("executor.permission-proof");
-      await waitForStatePermissions(
-        contract.state[invocation.terraformRoot],
-        invocation,
-        session.accessToken,
-        "read",
-        this.#fetcher,
-        this.#sleep,
-      );
-      await waitForControlPermissions(
-        invocation,
-        session.accessToken,
-        "read",
-        this.#fetcher,
-        this.#sleep,
-      );
+      await this.#waitForPermissionProjection(invocation, session.accessToken, "read");
       this.#telemetry.phase("executor.ready");
       return session;
     } catch (error) {
@@ -3665,21 +3790,7 @@ export class ExecutorLeaseManager {
         );
       }
     }
-    await waitForStatePermissions(
-      contract.state[invocation.terraformRoot],
-      invocation,
-      session.accessToken,
-      "mutation",
-      this.#fetcher,
-      this.#sleep,
-    );
-    await waitForControlPermissions(
-      invocation,
-      session.accessToken,
-      "mutation",
-      this.#fetcher,
-      this.#sleep,
-    );
+    await this.#waitForPermissionProjection(invocation, session.accessToken, "mutation");
     this.#elevated = true;
   }
 
@@ -3888,21 +3999,10 @@ export class ExecutorLeaseManager {
 
   async #proveExecutorPermissionsGone(invocation: Invocation): Promise<void> {
     if (this.#session === undefined) return;
-    const contract = REPOSITORIES[invocation.repository];
-    await waitForStatePermissions(
-      contract.state[invocation.terraformRoot],
+    await this.#waitForPermissionProjection(
       invocation,
       this.#session.accessToken,
       "none",
-      this.#fetcher,
-      this.#sleep,
-    );
-    await waitForControlPermissions(
-      invocation,
-      this.#session.accessToken,
-      "none",
-      this.#fetcher,
-      this.#sleep,
     );
   }
 
@@ -4753,12 +4853,15 @@ export async function recoverBridgeArtifactsUntilStable(
   sleep: (milliseconds: number) => Promise<void>,
   cleanupDeadlineMs: number,
   now: () => number = () => Date.now(),
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): Promise<void> {
+  telemetry = bestEffortTelemetry(telemetry);
   const projectId = REPOSITORIES[invocation.repository].projectId;
   const observationStartedAtMs = now();
   let emptySinceMs: number | undefined;
   let exactAccountWasAbsentOrDenied = false;
   while (now() < cleanupDeadlineMs) {
+    const scanStartedAtMs = now();
     try {
       const inventory = await inventoryBridgeArtifacts(
         projectId,
@@ -4782,32 +4885,56 @@ export async function recoverBridgeArtifactsUntilStable(
       const newlyMaskedExactAccount = exactAccountAbsentOrDenied &&
         !exactAccountWasAbsentOrDenied;
       exactAccountWasAbsentOrDenied = exactAccountAbsentOrDenied;
-      if (
-        remaining.active ||
-        !propagationHorizonComplete
-      ) {
+      let outcome: RecoveryScanOutcome;
+      let proofMs = 0;
+      let proofComplete = false;
+      if (remaining.active) {
+        emptySinceMs = undefined;
+        outcome = "reset-active-artifact";
+      } else if (!propagationHorizonComplete) {
         // The stable-empty proof begins only after the complete propagation
         // horizon. Clean scans inside that horizon are observation, not proof.
         emptySinceMs = undefined;
-      } else if (
-        newlyMaskedExactAccount ||
-        inventory.hadActiveArtifacts ||
-        emptySinceMs === undefined
-      ) {
-        // This scan's final proof is clean, so it may begin (or reset) the
-        // three-minute absence window even when the same scan contained an
-        // artifact or first lost exact-resource visibility. It can never reuse
-        // absence time from before either observation.
+        outcome = "reset-propagation-horizon";
+      } else if (newlyMaskedExactAccount) {
+        // A first authorization-masked exact-account read can begin a new
+        // absence window only after every global and detached-policy surface
+        // is clean. It can never reuse earlier 404 proof time.
         emptySinceMs = scanCompletedAtMs;
-      } else if (scanCompletedAtMs - emptySinceMs >= RECOVERY_STABLE_EMPTY_MS) {
-        return;
+        outcome = "reset-masked-account";
+      } else if (inventory.hadActiveArtifacts) {
+        // Recovery may have contained an artifact during this scan. Its clean
+        // final readback begins a new window but cannot inherit prior absence.
+        emptySinceMs = scanCompletedAtMs;
+        outcome = "reset-observed-artifact";
+      } else if (emptySinceMs === undefined) {
+        emptySinceMs = scanCompletedAtMs;
+        outcome = "proof-start";
+      } else {
+        proofMs = scanCompletedAtMs - emptySinceMs;
+        proofComplete = proofMs >= RECOVERY_STABLE_EMPTY_MS;
+        outcome = proofComplete ? "proof-complete" : "proof-continue";
       }
+      telemetry.recoveryScan({
+        elapsedMs: scanCompletedAtMs - observationStartedAtMs,
+        outcome,
+        proofMs,
+        scanMs: scanCompletedAtMs - scanStartedAtMs,
+      });
+      if (proofComplete) return;
     } catch (error) {
       if (!recursivelyRetryableCleanupError(error)) throw error;
       // A failed read is not negative proof. Retry the entire inventory while
       // preserving hard failure for identity drift and malformed authority.
       emptySinceMs = undefined;
       exactAccountWasAbsentOrDenied = false;
+      const scanFailedAtMs = now();
+      telemetry.recoveryScan({
+        elapsedMs: scanFailedAtMs - observationStartedAtMs,
+        outcome: "reset-retryable-read",
+        proofMs: 0,
+        scanMs: scanFailedAtMs - scanStartedAtMs,
+      });
       const remainingMs = cleanupDeadlineMs - now();
       if (remainingMs <= 0) break;
       await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, remainingMs));
@@ -6883,6 +7010,7 @@ export interface StorageObjectCreateProbeRequest {
 export interface StateStoragePermissionProbes {
   readonly testObjectPermissions: (
     request: StorageObjectPermissionProbeRequest,
+    options?: StoragePermissionRpcOptions,
   ) => Promise<StorageObjectPermissionProbeResult>;
   readonly testObjectCreate: (
     request: StorageObjectCreateProbeRequest,
@@ -7330,6 +7458,65 @@ const DEFAULT_STATE_STORAGE_PERMISSION_PROBES: StateStoragePermissionProbes = {
   testObjectPermissions: probeStorageObjectPermissions,
 };
 
+function permissionConsistencyDeadlineMs(apiDeadlineMs: number): number {
+  return Math.min(apiDeadlineMs, Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS);
+}
+
+class PermissionConsistencyDeadlineError extends Error {}
+
+function permissionConsistencyRemainingMs(
+  consistencyDeadlineMs: number,
+  now: () => number,
+): number {
+  const remainingMs = consistencyDeadlineMs - now();
+  if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
+    throw new PermissionConsistencyDeadlineError();
+  }
+  return remainingMs;
+}
+
+async function permissionSubrequest<T>(
+  operation: () => Promise<T>,
+  consistencyDeadlineMs: number,
+  now: () => number,
+): Promise<T> {
+  permissionConsistencyRemainingMs(consistencyDeadlineMs, now);
+  try {
+    const result = await operation();
+    permissionConsistencyRemainingMs(consistencyDeadlineMs, now);
+    return result;
+  } catch (error) {
+    if (now() >= consistencyDeadlineMs) throw new PermissionConsistencyDeadlineError();
+    throw error;
+  }
+}
+
+async function waitForPermissionConvergence(
+  scan: () => Promise<boolean>,
+  sleep: (milliseconds: number) => Promise<void>,
+  consistencyDeadlineMs: number,
+  timeoutMessage: string,
+  now: () => number,
+): Promise<void> {
+  let attempt = 0;
+  while (now() < consistencyDeadlineMs) {
+    let matches: boolean;
+    try {
+      matches = await scan();
+    } catch (error) {
+      if (error instanceof PermissionConsistencyDeadlineError) break;
+      throw error;
+    }
+    const completedAtMs = now();
+    if (matches && completedAtMs < consistencyDeadlineMs) return;
+    const remainingMs = consistencyDeadlineMs - completedAtMs;
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(Math.min(2 ** attempt, 12) * 1_000, remainingMs));
+    attempt += 1;
+  }
+  throw new Error(timeoutMessage);
+}
+
 export async function waitForStatePermissions(
   state: { readonly bucket: string; readonly prefix: string },
   invocation: Invocation,
@@ -7338,6 +7525,8 @@ export async function waitForStatePermissions(
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void> = (milliseconds) => Bun.sleep(milliseconds),
   probes: StateStoragePermissionProbes = DEFAULT_STATE_STORAGE_PERMISSION_PROBES,
+  consistencyDeadlineMs: number = Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS,
+  now: () => number = Date.now,
 ): Promise<void> {
   const allObjectPermissions = [
     "storage.objects.create",
@@ -7350,6 +7539,12 @@ export async function waitForStatePermissions(
   const noAccess = new Set<string>();
   const createRead = new Set<string>(["storage.objects.create", "storage.objects.get"]);
   const readOnly = new Set<string>(["storage.objects.get"]);
+  const permissionFetcher = deadlineFetcher(
+    fetcher,
+    () => consistencyDeadlineMs,
+    20_000,
+    now,
+  );
   const objects: readonly {
     readonly name: string;
     readonly required: ReadonlySet<string>;
@@ -7382,7 +7577,7 @@ export async function waitForStatePermissions(
         }]
       : []),
   ];
-  for (let attempt = 0; attempt < 7; attempt += 1) {
+  await waitForPermissionConvergence(async () => {
     const observed: boolean[] = [];
     const bucketUrl = new URL(
       `https://storage.googleapis.com/storage/v1/b/${state.bucket}/iam/testPermissions`,
@@ -7390,10 +7585,15 @@ export async function waitForStatePermissions(
     for (const permission of ["storage.buckets.get", "storage.objects.list"]) {
       bucketUrl.searchParams.append("permissions", permission);
     }
-    const bucketResponse = await fetcher(bucketUrl, {
-      headers: executorHeaders(executorToken),
-      redirect: "error",
-    });
+    const bucketResponse = await permissionSubrequest(
+      () =>
+        permissionFetcher(bucketUrl, {
+          headers: executorHeaders(executorToken),
+          redirect: "error",
+        }),
+      consistencyDeadlineMs,
+      now,
+    );
     if (!bucketResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(bucketResponse))) {
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
@@ -7421,12 +7621,21 @@ export async function waitForStatePermissions(
 
     for (const object of objects) {
       const resource = `projects/_/buckets/${state.bucket}/objects/${object.name}`;
-      const objectResult = await probes.testObjectPermissions({
-        bucketResource: `projects/_/buckets/${state.bucket}`,
-        executorToken,
-        permissions: STORAGE_OBJECT_RPC_PERMISSIONS,
-        resource,
-      });
+      const rpcTimeoutMs = Math.min(
+        STORAGE_PERMISSION_RPC_TIMEOUT_MS,
+        permissionConsistencyRemainingMs(consistencyDeadlineMs, now),
+      );
+      const objectResult = await permissionSubrequest(
+        () =>
+          probes.testObjectPermissions({
+            bucketResource: `projects/_/buckets/${state.bucket}`,
+            executorToken,
+            permissions: STORAGE_OBJECT_RPC_PERMISSIONS,
+            resource,
+          }, { timeoutMs: rpcTimeoutMs }),
+        consistencyDeadlineMs,
+        now,
+      );
       if (objectResult.denied && expected !== "none") {
         throw new Error("Storage object permission RPC denied the executor credential.");
       }
@@ -7441,9 +7650,14 @@ export async function waitForStatePermissions(
           throw new Error("Storage object permission probe escaped its permission allowlist.");
         }
       }
-      const create = await probes.testObjectCreate(
-        { bucket: state.bucket, executorToken, objectName: object.name },
-        fetcher,
+      const create = await permissionSubrequest(
+        () =>
+          probes.testObjectCreate(
+            { bucket: state.bucket, executorToken, objectName: object.name },
+            permissionFetcher,
+          ),
+        consistencyDeadlineMs,
+        now,
       );
       if (create) permissions.add("storage.objects.create");
       const forbidden = allObjectPermissions.filter((permission) => !object.required.has(permission));
@@ -7454,14 +7668,12 @@ export async function waitForStatePermissions(
           : allObjectPermissions.every((permission) => !permissions.has(permission)),
       );
     }
-    if (observed.every(Boolean)) return;
-    await sleep(Math.min(2 ** attempt, 12) * 1_000);
-  }
-  throw new Error(
+    return observed.every(Boolean);
+  }, sleep, consistencyDeadlineMs,
     expected !== "none"
       ? "The executor state lease did not propagate before the deadline."
       : "The executor retained state permissions after exact lease cleanup.",
-  );
+    now);
 }
 
 export async function waitForControlPermissions(
@@ -7470,6 +7682,8 @@ export async function waitForControlPermissions(
   expected: "mutation" | "none" | "read",
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void> = (milliseconds) => Bun.sleep(milliseconds),
+  consistencyDeadlineMs: number = Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS,
+  now: () => number = Date.now,
 ): Promise<void> {
   const contract = REPOSITORIES[invocation.repository];
   const projectPermissions = executorControlPermissions(
@@ -7482,15 +7696,26 @@ export async function waitForControlPermissions(
     : expected === "read"
     ? executorControlPermissions(invocation.repository, invocation.terraformRoot, "read")
     : []);
-  for (let attempt = 0; attempt < 7; attempt += 1) {
-    const projectResponse = await fetcher(
-      `https://cloudresourcemanager.googleapis.com/v1/projects/${contract.projectId}:testIamPermissions`,
-      {
-        body: JSON.stringify({ permissions: projectPermissions }),
-        headers: { ...executorHeaders(executorToken), "Content-Type": "application/json" },
-        method: "POST",
-        redirect: "error",
-      },
+  const permissionFetcher = deadlineFetcher(
+    fetcher,
+    () => consistencyDeadlineMs,
+    20_000,
+    now,
+  );
+  await waitForPermissionConvergence(async () => {
+    const projectResponse = await permissionSubrequest(
+      () =>
+        permissionFetcher(
+          `https://cloudresourcemanager.googleapis.com/v1/projects/${contract.projectId}:testIamPermissions`,
+          {
+            body: JSON.stringify({ permissions: projectPermissions }),
+            headers: { ...executorHeaders(executorToken), "Content-Type": "application/json" },
+            method: "POST",
+            redirect: "error",
+          },
+        ),
+      consistencyDeadlineMs,
+      now,
     );
     if (!projectResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(projectResponse))) {
@@ -7516,12 +7741,17 @@ export async function waitForControlPermissions(
     let actAsMatches = true;
     if (invocation.terraformRoot === "prod") {
       for (const email of runtimeServiceAccountEmails(invocation.repository)) {
-        const response = await fetcher(`${serviceAccountUrl(email)}:testIamPermissions`, {
-          body: JSON.stringify({ permissions: ["iam.serviceAccounts.actAs"] }),
-          headers: { ...executorHeaders(executorToken), "Content-Type": "application/json" },
-          method: "POST",
-          redirect: "error",
-        });
+        const response = await permissionSubrequest(
+          () =>
+            permissionFetcher(`${serviceAccountUrl(email)}:testIamPermissions`, {
+              body: JSON.stringify({ permissions: ["iam.serviceAccounts.actAs"] }),
+              headers: { ...executorHeaders(executorToken), "Content-Type": "application/json" },
+              method: "POST",
+              redirect: "error",
+            }),
+          consistencyDeadlineMs,
+          now,
+        );
         if (!response.ok &&
           !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
@@ -7539,14 +7769,12 @@ export async function waitForControlPermissions(
         }
       }
     }
-    if (projectMatches && actAsMatches) return;
-    await sleep(Math.min(2 ** attempt, 12) * 1_000);
-  }
-  throw new Error(
+    return projectMatches && actAsMatches;
+  }, sleep, consistencyDeadlineMs,
     expected !== "none"
       ? "The executor control-plane lease did not propagate before the deadline."
       : "The executor token retained control-plane or runtime actAs permissions after cleanup.",
-  );
+    now);
 }
 
 function permissionDenialProvesNoUsableCredential(response: Response): boolean {
@@ -8128,9 +8356,10 @@ export function deadlineFetcher(
   fetcher: Fetcher,
   deadline: () => number,
   maximumRequestMs = 20_000,
+  now: () => number = Date.now,
 ): Fetcher {
   return async (input, init = {}) => {
-    const remainingMs = Math.min(maximumRequestMs, deadline() - Date.now());
+    const remainingMs = Math.min(maximumRequestMs, deadline() - now());
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
       throw new Error("API request reached the protected operation deadline.");
     }
@@ -8682,6 +8911,25 @@ function assertPreApplyTime(
     requiredUntil >= tokenExpiresAtMs
   ) {
     throw new Error("Too little operation, IAM-lease, or executor-token lifetime remains to apply.");
+  }
+}
+
+function assertPreElevationTime(
+  nowMs: number,
+  operationDeadlineMs: number,
+  leaseExpiresAtMs: number,
+  tokenExpiresAtMs: number,
+): void {
+  const requiredUntil = nowMs +
+    (MINIMUM_PRE_APPLY_MINUTES + PRE_ELEVATION_CONVERGENCE_MINUTES) * 60_000;
+  if (
+    requiredUntil >= operationDeadlineMs ||
+    requiredUntil >= leaseExpiresAtMs ||
+    requiredUntil >= tokenExpiresAtMs
+  ) {
+    throw new Error(
+      "Too little operation, IAM-lease, or executor-token lifetime remains to converge elevation and apply.",
+    );
   }
 }
 

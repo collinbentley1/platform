@@ -389,12 +389,27 @@ jobs:
           [[ "$current_epoch" =~ ^[1-9][0-9]*$ ]]
           elapsed_seconds=$((current_epoch - job_start_epoch))
           test "$elapsed_seconds" -ge 0
-          # Keep fifteen minutes outside the bridge: a thirteen-minute step
-          # for source proof, the eleven-minute IAM operation, and its
-          # watchdog margin, plus one minute each for Docker and transitions.
-          bridge_budget_seconds=$((41 * 60 - elapsed_seconds - 15 * 60))
-          test "$bridge_budget_seconds" -ge 420
-          test "$bridge_budget_seconds" -le 1560
+          # Plan keeps its complete sixteen-minute same-job recovery tail.
+          # Apply keeps two minutes for opportunistic same-job containment and
+          # relies on the independently authenticated eighteen-minute fresh
+          # recovery job after a late failure. Its minimum admits at most five
+          # setup minutes while preserving both IAM windows and apply reserve.
+          case "$EXECUTION_MODE" in
+            plan)
+              bridge_reserve_seconds=$((16 * 60))
+              bridge_minimum_seconds=$((7 * 60))
+              bridge_maximum_seconds=$((25 * 60))
+              ;;
+            apply)
+              bridge_reserve_seconds=$((2 * 60))
+              bridge_minimum_seconds=$((34 * 60))
+              bridge_maximum_seconds=$((39 * 60))
+              ;;
+            *) exit 1 ;;
+          esac
+          bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))
+          test "$bridge_budget_seconds" -ge "$bridge_minimum_seconds"
+          test "$bridge_budget_seconds" -le "$bridge_maximum_seconds"
           shopt -s lastpipe
           {
             printf '%s\0%s\0%s\0' "$owner_token" "$consumer_token" "$platform_token"
@@ -621,7 +636,7 @@ jobs:
 
       - name: Recover exact IAM artifacts after bridge failure
         if: ${{ always() && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}
-        timeout-minutes: 13
+        timeout-minutes: 14
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
@@ -655,7 +670,7 @@ jobs:
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/timeout --signal=TERM --kill-after=15s 735s \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \
             /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \
@@ -683,7 +698,7 @@ jobs:
     needs: owner-terraform
     if: ${{ always() && needs.owner-terraform.result != 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 17
+    timeout-minutes: 18
     environment: protected-bootstrap-owner-token
     permissions: {}
 
@@ -779,7 +794,7 @@ jobs:
 
       - name: Recover exact IAM artifacts on a fresh runner
         if: ${{ always() && steps.recovery-bun.outcome == 'success' }}
-        timeout-minutes: 13
+        timeout-minutes: 14
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
@@ -813,7 +828,7 @@ jobs:
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/timeout --signal=TERM --kill-after=15s 735s \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \
             /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \

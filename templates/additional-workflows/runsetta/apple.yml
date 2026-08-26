@@ -32,6 +32,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq -e '
+              if .action == "edited" then
+                (.changes | type == "object") and
+                ((.changes | keys) == ["body"]) and
+                (.changes.body | type == "object") and
+                ((.changes.body | keys) == ["from"]) and
+                ((.changes.body.from | type) == "string" or .changes.body.from == null)
+              else
+                .action == "opened" or
+                .action == "reopened" or
+                .action == "synchronize"
+              end
+            ' "$GITHUB_EVENT_PATH" >/dev/null
             exit 0
           fi
           test "$GITHUB_EVENT_NAME" = "push"
