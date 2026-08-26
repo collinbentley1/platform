@@ -326,7 +326,7 @@ jobs:
           echo "$tools" >> "$GITHUB_PATH"
 
       - name: Validate GitHub Actions syntax
-        run: actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml
+        run: actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml templates/additional-workflows/runsetta/apple.yml
 
       - name: Install checksum-pinned Grype 0.117.0
         env:

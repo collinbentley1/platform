@@ -23,6 +23,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq -e '
+              if .action == "edited" then
+                (.changes | type == "object") and
+                ((.changes | keys) == ["body"]) and
+                (.changes.body | type == "object") and
+                ((.changes.body | keys) == ["from"]) and
+                ((.changes.body.from | type) == "string" or .changes.body.from == null)
+              else
+                .action == "opened" or
+                .action == "reopened" or
+                .action == "synchronize"
+              end
+            ' "$GITHUB_EVENT_PATH" >/dev/null
             exit 0
           fi
           test "$GITHUB_EVENT_NAME" = "push"
@@ -47,6 +60,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq -e '
+              if .action == "edited" then
+                (.changes | type == "object") and
+                ((.changes | keys) == ["body"]) and
+                (.changes.body | type == "object") and
+                ((.changes.body | keys) == ["from"]) and
+                ((.changes.body.from | type) == "string" or .changes.body.from == null)
+              else
+                .action == "opened" or
+                .action == "reopened" or
+                .action == "synchronize"
+              end
+            ' "$GITHUB_EVENT_PATH" >/dev/null
             exit 0
           fi
           test "$GITHUB_EVENT_NAME" = "push"
@@ -254,6 +280,19 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq -e '
+              if .action == "edited" then
+                (.changes | type == "object") and
+                ((.changes | keys) == ["body"]) and
+                (.changes.body | type == "object") and
+                ((.changes.body | keys) == ["from"]) and
+                ((.changes.body.from | type) == "string" or .changes.body.from == null)
+              else
+                .action == "opened" or
+                .action == "reopened" or
+                .action == "synchronize"
+              end
+            ' "$GITHUB_EVENT_PATH" >/dev/null
             exit 0
           fi
           test "$GITHUB_EVENT_NAME" = "push"
@@ -355,6 +394,29 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Reject alternate required-check event paths
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            jq -e '
+              if .action == "edited" then
+                (.changes | type == "object") and
+                ((.changes | keys) == ["body"]) and
+                (.changes.body | type == "object") and
+                ((.changes.body | keys) == ["from"]) and
+                ((.changes.body.from | type) == "string" or .changes.body.from == null)
+              else
+                .action == "opened" or
+                .action == "reopened" or
+                .action == "synchronize"
+              end
+            ' "$GITHUB_EVENT_PATH" >/dev/null
+            exit 0
+          fi
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF" = "refs/heads/main"
 
       - name: Reject a stale main-branch run after acquiring the production lock
         env:

@@ -26,6 +26,7 @@ import {
   executorControlPermissions,
   fencePolicyMutations,
   formatBridgeBreadcrumb,
+  formatRecoveryScanBreadcrumb,
   inventoryBridgeArtifacts,
   main,
   parseRecoverySecretBundle,
@@ -45,6 +46,7 @@ import {
   recoveryMain,
   recoverBridgeArtifactsUntilStable,
   releaseSandboxAndExecutor,
+  requiredOwnerTokenRemainingSeconds,
   requireFreshGoogleOwnerAccessToken,
   requireSameDhiTransitionCapability,
   runProtectedBootstrap,
@@ -70,6 +72,7 @@ import {
   type PreparationResult,
   type RecoveryDependencies,
   type RecoveryInvocation,
+  type RecoveryScanTelemetry,
   type StateStoragePermissionProbes,
   type TerraformSandboxDriver,
   type TerraformSandboxSpec,
@@ -151,11 +154,21 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
     );
+    expect(workflow).toContain("bridge_reserve_seconds=$((16 * 60))");
+    expect(workflow).toContain("bridge_maximum_seconds=$((25 * 60))");
+    expect(workflow).toContain("bridge_reserve_seconds=$((2 * 60))");
+    expect(workflow).toContain("bridge_minimum_seconds=$((34 * 60))");
+    expect(workflow).toContain("bridge_maximum_seconds=$((39 * 60))");
     expect(workflow).toContain(
-      "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - 15 * 60))",
+      "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))",
     );
-    expect(workflow).toContain('test "$bridge_budget_seconds" -le 1560');
-    expect(workflow.match(/timeout-minutes: 13/g)).toHaveLength(2);
+    expect(workflow).toContain(
+      'test "$bridge_budget_seconds" -ge "$bridge_minimum_seconds"',
+    );
+    expect(workflow).toContain(
+      'test "$bridge_budget_seconds" -le "$bridge_maximum_seconds"',
+    );
+    expect(workflow.match(/timeout-minutes: 14/g)).toHaveLength(2);
     const recoveryBlocks = [
       workflow.slice(
         workflow.indexOf("- name: Recover exact IAM artifacts after bridge failure"),
@@ -166,18 +179,18 @@ describe("protected owner Terraform bridge", () => {
       ),
     ];
     for (const recoveryBlock of recoveryBlocks) {
-      expect(recoveryBlock).toContain("timeout-minutes: 13");
+      expect(recoveryBlock).toContain("timeout-minutes: 14");
       expect(recoveryBlock).toContain(
-        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 735s \\\n" +
+        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \\\n" +
           "            /usr/bin/env -i \\",
       );
       expect(recoveryBlock).not.toContain("} | \\\n          exec /usr/bin/env -i");
       expect(recoveryBlock).toContain("--no-env-file --no-orphans");
     }
-    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1) * 60;
-    const recoveryWrapperSeconds = 735;
+    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1 + 1) * 60;
+    const recoveryWrapperSeconds = 795;
     const recoveryKillAfterSeconds = 15;
-    const recoveryActionsStepSeconds = 13 * 60;
+    const recoveryActionsStepSeconds = 14 * 60;
     expect(recoveryWrapperSeconds).toBeGreaterThan(recoveryInternalDeadlineSeconds);
     expect(recoveryWrapperSeconds + recoveryKillAfterSeconds).toBeLessThan(
       recoveryActionsStepSeconds,
@@ -185,7 +198,7 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
         "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 17",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 18",
     );
     expect(
       workflow.match(
@@ -289,7 +302,18 @@ describe("protected owner Terraform bridge", () => {
       "generic later active-only DHI cutover",
       "must use `legacy_compatibility_mode=false`",
       "Never enable a marker-unaware legacy PR-triggered privileged deployment",
-      "Permit only the credentialless exact-head Application, Infrastructure validation, and Socket checks",
+      "only the credentialless exact-head Application, Infrastructure validation, Socket, and, for Runsetta, Swift package checks",
+      "Do not use the repository Events API as a security gate",
+      "complete paginated `state=all` PR inventory",
+      "repository issue-event ID baseline",
+      "per-PR timeline ID baseline",
+      "rule out `synchronize` by both the frozen head SHA/tree comparison and timeline records",
+      "use the owner PAT for exactly one PR-body-only edit",
+      "resulting `pull_request: edited` delivery is the sole check-window trigger",
+      "Every expected job must first pass the shared fail-closed event-payload guard",
+      "an `edited` payload is accepted only when `changes` contains exactly `body`",
+      "title, base, mixed, missing, and expanded change shapes fail",
+      "For non-`edited` pull-request deliveries the same guard accepts only `opened`, `reopened`, and `synchronize`",
       "GitHub does not replay the merge's disabled `push`",
       "the production workflow intentionally has no manual-dispatch trust path",
       "selected-actions GET returns 409",
@@ -310,7 +334,7 @@ describe("protected owner Terraform bridge", () => {
       "the first `S` production deploy to complete the sealed DHI epoch transition",
       "never use the mixed-SHA transition path when `P` and `S` declare different DHI parity IDs",
       "wait at least 55 minutes after the failed workflow completes",
-      "exceeding both the 54-minute conditioned lease and 30-minute executor-token lifetimes",
+      "exceeding both the 54-minute conditioned lease and 35-minute executor-token lifetimes",
       "issue a new attempt-1 owner dispatch",
     ]) {
       expect(rollout).toContain(requirement);
@@ -331,6 +355,7 @@ describe("protected owner Terraform bridge", () => {
       "disable the `Cleanup preview`, `Reconcile previews`, and `Deploy production` workflow files",
       "explicitly enable `Deploy preview`",
       "inventory every open PR and its exact head repository and SHA",
+      "complete PR inventory, issue-event, per-PR timeline, and run surfaces defined above",
       "Outside the conservative UTC minute `:12` through `:22`",
       "this enable sequence replayed no event",
       "sole PR lifecycle event repository-wide",
@@ -537,6 +562,7 @@ describe("protected owner Terraform bridge", () => {
       validateInvocation({
         ...environment,
         APPROVED_MANIFEST_SHA256: "",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
         EXECUTION_MODE: "apply",
       }),
     ).toThrow("approved manifest digest");
@@ -718,6 +744,13 @@ describe("protected owner Terraform bridge", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
+  });
+
+  test("committed deployment-parity capability matches every protected source", async () => {
+    expect(await verifyPlatformCapability(root)).toEqual({
+      dhiParityId: "1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8",
+      maxMutatorTokenLifetimeSeconds: 300,
+    });
   });
 
   test("a mixed transition is accepted only when active and predecessor DHI parity match", () => {
@@ -1417,31 +1450,69 @@ describe("protected owner Terraform bridge", () => {
     expect(controller).toContain("} finally {");
     expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 41;");
     expect(controller).toContain("const LEASE_MINUTES = 54;");
-    expect(controller).toContain("const INTERNAL_OPERATION_MINUTES = 24;");
-    expect(controller).toContain("const MAIN_STEP_TIMEOUT_MINUTES = 26;");
+    expect(controller).toContain("const PLAN_INTERNAL_OPERATION_MINUTES = 24;");
+    expect(controller).toContain("const APPLY_INTERNAL_OPERATION_MINUTES = 33;");
+    expect(controller).toContain("const PLAN_MAIN_STEP_TIMEOUT_MINUTES = 25;");
+    expect(controller).toContain("const APPLY_MAIN_STEP_TIMEOUT_MINUTES = 39;");
     expect(controller).toContain("const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;");
     expect(controller).toContain("const RECOVERY_STABLE_EMPTY_MINUTES = 3;");
     expect(controller).toContain("const RECOVERY_SCAN_INTERVAL_MINUTES = 1;");
+    expect(controller).toContain("const RECOVERY_SCAN_LATENCY_MARGIN_MINUTES = 1;");
+    expect(controller).toContain("const RECOVERY_LATE_RETRY_MARGIN_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_SOURCE_PROOF_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;");
     expect(controller).toContain("const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +");
-    expect(controller).toContain("const MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +");
+    expect(controller).toContain("const PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +");
+    expect(controller).toContain("const APPLY_MAIN_JOB_TAIL_MINUTES = 2;");
     expect(controller).toContain("const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +");
     expect(controller).toContain(
-      "invocation.operationBudgetSeconds +\n          MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +\n          OWNER_TOKEN_EXPIRY_MARGIN_SECONDS",
+      "requiredOwnerTokenRemainingSeconds(invocation)",
     );
-    expect(controller).not.toContain(
-      "MAIN_JOB_RECOVERY_RESERVE_MINUTES * 60 +\n          FRESH_RECOVERY_JOB_TIMEOUT_MINUTES * 60",
+    const userAccessTokenMinutes = 60;
+    const mainJobMinutes = 41;
+    const freshRecoveryJobMinutes = 18;
+    const freshRecoveryTokenRequirementMinutes = 14 + 1;
+    const planTokenRequirementMinutes = requiredOwnerTokenRemainingSeconds({
+      mode: "plan",
+      operationBudgetSeconds: 25 * 60,
+    }) / 60;
+    const applyTokenRequirementMinutes = requiredOwnerTokenRemainingSeconds({
+      mode: "apply",
+      operationBudgetSeconds: 39 * 60,
+    }) / 60;
+    expect(planTokenRequirementMinutes).toBe(42);
+    expect(applyTokenRequirementMinutes).toBe(59);
+    expect(applyTokenRequirementMinutes).toBeLessThan(userAccessTokenMinutes);
+    expect(mainJobMinutes + freshRecoveryTokenRequirementMinutes).toBeLessThan(
+      userAccessTokenMinutes,
     );
-    expect(41 + 17).toBeLessThan(60);
+    expect(mainJobMinutes + freshRecoveryJobMinutes).toBeLessThan(userAccessTokenMinutes);
     expect(minuteConstant("LEASE_MINUTES")).toBeGreaterThan(
       minuteConstant("JOB_TIMEOUT_MINUTES") + 10,
     );
-    expect(minuteConstant("MAIN_STEP_TIMEOUT_MINUTES")).toBe(26);
+    expect(minuteConstant("PLAN_MAIN_STEP_TIMEOUT_MINUTES")).toBe(25);
+    expect(minuteConstant("APPLY_MAIN_STEP_TIMEOUT_MINUTES")).toBe(39);
+    expect(minuteConstant("EXECUTOR_TOKEN_MINUTES")).toBe(35);
     expect(controller).toContain("fencePolicyMutations(");
     expect(controller).toContain("codex-cleanup-fence-");
     expect(controller).toContain("await waitForStatePermissions(");
     expect(controller).toContain("await waitForControlPermissions(");
+    expect(controller).toContain("function permissionConsistencyDeadlineMs(");
+    expect(controller).toContain("Math.min(apiDeadlineMs, Date.now() + IAM_CONSISTENCY_MAX_WAIT_MS)");
+    expect(controller).toContain(
+      "const consistencyDeadlineMs = permissionConsistencyDeadlineMs(this.#apiDeadlineMs);",
+    );
+    expect(controller).toContain(
+      "this.#waitForPermissionProjection(invocation, session.accessToken, \"mutation\")",
+    );
+    expect(controller).toContain("while (now() < consistencyDeadlineMs)");
+    expect(controller).not.toContain(
+      "for (let attempt = 0; attempt < 7; attempt += 1) {\n    const observed: boolean[] = [];",
+    );
+    expect(controller).not.toContain(
+      "for (let attempt = 0; attempt < 7; attempt += 1) {\n    const projectResponse",
+    );
+    expect(15 + 2 * 5 + 8).toBe(minuteConstant("APPLY_INTERNAL_OPERATION_MINUTES"));
     expect(controller).toContain('stdin: `${executorToken}\\n`');
     expect(controller).not.toContain("GOOGLE_OAUTH_ACCESS_TOKEN: invocation.ownerAccessToken");
     expect(controller).toContain('delete process.env[name]');
@@ -1512,7 +1583,7 @@ describe("protected owner Terraform bridge", () => {
           accessToken: "short-lived-executor-access-token-value",
           executorEmail,
           executorUniqueId: "123456789012345678901",
-          tokenExpiresAtMs: Date.now() + 30 * 60_000,
+          tokenExpiresAtMs: Date.now() + 35 * 60_000,
         },
         join(invocation.platformRoot, "terraform/deployments/bootstrap"),
         ["plan", "-lock=false"],
@@ -1681,7 +1752,7 @@ describe("protected owner Terraform bridge", () => {
           accessToken: "short-lived-executor-access-token-value",
           executorEmail,
           executorUniqueId: "123456789012345678901",
-          tokenExpiresAtMs: startedAt + 30 * 60_000,
+          tokenExpiresAtMs: startedAt + 35 * 60_000,
         };
       },
       now: () => startedAt,
@@ -1694,7 +1765,73 @@ describe("protected owner Terraform bridge", () => {
     expect(() => validateInvocation({
       ...validEnvironment(),
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "419",
-    })).toThrow("420..1560");
+    })).toThrow("420..1500");
+  });
+
+  test("apply admits both five-minute IAM windows without weakening its reserve", async () => {
+    const startedAt = 1_800_000_000_000;
+    let now = startedAt;
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, {
+      ...identity(),
+      terraformRoot: "bootstrap",
+    });
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: review.sha256,
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+    });
+    const events: string[] = [];
+    let acquireDeadline = 0;
+    let cleanupDeadline = 0;
+    await runProtectedBootstrap(invocation, fakeDependencies(events, {
+      acquireExecutor: async (_invocation, _expiresAt, deadline) => {
+        events.push("acquire");
+        acquireDeadline = deadline;
+        now += 5 * 60_000 - 1_000;
+        return {
+          accessToken: "short-lived-executor-access-token-value",
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          tokenExpiresAtMs: startedAt + 35 * 60_000,
+        };
+      },
+      elevateExecutor: async () => {
+        events.push("elevate");
+        now += 5 * 60_000 - 1_000;
+      },
+      now: () => now,
+      planJson: JSON.stringify(raw),
+      readPlanJson: async () => {
+        events.push("show");
+        now += 7 * 60_000;
+        return JSON.stringify(raw);
+      },
+      releaseExecutor: async (_invocation, _session, deadline) => {
+        events.push("release");
+        cleanupDeadline = deadline;
+      },
+      verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
+        events.push("drain:post");
+        now = mutationCompletedAtMs + 7 * 60_000;
+      },
+    }));
+    expect(acquireDeadline).toBe(startedAt + 33 * 60_000);
+    expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
+    expect(events).toContain("terraform:apply");
+    expect(events).toContain("publish:post");
+    for (const budget of ["2039", "2341"]) {
+      expect(() => validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: budget,
+        EXECUTION_MODE: "apply",
+      })).toThrow("2040..2340 second apply range");
+    }
   });
 
   test("owner token introspection requires exact cloud scope and enough recovery lifetime", async () => {
@@ -1827,7 +1964,7 @@ describe("protected owner Terraform bridge", () => {
     expect(environment.OWNER_OAUTH_ACCESS_TOKEN).toBeUndefined();
     expect(() => validateRecoveryInvocation({
       ...validRecoveryEnvironment(),
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1560",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1500",
     })).toThrow("normal-operation capability");
   });
 
@@ -2048,7 +2185,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("target-project-policy-503")).toBe(1);
@@ -2088,7 +2225,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
@@ -2102,7 +2239,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
@@ -2115,7 +2252,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation.ownerAccessToken,
       fixture.fetcher,
       fixture.sleep,
-      fixture.now() + 11 * 60_000,
+      fixture.now() + 12 * 60_000,
       fixture.invocation,
     );
     expect(first.exactAccountAbsentOrDenied).toBeTrue();
@@ -2126,7 +2263,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
@@ -2150,7 +2287,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      fixture.now() + 11 * 60_000,
+      fixture.now() + 12 * 60_000,
       fixture.now,
     )).rejects.toThrow("orphan containment was incomplete; manual cleanup is required");
     expect(fixture.callCount("deterministic-email-disable-403")).toBeGreaterThan(1);
@@ -2168,13 +2305,13 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     )).rejects.toThrow(
       "did not observe the required stable-empty artifact inventory before its deadline",
     );
-    expect(fixture.callCount("deterministic-email-disable-403")).toBe(1);
-    expect(fixture.now() - startedAt).toBe(11 * 60_000);
+    expect(fixture.callCount("deterministic-email-disable-403")).toBe(2);
+    expect(fixture.now() - startedAt).toBe(12 * 60_000);
   });
 
   test("post-delete masking never relaxes global-list or policy 403s", async () => {
@@ -2191,7 +2328,7 @@ describe("protected owner Terraform bridge", () => {
         fixture.invocation,
         fixture.fetcher,
         fixture.sleep,
-        fixture.now() + 11 * 60_000,
+        fixture.now() + 12 * 60_000,
         fixture.now,
       )).rejects.toThrow(message);
       expect(fixture.callCount(tag)).toBeGreaterThan(0);
@@ -2217,7 +2354,7 @@ describe("protected owner Terraform bridge", () => {
       },
       verifySource: async () => undefined,
     });
-    expect(recoveryDeadlineMs - startedAt).toBe(11 * 60_000);
+    expect(recoveryDeadlineMs - startedAt).toBe(12 * 60_000);
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
@@ -2241,6 +2378,49 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.role.deleted).toBeTrue();
   });
 
+  test("the production recovery budget absorbs bounded nonzero scan latency", async () => {
+    const fixture = deterministicRecoveryHarness({ scanDurationMs: 5_000 });
+    const startedAt = fixture.now();
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 12 * 60_000,
+      fixture.now,
+    );
+    expect(fixture.now() - startedAt).toBeGreaterThan(10 * 60_000);
+    expect(fixture.now() - startedAt).toBeLessThan(12 * 60_000);
+  });
+
+  test("a late retryable read resets proof and completes inside the bounded margin", async () => {
+    const fixture = deterministicRecoveryHarness({ transientAccountListFailureScan: 9 });
+    const startedAt = fixture.now();
+    const scans: RecoveryScanTelemetry[] = [];
+    await recoverBridgeArtifactsUntilStable(
+      fixture.invocation,
+      fixture.fetcher,
+      fixture.sleep,
+      startedAt + 12 * 60_000,
+      fixture.now,
+      {
+        phase: () => undefined,
+        recoveryScan: (scan) => scans.push(scan),
+        stop: () => undefined,
+      },
+    );
+    expect(fixture.callCount("account-list-503")).toBe(1);
+    expect(fixture.now() - startedAt).toBeGreaterThan(11 * 60_000);
+    expect(fixture.now() - startedAt).toBeLessThan(12 * 60_000);
+    expect(scans.map((scan) => scan.outcome)).toContain("reset-retryable-read");
+    expect(scans.filter((scan) => scan.outcome === "proof-start")).toHaveLength(2);
+    expect(scans.at(-1)?.outcome).toBe("proof-complete");
+    expect(scans.every((scan) =>
+      [scan.elapsedMs, scan.proofMs, scan.scanMs].every((value) =>
+        Number.isSafeInteger(value) && value >= 0
+      )
+    )).toBeTrue();
+  });
+
   test("source proof has its own bound and cannot consume the IAM recovery horizon", async () => {
     const fixture = deterministicRecoveryHarness();
     const startedAt = fixture.now();
@@ -2255,7 +2435,7 @@ describe("protected owner Terraform bridge", () => {
         virtualNow += 59_000;
       },
     });
-    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 11 * 60_000);
+    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 12 * 60_000);
 
     let recoveryStarted = false;
     virtualNow = startedAt;
@@ -2280,7 +2460,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
@@ -2294,7 +2474,7 @@ describe("protected owner Terraform bridge", () => {
       fixture.invocation,
       fixture.fetcher,
       fixture.sleep,
-      startedAt + 11 * 60_000,
+      startedAt + 12 * 60_000,
       fixture.now,
     );
     expect(fixture.callCount("account-list-503")).toBe(1);
@@ -2324,12 +2504,32 @@ describe("protected owner Terraform bridge", () => {
         phase: () => {
           throw new Error("telemetry sink failed with secret-value");
         },
+        recoveryScan: () => {
+          throw new Error("telemetry scan failed with secret-value");
+        },
         stop: () => {
           throw new Error("telemetry stop failed with secret-value");
         },
       },
     );
     expect(events).toContain("release");
+    const recovery = deterministicRecoveryHarness();
+    const recoveryStartedAtMs = recovery.now();
+    await recoverBridgeArtifactsUntilStable(
+      recovery.invocation,
+      recovery.fetcher,
+      recovery.sleep,
+      recoveryStartedAtMs + 12 * 60_000,
+      recovery.now,
+      {
+        phase: () => undefined,
+        recoveryScan: () => {
+          throw new Error("telemetry scan failed with secret-value");
+        },
+        stop: () => undefined,
+      },
+    );
+    expect(recovery.now() - recoveryStartedAtMs).toBe(10 * 60_000);
     const breadcrumb = formatBridgeBreadcrumb("executor.permission-proof", 2_049, {
       currentBytes: 4_097,
       oom: 2,
@@ -2341,6 +2541,19 @@ describe("protected owner Terraform bridge", () => {
         "cgroup_current_kib=5 cgroup_peak_kib=9 cgroup_oom=2 cgroup_oom_kill=1",
     );
     expect(breadcrumb).not.toContain("secret");
+    const scanBreadcrumb = formatRecoveryScanBreadcrumb({
+      elapsedMs: 481_234,
+      outcome: "reset-retryable-read",
+      proofMs: 0,
+      scanMs: 5_678,
+    });
+    expect(scanBreadcrumb).toBe(
+      "Protected bridge recovery scan outcome=reset-retryable-read " +
+        "elapsed_ms=481234 scan_ms=5678 proof_ms=0",
+    );
+    expect(scanBreadcrumb).not.toContain("cdbentley");
+    expect(scanBreadcrumb).not.toContain("gha-pbt");
+    expect(scanBreadcrumb).not.toContain("HTTP");
   });
 
   test("executable apply consumes the fresh receipt once immediately before apply", async () => {
@@ -2353,6 +2566,7 @@ describe("protected owner Terraform bridge", () => {
       ...validEnvironment(),
       APPROVED_MANIFEST_SHA256: review.sha256,
       APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
     });
     const events: string[] = [];
@@ -2414,7 +2628,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events).toContain("release");
   });
 
-  test("apply refuses before mutation when the full post-WIF drain reserve cannot fit", async () => {
+  test("apply refuses before mutation when elevation convergence plus reserve cannot fit", async () => {
     const startedAt = 1_800_000_000_000;
     let now = startedAt;
     const raw = plan([]);
@@ -2426,6 +2640,7 @@ describe("protected owner Terraform bridge", () => {
       ...validEnvironment(),
       APPROVED_MANIFEST_SHA256: review.sha256,
       APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
     });
     const events: string[] = [];
@@ -2433,13 +2648,13 @@ describe("protected owner Terraform bridge", () => {
       now: () => now,
       readPlanJson: async () => {
         events.push("show");
-        now = startedAt + 10 * 60_000;
+        now = startedAt + 14 * 60_000;
         return JSON.stringify(raw);
       },
       verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
     });
     await expect(runProtectedBootstrap(invocation, dependencies)).rejects.toThrow(
-      "Too little operation, IAM-lease, or executor-token lifetime remains to apply",
+      "Too little operation, IAM-lease, or executor-token lifetime remains to converge elevation and apply",
     );
     expect(events).not.toContain("consume");
     expect(events).not.toContain("elevate");
@@ -2563,6 +2778,7 @@ describe("protected owner Terraform bridge", () => {
       ...validEnvironment(),
       APPROVED_MANIFEST_SHA256: review.sha256,
       APPROVED_PLAN_RUN_ID: "123456",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
       GITHUB_RUN_ID_EXACT: "123457",
     });
@@ -2721,6 +2937,138 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(planPermissionGrant?.permissions).toEqual(["storage.objects.get"]);
     expect(planCreateGrant?.create).toBeTrue();
+  });
+
+  test("state grant and revocation proofs converge beyond seven realistic-latency scans within the shared deadline", async () => {
+    const invocation = validateInvocation(validEnvironment());
+    const state = {
+      bucket: "cdbentley-tfstate-882468538648-bootstrap",
+      prefix: "cdbentley/bootstrap",
+    };
+    const run = async (expected: "none" | "read"): Promise<void> => {
+      const startedAtMs = 1_000;
+      let nowMs = startedAtMs;
+      let scan = 0;
+      let active = expected === "none";
+      const fetcher = async (input: string | URL | Request): Promise<Response> => {
+        scan += 1;
+        nowMs += 20_000;
+        active = expected === "none" ? scan < 8 : scan >= 8;
+        const requested = new URL(String(input)).searchParams.getAll("permissions");
+        return Response.json({ permissions: active ? requested : [] });
+      };
+      const probes: StateStoragePermissionProbes = {
+        testObjectCreate: async ({ objectName }) =>
+          active && objectName.includes("/.protected-bootstrap/plans/"),
+        testObjectPermissions: async ({ permissions, resource }) => ({
+          denied: false,
+          permissions: active &&
+              (resource.endsWith("default.tfstate") ||
+                resource.includes("/.protected-bootstrap/plans/"))
+            ? permissions.filter((permission) => permission === "storage.objects.get")
+            : [],
+        }),
+      };
+      await waitForStatePermissions(
+        state,
+        invocation,
+        "short-lived-executor-access-token-value",
+        expected,
+        fetcher,
+        async (milliseconds) => {
+          nowMs += milliseconds;
+        },
+        probes,
+        startedAtMs + 5 * 60_000,
+        () => nowMs,
+      );
+      expect(scan).toBe(8);
+      expect(nowMs - startedAtMs).toBeGreaterThan(3 * 60_000);
+      expect(nowMs - startedAtMs).toBeLessThan(5 * 60_000);
+    };
+
+    await run("read");
+    await run("none");
+  });
+
+  test("shared permission convergence fails closed exactly at its bounded deadline", async () => {
+    const invocation = validateInvocation(validEnvironment());
+    const startedAtMs = 1_000;
+    const deadlineMs = startedAtMs + 3 * 60_000;
+    let nowMs = startedAtMs;
+    let scan = 0;
+    await expect(waitForStatePermissions(
+      {
+        bucket: "cdbentley-tfstate-882468538648-bootstrap",
+        prefix: "cdbentley/bootstrap",
+      },
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async () => {
+        scan += 1;
+        nowMs += 20_000;
+        return Response.json({ permissions: [] });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectCreate: async () => false,
+        testObjectPermissions: async () => ({ denied: false, permissions: [] }),
+      },
+      deadlineMs,
+      () => nowMs,
+    )).rejects.toThrow("state lease did not propagate before the deadline");
+    expect(scan).toBe(7);
+    expect(nowMs).toBe(deadlineMs);
+  });
+
+  test("state scans apply the absolute consistency deadline to every subprobe", async () => {
+    const invocation = validateInvocation(validEnvironment());
+    const startedAtMs = 1_000;
+    const deadlineMs = startedAtMs + 10_000;
+    let nowMs = startedAtMs;
+    let bucketCalls = 0;
+    let objectPermissionCalls = 0;
+    let objectCreateCalls = 0;
+    let observedRpcTimeoutMs: number | undefined;
+    await expect(waitForStatePermissions(
+      {
+        bucket: "cdbentley-tfstate-882468538648-bootstrap",
+        prefix: "cdbentley/bootstrap",
+      },
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input) => {
+        bucketCalls += 1;
+        nowMs += 8_000;
+        return Response.json({
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async () => undefined,
+      {
+        testObjectCreate: async () => {
+          objectCreateCalls += 1;
+          return true;
+        },
+        testObjectPermissions: async (_request, options) => {
+          objectPermissionCalls += 1;
+          observedRpcTimeoutMs = options?.timeoutMs;
+          nowMs += 3_000;
+          return { denied: false, permissions: ["storage.objects.get"] };
+        },
+      },
+      deadlineMs,
+      () => nowMs,
+    )).rejects.toThrow("state lease did not propagate before the deadline");
+    expect(bucketCalls).toBe(1);
+    expect(objectPermissionCalls).toBe(1);
+    expect(objectCreateCalls).toBe(0);
+    expect(observedRpcTimeoutMs).toBe(2_000);
+    expect(nowMs).toBeGreaterThan(deadlineMs);
   });
 
   test("state validation treats gRPC credential denial as absence only for the no-access proof", async () => {
@@ -3173,6 +3521,67 @@ describe("protected owner Terraform bridge", () => {
       "https://iam.googleapis.com/v1/projects/cdbentley/serviceAccounts/cloud-run-preview%40cdbentley.iam.gserviceaccount.com:testIamPermissions",
       "https://iam.googleapis.com/v1/projects/cdbentley/serviceAccounts/cloud-run-runtime%40cdbentley.iam.gserviceaccount.com:testIamPermissions",
     ]);
+  });
+
+  test("control and runtime actAs grant and revocation proofs converge beyond seven scans within the shared deadline", async () => {
+    const invocation = validateInvocation({ ...validEnvironment(), TERRAFORM_ROOT: "prod" });
+    const run = async (expected: "mutation" | "none"): Promise<void> => {
+      const startedAtMs = 1_000;
+      let nowMs = startedAtMs;
+      let scan = 0;
+      let active = expected === "none";
+      await waitForControlPermissions(
+        invocation,
+        "short-lived-executor-access-token-value",
+        expected,
+        async (input, init) => {
+          if (String(input).includes("cloudresourcemanager")) {
+            scan += 1;
+            nowMs += 20_000;
+            active = expected === "none" ? scan < 8 : scan >= 8;
+          }
+          const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] })
+            .permissions;
+          return Response.json({ permissions: active ? permissions : [] });
+        },
+        async (milliseconds) => {
+          nowMs += milliseconds;
+        },
+        startedAtMs + 5 * 60_000,
+        () => nowMs,
+      );
+      expect(scan).toBe(8);
+      expect(nowMs - startedAtMs).toBeGreaterThan(3 * 60_000);
+      expect(nowMs - startedAtMs).toBeLessThan(5 * 60_000);
+    };
+
+    await run("mutation");
+    await run("none");
+  });
+
+  test("control scans stop at the absolute deadline before any remaining runtime surface", async () => {
+    const invocation = validateInvocation({ ...validEnvironment(), TERRAFORM_ROOT: "prod" });
+    const startedAtMs = 1_000;
+    let nowMs = startedAtMs;
+    const urls: string[] = [];
+    await expect(waitForControlPermissions(
+      invocation,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input, init) => {
+        urls.push(String(input));
+        nowMs += 11_000;
+        const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] })
+          .permissions;
+        return Response.json({ permissions });
+      },
+      async () => undefined,
+      startedAtMs + 10_000,
+      () => nowMs,
+    )).rejects.toThrow("control-plane lease did not propagate before the deadline");
+    expect(urls).toHaveLength(1);
+    expect(urls[0]).toContain("cloudresourcemanager.googleapis.com");
+    expect(urls.some((url) => url.includes("iam.googleapis.com"))).toBeFalse();
   });
 
   test("new executor visibility retries 404s and lifecycle writes use the stable unique ID", async () => {
@@ -4094,12 +4503,12 @@ function fakeDependencies(
     accessToken: "short-lived-executor-access-token-value",
     executorEmail: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
     executorUniqueId: "123456789012345678901",
-    tokenExpiresAtMs: defaultNow + 30 * 60_000,
+    tokenExpiresAtMs: defaultNow + 35 * 60_000,
   };
   return {
     acquireExecutor: overrides.acquireExecutor ?? (async () => {
       events.push("acquire");
-      return { ...session, tokenExpiresAtMs: now() + 30 * 60_000 };
+      return { ...session, tokenExpiresAtMs: now() + 35 * 60_000 };
     }),
     appendSummary: overrides.appendSummary ?? (async () => {
       events.push("summary");
@@ -4170,7 +4579,7 @@ function validEnvironment(): NodeJS.ProcessEnv {
   return {
     APPROVED_MANIFEST_SHA256: "",
     APPROVED_PLAN_RUN_ID: "",
-    BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1560",
+    BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "1500",
     CONSUMER_ACTIONS_READ_TOKEN: "github-actions-read-token-value",
     CONSUMER_ROOT: "/tmp/consumer",
     CONSUMER_SHA: consumerSha,
@@ -4249,8 +4658,10 @@ function deterministicRecoveryHarness(options: {
   readonly revealAccountOnScan?: number;
   readonly roleAppearanceScan?: number;
   readonly runtimePolicyFailureStatus?: number;
+  readonly scanDurationMs?: number;
   readonly targetProjectPolicyFailureStatus?: number;
   readonly targetProjectMembers?: boolean;
+  readonly transientAccountListFailureScan?: number;
   readonly transientAccountListFailures?: number;
   readonly transientTargetPolicyFailures?: number;
 } = {}) {
@@ -4384,6 +4795,7 @@ function deterministicRecoveryHarness(options: {
   let roleExists = false;
   let roleAppearanceObserved = false;
   let scan = 0;
+  let transientAccountListFailureScanObserved = false;
   let transientAccountListFailures = options.transientAccountListFailures ?? 0;
   let transientTargetPolicyFailures = options.transientTargetPolicyFailures ?? 0;
   let fakeNow = Date.now();
@@ -4423,6 +4835,7 @@ function deterministicRecoveryHarness(options: {
 
     if (path.endsWith(`/serviceAccounts/${email}:disable`) && method === "POST") {
       scan += 1;
+      fakeNow += options.scanDurationMs ?? 0;
       disableAttempts += 1;
       if (options.revealAccountOnScan === scan) accountVisible = true;
       if (!roleAppearanceObserved && options.roleAppearanceScan === scan) {
@@ -4496,8 +4909,13 @@ function deterministicRecoveryHarness(options: {
     }
 
     if (path === `/v1/projects/${projectId}/serviceAccounts` && method === "GET") {
-      if (transientAccountListFailures > 0) {
-        transientAccountListFailures -= 1;
+      if (
+        transientAccountListFailures > 0 ||
+        (!transientAccountListFailureScanObserved &&
+          options.transientAccountListFailureScan === scan)
+      ) {
+        if (transientAccountListFailures > 0) transientAccountListFailures -= 1;
+        transientAccountListFailureScanObserved = true;
         recordCall(method, "account-list-503", rawUrl);
         return new Response("", { status: 503 });
       }
@@ -5021,7 +5439,7 @@ function executorLifecycleFixture(
         call.tag = "mint-200";
         return Response.json({
           accessToken: "google-owner-access-token-value",
-          expireTime: new Date(Date.now() + 30 * 60_000).toISOString(),
+          expireTime: new Date(Date.now() + 35 * 60_000).toISOString(),
         });
       }
       phase = "cleanup";

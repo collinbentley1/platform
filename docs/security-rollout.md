@@ -32,19 +32,32 @@ migration controls. Its protected environment contains one
 fresh Google user OAuth access token, never a refresh token or service-account
 key. Before creating any temporary IAM artifact, the controller introspects
 Google's documented subject, `exp`, `expires_in`, and scope metadata, requires
-the exact owner subject, and rejects a token that cannot cover the bounded
-bridge, same-job reserve, and one-minute margin;
+the exact owner subject, and rejects a token that cannot cover the mode-specific
+bounded bridge and recovery envelope. Plan requires its full same-job recovery
+tail and one-minute margin. Apply requires its two-minute main-job tail plus the
+complete immediate fresh-runner recovery job, a maximum 59-minute envelope;
 replace the protected-environment secret immediately before every dispatch.
 GitHub queue delay is not bounded by job timeouts, so each recovery entry
-independently requires fourteen minutes of remaining token lifetime. A delayed
+independently requires fifteen minutes of remaining token lifetime. A delayed
 fallback fails closed before mutation; the temporary leases independently
 expire on their bound. If automatic fresh-runner recovery rejects a stale
 token, do not immediately start a normal dispatch: wait at least 55 minutes
 after the failed workflow completes, exceeding both the 54-minute conditioned
-lease and 30-minute executor-token lifetimes, then replace the environment
+lease and 35-minute executor-token lifetimes, then replace the environment
 secret and issue a new attempt-1 owner dispatch. Any unseen residue is inert by
 then, and startup removes visible reserved artifacts before creating new
 authority.
+Each recovery operation reserves twelve minutes: seven minutes of documented
+IAM propagation observation, three minutes of uninterrupted stable-empty
+proof, one minute for cumulative read latency, and one minute for a bounded
+late retry. Any later or repeated uncertainty still fails closed. Every scan
+emits only a closed outcome label plus elapsed, scan, and stable-proof
+milliseconds. The breadcrumb never includes an account, role, project, member,
+policy, HTTP response, error text, credential, or other caller-controlled
+value. Treat `reset-active-artifact`, `reset-observed-artifact`,
+`reset-propagation-horizon`, `reset-masked-account`, and
+`reset-retryable-read` as proof resets, not as cleanup success;
+`proof-complete` is the sole successful terminal scan.
 The environment also contains a fine-grained GitHub token with repository **Actions: read** and
 **Administration: read** for the four consumers. Keep all four consumers'
 Actions disabled: the bridge verifies
@@ -67,7 +80,7 @@ deletes the current identity by immutable unique ID during cleanup. It requires
 zero user-managed keys, standing IAM policy, project/resource binding, or
 effective state/control-plane/runtime `actAs` permission. The owner OAuth token
 is used only by the trusted controller for exact etag-CAS leases, lifecycle
-operations on that random identity/role set, and one 30-minute token mint. The
+operations on that random identity/role set, and one 35-minute token mint. The
 workflow copies exported secrets into non-exported shell variables, unsets the
 exported names, and passes one bounded NUL-delimited bundle to Bun over a pipe
 after `exec env -i`; Bun consumes and closes stdin. Only the random executor
@@ -116,6 +129,22 @@ stop, designate and release the new final `S`, repin all four consumers, and
 repeat every check before another protected plan. Never dispatch the bridge
 from a tag or pretend an older receipt authorizes a different platform commit.
 
+For every bounded PR-lifecycle proof below, take a complete paginated
+`state=all` PR inventory, a repository issue-event ID baseline, a per-PR
+timeline ID baseline for every PR created or updated in the window, and an
+Actions run-ID baseline. Do not use the repository Events API as a security
+gate ([API reference](https://docs.github.com/en/rest/activity/events)): GitHub
+documents that it is not real time and may lag by 30 seconds to six hours. Use the
+[repository issue events](https://docs.github.com/en/rest/issues/events#list-issue-events-for-a-repository)
+and each affected PR's
+[timeline](https://docs.github.com/en/rest/issues/timeline#list-timeline-events-for-an-issue)
+together with the all-state PR inventory and run list. Prove `opened` from the
+sole new PR plus its issue/timeline records; prove draft, ready, reopen, close,
+and force-push transitions from issue/timeline records; and rule out
+`synchronize` by both the frozen head SHA/tree comparison and timeline records.
+For an intentional `edited` trigger, require the expected Actions jobs' exact
+event-payload guard to pass and reconcile that run set against every baseline.
+
 1. Prepare one complete branch per consumer whose exact head `C_repo` pins every
    reusable workflow to `S`, then freeze it before opening a draft PR. Never
    enable a marker-unaware legacy PR-triggered privileged deployment merely to
@@ -126,14 +155,26 @@ from a tag or pretend an older receipt authorizes a different platform commit.
    legacy main may return an exact proven absent workflow until the hardened
    caller is merged. Only then, during one bounded monitored check window,
    restore and read back the exact selected/SHA-only `S` Actions policy. Permit
-   only the credentialless exact-head
-   Application, Infrastructure validation, and Socket checks. No cloud job,
-   environment, DHI credential, or OIDC exchange may run; any missing privileged
-   branch-protection status remains missing rather than being synthesized.
-   Immediately disable and drain Actions after those safe checks. A failed check
-   requires a fresh branch and draft attempt assembled while disabled, never a
-   synchronize, rebase, amend, or force-push. Record each full checked head SHA
-   and keep all four heads immutable through the protected plans and merges.
+   only the credentialless exact-head Application, Infrastructure validation,
+   Socket, and, for Runsetta, Swift package checks. No cloud job, environment,
+   DHI credential, or OIDC exchange may run; any missing privileged
+   branch-protection status remains missing rather than being synthesized. With
+   the frozen PR still a draft and every privileged workflow still
+   `disabled_manually`, use the owner PAT for exactly one PR-body-only edit. The
+   resulting `pull_request: edited` delivery is the sole check-window trigger.
+   Every expected job must first pass the shared fail-closed event-payload guard:
+   an `edited` payload is accepted only when `changes` contains exactly `body`
+   and that object contains exactly a string-or-null `from`; title, base, mixed,
+   missing, and expanded change shapes fail. For non-`edited` pull-request
+   deliveries the same guard accepts only `opened`, `reopened`, and
+   `synchronize`; applicable push callers remain main-only. Only the normal
+   credentialless exact-head checks may run. Reconcile the complete lifecycle and
+   run baselines above, then immediately disable and drain Actions after those
+   safe checks. A failed check requires a fresh branch and draft attempt assembled
+   while disabled,
+   never a synchronize, rebase, amend, or force-push. Record each full checked
+   head SHA and keep all four heads immutable through the protected plans and
+   merges.
 2. Keep Actions disabled in all four consumers. Require no active run, drain all
    possible old-`P` tokens, and reject any non-clear marker. In the current
    marker-unaware v0.4 initial adoption, an as-yet-unmigrated repository's marker
@@ -206,8 +247,9 @@ from a tag or pretend an older receipt authorizes a different platform commit.
       that inherited three disabled workflows; global disablement makes this
       workflow-state preparation non-triggering. Establish a run-list baseline,
       inventory every open PR and its exact head repository and SHA, freeze every
-      other same-repository lifecycle source, and begin monitoring the repository
-      event and run feeds. Outside the conservative UTC minute `:12` through
+      other same-repository lifecycle source, and begin monitoring the complete
+      PR inventory, issue-event, per-PR timeline, and run surfaces defined above.
+      Outside the conservative UTC minute `:12` through
       `:22` reconciliation window, PUT the exact general policy and then
       immediately PUT the exact selected policy. Immediately GET both surfaces
       and require an exact normalized readback, then re-read all four workflow
@@ -221,7 +263,7 @@ from a tag or pretend an older receipt authorizes a different platform commit.
       event's `Deploy preview` run materializes both `invalidate` and `deploy` as
       skipped before every credential-bearing environment, DHI, or OIDC entry.
       Immediately disable `Deploy preview`, require `disabled_manually`, and
-      prove the bounded run/event feed contains no other lifecycle event or
+      prove the bounded lifecycle and run surfaces contain no other event or
       unexpected run. All three preview lifecycle workflows are now individually
       disabled; only then wait for and require all normal exact-head checks. A
       draft does not make `synchronize` harmless: it enters the credentialed
@@ -293,10 +335,22 @@ cryptographic trust boundary, followed by a zero-diff post-apply plan and live
 policy/permission cleanup proofs.
 
 The executor receives a 54-minute conditioned lease, safely beyond the 41-minute
-job timeout, while a 24-minute internal deadline leaves a reserved cleanup
-window. Apply refuses before consuming/elevating unless at least 15 minutes
-remain, reserving seven minutes for the post-WIF drain and eight for bounded
-apply/readback/proof work. Plan gets only read control permissions, read-only state, and immutable
+job timeout. Plan retains its 25-minute bridge cap and complete 16-minute
+same-job recovery tail. Apply may use a 34-to-39-minute bridge budget after
+setup, retains a two-minute main-job tail for opportunistic containment, and
+uses the independent 18-minute fresh-runner job as its authoritative late-failure
+recovery path. The wrapper keeps one minute ahead of its hard timeout and the
+controller keeps another five minutes for exact cleanup, so apply receives a
+28-to-33-minute internal operation deadline. The workflow rejects setup that
+leaves less than the 34-minute apply minimum.
+
+Before consuming the receipt or creating mutation authority, apply requires
+more than 20 minutes to remain: the unchanged 15-minute post-elevation reserve
+plus the full five-minute mutation-permission convergence window. It rechecks
+that 20-minute bound after fresh proofs and receipt consumption, then rechecks
+the unchanged 15-minute reserve after elevation. The latter reserves seven
+minutes for the post-WIF drain and eight for bounded apply/readback/proof work.
+Plan gets only read control permissions, read-only state, and immutable
 receipt creation; it uses `-lock=false`. Apply creates the mutation role and the
 three exact production runtime `actAs` leases only after consuming the approved
 receipt. Marker access consists of four distinct conditional bindings whose
@@ -306,8 +360,16 @@ Storage is otherwise restricted to registered buckets and exact state/lock
 objects. Receipts have separate exact-object create-only and read-only leases;
 the executor never gets receipt overwrite or delete authority. Permission
 propagation and revocation use
-`testIamPermissions`; validation never lists or reads a state object. Every API
-request and subprocess has a bounded deadline. The `finally` path CAS-removes
+`testIamPermissions`; validation never lists or reads a state object. State and
+control-plane proofs for one permission transition share one absolute deadline:
+together they may retry until the earlier of the manager's remaining API
+deadline or a new five-minute consistency window, instead of each receiving a
+fresh window or stopping after a fixed scan count. That same absolute deadline
+caps every HTTP, gRPC, and create subprobe;
+a scan that reaches it stops before touching another permission surface. Exact
+permission and runtime `actAs` projections remain unchanged, and failure to
+converge by that bound still fails closed. Every API request and subprocess has
+a bounded deadline. The `finally` path CAS-removes
 only the exact leases from the latest policies, restores the original policy
 version when conditions no longer require version 3, proves the still-live token
 lost every tested project/state/`actAs` permission, verifies zero keys and

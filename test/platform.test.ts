@@ -63,7 +63,7 @@ describe("platform scaffold and doctor", () => {
 
     expect(runnerJobs.length).toBeGreaterThan(0);
     expect(protectedOwnerTimeout).toBe(41);
-    expect(protectedRecoveryTimeout).toBe(17);
+    expect(protectedRecoveryTimeout).toBe(18);
     expect(protectedRecoveryTimeout).toBeLessThanOrEqual(35);
   });
 
@@ -1266,43 +1266,143 @@ describe("platform scaffold and doctor", () => {
       push: { branches: ["main"] },
     });
     expect(appleSource).not.toContain("workflow_dispatch");
-    expect(apple.jobs["swift-package"].steps.slice(0, 2)).toEqual([
-      {
-        name: "Reject workflow reruns before any required check",
-        shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
-        run: 'set -euo pipefail\ntest "$GITHUB_RUN_ATTEMPT" = "1"\n',
-      },
-      {
-        name: "Reject alternate required-check event paths",
-        shell: "/bin/bash --noprofile --norc -euo pipefail {0}",
-        run:
-          'set -euo pipefail\nif [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then\n  exit 0\nfi\ntest "$GITHUB_EVENT_NAME" = "push"\ntest "$GITHUB_REF" = "refs/heads/main"\n',
-      },
+    expect(apple.jobs["swift-package"].steps.slice(0, 2).map((step) => step.name)).toEqual([
+      "Reject workflow reruns before any required check",
+      "Reject alternate required-check event paths",
     ]);
   });
 
-  test("required reusable jobs reject alternate event aliases", async () => {
-    const application = Bun.YAML.parse(
-      await readFile(join(repoRoot, ".github/workflows/application.yml"), "utf8"),
-    ) as { jobs: { verify: { steps: Array<Record<string, unknown>> } } };
-    const infrastructure = Bun.YAML.parse(
-      await readFile(join(repoRoot, ".github/workflows/infrastructure.yml"), "utf8"),
-    ) as { jobs: Record<string, { steps?: Array<Record<string, unknown>> }> };
-    const jobs = [
-      application.jobs.verify,
-      infrastructure.jobs["rerun-guard"],
-      infrastructure.jobs["terraform-validate"],
-      infrastructure.jobs.checkov,
-    ];
-    const guards = jobs.map((job) =>
-      job?.steps?.find((step) => step.name === "Reject alternate required-check event paths")
+  test("required jobs share one fail-closed pull-request action guard", async () => {
+    type WorkflowStep = {
+      readonly name?: string;
+      readonly run?: string;
+      readonly shell?: string;
+    };
+    type WorkflowJob = { readonly steps?: readonly WorkflowStep[] };
+    const guardedWorkflows = [
+      {
+        jobs: ["verify"],
+        path: ".github/workflows/application.yml",
+      },
+      {
+        jobs: ["rerun-guard", "terraform-validate", "checkov", "terraform-convergence"],
+        path: ".github/workflows/infrastructure.yml",
+      },
+      {
+        jobs: ["firewall"],
+        path: ".github/workflows/socket-firewall.yml",
+      },
+      {
+        jobs: ["swift-package"],
+        path: "templates/additional-workflows/runsetta/apple.yml",
+      },
+    ] as const;
+    const guards: WorkflowStep[] = [];
+
+    for (const guardedWorkflow of guardedWorkflows) {
+      const workflow = Bun.YAML.parse(
+        await readFile(join(repoRoot, guardedWorkflow.path), "utf8"),
+      ) as { readonly jobs?: Readonly<Record<string, WorkflowJob>> };
+      for (const jobName of guardedWorkflow.jobs) {
+        const steps = workflow.jobs?.[jobName]?.steps;
+        expect(steps, `${guardedWorkflow.path}:${jobName} must have steps`).toBeArray();
+        expect(
+          steps?.slice(0, 2).map((step) => step.name),
+          `${guardedWorkflow.path}:${jobName} must guard before executing caller code`,
+        ).toEqual([
+          jobName === "swift-package"
+            ? "Reject workflow reruns before any required check"
+            : "Reject workflow reruns before any privileged action",
+          "Reject alternate required-check event paths",
+        ]);
+        const matching = steps?.filter((step) =>
+          step.name === "Reject alternate required-check event paths"
+        ) ?? [];
+        expect(matching, `${guardedWorkflow.path}:${jobName} must have one action guard`).toHaveLength(
+          1,
+        );
+        guards.push(matching[0]!);
+      }
+    }
+
+    expect(guards).toHaveLength(7);
+    expect(new Set(guards.map((guard) => guard.run)).size).toBe(1);
+    expect(new Set(guards.map((guard) => guard.shell))).toEqual(
+      new Set(["/bin/bash --noprofile --norc -euo pipefail {0}"]),
     );
-    expect(guards.every((guard) => typeof guard?.run === "string")).toBe(true);
-    expect(new Set(guards.map((guard) => guard?.run)).size).toBe(1);
-    const guard = guards[0]?.run as string;
-    expect(guard).toContain('if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then');
+    const guard = guards[0]?.run;
+    expect(guard).toBeString();
+    expect(guard).toContain('if .action == "edited" then');
+    expect(guard).toContain('((.changes | keys) == ["body"])');
+    expect(guard).toContain('((.changes.body | keys) == ["from"])');
+    expect(guard).toContain('.action == "opened"');
+    expect(guard).toContain('.action == "reopened"');
+    expect(guard).toContain('.action == "synchronize"');
     expect(guard).toContain('test "$GITHUB_EVENT_NAME" = "push"');
     expect(guard).toContain('test "$GITHUB_REF" = "refs/heads/main"');
+
+    const root = await mkdtemp(join(tmpdir(), "platform-required-check-event-guard-"));
+    temporaryRoots.push(root);
+    const eventPath = join(root, "event.json");
+    const executeGuard = async (
+      eventName: string,
+      eventDocument: Record<string, unknown>,
+      ref = eventName === "push" ? "refs/heads/main" : "refs/pull/1/merge",
+    ): Promise<number> => {
+      await writeFile(eventPath, JSON.stringify(eventDocument));
+      const child = Bun.spawn(
+        ["/bin/bash", "--noprofile", "--norc", "-c", guard as string],
+        {
+          cwd: root,
+          env: {
+            GITHUB_EVENT_NAME: eventName,
+            GITHUB_EVENT_PATH: eventPath,
+            GITHUB_REF: ref,
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+          },
+          stderr: "ignore",
+          stdout: "ignore",
+        },
+      );
+      return await child.exited;
+    };
+
+    for (const eventDocument of [
+      { action: "edited", changes: { body: { from: "old body" } } },
+      { action: "edited", changes: { body: { from: null } } },
+      { action: "opened" },
+      { action: "reopened" },
+      { action: "synchronize" },
+    ]) {
+      expect(await executeGuard("pull_request", eventDocument), JSON.stringify(eventDocument)).toBe(
+        0,
+      );
+    }
+    expect(await executeGuard("push", {})).toBe(0);
+
+    for (const eventDocument of [
+      { action: "edited" },
+      { action: "edited", changes: null },
+      { action: "edited", changes: {} },
+      { action: "edited", changes: { body: null } },
+      { action: "edited", changes: { body: { from: 7 } } },
+      { action: "edited", changes: { title: { from: "old title" } } },
+      { action: "edited", changes: { base: { ref: { from: "staging" } } } },
+      {
+        action: "edited",
+        changes: { body: { from: "old body" }, title: { from: "old title" } },
+      },
+      { action: "edited", changes: { body: { from: "old body", to: "new body" } } },
+      { action: "closed" },
+      { action: "ready_for_review" },
+    ]) {
+      expect(await executeGuard("pull_request", eventDocument), JSON.stringify(eventDocument)).toBe(
+        1,
+      );
+    }
+    expect(await executeGuard("push", {}, "refs/heads/feature")).toBe(1);
+    expect(await executeGuard("workflow_dispatch", {})).toBe(1);
+    expect(await executeGuard("pull_request_target", { action: "edited" })).toBe(1);
   });
 
   test("Socket check gating binds success to the current pull request and commit", async () => {

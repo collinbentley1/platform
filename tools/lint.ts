@@ -39,6 +39,26 @@ const expectedPreviewSecretContextReferences: SecretContextReference[] = [
 ];
 const expectedProductionSecretContextReferences: SecretContextReference[] =
   expectedPreviewSecretContextReferences;
+const requiredCheckEventGuard = `set -euo pipefail
+if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+  jq -e '
+    if .action == "edited" then
+      (.changes | type == "object") and
+      ((.changes | keys) == ["body"]) and
+      (.changes.body | type == "object") and
+      ((.changes.body | keys) == ["from"]) and
+      ((.changes.body.from | type) == "string" or .changes.body.from == null)
+    else
+      .action == "opened" or
+      .action == "reopened" or
+      .action == "synchronize"
+    end
+  ' "$GITHUB_EVENT_PATH" >/dev/null
+  exit 0
+fi
+test "$GITHUB_EVENT_NAME" = "push"
+test "$GITHUB_REF" = "refs/heads/main"
+`;
 
 for (const workflow of reusableWorkflows) {
   const path = `.github/workflows/${workflow}`;
@@ -1255,6 +1275,28 @@ rejectContains(
 );
 
 const infrastructure = await read(".github/workflows/infrastructure.yml");
+checkRequiredCheckEventGuards([
+  {
+    jobs: ["verify"],
+    path: ".github/workflows/application.yml",
+    source: application,
+  },
+  {
+    jobs: ["rerun-guard", "terraform-validate", "checkov", "terraform-convergence"],
+    path: ".github/workflows/infrastructure.yml",
+    source: infrastructure,
+  },
+  {
+    jobs: ["firewall"],
+    path: ".github/workflows/socket-firewall.yml",
+    source: socketFirewall,
+  },
+  {
+    jobs: ["swift-package"],
+    path: "templates/additional-workflows/runsetta/apple.yml",
+    source: runsettaAppleWorkflow,
+  },
+]);
 for (const boundary of [
   "infra/terraform >/dev/null; then",
   "grep -rahcE --include='*.tf'",
@@ -3017,7 +3059,7 @@ requireContains(
 requireContains(
   ".github/workflows/platform.yml",
   platformWorkflow,
-  "actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml",
+  "actionlint .github/workflows/*.yml templates/app/.github/workflows/*.yml templates/additional-workflows/runsetta/apple.yml",
   "Platform CI must lint reusable and caller workflow syntax.",
 );
 const actionlintConfig = await read(".github/actionlint.yaml");
@@ -3085,6 +3127,71 @@ function requireBefore(
   const secondIndex = text.indexOf(second);
   if (firstIndex === -1 || secondIndex === -1 || firstIndex >= secondIndex) {
     failures.push(`${path}: ${message}`);
+  }
+}
+
+function checkRequiredCheckEventGuards(
+  specifications: readonly {
+    readonly jobs: readonly string[];
+    readonly path: string;
+    readonly source: string;
+  }[],
+): void {
+  for (const specification of specifications) {
+    let workflow: {
+      readonly jobs?: Readonly<
+        Record<
+          string,
+          {
+            readonly steps?: readonly {
+              readonly name?: unknown;
+              readonly run?: unknown;
+              readonly shell?: unknown;
+            }[];
+          }
+        >
+      >;
+    };
+    try {
+      workflow = Bun.YAML.parse(specification.source) as typeof workflow;
+    } catch (error) {
+      failures.push(`${specification.path}: required-check guard YAML is invalid: ${String(error)}`);
+      continue;
+    }
+    for (const jobName of specification.jobs) {
+      const steps = workflow.jobs?.[jobName]?.steps;
+      if (!Array.isArray(steps)) {
+        failures.push(`${specification.path}:${jobName}: required-check job must have steps.`);
+        continue;
+      }
+      const guardIndexes = steps.flatMap((step, index) =>
+        step.name === "Reject alternate required-check event paths" ? [index] : []
+      );
+      if (guardIndexes.length !== 1) {
+        failures.push(
+          `${specification.path}:${jobName}: required-check job must have exactly one event guard.`,
+        );
+        continue;
+      }
+      const guardIndex = guardIndexes[0]!;
+      const guard = steps[guardIndex]!;
+      if (guardIndex !== 1 || typeof steps[0]?.name !== "string" ||
+        !steps[0].name.startsWith("Reject workflow reruns before any ")) {
+        failures.push(
+          `${specification.path}:${jobName}: required-check event guard must immediately follow the rerun guard.`,
+        );
+      }
+      if (guard.shell !== "/bin/bash --noprofile --norc -euo pipefail {0}") {
+        failures.push(
+          `${specification.path}:${jobName}: required-check event guard must use the hardened Bash shell.`,
+        );
+      }
+      if (guard.run !== requiredCheckEventGuard) {
+        failures.push(
+          `${specification.path}:${jobName}: required-check event guard must use the shared exact payload contract.`,
+        );
+      }
+    }
   }
 }
 
