@@ -20,7 +20,9 @@ that it can.
 The migration bridge is
 `.github/workflows/protected-bootstrap-implementation.yml`. It accepts only an
 owner `workflow_dispatch` from the platform `main` ref, one repository, and
-one exact `bootstrap` or `prod` root. The active workflow SHA is always the
+one exact `bootstrap`, `prod`, or `exposure` root. The v0.5.11 exposure path is
+locked in both shell and controller validation to Runsetta's one reviewed
+two-mapping adoption; it is not a general exposure mutator. The active workflow SHA is always the
 immutable platform commit running the bridge. Initial adoption requires
 `legacy_compatibility_mode = true` and an empty transition. A later staged
 repin requires `false` and a transition SHA equal to the exact consumer
@@ -191,13 +193,18 @@ event-payload guard to pass and reconcile that run set against every baseline.
    or infer `false` merely because old and new DHI parity IDs differ. The bridge
    fetches the unmerged public head by exact SHA and refuses a tree whose workflow
    pins are not all `S`.
-4. Do not merge any PR until four immutable result receipts exist—one for each
-   repository—and each binds `platformSha=S`, its recorded `consumerSha` and
-   `consumerTreeSha`, `terraformRoot=bootstrap`, an empty transition, the
-   reviewed active-only manifest digest, and the post-300-second-plus-skew
-   Actions/run/marker proofs. A missing, stale, failed, or mismatched receipt
-   stops all four merges.
-5. With Actions still disabled, prepare each of the four unchanged draft PRs for
+4. Do not merge after bootstrap alone. First require four immutable bootstrap
+   result receipts—one for each repository—binding `platformSha=S`, the recorded
+   consumer SHA/tree, an empty transition, the reviewed manifest, and the final
+   Actions/run/marker proofs. Next complete the one-shot Runsetta exposure-state
+   adoption described below and retain its successful `adoption-complete`
+   receipt. Then run protected production plan/apply for all four unchanged
+   consumer trees; Runsetta must name that exact successful adoption run. Only
+   four successful production result receipts, in addition to the four
+   bootstrap results and the Runsetta adoption receipt, unlock the first merge.
+   Any missing, stale, failed, or mismatched evidence stops the rollout.
+5. With Actions still disabled and all nine prerequisite receipts established,
+   prepare each of the four unchanged draft PRs for
    merge one at a time. Establish a run-list baseline, mark that exact draft
    ready while Actions remains globally disabled, and prove exactly the one
    expected `ready_for_review` lifecycle event was created, zero workflow runs
@@ -357,15 +364,25 @@ receipt. Marker access consists of four distinct conditional bindings whose
 `resource.type` and full `resource.name` select only each project's fixed
 `deployment-parity-transition` object; no marker lease reaches Terraform state.
 Storage is otherwise restricted to registered buckets and exact state/lock
-objects. Receipts have separate exact-object create-only and read-only leases;
+objects. Every normal plan keeps one condition-scoped Storage Object Viewer
+binding: the bucket-resource arm supplies Terraform's required workspace object
+listing, while the object arm permits payload read only for the exact
+`default.tfstate`. Google Storage conditions cannot prefix-limit
+`storage.objects.list`, so the executor can temporarily enumerate object names
+and metadata in that one backend bucket; it cannot read sibling object payloads.
+Runsetta production additionally gets exact-object read of the canonical
+exposure state and named adoption receipt, without list access to the exposure
+bucket. Receipts have separate exact-object create-only and read-only leases;
 the executor never gets receipt overwrite or delete authority. Permission
 propagation and revocation use
-`testIamPermissions`; validation never lists or reads a state object. State and
+`testIamPermissions` and a zero-byte effective-overwrite probe. Those permission
+probes never read object payloads; the controller separately performs bounded,
+generation-qualified state and receipt reads where the protocol requires them. State and
 control-plane proofs for one permission transition share one absolute deadline:
 together they may retry until the earlier of the manager's remaining API
 deadline or a new five-minute consistency window, instead of each receiving a
 fresh window or stopping after a fixed scan count. That same absolute deadline
-caps every HTTP, gRPC, and create subprobe;
+caps every HTTP, gRPC, and overwrite subprobe;
 a scan that reaches it stops before touching another permission surface. Exact
 permission and runtime `actAs` projections remain unchanged, and failure to
 converge by that bound still fails closed. Every API request and subprocess has
@@ -394,11 +411,12 @@ generation/metageneration/metadata snapshots plus Actions-disable, active-run,
 and token-drain snapshots. After bootstrap apply and convergence, the bridge
 waits 300 seconds plus skew from the completed WIF mutation, then rechecks all
 four markers and every consumer before publishing the immutable result receipt.
-No raw
-plan, state, token, or Actions artifact is uploaded. Delete the temporary OAuth
-environment secret after the protected runs. This bridge intentionally rejects
-exposure roots; a future exposure mutation requires its own reviewed state lease
-and workflow expansion.
+No raw plan, state, token, or Actions artifact is uploaded. Delete the temporary
+OAuth environment secret after the protected runs. Exposure is deliberately
+different: v0.5.11 permits only one confirmed Runsetta state adoption, publishes
+one terminal `adoption-complete` receipt, and has no plan receipt, approval,
+consume marker, Terraform apply, or post-apply result. Any future exposure
+mutation requires a separate workflow expansion and adversarial review.
 
 Before its first apply, inventory every Compute Engine default service account,
 instance, job, trigger, and attached workload and prove nothing depends on the
@@ -443,33 +461,68 @@ Cloud Run's legacy domain-mapping API has no no-data IAM viewer permission.
 Domain mappings therefore live in `terraform/deployments/exposure`, not in the
 routine production root. Its backend is the protected bootstrap-state bucket at
 the fixed `<app>/exposure` prefix. Routine `gha-terraform` must be unable to list,
-read, lock, overwrite, or delete that state. For an existing app, migrate in this
-order through the protected pipeline:
+read, lock, overwrite, or delete that state.
 
-1. Save checksum-addressed recovery copies of both current production state and
-   the initially empty exposure state. Record each state's lineage and serial.
-2. Read every existing
-   `module.site.google_cloud_run_domain_mapping.site["<domain>"]` instance ID from
-   the saved production state. Initialize the exact reviewed exposure root
-   against the protected `<app>/exposure` prefix and import each ID at
-   `module.domains.google_cloud_run_domain_mapping.site["<domain>"]`.
-3. Require an exposure plan with no create, update, or destroy operations. Verify
-   that every expected domain remains mapped to the registered production service,
-   its reported DNS records are unchanged, and its live HTTPS route still works.
-4. Only then apply the exact production root containing the no-destroy `removed`
-   block. Confirm the new production-state serial no longer contains any domain
-   mapping and the protected exposure state contains all of them. Stop and restore
-   the reviewed recovery generations if either state is incomplete; never allow a
-   destroy/recreate migration. The production root temporarily retains the inert
-   `google.no_attribution` provider alias because the historical state instances
-   are bound to that address; no configured production resource uses the alias.
-   Remove it in a later reviewed platform release only after all four production
-   states prove that every domain-mapping address is gone.
+v0.5.11 exposes only the following one-shot Runsetta adoption. It is a state
+mutation performed by the trusted controller, not a Terraform apply:
 
-For a fresh app, the protected pipeline applies the production root first to
-create the service, then applies the exposure root in its protected prefix. No
-import is involved. All later domain additions/removals require a separate
-owner-reviewed exposure plan; `prevent_destroy` makes removal fail closed.
+1. Dispatch the protected workflow at exact platform SHA `S` with
+   `target_repository=runsetta`, `terraform_root=exposure`, `mode=plan`, and the
+   literal confirmation `ADOPT_RUNSETTA_EXPOSURE_STATE`. Leave plan-approval and
+   adoption-run inputs empty. Any other repository, mode, or confirmation fails
+   before credentials are mapped.
+2. The random keyless executor first receives condition-scoped backend list plus
+   exact `runsetta/exposure/default.tfstate` read. It receives no Cloud Run role,
+   Domain Mapping permission, Viewer basic role, state write, lock, or delete.
+   The controller owner token reads the exact regional Domain Mapping list and
+   both mappings, validates the numeric project namespace, immutable IDs, route,
+   certificate and Ready conditions, exact DNS records, and both production
+   HTTPS health routes. The executor is independently proven unable to call that
+   API.
+3. If the state is absent, the controller temporarily grants only its exact owner
+   member `roles/storage.objectCreator` on that one object, create-only writes a
+   deterministic full Terraform v4 state with `ifGenerationMatch=0`, and rereads
+   the returned generation through the executor. A 412 or ambiguous response is
+   accepted only when the generation-bound bytes equal that invocation's exact
+   proposed lineage and state. An existing byte-identical canonical serial-1
+   state is idempotently reused; partial, foreign, noncanonical, or changed state
+   fails closed. The creator lease is CAS-removed and read back absent before
+   Terraform starts; crash recovery recognizes its exact owner-member contract
+   and removes only that lease while preserving unrelated IAM.
+4. Terraform 1.14.5 with Google provider 7.45.0 initializes from the reviewed
+   filesystem mirror and runs only `plan -refresh=false`. The raw plan must be
+   non-applyable and contain exactly the two Runsetta mapping resources as
+   `no-op`, with equal before/after values, no import identity, no drift or
+   unknown/sensitive/replacement data, the one exact relevant-attribute entry,
+   and the three exact no-op outputs. No saved plan is applied and no raw state
+   or plan leaves the runner.
+5. The controller repeats the live API and HTTPS proof and requires exact
+   pre/post continuity. Success publishes one immutable terminal
+   `adoption-complete` receipt binding the dispatch confirmation, platform and
+   frozen consumer SHA/tree, canonical state lineage/serial/generation/hash/size,
+   live proofs, adoption outcome, and creator-lease disposition. There is no
+   plan receipt, approval, consume marker, Terraform apply, or result receipt.
+
+Runsetta protected production plan and apply must name that exact successful
+adoption run via `exposure_adoption_run_id`. Before the production plan receipt,
+before approval consumption, and again immediately before mutation, the bridge
+generation-reads the terminal receipt and canonical state, verifies the
+referenced GitHub run completed successfully on main at `S` as the fixed owner,
+and re-proves the two live mappings and HTTPS routes with the owner token. Those
+generation/hash commitments are part of the production manifest and receipt.
+Only then may the production root's no-destroy `removed` blocks forget the old
+state addresses. The temporary cross-state overlap is intentional; the Cloud
+Run resources are never destroyed or recreated. Bucket versioning remains a
+recovery backstop, not permission to accept unexplained state bytes.
+
+The provider state remains `deletion_policy = "DELETE"` in v0.5.11 because
+changing it produces a state update. Resource-level `prevent_destroy`, the
+bridge's rejection of every non-no-op adoption plan, and the executor's lack of
+Domain Mapping mutation authority are the current protections. A provider
+`PREVENT` migration, a fresh-app exposure create, any mapping addition/removal,
+or any Critical History load-balancer change requires a new separately reviewed
+workflow design; the v0.5.11 route cannot perform it. Existing cdbentley,
+Health/Medlock, and Critical History exposure state must remain unchanged.
 
 A fresh scaffold is different: its configured GCS backend cannot exist before
 bootstrap creates it. `terraform init -backend=false` only skips backend
@@ -665,10 +718,11 @@ the recovery object and stop; never rerun from empty state.
    Compute and routine `gha-terraform` identities cannot read bootstrap state
    and neither can write it. Read the live project IAM policy again and require
    exactly zero direct `roles/editor` members before continuing.
-5. Merge prepared consumer PRs only after the applicable protocol above is
-   complete. For a DHI-changing active-only cutover, that means all four exact
-   unmerged heads were independently fetched, planned, applied, and named by
-   four immutable successful result receipts before the first merge. Keep
+5. Merge prepared consumer PRs only after all four bootstrap result receipts,
+   the successful one-shot Runsetta adoption receipt, and all four production
+   result receipts exist for the exact unchanged heads and platform SHA. For a
+   DHI-changing active-only cutover, every unmerged head must be independently
+   fetched and bound throughout that ordered nine-receipt gate. Keep
    Actions disabled across the entire four-project gate and all merges, merge
    no changed head, and compare each resulting `main^{tree}` with the receipt's
    `consumerTreeSha`. The normal production Terraform job now executes only
@@ -690,10 +744,15 @@ the recovery object and stop; never rerun from empty state.
    binding. Every cloud workflow performs this exchange unconditionally and
    fails closed before its operational identity if exact reusable-workflow SHA
    trust is absent.
-8. For existing apps, import and verify every domain mapping in the protected
-   exposure state using the migration sequence above. Then apply the trusted
-   production root through the protected pipeline. This relinquishes the old
-   domain-mapping state without destroying it and creates the separate preview
+8. After all four bootstrap result receipts exist, perform only the one-shot
+   Runsetta exposure-state adoption above and retain its successful terminal
+   receipt. Then plan and apply all four trusted production roots before any
+   consumer merge. Runsetta must name the exact adoption run and revalidate its
+   canonical state, receipt, live mappings, and HTTPS immediately before the
+   no-destroy `removed` transition. The other three exposure states and all
+   Critical History edge resources remain untouched. Production convergence
+   relinquishes Runsetta's old domain-mapping state without destroying it and
+   creates the separate preview
    image repository, no-data preview runtime identity, shared preview service,
    and service-level deploy IAM. In the same saved production plan, require each
    repository-scoped Writer member to move from the deploy identity to its
@@ -710,40 +769,25 @@ the recovery object and stop; never rerun from empty state.
    `preview-operations` environment/event claims, immutable project/service
    selection, fixed CLI arguments, and no PR checkout or PR-controlled code
    after authentication. No credential may reach PR-controlled code.
-   Require the subsequent exposure plan to remain empty. For a
-   fresh app, apply production first and exposure second. The current Critical
-   History service already completed this baseline migration with public preview
-   ingress. For its follow-on stable namespace, do not apply the new production
-   root that restricts ingress until step 9 has activated and verified the
-   frontend.
-9. For Critical History, use the protected bootstrap root to enable the Compute
-   and Certificate Manager APIs, then apply the protected exposure root to
-   create the dedicated global external HTTPS load balancer, fixed-service
-   serverless NEG, TLS policy, global address, Certificate Manager DNS
-   authorization, wildcard certificate, and certificate map. Add exactly the
-   emitted DNS-authorization CNAME and wildcard A record
-   `*.preview.ycriticalhistory.org` to the authoritative zone, both DNS-only and
-   unproxied. Wait until the
-   certificate and certificate-map entry are active. The NEG must fix
-   `critical-history-preview` and parse only the tag with
-   `<tag>.preview.ycriticalhistory.org`; no caller or pull request may mutate DNS
-   or load-balancer resources. While the existing preview service still has
-   public ingress, confirm a nonexistent tag returns 404 through the stable
-   frontend. Do not apply the new Critical production root yet: a 404 proves the
-   frontend can reject a missing tag, but does not prove that it can reach a live
-   tagged revision after ingress is restricted. Never apply an older exposure
-   root that omits this module: review every saved exposure plan for zero destroy
-   operations even though both Terraform and provider deletion prevention are
-   present.
+   No subsequent exposure apply exists in v0.5.11. A fresh-app exposure create
+   is outside this release and must not be approximated by this adoption route.
+9. Critical History's existing load balancer, serverless NEG, TLS policy,
+   global address, Certificate Manager authorization/certificate/map, and DNS
+   must remain byte-for-byte unchanged during v0.5.11. Verify their already
+   established live continuity read-only, including the fixed
+   `critical-history-preview` service and missing-tag 404 behavior, but do not
+   dispatch the Runsetta-only exposure route for Critical History. Any create,
+   update, import, or recovery of those resources requires a separate protected
+   workflow expansion with zero-destroy review; never apply an older exposure
+   root that omits them.
 10. Keep consumer Actions disabled until the no-data preview runtime, shared
    preview service, service-scoped IAM, and exact-WIF bindings are independently
    verified from the protected pipeline. The ordering now forks explicitly for
-   Critical History. After all four bootstrap result receipts exist and all four
-   receipt-bound cutover trees are merged with Actions disabled, run and apply
-   the protected production plans for cdbentley, Runsetta, and Health/Medlock.
-   For Critical History, first complete the protected exposure/load-balancer
-   apply and missing-tag 404 proof from step 9, then plan and apply its protected
-   production root before activation. The push-only production caller requires
+   Critical History. After all four bootstrap results, the Runsetta terminal
+   adoption receipt, and all four protected production results exist, merge the
+   four receipt-bound cutover trees with Actions still disabled. For Critical
+   History, the read-only edge continuity proof from step 9 is a prerequisite to
+   its production plan; there is no v0.5.11 exposure apply. The push-only production caller requires
    infrastructure convergence before its deploy job, so a nonempty deferred
    production plan is a hard stop, not a staging mechanism. The production root
    records the controller's expected open ingress and installs IAM/resources,
@@ -839,7 +883,9 @@ the recovery object and stop; never rerun from empty state.
   separate recovery root `R` from `S` that changes only the immutable Critical
   preview ingress map and production preview-ingress value back to public
   ingress while retaining the current exposure resources. Review fresh
-  bootstrap, production, and exposure plans from live state: the recovery plans
+  bootstrap, production, and exposure plans from live state through a separately
+  reviewed workflow expansion; the v0.5.11 Runsetta adoption lane cannot execute
+  this recovery. The recovery plans
   must contain no deletion or replacement of DNS, certificate, load balancer,
   NEG, or URL-map resources. Only after no `P` workflow can run may the protected
   bootstrap transition exact WIF trust from `{P, S}` to `{S, R}`. Run the exact

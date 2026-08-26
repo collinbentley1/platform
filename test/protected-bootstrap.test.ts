@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { connect as connectHttp2, createServer as createHttp2Server } from "node:http2";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -9,32 +9,42 @@ import {
   addExactBindings,
   addLeaseWithCas,
   buildExecutorProjectLeases,
+  buildExposureControllerCreateLease,
   buildMarkerMutationLease,
   buildMarkerReadLease,
   buildReceiptLeases,
   buildReviewManifest,
   buildRuntimeActAsLeases,
   buildStorageLease,
+  buildStorageAcquisitionLeases,
+  buildStorageReadLease,
   buildTokenCreatorLease,
   canonicalJson,
+  canonicalRunsettaExposureState,
   consumePlanReceipt,
+  createEphemeralExecutor,
   deadlineFetcher,
   decodeStorageTestIamPermissionsResponse,
   deterministicArtifactHex,
   encodeStorageTestIamPermissionsRequest,
   ExecutorLeaseManager,
+  ensureExposureStateInitialized,
+  exposureControllerCreateLeaseOrUndefined,
   executorControlPermissions,
+  executorDescription,
   fencePolicyMutations,
   formatBridgeBreadcrumb,
   formatRecoveryScanBreadcrumb,
   inventoryBridgeArtifacts,
   main,
   parseRecoverySecretBundle,
+  parseExecutorProvenance,
   publishPlanReceipt,
   publishPostApplyReceipt,
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
-  probeStorageObjectCreatePermission,
+  proveExposure,
+  probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
   randomExecutorAccountId,
   randomExecutorRoleId,
@@ -42,19 +52,25 @@ import {
   REPOSITORIES,
   removeExactLease,
   removeExactBindings,
+  removeDeterministicExecutorMembers,
   removeLeaseWithCas,
   recoveryMain,
   recoverBridgeArtifactsUntilStable,
   releaseSandboxAndExecutor,
   requiredOwnerTokenRemainingSeconds,
   requireFreshGoogleOwnerAccessToken,
+  requireExposureControllerCreateLeaseCandidate,
+  requireLeaseAbsentWithReadback,
   requireSameDhiTransitionCapability,
+  requireStorageBackendRoleContracts,
   runProtectedBootstrap,
   runProtectedRecovery,
   storageV2TestIamPermissions,
   TerraformSandboxExecutor,
   validateInvocation,
   validateRecoveryInvocation,
+  validateStorageBackendRolePermissionInventory,
+  verifyTerraformProviderMirrorLayout,
   verifyLocalSource,
   verifyPlatformCapability,
   verifyPlanApproval,
@@ -63,6 +79,7 @@ import {
   type BridgeDependencies,
   type ExecutorSession,
   type ExecutionProof,
+  type ExposureProof,
   type IamBinding,
   type IamPolicy,
   type Invocation,
@@ -126,6 +143,21 @@ describe("protected owner Terraform bridge", () => {
       "LEGACY_COMPATIBILITY_MODE: ${{ inputs.legacy_compatibility_mode }}",
     );
     expect(workflow).toContain("TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}");
+    expect(workflow).toContain('if [ "$TERRAFORM_ROOT" = "exposure" ]; then');
+    expect(workflow).toContain('test "$TARGET_REPOSITORY" = "runsetta"');
+    expect(workflow).toContain('test "$EXECUTION_MODE" = "plan"');
+    expect(workflow).toContain(
+      'test "$EXPOSURE_ADOPTION_CONFIRMATION" = "ADOPT_RUNSETTA_EXPOSURE_STATE"',
+    );
+    expect(workflow).toContain(
+      "EXPOSURE_ADOPTION_CONFIRMATION: ${{ inputs.exposure_adoption_confirmation }}",
+    );
+    expect(workflow).toContain(
+      "EXPOSURE_ADOPTION_RUN_ID: ${{ inputs.exposure_adoption_run_id }}",
+    );
+    expect(workflow).toContain(
+      'if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ]; then',
+    );
     expect(workflow).toContain("PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}");
     expect(workflow).toContain("/usr/bin/env -i");
     expect(workflow.match(/OWNER_OAUTH_ACCESS_TOKEN: \$\{\{ secrets\.OWNER_OAUTH_ACCESS_TOKEN \}\}/g)).toHaveLength(
@@ -228,6 +260,9 @@ describe("protected owner Terraform bridge", () => {
       "GOOGLE_PROVIDER_SHA256: fb1b9d1ea7bc79b7409f02aa7c19ba39afa22dbead69e83ae7eb2691ac5c2426",
     );
     expect(workflow).toContain("terraform-provider-google_7.45.0_linux_amd64.zip");
+    expect(workflow).toContain(
+      'mirror="$destination/registry.terraform.io/hashicorp/google/7.45.0/linux_amd64"',
+    );
     expect(workflow.match(/^\s+uses:/gm)).toBeNull();
     expect(workflow).toContain("merge-base --is-ancestor");
     expect(workflow).toContain(
@@ -259,7 +294,35 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
-  test("DHI-changing rollout keeps Actions disabled through four result receipts and merges", async () => {
+  test("Terraform provider extraction is an exact discoverable filesystem mirror", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "protected-provider-mirror-"));
+    const leaf = join(
+      directory,
+      "registry.terraform.io/hashicorp/google/7.45.0/linux_amd64",
+    );
+    try {
+      await mkdir(leaf, { recursive: true });
+      await writeFile(join(leaf, "LICENSE.txt"), "license\n");
+      const binary = join(leaf, "terraform-provider-google_v7.45.0_x5");
+      await writeFile(binary, "provider\n");
+      await chmod(binary, 0o500);
+      await expect(verifyTerraformProviderMirrorLayout(directory)).resolves.toBeUndefined();
+
+      await writeFile(join(directory, "terraform-provider-google_v7.45.0_x5"), "flat\n");
+      await expect(verifyTerraformProviderMirrorLayout(directory)).rejects.toThrow(
+        "exact directory layout",
+      );
+      await rm(join(directory, "terraform-provider-google_v7.45.0_x5"));
+      await writeFile(join(leaf, "unexpected"), "foreign\n");
+      await expect(verifyTerraformProviderMirrorLayout(directory)).rejects.toThrow(
+        "exact two-file leaf contract",
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("DHI-changing rollout keeps Actions disabled through the ordered nine-receipt gate", async () => {
     const [
       rolloutSource,
       deployPreview,
@@ -291,7 +354,10 @@ describe("protected owner Terraform bridge", () => {
     for (const requirement of [
       "current head of an open, unmerged public consumer PR",
       "deliberately imposes no consumer-`main` ancestry requirement",
-      "Do not merge any PR until four immutable result receipts exist",
+      "Do not merge after bootstrap alone",
+      "complete the one-shot Runsetta exposure-state adoption",
+      "four successful production result receipts",
+      "all nine prerequisite receipts established",
       "mark that exact draft ready while Actions remains globally disabled",
       "exactly the one expected `ready_for_review` lifecycle event was created",
       "zero workflow runs were created after the baseline",
@@ -340,12 +406,30 @@ describe("protected owner Terraform bridge", () => {
       expect(rollout).toContain(requirement);
     }
 
+    let previousIndex = -1;
+    const currentRolloutGate = rolloutSource.slice(
+      rolloutSource.indexOf("4. Do not merge after bootstrap alone"),
+      rolloutSource.indexOf("6. Recheck disabled Actions"),
+    ).replace(/\s+/g, " ");
+    previousIndex = -1;
+    for (const orderedRequirement of [
+      "four immutable bootstrap result receipts",
+      "one-shot Runsetta exposure-state adoption",
+      "four successful production result receipts",
+      "all nine prerequisite receipts established",
+      "prepare each of the four unchanged draft PRs for",
+    ]) {
+      const currentIndex = currentRolloutGate.indexOf(orderedRequirement);
+      expect(currentIndex, orderedRequirement).toBeGreaterThan(previousIndex);
+      previousIndex = currentIndex;
+    }
+
     const activationSource = rolloutSource.slice(
       rolloutSource.indexOf("6. Recheck disabled Actions"),
       rolloutSource.indexOf("The active-only apply removes"),
     );
     const activation = activationSource.replace(/\s+/g, " ");
-    let previousIndex = -1;
+    previousIndex = -1;
     for (const orderedRequirement of [
       "prepare the complete activation branch before opening a PR",
       "platform-production-activation-v1",
@@ -495,10 +579,12 @@ describe("protected owner Terraform bridge", () => {
       .replace(/\s+/g, " ");
     previousIndex = -1;
     for (const orderedRequirement of [
-      "all four bootstrap result receipts exist",
-      "protected production plans for cdbentley, Runsetta, and Health/Medlock",
-      "protected exposure/load-balancer apply and missing-tag 404 proof",
-      "plan and apply its protected production root before activation",
+      "all four bootstrap results",
+      "Runsetta terminal adoption receipt",
+      "all four protected production results exist",
+      "merge the four receipt-bound cutover trees",
+      "read-only edge continuity proof from step 9",
+      "there is no v0.5.11 exposure apply",
       "leave the existing public, zero-tag bootstrap exposure byte-for-byte unchanged",
       "production convergence plan is empty",
       "prerequisite infrastructure exposure proof may admit the public zero-tag state only",
@@ -591,7 +677,48 @@ describe("protected owner Terraform bridge", () => {
         LEGACY_COMPATIBILITY_MODE: "true",
         TERRAFORM_ROOT: "prod",
       })
-    ).toThrow("Production mode forbids");
+    ).toThrow("Non-bootstrap mode forbids");
+    expect(() => validateInvocation({
+      ...environment,
+      TARGET_REPOSITORY: "cdbentley",
+      TERRAFORM_ROOT: "exposure",
+    })).toThrow("locked to a Runsetta plan run");
+    expect(() => validateInvocation({
+      ...environment,
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    })).toThrow("adoption confirmation drifted");
+    expect(() => validateInvocation({
+      ...environment,
+      APPROVED_MANIFEST_SHA256: "d".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    })).toThrow("locked to a Runsetta plan run");
+    expect(validateInvocation({
+      ...environment,
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    }).repository).toBe("runsetta");
+    expect(() => validateInvocation({
+      ...environment,
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    })).toThrow("exposure adoption run ID");
+    expect(validateInvocation({
+      ...environment,
+      EXPOSURE_ADOPTION_RUN_ID: "123455",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    }).exposureAdoptionRunId).toBe("123455");
+    expect(() => validateInvocation({
+      ...environment,
+      EXPOSURE_ADOPTION_RUN_ID: "123455",
+    })).toThrow("non-Runsetta-prod");
   });
 
   test("consumer pin proof requires one consistent safe SHA across every reusable caller", async () => {
@@ -940,6 +1067,358 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow("unreviewed field unexpected");
   });
 
+  test("Runsetta exposure proof uses the regional API, exact list, live mappings, and HTTPS", async () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const urls: string[] = [];
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      urls.push(url.href);
+      if (url.hostname === "storage.googleapis.com") return new Response("", { status: 404 });
+      if (url.hostname === "us-east4-run.googleapis.com") {
+        const suffix = url.pathname.split("/domainmappings")[1] ?? "";
+        if (suffix === "") {
+          return Response.json({
+            apiVersion: "domains.cloudrun.com/v1",
+            items: ["runsetta.com", "www.runsetta.com"].map((domain, index) => ({
+              metadata: {
+                generation: 1,
+                name: domain,
+                namespace: "601124730704",
+                uid: index === 0
+                  ? "054a1acd-cfa0-4a47-b6f2-238753c0c2bc"
+                  : "3a72ca14-d15b-40f9-9920-a9b7083eb771",
+              },
+            })),
+            kind: "DomainMappingList",
+            metadata: {
+              resourceVersion: "opaque-601124730704-1",
+              selfLink: "/apis/domains.cloudrun.com/v1/namespaces/601124730704/domainmappings",
+            },
+          });
+        }
+        const domain = decodeURIComponent(suffix.slice(1));
+        const www = domain === "www.runsetta.com";
+        return Response.json({
+          apiVersion: "domains.cloudrun.com/v1",
+          kind: "DomainMapping",
+          metadata: {
+            generation: 1,
+            name: domain,
+            namespace: "601124730704",
+            selfLink:
+              `/apis/domains.cloudrun.com/v1/namespaces/601124730704/domainmappings/${domain}`,
+            uid: www
+              ? "3a72ca14-d15b-40f9-9920-a9b7083eb771"
+              : "054a1acd-cfa0-4a47-b6f2-238753c0c2bc",
+          },
+          spec: { certificateMode: "AUTOMATIC", routeName: "runsetta" },
+          status: {
+            conditions: ["Ready", "CertificateProvisioned", "DomainRoutable"].map((type) => ({
+              status: "True",
+              type,
+            })),
+            mappedRouteName: "runsetta",
+            observedGeneration: 1,
+            resourceRecords: www
+              ? [{ name: "www", rrdata: "ghs.googlehosted.com.", type: "CNAME" }]
+              : [
+                  { rrdata: "216.239.32.21", type: "A" },
+                  { rrdata: "216.239.34.21", type: "A" },
+                  { rrdata: "216.239.36.21", type: "A" },
+                  { rrdata: "216.239.38.21", type: "A" },
+                  { rrdata: "2001:4860:4802:32::15", type: "AAAA" },
+                  { rrdata: "2001:4860:4802:34::15", type: "AAAA" },
+                  { rrdata: "2001:4860:4802:36::15", type: "AAAA" },
+                  { rrdata: "2001:4860:4802:38::15", type: "AAAA" },
+                ],
+          },
+        });
+      }
+      if (url.hostname === "runsetta.com" || url.hostname === "www.runsetta.com") {
+        return new Response(
+          JSON.stringify({
+            environment: "production",
+            ok: true,
+            openaiConfigured: false,
+            service: "runsetta",
+            spotifyConfigured: false,
+          }),
+          { headers: { "content-type": "application/json; charset=utf-8" }, status: 200 },
+        );
+      }
+      return new Response("", { status: 500 });
+    };
+    const proof = await proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      fetcher,
+    );
+    expect(proof?.state.state).toBe("absent");
+    expect(proof?.mappingListCount).toBe(2);
+    expect(proof?.mappings.map(({ domain }) => domain)).toEqual([
+      "runsetta.com",
+      "www.runsetta.com",
+    ]);
+    expect(proof?.https).toHaveLength(2);
+    expect(urls.filter((url) => url.includes("run.googleapis.com"))).toHaveLength(3);
+    expect(urls.some((url) => url.startsWith("https://run.googleapis.com/"))).toBeFalse();
+
+    await expect(proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      async (input) => {
+        const url = new URL(String(input));
+        if (url.hostname === "storage.googleapis.com") return new Response("", { status: 404 });
+        if (url.pathname.endsWith("/domainmappings")) {
+          return Response.json({
+            apiVersion: "domains.cloudrun.com/v1",
+            items: [],
+            kind: "DomainMappingList",
+            metadata: {
+              selfLink: "/apis/domains.cloudrun.com/v1/namespaces/601124730704/domainmappings",
+            },
+          });
+        }
+        return new Response("", { status: 500 });
+      },
+    )).rejects.toThrow("missing or foreign domains");
+
+    await expect(proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      async (input, init) => {
+        const url = new URL(String(input));
+        const response = await fetcher(input, init);
+        if (url.hostname !== "us-east4-run.googleapis.com" ||
+          !url.pathname.endsWith("/domainmappings")) return response;
+        const value = await response.json() as Record<string, unknown>;
+        return Response.json({
+          ...value,
+          metadata: { ...(value.metadata as object), continue: "hidden-next-page" },
+        });
+      },
+    )).rejects.toThrow("continuation page");
+
+    await expect(proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      async (input, init) => {
+        const url = new URL(String(input));
+        const response = await fetcher(input, init);
+        if (url.hostname !== "us-east4-run.googleapis.com" ||
+          !url.pathname.endsWith("/domainmappings")) return response;
+        const value = await response.json() as Record<string, unknown>;
+        return Response.json({ ...value, unreachable: ["us-west1"] });
+      },
+    )).rejects.toThrow("unreachable resources");
+
+    await expect(proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      async (input, init) => {
+        const url = new URL(String(input));
+        const response = await fetcher(input, init);
+        if (
+          url.hostname !== "us-east4-run.googleapis.com" ||
+          url.pathname.endsWith("/domainmappings")
+        ) return response;
+        const value = await response.json() as Record<string, unknown>;
+        return Response.json({
+          ...value,
+          spec: { ...(value.spec as object), forceOverride: true },
+        });
+      },
+    )).rejects.toThrow("forceOverride is enabled");
+
+    await expect(proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      async (input, init) => {
+        const url = new URL(String(input));
+        const response = await fetcher(input, init);
+        if (
+          url.hostname !== "us-east4-run.googleapis.com" ||
+          url.pathname.endsWith("/domainmappings")
+        ) return response;
+        const value = await response.json() as Record<string, unknown>;
+        const status = value.status as { conditions: unknown[] };
+        return Response.json({
+          ...value,
+          status: { ...status, conditions: [...status.conditions, status.conditions[0]] },
+        });
+      },
+    )).rejects.toThrow("duplicate condition type");
+  });
+
+  test("exposure state initialization is exact, generation-bound, and idempotent", async () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const lineage = "123e4567-e89b-42d3-a456-426614174000";
+    let stored: string | undefined;
+    let generation = "9";
+    let uploads = 0;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const liveResponse = runsettaExposureApiResponse(url);
+      if (liveResponse !== undefined) return liveResponse;
+      if (url.pathname.startsWith("/upload/storage/v1/")) {
+        uploads += 1;
+        expect(init?.method).toBe("POST");
+        expect(url.searchParams.get("ifGenerationMatch")).toBe("0");
+        expect(url.searchParams.get("name")).toBe("runsetta/exposure/default.tfstate");
+        stored = String(init?.body);
+        return Response.json({
+          bucket: "runsetta-tfstate-601124730704-bootstrap",
+          generation,
+          name: "runsetta/exposure/default.tfstate",
+          size: String(Buffer.byteLength(stored)),
+        });
+      }
+      if (stored === undefined) return new Response("", { status: 404 });
+      if (url.searchParams.get("alt") === "media") {
+        expect(url.searchParams.get("ifGenerationMatch")).toBe(generation);
+        return new Response(stored);
+      }
+      return Response.json({
+        bucket: "runsetta-tfstate-601124730704-bootstrap",
+        generation,
+        metageneration: "1",
+        name: "runsetta/exposure/default.tfstate",
+        size: String(Buffer.byteLength(stored)),
+      });
+    };
+    const created = await ensureExposureStateInitialized(
+      invocation,
+      "short-lived-executor-access-token-value",
+      "google-owner-access-token-value",
+      exposureProofFixture("runsetta", "unadopted"),
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      () => lineage,
+    );
+    expect(created.state).toMatchObject({ generation: "9", lineage, serial: 1, state: "present" });
+    expect(stored).toBe(canonicalRunsettaExposureState(lineage));
+    const existingProof = await proveExposure(
+      invocation,
+      "short-lived-executor-access-token-value",
+      fetcher,
+      "google-owner-access-token-value",
+    );
+    expect(existingProof).not.toBeNull();
+    const existing = await ensureExposureStateInitialized(
+      invocation,
+      "short-lived-executor-access-token-value",
+      "google-owner-access-token-value",
+      existingProof!,
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      () => "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    );
+    expect(existing.state.generation).toBe("9");
+    expect(uploads).toBe(1);
+
+    stored = undefined;
+    generation = "10";
+    await expect(ensureExposureStateInitialized(
+      invocation,
+      "short-lived-executor-access-token-value",
+      "google-owner-access-token-value",
+      exposureProofFixture("runsetta", "unadopted"),
+      async (input, init) => {
+        const url = new URL(String(input));
+        const liveResponse = runsettaExposureApiResponse(url);
+        if (liveResponse !== undefined) return liveResponse;
+        if (url.pathname.startsWith("/upload/storage/v1/")) {
+          stored = String(init?.body);
+          return Response.json({
+            bucket: "runsetta-tfstate-601124730704-bootstrap",
+            generation: "9",
+            name: "runsetta/exposure/default.tfstate",
+            size: String(Buffer.byteLength(stored)),
+          });
+        }
+        if (url.searchParams.get("alt") === "media") return new Response(stored);
+        if (stored === undefined) return new Response("", { status: 404 });
+        return Response.json({
+          bucket: "runsetta-tfstate-601124730704-bootstrap",
+          generation,
+          metageneration: "1",
+          name: "runsetta/exposure/default.tfstate",
+          size: String(Buffer.byteLength(stored)),
+        });
+      },
+      async () => undefined,
+      Date.now() + 60_000,
+      () => lineage,
+    )).rejects.toThrow("created exposure state generation drifted");
+  });
+
+  test("exposure initialization accepts only its exact bytes after 412 or response loss", async () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const lineage = "123e4567-e89b-42d3-a456-426614174000";
+    const different = canonicalRunsettaExposureState(
+      "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    );
+    const run = async (failure: "lost" | "precondition", sameBytes: boolean) => {
+      let object: string | undefined;
+      let attempted = false;
+      return ensureExposureStateInitialized(
+        invocation,
+        "short-lived-executor-access-token-value",
+        "google-owner-access-token-value",
+        exposureProofFixture("runsetta", "unadopted"),
+        async (input, init) => {
+          const url = new URL(String(input));
+          const liveResponse = runsettaExposureApiResponse(url);
+          if (liveResponse !== undefined) return liveResponse;
+          if (url.pathname.startsWith("/upload/storage/v1/")) {
+            attempted = true;
+            object = sameBytes ? String(init?.body) : different;
+            if (failure === "lost") throw new TypeError("fetch failed after commit");
+            return new Response("", { status: 412 });
+          }
+          if (!attempted) return new Response("", { status: 404 });
+          if (url.searchParams.get("alt") === "media") return new Response(object);
+          return Response.json({
+            bucket: "runsetta-tfstate-601124730704-bootstrap",
+            generation: "11",
+            metageneration: "1",
+            name: "runsetta/exposure/default.tfstate",
+            size: String(Buffer.byteLength(object!)),
+          });
+        },
+        async () => undefined,
+        Date.now() + 60_000,
+        () => lineage,
+      );
+    };
+    await expect(run("precondition", true)).resolves.toMatchObject({
+      state: {
+        generation: "11",
+        lineage,
+        state: "present",
+      },
+    });
+    await expect(run("precondition", false)).rejects.toThrow("raced exposure state lineage");
+    await expect(run("lost", false)).rejects.toThrow("raced exposure state lineage");
+  });
+
   test("production lease is object-only and cannot reach bootstrap or access-log buckets", () => {
     const lease = buildStorageLease(
       "healthmcp",
@@ -959,6 +1438,205 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(lease.condition.expression).not.toContain("medlock-tfstate-1025243085-bootstrap");
     expect(lease.condition.expression).not.toContain("-access-logs");
+  });
+
+  test("exposure adoption identity is fixed and its executor receives read-only state access", () => {
+    expect(REPOSITORIES.runsetta.exposure).toEqual({
+      domains: ["runsetta.com", "www.runsetta.com"],
+      projectNumber: "601124730704",
+      region: "us-east4",
+      serviceName: "runsetta",
+    });
+    expect(REPOSITORIES.healthmcp.repositoryId).toBe("1025243085");
+    expect(REPOSITORIES.healthmcp.exposure.projectNumber).toBe("229383559510");
+    expect(REPOSITORIES.healthmcp.exposure.projectNumber).not.toBe(
+      REPOSITORIES.healthmcp.repositoryId,
+    );
+    const expiration = new Date("2026-08-26T22:00:00.000Z");
+    const email = "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com";
+    const leases = buildStorageAcquisitionLeases(
+      "runsetta",
+      "exposure",
+      "plan",
+      "123456",
+      expiration,
+      email,
+    );
+    expect(leases.map(({ role }) => role)).toEqual(["roles/storage.objectViewer"]);
+    expect(leases[0]!.condition.expression).toContain("runsetta/exposure/default.tfstate");
+    expect(leases[0]!.condition.expression).not.toContain("default.tflock");
+    expect(leases[0]!.condition.expression).not.toContain("runsetta/prod");
+    expect(executorControlPermissions("runsetta", "exposure", "read")).toEqual([]);
+    expect(executorControlPermissions("runsetta", "exposure", "mutation")).toEqual([]);
+  });
+
+  test("Runsetta adoption separates executor read from owner create-only state authority", () => {
+    const expiration = new Date("2026-08-26T22:00:00.000Z");
+    const creator = buildExposureControllerCreateLease("123456", expiration);
+    expect(creator).toEqual({
+      condition: {
+        description: "Controller may create only the absent canonical Runsetta exposure state.",
+        expression:
+          "request.time < timestamp('2026-08-26T22:00:00.000Z') && " +
+          "resource.type == 'storage.googleapis.com/Object' && " +
+          "resource.name == 'projects/_/buckets/runsetta-tfstate-601124730704-bootstrap/objects/runsetta/exposure/default.tfstate'",
+        title: "codex-controller-exposure-create-123456",
+      },
+      members: ["user:CollinBentley1@gmail.com"],
+      role: "roles/storage.objectCreator",
+    });
+    const executorRead = buildStorageAcquisitionLeases(
+      "runsetta",
+      "exposure",
+      "plan",
+      "123456",
+      expiration,
+      "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+    );
+    expect(executorRead).toHaveLength(1);
+    expect(executorRead[0]?.role).toBe("roles/storage.objectViewer");
+    expect(executorRead[0]?.members).toEqual([
+      "serviceAccount:gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+    ]);
+    expect(executorRead[0]?.condition.expression).toContain(
+      "runsetta/exposure/default.tfstate",
+    );
+    expect(executorRead[0]?.condition.expression).not.toContain("roles/viewer");
+    expect(creator.condition.expression).not.toContain("default.tflock");
+    expect(creator.condition.expression).not.toContain("/plans/");
+
+    expect(exposureControllerCreateLeaseOrUndefined(creator, "123456")).toEqual(creator);
+    expect(exposureControllerCreateLeaseOrUndefined({
+      ...creator,
+      members: ["user:attacker@example.com"],
+    }, "123456")).toBeUndefined();
+    expect(() => requireExposureControllerCreateLeaseCandidate({
+      ...creator,
+      members: ["user:attacker@example.com"],
+    }, "123456")).toThrow("title was reused with altered authority");
+    const unrelated: IamBinding = {
+      members: ["user:unrelated@example.com"],
+      role: "roles/viewer",
+    };
+    const executorLease: IamBinding = {
+      condition: {
+        description: "temporary test lease",
+        expression: "request.time < timestamp('2026-08-26T22:00:00.000Z')",
+        title: "temporary-executor-lease",
+      },
+      members: [
+        "serviceAccount:gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+      ],
+      role: "roles/storage.objectViewer",
+    };
+    const cleaned = removeDeterministicExecutorMembers(
+      { bindings: [unrelated, executorLease, creator], etag: "etag-1", version: 3 },
+      "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+      "123456",
+    );
+    expect(cleaned.bindings).toEqual([unrelated]);
+    expect(removeDeterministicExecutorMembers(
+      { bindings: [unrelated, creator], etag: "etag-1", version: 3 },
+      "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+    ).bindings).toEqual([unrelated, creator]);
+  });
+
+  test("conditional IAM readback requires exact absence and rejects title reuse", async () => {
+    const lease = buildStorageReadLease(
+      "runsetta",
+      "exposure",
+      "123456",
+      new Date("2026-08-26T22:00:00.000Z"),
+      "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+    );
+    const response = (bindings: IamPolicy["bindings"]): Response => Response.json({
+      bindings,
+      etag: "policy-etag",
+      version: 3,
+    });
+    await expect(requireLeaseAbsentWithReadback(
+      "runsetta",
+      "owner-token-value",
+      lease,
+      async () => response([]),
+    )).resolves.toBeUndefined();
+    await expect(requireLeaseAbsentWithReadback(
+      "runsetta",
+      "owner-token-value",
+      lease,
+      async () => response([{
+        ...lease,
+        condition: { ...lease.condition, expression: "request.time < timestamp('2026-08-26T22:01:00Z')" },
+      }]),
+    )).rejects.toThrow("lease title was reused with altered authority");
+    let nowMs = 1_000;
+    let reads = 0;
+    await expect(requireLeaseAbsentWithReadback(
+      "runsetta",
+      "owner-token-value",
+      lease,
+      async () => {
+        reads += 1;
+        return response([lease]);
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      5_000,
+      () => nowMs,
+    )).rejects.toThrow("lease removal did not become observable");
+    expect(reads).toBeGreaterThan(1);
+  });
+
+  test("Storage read/create roles are inventory-pinned and contain no overwrite or delete", async () => {
+    const inventories = {
+      "roles/storage.objectCreator": [
+        "orgpolicy.policy.get",
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.list",
+        "storage.folders.create",
+        "storage.managedFolders.create",
+        "storage.multipartUploads.abort",
+        "storage.multipartUploads.create",
+        "storage.multipartUploads.listParts",
+        "storage.objects.create",
+        "storage.objects.createContext",
+      ],
+      "roles/storage.objectViewer": [
+        "resourcemanager.projects.get",
+        "resourcemanager.projects.list",
+        "storage.folders.get",
+        "storage.folders.list",
+        "storage.managedFolders.get",
+        "storage.managedFolders.list",
+        "storage.objects.get",
+        "storage.objects.list",
+      ],
+    } as const;
+    for (const [role, permissions] of Object.entries(inventories)) {
+      expect(() => validateStorageBackendRolePermissionInventory(
+        role as keyof typeof inventories,
+        permissions,
+      )).not.toThrow();
+    }
+    expect(() => validateStorageBackendRolePermissionInventory(
+      "roles/storage.objectCreator",
+      [...inventories["roles/storage.objectCreator"], "storage.objects.delete"],
+    )).toThrow("permission inventory drifted");
+    const seen: string[] = [];
+    await requireStorageBackendRoleContracts(
+      "owner-token-value",
+      async (input) => {
+        const role = new URL(String(input)).pathname.slice(4) as keyof typeof inventories;
+        seen.push(role);
+        return Response.json({
+          includedPermissions: inventories[role],
+          name: role,
+          stage: "GA",
+        });
+      },
+    );
+    expect(seen.toSorted()).toEqual(Object.keys(inventories).toSorted());
   });
 
   test("executor roles are exact per root and prod actAs is only the three runtime accounts", () => {
@@ -1005,7 +1683,7 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("IAM transformations preserve latest policy data and remove only the exact lease", () => {
-    const lease = buildStorageLease(
+    const lease = buildStorageReadLease(
       "runsetta",
       "prod",
       "42",
@@ -1043,7 +1721,7 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("condition-title collisions fail closed without modifying IAM", () => {
-    const lease = buildStorageLease(
+    const lease = buildStorageReadLease(
       "critical-history",
       "prod",
       "77",
@@ -1090,7 +1768,7 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("IAM API writes use the fetched etag, retry CAS conflicts, and clean the latest policy", async () => {
-    const lease = buildStorageLease(
+    const lease = buildStorageReadLease(
       "cdbentley",
       "prod",
       "9001",
@@ -1152,7 +1830,7 @@ describe("protected owner Terraform bridge", () => {
       etag: "etag-0",
       version: 1,
     };
-    const lease = buildStorageLease(
+    const lease = buildStorageReadLease(
       "cdbentley",
       "prod",
       "8181",
@@ -1307,6 +1985,57 @@ describe("protected owner Terraform bridge", () => {
       terraformRoot: "bootstrap",
       transitionWorkflowSha: "d".repeat(40),
     })).toThrow("cannot combine");
+  });
+
+  test("Runsetta adoption requires exactly two complete no-op resources and a non-applyable plan", () => {
+    const exactChanges = [
+      exposureDomainChange("runsetta.com", false),
+      exposureDomainChange("www.runsetta.com", false),
+    ];
+    const adoption = exposureAdoptionPlan(exactChanges);
+    const review = buildReviewManifest(adoption, exposureIdentity("runsetta", "adopted"));
+    expect(review.canonical).toContain('"approvalMode":"adoption"');
+    expect(review.canonical).toContain('"resourceChangesCount":2');
+    expect(review.canonical).toContain('"applyable":false');
+
+    const missing = exposureAdoptionPlan([exactChanges[0]]);
+    expect(() => buildReviewManifest(missing, exposureIdentity("runsetta", "adopted")))
+      .toThrow("exactly both Runsetta domain mappings");
+
+    const importPlan = exposureAdoptionPlan([
+      exposureDomainChange("runsetta.com", true),
+      exposureDomainChange("www.runsetta.com", true),
+    ]);
+    expect(() => buildReviewManifest(importPlan, exposureIdentity("runsetta", "adopted")))
+      .toThrow("without import identity");
+
+    const applyable = exposureAdoptionPlan(exactChanges);
+    applyable.applyable = true;
+    expect(() => buildReviewManifest(applyable, exposureIdentity("runsetta", "adopted")))
+      .toThrow("applyability drifted");
+
+    const drift = exposureAdoptionPlan(exactChanges);
+    drift.resource_drift = [exactChanges[0]];
+    expect(() => buildReviewManifest(drift, exposureIdentity("runsetta", "adopted")))
+      .toThrow("resource drift count drifted");
+
+    const unknown = exposureAdoptionPlan(structuredClone(exactChanges));
+    (unknown.resource_changes as typeof exactChanges)[0]!.change.after_unknown = { id: true };
+    expect(() => buildReviewManifest(unknown, exposureIdentity("runsetta", "adopted")))
+      .toThrow("unknown value map contains a sensitive value");
+
+    const relevantDrift = exposureAdoptionPlan(exactChanges);
+    relevantDrift.relevant_attributes = [{
+      attribute: ["id"],
+      resource: "module.domains.google_cloud_run_domain_mapping.site",
+    }];
+    expect(() => buildReviewManifest(relevantDrift, exposureIdentity("runsetta", "adopted")))
+      .toThrow("relevant attribute contract");
+
+    const outputDrift = exposureAdoptionPlan(exactChanges);
+    delete (outputDrift.output_changes as Record<string, unknown>).preview_url_pattern;
+    expect(() => buildReviewManifest(outputDrift, exposureIdentity("runsetta", "adopted")))
+      .toThrow("exposure output change names drifted");
   });
 
   test("initial bootstrap review requires the one exact absent-to-clear marker creation", () => {
@@ -1621,6 +2350,45 @@ describe("protected owner Terraform bridge", () => {
     expect(events.some((event) => event.includes("consumer/infra"))).toBeFalse();
   });
 
+  test("executable Runsetta adoption is refreshless, plan-only, and terminal", async () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const adoptionPlan = exposureAdoptionPlan([
+      exposureDomainChange("runsetta.com", false),
+      exposureDomainChange("www.runsetta.com", false),
+    ]);
+    const events: string[] = [];
+    const terraformArgv: readonly string[][] = [];
+    let publishedProof: ExposureProof | null | undefined;
+    await runProtectedBootstrap(invocation, fakeDependencies(events, {
+      planJson: JSON.stringify(adoptionPlan),
+      proveExposure: async () => exposureProofFixture("runsetta", "adopted"),
+      publishPlanReceipt: async (_invocation, _session, _review, proof) => {
+        events.push("publish:adoption");
+        publishedProof = proof.exposureProof;
+      },
+      runTerraform: async (_invocation, _session, directory, args) => {
+        expect(directory).toBe("/tmp/platform/terraform/deployments/exposure");
+        terraformArgv.push(args);
+        events.push(`terraform:${args[0]}`);
+      },
+    }));
+    const planArgv = terraformArgv.find((args) => args[0] === "plan");
+    expect(planArgv).toContain("-refresh=false");
+    expect(terraformArgv.map((args) => args[0])).toEqual(["init", "plan"]);
+    expect(events).toContain("publish:adoption");
+    expect(events).not.toContain("consume");
+    expect(events).not.toContain("elevate");
+    expect(events).not.toContain("publish:post");
+    expect(publishedProof?.seedContract?.confirmation).toBe(
+      "ADOPT_RUNSETTA_EXPOSURE_STATE",
+    );
+  });
+
   test("normal cleanup starts IAM containment before blocked filesystem and Docker cleanup", async () => {
     let unblockFilesystem!: () => void;
     const filesystemBlocked = new Promise<void>((resolve) => {
@@ -1735,6 +2503,231 @@ describe("protected owner Terraform bridge", () => {
     expect(deterministicArtifactHex("runsetta", "123456", "service-account")).not.toBe(
       deterministicArtifactHex("cdbentley", "123456", "service-account"),
     );
+  });
+
+  test("executor provenance v2 is fixed-field, bounded, and approval-complete", () => {
+    const expiresAt = new Date("2026-08-26T23:00:00.000Z");
+    const manifest = "d".repeat(64);
+    const apply = {
+      approvedManifestSha256: manifest,
+      approvedPlanRunId: "7654320",
+      expiresAt,
+      exposureAdoptionRunId: "7654319",
+      mode: "apply" as const,
+      repository: "runsetta" as const,
+      root: "prod" as const,
+      runId: "7654321",
+    };
+    const description = executorDescription(apply);
+    expect(description).toBe(
+      "pbt-v2;repository=runsetta;run=7654321;root=prod;mode=apply;" +
+        `approved=7654320;manifest=${manifest};adoption=7654319;` +
+        "expires=2026-08-26T23:00:00.000Z",
+    );
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(256);
+    expect(parseExecutorProvenance(description, "runsetta")).toEqual(apply);
+    const maximumDescription = executorDescription({
+      ...apply,
+      approvedPlanRunId: "9".repeat(20),
+      exposureAdoptionRunId: "9".repeat(20),
+      runId: "9".repeat(20),
+    });
+    expect(Buffer.byteLength(maximumDescription, "utf8")).toBe(239);
+
+    const plan = {
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      expiresAt,
+      exposureAdoptionRunId: "",
+      mode: "plan" as const,
+      repository: "cdbentley" as const,
+      root: "bootstrap" as const,
+      runId: "7654321",
+    };
+    expect(executorDescription(plan)).toContain(
+      ";approved=none;manifest=none;adoption=none;expires=",
+    );
+    expect(parseExecutorProvenance(executorDescription(plan), "cdbentley")).toEqual(plan);
+    const runsettaPlan = {
+      ...plan,
+      exposureAdoptionRunId: "7654319",
+      repository: "runsetta" as const,
+      root: "prod" as const,
+    };
+    expect(executorDescription(runsettaPlan)).toContain(
+      ";approved=none;manifest=none;adoption=7654319;expires=",
+    );
+    expect(parseExecutorProvenance(executorDescription(runsettaPlan), "runsetta"))
+      .toEqual(runsettaPlan);
+    expect(() => executorDescription({ ...plan, root: "exposure" })).toThrow(
+      "Only Runsetta plan provenance may name the exposure root",
+    );
+
+    const invalidV2 = [
+      description.replace(`manifest=${manifest}`, "manifest=none"),
+      description.replace("approved=7654320", "approved=none"),
+      executorDescription(plan).replace("approved=none", "approved=7654320"),
+      executorDescription(plan).replace("manifest=none", `manifest=${manifest}`),
+      description.replace("adoption=7654319", "adoption=none"),
+      description.replace(";adoption=7654319", ""),
+      executorDescription(plan).replace("adoption=none", "adoption=7654319"),
+      executorDescription(plan).replace("root=bootstrap", "root=exposure"),
+      description.replace("root=prod", "root=exposure"),
+      description.replace("run=7654321", `run=${"9".repeat(21)}`),
+    ];
+    for (const invalid of invalidV2) {
+      expect(() => parseExecutorProvenance(invalid, invalid.includes("repository=runsetta")
+        ? "runsetta"
+        : "cdbentley")).toThrow();
+    }
+    expect(() => executorDescription({ ...apply, runId: "9".repeat(21) }))
+      .toThrow("decimal length bound");
+  });
+
+  test("executor provenance v1 recovery accepts only legacy and the precise stranded adoption shape", () => {
+    const expiresAt = "2026-08-26T23:00:00.000Z";
+
+    const legacy =
+      "pbt-v1;repository=cdbentley;run=7654321;root=prod;mode=apply;" +
+      `approved=7654320;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(legacy, "cdbentley")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "7654320",
+      exposureAdoptionRunId: "",
+      mode: "apply",
+    });
+
+    const strandedManifestlessAdoption =
+      "pbt-v1;repository=runsetta;run=7654321;root=prod;mode=apply;" +
+      `approved=7654320;adoption=7654319;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(strandedManifestlessAdoption, "runsetta")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "7654320",
+      exposureAdoptionRunId: "7654319",
+      mode: "apply",
+      repository: "runsetta",
+      root: "prod",
+    });
+    const strandedManifestlessPlan =
+      "pbt-v1;repository=runsetta;run=7654321;root=prod;mode=plan;" +
+      `approved=none;adoption=7654319;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(strandedManifestlessPlan, "runsetta")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      exposureAdoptionRunId: "7654319",
+      mode: "plan",
+      repository: "runsetta",
+      root: "prod",
+    });
+
+    for (const invalid of [
+      strandedManifestlessAdoption.replace("repository=runsetta", "repository=cdbentley"),
+      strandedManifestlessAdoption.replace("root=prod", "root=bootstrap"),
+      strandedManifestlessAdoption.replace("mode=apply", "mode=plan"),
+      strandedManifestlessAdoption.replace(";adoption=7654319", ";manifest=none;adoption=7654319"),
+      strandedManifestlessAdoption.replace("run=7654321", `run=${"9".repeat(21)}`),
+      `pbt-v1;repository=cdbentley;run=7654321;root=exposure;mode=plan;` +
+      `approved=none;expires=${expiresAt}`,
+    ]) {
+      expect(() => parseExecutorProvenance(
+        invalid,
+        invalid.includes("repository=runsetta") ? "runsetta" : "cdbentley",
+      )).toThrow();
+    }
+  });
+
+  test("Runsetta prod apply creates and disables an exact v2 executor", async () => {
+    const manifest = "d".repeat(64);
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: manifest,
+      APPROVED_PLAN_RUN_ID: "7654320",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+      EXPOSURE_ADOPTION_RUN_ID: "7654319",
+      GITHUB_RUN_ID_EXACT: "7654321",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    });
+    const expiresAt = new Date("2026-08-26T23:00:00.000Z");
+    const accountId = "gha-pbt-33333333333333333333";
+    const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
+    const uniqueId = "333333333333333333333";
+    const calls: Array<{ method: string; path: string }> = [];
+    let account: Record<string, unknown> | undefined;
+    let attempted = false;
+    let rejected = false;
+    let armedUniqueId: string | undefined;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = decodeURIComponent(url.pathname);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path });
+      if (path.endsWith(`/serviceAccounts/${email}`) && method === "GET") {
+        return new Response("", { status: 404 });
+      }
+      if (path === "/v1/projects/runsetta/serviceAccounts" && method === "POST") {
+        const request = JSON.parse(String(init?.body)) as {
+          accountId: string;
+          serviceAccount: { description: string; displayName: string };
+        };
+        expect(request.accountId).toBe(accountId);
+        expect(request.serviceAccount.description).toContain(
+          `;approved=7654320;manifest=${manifest};adoption=7654319;`,
+        );
+        account = {
+          description: request.serviceAccount.description,
+          disabled: false,
+          displayName: request.serviceAccount.displayName,
+          email,
+          etag: "executor-etag-1",
+          name: `projects/runsetta/serviceAccounts/${email}`,
+          projectId: "runsetta",
+          uniqueId,
+        };
+        return Response.json(account);
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}:disable`) && method === "POST") {
+        account = { ...account!, disabled: true };
+        return Response.json({});
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}`) && method === "GET") {
+        return Response.json(account);
+      }
+      return new Response("", { status: 400 });
+    };
+    const created = await createEphemeralExecutor(
+      "runsetta",
+      accountId,
+      invocation,
+      expiresAt,
+      "google-owner-access-token-value",
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      async () => {
+        attempted = true;
+      },
+      () => {
+        rejected = true;
+      },
+      (identity) => {
+        armedUniqueId = identity.uniqueId;
+      },
+    );
+    expect(attempted).toBeTrue();
+    expect(rejected).toBeFalse();
+    expect(armedUniqueId).toBe(uniqueId);
+    expect(created.disabled).toBeTrue();
+    expect(created.description).toStartWith("pbt-v2;");
+    const disableIndex = calls.findIndex(({ path, method }) =>
+      method === "POST" && path.endsWith(`/${uniqueId}:disable`)
+    );
+    const readbackIndex = calls.findIndex(({ path, method }, index) =>
+      index > disableIndex && method === "GET" && path.endsWith(`/${uniqueId}`)
+    );
+    expect(disableIndex).toBeGreaterThanOrEqual(0);
+    expect(readbackIndex).toBeGreaterThan(disableIndex);
   });
 
   test("normal bridge budget reserves in-process cleanup before the wrapper deadline", async () => {
@@ -2588,6 +3581,71 @@ describe("protected owner Terraform bridge", () => {
     expect(events).toContain("release");
   });
 
+  test("Runsetta production revalidates adoption through elevation and reaches apply", async () => {
+    const exposureProof = runsettaProdExposureProof("123454");
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, {
+      ...identity(),
+      exposureProof,
+      projectId: "runsetta",
+      repository: "runsetta",
+      repositoryId: "711292980",
+      terraformRoot: "prod",
+    });
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: review.sha256,
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+      EXPOSURE_ADOPTION_RUN_ID: "123454",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    });
+    const events: string[] = [];
+    const dependencies = fakeDependencies(events, {
+      planJson: JSON.stringify(raw),
+      proveExposure: async () => {
+        events.push("exposure");
+        return exposureProof;
+      },
+      verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+    });
+    await runProtectedBootstrap(invocation, dependencies);
+    expect(events.filter((event) => event === "exposure")).toHaveLength(4);
+    expect(events.indexOf("elevate")).toBeGreaterThan(events.indexOf("consume"));
+    expect(events.indexOf("terraform:apply")).toBeGreaterThan(events.indexOf("elevate"));
+    expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("terraform:apply"));
+
+    const rejectedEvents: string[] = [];
+    await expect(runProtectedBootstrap(
+      invocation,
+      fakeDependencies(rejectedEvents, {
+        proveExposure: async () => {
+          throw new Error("missing exact Runsetta adoption prerequisite");
+        },
+      }),
+    )).rejects.toThrow("missing exact Runsetta adoption prerequisite");
+    expect(rejectedEvents).not.toContain("elevate");
+    expect(rejectedEvents).not.toContain("terraform:apply");
+
+    const unacquiredManager = new ExecutorLeaseManager(
+      async () => new Response("", { status: 500 }),
+      async () => undefined,
+    );
+    await expect(unacquiredManager.elevate(
+      invocation,
+      {
+        accessToken: "short-lived-executor-access-token-value",
+        executorEmail: "gha-pbt-0123456789abcdefabcd@runsetta.iam.gserviceaccount.com",
+        executorUniqueId: "123456789012345678901",
+        tokenExpiresAtMs: Date.now() + 35 * 60_000,
+      },
+      new Date(Date.now() + 54 * 60_000),
+      Date.now() + 20 * 60_000,
+    )).rejects.toThrow("did not match the acquired single-run identity");
+  });
+
   test("Terraform crash and malformed plan both execute finally cleanup", async () => {
     for (const failure of ["terraform", "malformed"] as const) {
       const events: string[] = [];
@@ -2770,7 +3828,8 @@ describe("protected owner Terraform bridge", () => {
       objects.get("cdbentley/bootstrap/.protected-bootstrap/plans/123456.json") ?? "{}",
     ) as Record<string, unknown>;
     expect(publishedReceipt.mode).toBe("plan");
-    expect(publishedReceipt.schemaVersion).toBe(3);
+    expect(publishedReceipt.schemaVersion).toBe(4);
+    expect(publishedReceipt.exposureProof).toBeNull();
     expect(publishedReceipt.legacyCompatibilityMode).toBeFalse();
     expect(publishedReceipt.markerProof).toEqual(markers());
     expect(publishedReceipt.transitionWorkflowSha).toBe("");
@@ -2804,7 +3863,7 @@ describe("protected owner Terraform bridge", () => {
     await expect(
       consumePlanReceipt(applyInvocation, executorToken, review, executionProof(), now, fetcher),
     )
-      .rejects.toThrow("already consumed");
+      .rejects.toThrow("already published or consumed");
     expect([...objects.keys()].filter((name) => name.includes("/consumed/"))).toHaveLength(1);
     const postProof = executionProof({
       freezeProof: freezeSnapshot(now + 420_000),
@@ -2825,6 +3884,247 @@ describe("protected owner Terraform bridge", () => {
     expect((result.freezeProof as Record<string, unknown>).observedAt).toBe(
       new Date(now + 420_000).toISOString(),
     );
+  });
+
+  test("Runsetta adoption publishes one immutable terminal receipt with no apply capability", async () => {
+    const now = Date.parse("2026-08-26T16:00:00.000Z");
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const adoptedProof = exposureProofFixture("runsetta", "adopted");
+    const rawPlan = exposureAdoptionPlan([
+      exposureDomainChange("runsetta.com", false),
+      exposureDomainChange("www.runsetta.com", false),
+    ]);
+    const review = buildReviewManifest(rawPlan, exposureIdentity("runsetta", "adopted"));
+    const objects = new Map<string, string>();
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      if (url.hostname === "storage.googleapis.com" && url.pathname.startsWith("/upload/")) {
+        expect(url.searchParams.get("ifGenerationMatch")).toBe("0");
+        const name = url.searchParams.get("name");
+        if (name === null) return new Response("", { status: 400 });
+        if (objects.has(name)) return new Response("", { status: 412 });
+        objects.set(name, String(init?.body));
+        return Response.json({ bucket: REPOSITORIES.runsetta.state.exposure.bucket, name });
+      }
+      if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
+        const encoded = url.pathname.split("/o/")[1];
+        const name = encoded === undefined ? "" : decodeURIComponent(encoded);
+        const body = objects.get(name);
+        return body === undefined ? new Response("", { status: 404 }) : new Response(body);
+      }
+      return new Response("", { status: 500 });
+    };
+    await publishPlanReceipt(
+      invocation,
+      "short-lived-executor-access-token-value",
+      review,
+      executionProof({ exposureProof: adoptedProof }),
+      now,
+      fetcher,
+    );
+    const objectName = "runsetta/exposure/.protected-bootstrap/adoptions/123456.json";
+    expect([...objects.keys()]).toEqual([objectName]);
+    const receipt = JSON.parse(objects.get(objectName) ?? "{}") as Record<string, unknown>;
+    expect(receipt.mode).toBe("adoption-complete");
+    expect(receipt.schemaVersion).toBe(1);
+    expect(receipt.confirmation).toBe("ADOPT_RUNSETTA_EXPOSURE_STATE");
+    expect(receipt.runId).toBe("123456");
+    expect(receipt.exposureProof).toEqual(adoptedProof);
+    expect(receipt).not.toHaveProperty("expiresAt");
+    expect(receipt).not.toHaveProperty("planRunId");
+    expect(receipt).not.toHaveProperty("approvedPlanRunId");
+    await expect(publishPlanReceipt(
+      invocation,
+      "short-lived-executor-access-token-value",
+      review,
+      executionProof({ exposureProof: adoptedProof }),
+      now,
+      fetcher,
+    )).rejects.toThrow("already published or consumed");
+  });
+
+  test("Runsetta production requires the exact successful adoption run, state, receipt, and live proof", async () => {
+    const now = Date.parse("2026-08-26T16:00:00.000Z");
+    const executorToken = "short-lived-executor-access-token-value";
+    const ownerToken = "google-owner-access-token-value";
+    const adoptionInvocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const adoptedProof = exposureProofFixture("runsetta", "adopted");
+    const rawPlan = exposureAdoptionPlan([
+      exposureDomainChange("runsetta.com", false),
+      exposureDomainChange("www.runsetta.com", false),
+    ]);
+    const review = buildReviewManifest(rawPlan, exposureIdentity("runsetta", "adopted"));
+    const stateName = "runsetta/exposure/default.tfstate";
+    const receiptName = "runsetta/exposure/.protected-bootstrap/adoptions/123456.json";
+    const objects = new Map<string, {
+      generation: string;
+      metageneration: string;
+      raw: string;
+    }>([[stateName, {
+      generation: "7",
+      metageneration: "1",
+      raw: canonicalRunsettaExposureState("123e4567-e89b-42d3-a456-426614174000"),
+    }]]);
+    const observedAuthorization = {
+      github: new Set<string>(),
+      https: new Set<string | null>(),
+      live: new Set<string>(),
+      storage: new Set<string>(),
+    };
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const authorization = new Headers(init?.headers).get("authorization");
+      if (url.hostname === "api.github.com") {
+        observedAuthorization.github.add(authorization ?? "");
+        if (url.pathname.endsWith("/actions/runs/123456")) {
+          return Response.json({
+            actor: { id: 16823277 },
+            conclusion: "success",
+            event: "workflow_dispatch",
+            head_branch: "main",
+            head_sha: platformSha,
+            id: 123456,
+            repository: { id: 1255856466 },
+            run_attempt: 1,
+            status: "completed",
+            workflow_id: 77,
+          });
+        }
+        if (url.pathname.endsWith("/actions/workflows/77")) {
+          return Response.json({
+            path: ".github/workflows/protected-bootstrap-implementation.yml",
+          });
+        }
+      }
+      const liveResponse = runsettaExposureApiResponse(url);
+      if (liveResponse !== undefined) {
+        if (url.hostname.endsWith("-run.googleapis.com")) {
+          observedAuthorization.live.add(authorization ?? "");
+        } else {
+          observedAuthorization.https.add(authorization);
+        }
+        return liveResponse;
+      }
+      if (url.hostname === "storage.googleapis.com") {
+        observedAuthorization.storage.add(authorization ?? "");
+        if (url.pathname.startsWith("/upload/")) {
+          const name = url.searchParams.get("name");
+          if (name === null) return new Response("", { status: 400 });
+          if (objects.has(name)) return new Response("", { status: 412 });
+          const raw = String(init?.body);
+          objects.set(name, { generation: "8", metageneration: "1", raw });
+          return Response.json({
+            bucket: REPOSITORIES.runsetta.state.exposure.bucket,
+            generation: "8",
+            name,
+            size: String(Buffer.byteLength(raw)),
+          });
+        }
+        const encoded = url.pathname.split("/o/")[1];
+        const name = encoded === undefined ? "" : decodeURIComponent(encoded);
+        const object = objects.get(name);
+        if (object === undefined) return new Response("", { status: 404 });
+        if (url.searchParams.get("alt") === "media") {
+          const generation = url.searchParams.get("ifGenerationMatch");
+          if (generation !== null) expect(generation).toBe(object.generation);
+          return new Response(object.raw);
+        }
+        return Response.json({
+          bucket: REPOSITORIES.runsetta.state.exposure.bucket,
+          generation: object.generation,
+          metageneration: object.metageneration,
+          name,
+          size: String(Buffer.byteLength(object.raw)),
+        });
+      }
+      return new Response("", { status: 500 });
+    };
+    await publishPlanReceipt(
+      adoptionInvocation,
+      executorToken,
+      review,
+      executionProof({ exposureProof: adoptedProof }),
+      now,
+      fetcher,
+    );
+    expect(objects.has(receiptName)).toBeTrue();
+    const prodInvocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_RUN_ID: "123456",
+      GITHUB_RUN_ID_EXACT: "123457",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    });
+    const proof = await proveExposure(
+      prodInvocation,
+      executorToken,
+      fetcher,
+      ownerToken,
+      undefined,
+      preparation(),
+    );
+    expect(proof?.adoptionReceipt).toMatchObject({
+      generation: "8",
+      metageneration: "1",
+      runId: "123456",
+      size: String(Buffer.byteLength(objects.get(receiptName)!.raw)),
+    });
+    expect(observedAuthorization.github).toEqual(new Set([
+      "Bearer platform-actions-read-token-value",
+    ]));
+    expect(observedAuthorization.storage).toEqual(new Set([`Bearer ${executorToken}`]));
+    expect(observedAuthorization.live).toEqual(new Set([`Bearer ${ownerToken}`]));
+    expect(observedAuthorization.https).toEqual(new Set([null]));
+
+    await expect(proveExposure(
+      prodInvocation,
+      executorToken,
+      async (input, init) => {
+        const url = new URL(String(input));
+        if (url.hostname === "api.github.com" && url.pathname.endsWith("/actions/runs/123456")) {
+          const response = await fetcher(input, init);
+          const value = await response.json() as Record<string, unknown>;
+          return Response.json({ ...value, conclusion: "failure" });
+        }
+        return fetcher(input, init);
+      },
+      ownerToken,
+      undefined,
+      preparation(),
+    )).rejects.toThrow("adoption conclusion");
+
+    await expect(proveExposure(
+      prodInvocation,
+      executorToken,
+      async (input, init) => {
+        const url = new URL(String(input));
+        if (
+          url.hostname === "us-east4-run.googleapis.com" &&
+          url.pathname.endsWith("/domainmappings/runsetta.com")
+        ) {
+          const response = await fetcher(input, init);
+          const value = await response.json() as Record<string, unknown>;
+          return Response.json({
+            ...value,
+            spec: { ...(value.spec as object), routeName: "foreign-service" },
+          });
+        }
+        return fetcher(input, init);
+      },
+      ownerToken,
+      undefined,
+      preparation(),
+    )).rejects.toThrow("exposure mapping route");
   });
 
   test("consumer freeze status-filters every active state and paginates beyond 100", async () => {
@@ -2869,7 +4169,7 @@ describe("protected owner Terraform bridge", () => {
     expect(requestedPages).toEqual([1, 2]);
   });
 
-  test("state validation uses the exact gRPC/create probes and never reads or writes object bytes", async () => {
+  test("state validation uses exact gRPC/overwrite probes and never reads or writes object bytes", async () => {
     const invocation = validateInvocation(validEnvironment());
     const requests: Array<{ method: string; url: string }> = [];
     const objectRequests: Array<{
@@ -2885,7 +4185,7 @@ describe("protected owner Terraform bridge", () => {
       return Response.json({ permissions: granted ? new URL(url).searchParams.getAll("permissions") : [] });
     };
     const probes: StateStoragePermissionProbes = {
-      testObjectCreate: async ({ objectName }) => {
+      testObjectOverwrite: async ({ objectName }) => {
         const allowed = granted && objectName.includes("/.protected-bootstrap/plans/");
         objectRequests.push({ create: allowed, permissions: [], resource: objectName });
         return allowed;
@@ -2939,6 +4239,45 @@ describe("protected owner Terraform bridge", () => {
     expect(planCreateGrant?.create).toBeTrue();
   });
 
+  test("read projection cannot pass while effective exposure-state overwrite remains", async () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    let nowMs = 1_000;
+    await expect(waitForStatePermissions(
+      REPOSITORIES.runsetta.state.exposure,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input) => {
+        nowMs += 100;
+        return Response.json({
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async ({ objectName }) =>
+          objectName === "runsetta/exposure/default.tfstate" ||
+          objectName.includes("/.protected-bootstrap/adoptions/"),
+        testObjectPermissions: async ({ permissions, resource }) => ({
+          denied: false,
+          permissions: resource.endsWith("default.tfstate") ||
+              resource.includes("/.protected-bootstrap/adoptions/")
+            ? permissions.filter((permission) => permission === "storage.objects.get")
+            : [],
+        }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow("state lease did not propagate before the deadline");
+  });
+
   test("state grant and revocation proofs converge beyond seven realistic-latency scans within the shared deadline", async () => {
     const invocation = validateInvocation(validEnvironment());
     const state = {
@@ -2958,7 +4297,7 @@ describe("protected owner Terraform bridge", () => {
         return Response.json({ permissions: active ? requested : [] });
       };
       const probes: StateStoragePermissionProbes = {
-        testObjectCreate: async ({ objectName }) =>
+        testObjectOverwrite: async ({ objectName }) =>
           active && objectName.includes("/.protected-bootstrap/plans/"),
         testObjectPermissions: async ({ permissions, resource }) => ({
           denied: false,
@@ -3014,7 +4353,7 @@ describe("protected owner Terraform bridge", () => {
         nowMs += milliseconds;
       },
       {
-        testObjectCreate: async () => false,
+        testObjectOverwrite: async () => false,
         testObjectPermissions: async () => ({ denied: false, permissions: [] }),
       },
       deadlineMs,
@@ -3050,7 +4389,7 @@ describe("protected owner Terraform bridge", () => {
       },
       async () => undefined,
       {
-        testObjectCreate: async () => {
+        testObjectOverwrite: async () => {
           objectCreateCalls += 1;
           return true;
         },
@@ -3083,7 +4422,7 @@ describe("protected owner Terraform bridge", () => {
     };
     const deniedBucketFetcher = async (): Promise<Response> => new Response("", { status: 403 });
     const denied: StateStoragePermissionProbes = {
-      testObjectCreate: async () => false,
+      testObjectOverwrite: async () => false,
       testObjectPermissions: async () => ({ denied: true, permissions: [] }),
     };
     await waitForStatePermissions(
@@ -3303,7 +4642,7 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
-  test("exact create proof only initiates and cancels a validated resumable session", async () => {
+  test("exact overwrite proof only initiates and cancels a validated resumable session", async () => {
     const objectName = "cdbentley/bootstrap/.protected-bootstrap/plans/32894958492.json";
     const session = new URL(
       "https://storage.googleapis.com/upload/storage/v1/b/example-bucket/o",
@@ -3329,7 +4668,7 @@ describe("protected owner Terraform bridge", () => {
       }
       return new Response("", { status: 499 });
     };
-    expect(await probeStorageObjectCreatePermission(
+    expect(await probeStorageObjectOverwritePermission(
       {
         bucket: "example-bucket",
         executorToken: "short-lived-executor-access-token-value",
@@ -3356,7 +4695,7 @@ describe("protected owner Terraform bridge", () => {
     expect(requests[1]!.headers.get("authorization")).toBeNull();
   });
 
-  test("create proof never treats a precondition result as authorization evidence", async () => {
+  test("overwrite proof accepts only denial as absence and rejects precondition ambiguity", async () => {
     const request = {
       bucket: "example-bucket",
       executorToken: "short-lived-executor-access-token-value",
@@ -3364,7 +4703,7 @@ describe("protected owner Terraform bridge", () => {
     } as const;
     for (const status of [401, 403]) {
       const response = new Response("bounded diagnostic", { status });
-      expect(await probeStorageObjectCreatePermission(
+      expect(await probeStorageObjectOverwritePermission(
         request,
         async () => response,
       )).toBeFalse();
@@ -3372,7 +4711,7 @@ describe("protected owner Terraform bridge", () => {
     }
     const precondition = new Response("bounded diagnostic", { status: 412 });
     let preconditionCalls = 0;
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async () => {
         preconditionCalls += 1;
@@ -3382,7 +4721,7 @@ describe("protected owner Terraform bridge", () => {
     expect(precondition.bodyUsed).toBeTrue();
     expect(preconditionCalls).toBe(1);
     const missing = new Response("bounded diagnostic", { status: 404 });
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async () => missing,
     )).rejects.toThrow("HTTP 404");
@@ -3390,22 +4729,22 @@ describe("protected owner Terraform bridge", () => {
     const session =
       "https://storage.googleapis.com/upload/storage/v1/b/example-bucket/o" +
       "?uploadType=resumable&name=exact%2Fobject&upload_id=" + "B".repeat(32);
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async (_input, init) => init?.method === "POST"
         ? new Response("", { headers: { location: session }, status: 200 })
         : new Response("", { status: 500 }),
     )).rejects.toThrow("cancellation failed with HTTP 500");
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async () => { throw new Error(`secret ${session}`); },
     )).rejects.toThrow("transport failed");
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async () => { throw new Error(`secret ${session}`); },
     )).rejects.not.toThrow(session);
     let unexpectedInitiationCalls = 0;
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async (_input, init) => {
         unexpectedInitiationCalls += 1;
@@ -3418,19 +4757,19 @@ describe("protected owner Terraform bridge", () => {
     const documentedCancellation = new Response("bounded-undocumented-payload", {
       status: 499,
     });
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async (_input, init) => init?.method === "POST"
         ? new Response("", { headers: { location: session }, status: 200 })
         : documentedCancellation,
     )).resolves.toBeTrue();
     expect(documentedCancellation.bodyUsed).toBeTrue();
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async () => new Response("x".repeat(16 * 1024 + 1), { status: 403 }),
     )).rejects.toThrow("exceeded its bound");
     let oversizedInitiationCalls = 0;
-    await expect(probeStorageObjectCreatePermission(
+    await expect(probeStorageObjectOverwritePermission(
       request,
       async (_input, init) => {
         oversizedInitiationCalls += 1;
@@ -3445,7 +4784,7 @@ describe("protected owner Terraform bridge", () => {
     expect(oversizedInitiationCalls).toBe(2);
   });
 
-  test("create proof rejects every session URI that is not exactly target-bound", async () => {
+  test("overwrite proof rejects every session URI that is not exactly target-bound", async () => {
     const request = {
       bucket: "example-bucket",
       executorToken: "short-lived-executor-access-token-value",
@@ -3461,16 +4800,15 @@ describe("protected owner Terraform bridge", () => {
       `${valid.href}&unexpected=value`,
       valid.href.replace("name=exact%2Fobject&", ""),
       `${valid.href}&ifGenerationMatch=0`,
-      `${valid.href}&ifGenerationMatch=1`,
     ];
     for (const invalidSession of invalidSessions) {
       let calls = 0;
-      const result = probeStorageObjectCreatePermission(request, async () => {
+      const result = probeStorageObjectOverwritePermission(request, async () => {
         calls += 1;
         return new Response("", { headers: { location: invalidSession }, status: 200 });
       });
       await expect(result).rejects.toThrow("invalid session URI");
-      await expect(probeStorageObjectCreatePermission(request, async () => {
+      await expect(probeStorageObjectOverwritePermission(request, async () => {
         throw new Error(`secret ${invalidSession}`);
       })).rejects.not.toThrow(invalidSession);
       expect(calls).toBe(1);
@@ -3508,9 +4846,14 @@ describe("protected owner Terraform bridge", () => {
       "short-lived-executor-access-token-value",
       "mutation",
       async (input, init) => {
-        urls.push(String(input));
+        const url = String(input);
+        urls.push(url);
         const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions;
-        return Response.json({ permissions });
+        return Response.json({
+          permissions: url.includes("iam.googleapis.com")
+            ? permissions.filter((permission) => permission === "iam.serviceAccounts.actAs")
+            : permissions,
+        });
       },
       async () => undefined,
     );
@@ -3520,6 +4863,72 @@ describe("protected owner Terraform bridge", () => {
       "https://iam.googleapis.com/v1/projects/cdbentley/serviceAccounts/cloud-run-bootstrap%40cdbentley.iam.gserviceaccount.com:testIamPermissions",
       "https://iam.googleapis.com/v1/projects/cdbentley/serviceAccounts/cloud-run-preview%40cdbentley.iam.gserviceaccount.com:testIamPermissions",
       "https://iam.googleapis.com/v1/projects/cdbentley/serviceAccounts/cloud-run-runtime%40cdbentley.iam.gserviceaccount.com:testIamPermissions",
+    ]);
+
+    const runsettaProd = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_RUN_ID: "123455",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    });
+    const runControlProof = (mappingStatus: number) => {
+      let nowMs = 1_000;
+      return waitForControlPermissions(
+        runsettaProd,
+        "short-lived-executor-access-token-value",
+        "read",
+        async (input, init) => {
+          const url = String(input);
+          if (url.includes("-run.googleapis.com/apis/domains.cloudrun.com/")) {
+            return new Response("", { status: mappingStatus });
+          }
+          const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] })
+            .permissions;
+          const readPermissions = new Set(executorControlPermissions("runsetta", "prod", "read"));
+          return Response.json({
+            permissions: url.includes("iam.googleapis.com")
+              ? []
+              : permissions.filter((permission) => readPermissions.has(permission)),
+          });
+        },
+        async (milliseconds) => {
+          nowMs += milliseconds;
+        },
+        61_000,
+        () => nowMs,
+      );
+    };
+    await runControlProof(403);
+    await expect(runControlProof(200)).rejects.toThrow(
+      "unexpectedly reached the Domain Mapping API",
+    );
+
+    const exposure = validateInvocation({
+      ...validEnvironment(),
+      EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "exposure",
+    });
+    const exposureProjectGrants: string[] = [];
+    await waitForControlPermissions(
+      exposure,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input, init) => {
+        const url = String(input);
+        if (url.includes("-run.googleapis.com/apis/domains.cloudrun.com/")) {
+          return new Response("", { status: 403 });
+        }
+        const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] })
+          .permissions;
+        if (url.includes("cloudresourcemanager")) exposureProjectGrants.push(...permissions);
+        return Response.json({ permissions: [] });
+      },
+      async () => undefined,
+    );
+    expect(exposureProjectGrants.toSorted()).toEqual([
+      "run.domainmappings.create",
+      "run.domainmappings.delete",
     ]);
   });
 
@@ -3542,7 +4951,13 @@ describe("protected owner Terraform bridge", () => {
           }
           const permissions = (JSON.parse(String(init?.body)) as { permissions: string[] })
             .permissions;
-          return Response.json({ permissions: active ? permissions : [] });
+          return Response.json({
+            permissions: active
+              ? String(input).includes("iam.googleapis.com")
+                ? permissions.filter((permission) => permission === "iam.serviceAccounts.actAs")
+                : permissions
+              : [],
+          });
         },
         async (milliseconds) => {
           nowMs += milliseconds;
@@ -4201,6 +5616,116 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.accountDeleted()).toBeTrue();
   });
 
+  test("fresh recovery deletes a disabled v1 Runsetta adoption executor", async () => {
+    const runId = "7654321";
+    const uniqueId = "333333333333333333333";
+    const accountId = randomExecutorAccountId(
+      deterministicArtifactHex("runsetta", runId, "service-account"),
+    );
+    const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
+    const account = {
+      description:
+        `pbt-v1;repository=runsetta;run=${runId};root=prod;mode=apply;` +
+        "approved=7654320;adoption=7654319;expires=2026-08-26T23:00:00.000Z",
+      disabled: false,
+      displayName: "Protected Terraform Executor",
+      email,
+      etag: "executor-etag-1",
+      name: `projects/runsetta/serviceAccounts/${email}`,
+      projectId: "runsetta",
+      uniqueId,
+    };
+    const calls: Array<{ method: string; path: string }> = [];
+    const policies = new Map<string, IamPolicy>();
+    let policyGeneration = 1;
+    let exists = true;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = decodeURIComponent(url.pathname);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path });
+      if (path === "/v1/projects/runsetta/serviceAccounts" && method === "GET") {
+        return Response.json({ accounts: exists ? [account] : [] });
+      }
+      if (path === "/v1/projects/runsetta/roles" && method === "GET") {
+        return Response.json({ roles: [] });
+      }
+      if (
+        (path.endsWith(`/serviceAccounts/${uniqueId}:disable`) ||
+          path.endsWith(`/serviceAccounts/${email}:disable`)) &&
+        method === "POST"
+      ) {
+        account.disabled = true;
+        return Response.json({});
+      }
+      if (/^\/v1\/projects\/runsetta\/roles\/pbt_[rm]_[0-9a-f]{20}$/.test(path) &&
+        method === "GET") {
+        return new Response("", { status: 404 });
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}/keys`) && method === "GET") {
+        return Response.json({ keys: [] });
+      }
+      const policyMatch = /^(.*):(get|set)IamPolicy$/.exec(path);
+      if (policyMatch !== null && method === "POST") {
+        const key = `${url.hostname}${policyMatch[1]}`;
+        const current = policies.get(key) ?? {
+          bindings: [],
+          etag: `policy-etag-${policyGeneration}`,
+          version: 1,
+        };
+        policies.set(key, current);
+        if (policyMatch[2] === "get") return Response.json(current);
+        const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
+        if (requested.etag !== current.etag) return new Response("", { status: 412 });
+        policyGeneration += 1;
+        const updated = { ...requested, etag: `policy-etag-${policyGeneration}` };
+        policies.set(key, updated);
+        return Response.json(updated);
+      }
+      if (
+        path.endsWith(`/serviceAccounts/${uniqueId}`) ||
+        path.endsWith(`/serviceAccounts/${email}`)
+      ) {
+        if (!exists) return new Response("", { status: 404 });
+        if (method === "DELETE") {
+          exists = false;
+          return new Response("{}");
+        }
+        if (method === "GET") return Response.json(account);
+      }
+      return new Response("", { status: 400 });
+    };
+    const recoveryInvocation = validateRecoveryInvocation({
+      ...validRecoveryEnvironment(),
+      GITHUB_RUN_ID_EXACT: runId,
+      TARGET_REPOSITORY: "runsetta",
+    });
+    await inventoryBridgeArtifacts(
+      "runsetta",
+      "google-owner-access-token-value",
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      recoveryInvocation,
+    );
+    expect(account.disabled).toBeTrue();
+    expect(exists).toBeFalse();
+    const disableIndex = calls.findIndex(({ method, path }) =>
+      method === "POST" && path.endsWith(":disable")
+    );
+    const policyIndex = calls.findIndex(({ method, path }) =>
+      method === "POST" && path.endsWith(":getIamPolicy")
+    );
+    const deleteIndex = calls.findIndex(({ method, path }) =>
+      method === "DELETE" && path.endsWith(`/${uniqueId}`)
+    );
+    expect(disableIndex).toBeGreaterThanOrEqual(0);
+    expect(policyIndex).toBeGreaterThan(disableIndex);
+    expect(deleteIndex).toBeGreaterThan(policyIndex);
+    expect(calls.some(({ path }) => path.endsWith(":setIamPolicy"))).toBeTrue();
+    expect([...policies.values()].every((policy) => policy.bindings.length === 0)).toBeTrue();
+  });
+
   test("orphan custom-role deletion fails fast on HTTP 403 without retry backoff", async () => {
     const fixture = abruptLossFixture({ roleDeleteForbidden: true });
     let failure: unknown;
@@ -4392,7 +5917,7 @@ describe("protected owner Terraform bridge", () => {
     const randomEmail = `${accountId}@cdbentley.iam.gserviceaccount.com`;
     const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
     const account = {
-      description: `pbt-v1;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;expires=${leaseExpiresAt.toISOString()}`,
+      description: `pbt-v2;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;manifest=none;adoption=none;expires=${leaseExpiresAt.toISOString()}`,
       disabled: true,
       displayName: "Protected Terraform Executor",
       email: randomEmail,
@@ -4527,6 +6052,7 @@ function fakeDependencies(
       events.push("prepare");
       return preparation();
     }),
+    proveExposure: overrides.proveExposure ?? (async () => null),
     proveFreeze: overrides.proveFreeze ?? (async (_invocation, tokenDrainSeconds) => {
       events.push("freeze");
       return freezeSnapshot(now(), tokenDrainSeconds);
@@ -4584,6 +6110,8 @@ function validEnvironment(): NodeJS.ProcessEnv {
     CONSUMER_ROOT: "/tmp/consumer",
     CONSUMER_SHA: consumerSha,
     EXECUTION_MODE: "plan",
+    EXPOSURE_ADOPTION_CONFIRMATION: "",
+    EXPOSURE_ADOPTION_RUN_ID: "",
     GITHUB_ACTOR_ID_EXACT: "16823277",
     GITHUB_EVENT_NAME_EXACT: "workflow_dispatch",
     GITHUB_REF_EXACT: "refs/heads/main",
@@ -5042,6 +6570,7 @@ function identity(): PlanIdentity {
     consumerSha,
     consumerTreeSha,
     dhiParityId: "a".repeat(50),
+    exposureProof: null,
     legacyCompatibilityMode: false,
     maxMutatorTokenLifetimeSeconds: 300,
     markerProof: markers(),
@@ -5068,6 +6597,7 @@ function preparation(overrides: Partial<PreparationResult> = {}): PreparationRes
 function executionProof(overrides: Partial<ExecutionProof> = {}): ExecutionProof {
   return {
     ...preparation(),
+    exposureProof: null,
     freezeProof: freezeSnapshot(1_800_000_000_000),
     markerProof: markers(),
     ...overrides,
@@ -5167,6 +6697,308 @@ function plan(resourceChanges: unknown[]): Record<string, unknown> {
   };
 }
 
+function exposureAdoptionPlan(resourceChanges: unknown[]): Record<string, unknown> {
+  const result = plan(resourceChanges);
+  const state = JSON.parse(
+    canonicalRunsettaExposureState("123e4567-e89b-42d3-a456-426614174000"),
+  ) as { outputs: { cloud_run_domain_mappings: { value: unknown } } };
+  const mappingOutput = state.outputs.cloud_run_domain_mappings.value;
+  const noOpOutput = (value: unknown) => ({
+    actions: ["no-op"],
+    after: structuredClone(value),
+    after_sensitive: false,
+    after_unknown: false,
+    before: structuredClone(value),
+    before_sensitive: false,
+  });
+  result.applyable = false;
+  result.output_changes = {
+    cloud_run_domain_mappings: noOpOutput(mappingOutput),
+    preview_domain_dns_records: noOpOutput(null),
+    preview_url_pattern: noOpOutput(null),
+  };
+  result.relevant_attributes = [{
+    attribute: [],
+    resource: "module.domains.google_cloud_run_domain_mapping.site",
+  }];
+  return result;
+}
+
+function exposureProofFixture(
+  repository: "runsetta",
+  stateMode: "adopted" | "unadopted",
+): ExposureProof {
+  const contract = REPOSITORIES[repository];
+  const domains = ["runsetta.com", "www.runsetta.com"] as const;
+  const records = {
+    "runsetta.com": [
+      { name: "", rrdata: "216.239.32.21", type: "A" },
+      { name: "", rrdata: "216.239.34.21", type: "A" },
+      { name: "", rrdata: "216.239.36.21", type: "A" },
+      { name: "", rrdata: "216.239.38.21", type: "A" },
+      { name: "", rrdata: "2001:4860:4802:32::15", type: "AAAA" },
+      { name: "", rrdata: "2001:4860:4802:34::15", type: "AAAA" },
+      { name: "", rrdata: "2001:4860:4802:36::15", type: "AAAA" },
+      { name: "", rrdata: "2001:4860:4802:38::15", type: "AAAA" },
+    ],
+    "www.runsetta.com": [
+      { name: "www", rrdata: "ghs.googlehosted.com.", type: "CNAME" },
+    ],
+  } as const;
+  const lineage = "123e4567-e89b-42d3-a456-426614174000";
+  const rawState = canonicalRunsettaExposureState(lineage);
+  const stateMappings = stateMode === "adopted"
+    ? domains.map((domain) => ({
+        address: `module.domains.google_cloud_run_domain_mapping.site[${JSON.stringify(domain)}]`,
+        domain,
+        id: `locations/us-east4/namespaces/${contract.projectId}/domainmappings/${domain}`,
+      }))
+    : [];
+  const mappings = domains.map((domain) => ({
+    domain,
+    generation: "1",
+    id: `locations/us-east4/namespaces/${contract.projectId}/domainmappings/${domain}`,
+    observedGeneration: "1",
+    recordsSha256: createHash("sha256").update(canonicalJson(
+      [...records[domain]].toSorted((left, right) =>
+        canonicalJson(left).localeCompare(canonicalJson(right))
+      ),
+    )).digest("hex"),
+    uid: domain === "runsetta.com"
+      ? "054a1acd-cfa0-4a47-b6f2-238753c0c2bc"
+      : "3a72ca14-d15b-40f9-9920-a9b7083eb771",
+  }));
+  const healthBody = JSON.stringify({
+    environment: "production",
+    ok: true,
+    openaiConfigured: false,
+    service: "runsetta",
+    spotifyConfigured: false,
+  });
+  const https = domains.map((domain) => ({
+    bodySha256: createHash("sha256").update(healthBody).digest("hex"),
+    domain,
+    status: 200 as const,
+    url: `https://${domain}/livez`,
+  }));
+  const mappingListSha256 = createHash("sha256").update(canonicalJson(
+    mappings.map(({ domain, generation, uid }) => ({ domain, generation, uid })),
+  )).digest("hex");
+  const liveContinuitySha256 = createHash("sha256").update(canonicalJson({
+    https,
+    mappingListCount: mappings.length,
+    mappingListSha256,
+    mappings,
+  })).digest("hex");
+  const absentState: ExposureProof["state"] = {
+    bucket: contract.state.exposure.bucket,
+    generation: null,
+    lineage: null,
+    mappings: [],
+    metageneration: null,
+    object: `${contract.state.exposure.prefix}/default.tfstate`,
+    serial: null,
+    sha256: null,
+    size: null,
+    state: "absent",
+  };
+  const adoptedState: ExposureProof["state"] = {
+    bucket: contract.state.exposure.bucket,
+    generation: "7",
+    lineage,
+    mappings: stateMappings,
+    metageneration: "1",
+    object: `${contract.state.exposure.prefix}/default.tfstate`,
+    serial: 1,
+    sha256: createHash("sha256").update(rawState).digest("hex"),
+    size: String(Buffer.byteLength(rawState)),
+    state: "present",
+  };
+  return {
+    adoptionReceipt: null,
+    https,
+    mappingListCount: mappings.length,
+    mappingListSha256,
+    mappings,
+    seedContract: stateMode === "unadopted"
+      ? null
+      : {
+          adoptionAudit: {
+            controllerCreateLeaseDisposition: "removed",
+            initialState: absentState,
+            liveContinuityEqual: true,
+            outcome: "created",
+            postLiveSha256: liveContinuitySha256,
+            preLiveSha256: liveContinuitySha256,
+            stateTransitionSha256: createHash("sha256").update(canonicalJson({
+              finalState: adoptedState,
+              initialState: absentState,
+            })).digest("hex"),
+          },
+          byteLength: String(Buffer.byteLength(rawState)),
+          confirmation: "ADOPT_RUNSETTA_EXPOSURE_STATE",
+          liveContinuitySha256,
+          mode: "controller-create-only-refreshless-v1",
+          provider: "registry.terraform.io/hashicorp/google@7.45.0",
+          resourceSchemaVersion: 1,
+          sha256: createHash("sha256").update(rawState).digest("hex"),
+          stateFormatVersion: 4,
+          terraformVersion: "1.14.5",
+        },
+    state: stateMode === "unadopted" ? absentState : adoptedState,
+  };
+}
+
+function runsettaProdExposureProof(adoptionRunId: string): ExposureProof {
+  const proof = exposureProofFixture("runsetta", "adopted");
+  return {
+    ...proof,
+    adoptionReceipt: {
+      adoptedAt: "2026-08-26T16:00:00.000Z",
+      generation: "8",
+      manifestSha256: "d".repeat(64),
+      metageneration: "1",
+      runId: adoptionRunId,
+      sha256: "e".repeat(64),
+      size: "16000",
+    },
+  };
+}
+
+function exposureIdentity(
+  repository: "runsetta",
+  stateMode: "adopted" | "unadopted",
+): PlanIdentity {
+  const contract = REPOSITORIES[repository];
+  return {
+    ...identity(),
+    exposureProof: exposureProofFixture(repository, stateMode),
+    projectId: contract.projectId,
+    repository,
+    repositoryId: contract.repositoryId,
+    terraformRoot: "exposure",
+  };
+}
+
+function exposureDomainChange(
+  domain: "runsetta.com" | "www.runsetta.com",
+  importing: boolean,
+): {
+  address: string;
+  change: Record<string, unknown>;
+  index: string;
+  mode: string;
+  module_address: string;
+  name: string;
+  provider_name: string;
+  type: string;
+} {
+  const id = `locations/us-east4/namespaces/runsetta/domainmappings/${domain}`;
+  const after = {
+    deletion_policy: "DELETE",
+    id,
+    location: "us-east4",
+    metadata: [{ namespace: "runsetta" }],
+    name: domain,
+    project: "runsetta",
+    spec: [{ certificate_mode: "AUTOMATIC", route_name: "runsetta" }],
+  };
+  return {
+    address: `module.domains.google_cloud_run_domain_mapping.site[${JSON.stringify(domain)}]`,
+    change: {
+      actions: ["no-op"],
+      after,
+      after_sensitive: {},
+      after_unknown: {},
+      before: after,
+      before_sensitive: {},
+      ...(importing ? { importing: { id } } : {}),
+      replace_paths: [],
+    },
+    index: domain,
+    mode: "managed",
+    module_address: "module.domains",
+    name: "site",
+    provider_name: "registry.terraform.io/hashicorp/google",
+    type: "google_cloud_run_domain_mapping",
+  };
+}
+
+function runsettaExposureApiResponse(url: URL): Response | undefined {
+  if (url.hostname === "us-east4-run.googleapis.com") {
+    const suffix = url.pathname.split("/domainmappings")[1] ?? "";
+    if (suffix === "") {
+      return Response.json({
+        apiVersion: "domains.cloudrun.com/v1",
+        items: ["runsetta.com", "www.runsetta.com"].map((domain, index) => ({
+          metadata: {
+            generation: 1,
+            name: domain,
+            namespace: "601124730704",
+            uid: index === 0
+              ? "054a1acd-cfa0-4a47-b6f2-238753c0c2bc"
+              : "3a72ca14-d15b-40f9-9920-a9b7083eb771",
+          },
+        })),
+        kind: "DomainMappingList",
+        metadata: {
+          selfLink: "/apis/domains.cloudrun.com/v1/namespaces/601124730704/domainmappings",
+        },
+      });
+    }
+    const domain = decodeURIComponent(suffix.slice(1));
+    const www = domain === "www.runsetta.com";
+    return Response.json({
+      apiVersion: "domains.cloudrun.com/v1",
+      kind: "DomainMapping",
+      metadata: {
+        generation: 1,
+        name: domain,
+        namespace: "601124730704",
+        selfLink:
+          `/apis/domains.cloudrun.com/v1/namespaces/601124730704/domainmappings/${domain}`,
+        uid: www
+          ? "3a72ca14-d15b-40f9-9920-a9b7083eb771"
+          : "054a1acd-cfa0-4a47-b6f2-238753c0c2bc",
+      },
+      spec: { certificateMode: "AUTOMATIC", routeName: "runsetta" },
+      status: {
+        conditions: ["Ready", "CertificateProvisioned", "DomainRoutable"].map((type) => ({
+          status: "True",
+          type,
+        })),
+        mappedRouteName: "runsetta",
+        observedGeneration: 1,
+        resourceRecords: www
+          ? [{ name: "www", rrdata: "ghs.googlehosted.com.", type: "CNAME" }]
+          : [
+              { rrdata: "216.239.32.21", type: "A" },
+              { rrdata: "216.239.34.21", type: "A" },
+              { rrdata: "216.239.36.21", type: "A" },
+              { rrdata: "216.239.38.21", type: "A" },
+              { rrdata: "2001:4860:4802:32::15", type: "AAAA" },
+              { rrdata: "2001:4860:4802:34::15", type: "AAAA" },
+              { rrdata: "2001:4860:4802:36::15", type: "AAAA" },
+              { rrdata: "2001:4860:4802:38::15", type: "AAAA" },
+            ],
+      },
+    });
+  }
+  if (url.hostname === "runsetta.com" || url.hostname === "www.runsetta.com") {
+    return new Response(
+      JSON.stringify({
+        environment: "production",
+        ok: true,
+        openaiConfigured: false,
+        service: "runsetta",
+        spotifyConfigured: false,
+      }),
+      { headers: { "content-type": "application/json; charset=utf-8" }, status: 200 },
+    );
+  }
+  return undefined;
+}
+
 function resourceChange(
   address: string,
   type: string,
@@ -5252,7 +7084,7 @@ function executorLifecycleFixture(
   const accountId = "gha-pbt-0123456789abcdefabcd";
   const email = `${accountId}@cdbentley.iam.gserviceaccount.com`;
   const account = {
-    description: `pbt-v1;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;expires=${leaseExpiresAt.toISOString()}`,
+    description: `pbt-v2;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;manifest=none;adoption=none;expires=${leaseExpiresAt.toISOString()}`,
     disabled: false,
     displayName: "Protected Terraform Executor",
     email,
@@ -5808,7 +7640,7 @@ function abruptLossFixture(options: {
       roles[1]!.name,
       "mutation",
     ),
-    buildStorageLease("cdbentley", "prod", runId, expiresAt, email, "plan", ""),
+    buildStorageReadLease("cdbentley", "prod", runId, expiresAt, email),
     ...buildReceiptLeases(
       "cdbentley",
       "prod",

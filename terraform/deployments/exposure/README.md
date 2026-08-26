@@ -1,23 +1,37 @@
-# Trusted public-exposure deployment root
+# Trusted public-exposure state
 
-Only the owner-controlled protected pipeline may execute this directory, from an
-exact reviewed `platform` commit. It owns the legacy Cloud Run domain-mapping API
-resources because Google Cloud does not expose a no-data IAM viewer permission for
-them. For Critical History it also owns the stable wildcard preview load balancer,
-serverless NEG, certificate, and DNS-authorization outputs. Routine GitHub
-Terraform must have no access to this root's state.
+Only the owner-controlled protected pipeline may inspect this directory from an
+exact reviewed `platform` commit. Routine GitHub Terraform has no access to its
+state. Google Cloud exposes no no-data IAM viewer permission for the legacy
+Domain Mapping API, so v0.5.11 implements one narrow exception: a confirmed,
+Runsetta-only, controller-side state adoption. It has no Terraform exposure
+apply route.
 
-The protected pipeline supplies the immutable numeric repository ID and configures
-the separately protected bootstrap-state bucket with a fixed `<app>/exposure`
-prefix. Existing mappings must be imported into this root and verified before the
-production root's no-destroy `removed` block is applied. See
-`docs/security-rollout.md` for the migration order. The Critical History preview
-records must be copied exactly from `preview_domain_dns_records` into the
-authoritative DNS zone as DNS-only records; no pull-request workflow mutates this
-root or DNS. After the preview frontend exists, never apply an older platform
-exposure root that omits it. Every protected plan must show zero destroys;
-resource-level `prevent_destroy` and provider-level `deletion_policy = "PREVENT"`
-are defense in depth, not substitutes for reviewing the saved plan. Keep the
+The controller proves the exact live `runsetta.com` and `www.runsetta.com`
+mappings and HTTPS routes with the owner token, create-only writes a canonical
+full serial-1 state with `ifGenerationMatch=0` when the fixed exposure object is
+absent, immediately removes that exact owner Object Creator lease, and runs
+Terraform only as `plan -refresh=false`. The plan must be non-applyable and show
+exactly two no-op mapping resources, one exact relevant-attribute entry, three
+exact no-op outputs, and no imports, drift, replacements, unknowns, or sensitive
+data. Success writes one terminal `adoption-complete` receipt; no plan receipt,
+consume marker, apply, or result exists. The exact idempotency, crash-recovery,
+production-prerequisite, and rollout-order contracts are in
+`docs/security-rollout.md`.
+
+Critical History's stable wildcard preview load balancer, serverless NEG,
+certificate, DNS authorization, and outputs remain represented here but cannot
+be changed by the v0.5.11 Runsetta route. Existing cdbentley, Health/Medlock, and
+Critical History exposure states must remain unchanged. Any exposure create,
+update, delete, import, provider-state migration, or recovery requires a new
+separately reviewed workflow expansion. Resource-level `prevent_destroy`, the
+bridge's rejection of every non-no-op adoption plan, and the executor's lack of
+Domain Mapping create/delete authority are the current defenses. The Runsetta
+state deliberately retains provider `deletion_policy = "DELETE"`: changing it
+to `PREVENT` is a separate state migration and must be reviewed before any
+remote mutation authority is introduced.
+
+Keep the
 existing public preview ingress through the protected production apply: that
 root installs the reviewed resources and IAM and records the expected
 controller-open ingress, but deliberately ignores the preview service's live
