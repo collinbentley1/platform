@@ -22,6 +22,7 @@ import {
   canonicalJson,
   canonicalRunsettaExposureState,
   consumePlanReceipt,
+  createEphemeralExecutor,
   deadlineFetcher,
   decodeStorageTestIamPermissionsResponse,
   deterministicArtifactHex,
@@ -30,12 +31,14 @@ import {
   ensureExposureStateInitialized,
   exposureControllerCreateLeaseOrUndefined,
   executorControlPermissions,
+  executorDescription,
   fencePolicyMutations,
   formatBridgeBreadcrumb,
   formatRecoveryScanBreadcrumb,
   inventoryBridgeArtifacts,
   main,
   parseRecoverySecretBundle,
+  parseExecutorProvenance,
   publishPlanReceipt,
   publishPostApplyReceipt,
   proveConsumerFreeze,
@@ -2500,6 +2503,231 @@ describe("protected owner Terraform bridge", () => {
     expect(deterministicArtifactHex("runsetta", "123456", "service-account")).not.toBe(
       deterministicArtifactHex("cdbentley", "123456", "service-account"),
     );
+  });
+
+  test("executor provenance v2 is fixed-field, bounded, and approval-complete", () => {
+    const expiresAt = new Date("2026-08-26T23:00:00.000Z");
+    const manifest = "d".repeat(64);
+    const apply = {
+      approvedManifestSha256: manifest,
+      approvedPlanRunId: "7654320",
+      expiresAt,
+      exposureAdoptionRunId: "7654319",
+      mode: "apply" as const,
+      repository: "runsetta" as const,
+      root: "prod" as const,
+      runId: "7654321",
+    };
+    const description = executorDescription(apply);
+    expect(description).toBe(
+      "pbt-v2;repository=runsetta;run=7654321;root=prod;mode=apply;" +
+        `approved=7654320;manifest=${manifest};adoption=7654319;` +
+        "expires=2026-08-26T23:00:00.000Z",
+    );
+    expect(Buffer.byteLength(description, "utf8")).toBeLessThanOrEqual(256);
+    expect(parseExecutorProvenance(description, "runsetta")).toEqual(apply);
+    const maximumDescription = executorDescription({
+      ...apply,
+      approvedPlanRunId: "9".repeat(20),
+      exposureAdoptionRunId: "9".repeat(20),
+      runId: "9".repeat(20),
+    });
+    expect(Buffer.byteLength(maximumDescription, "utf8")).toBe(239);
+
+    const plan = {
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      expiresAt,
+      exposureAdoptionRunId: "",
+      mode: "plan" as const,
+      repository: "cdbentley" as const,
+      root: "bootstrap" as const,
+      runId: "7654321",
+    };
+    expect(executorDescription(plan)).toContain(
+      ";approved=none;manifest=none;adoption=none;expires=",
+    );
+    expect(parseExecutorProvenance(executorDescription(plan), "cdbentley")).toEqual(plan);
+    const runsettaPlan = {
+      ...plan,
+      exposureAdoptionRunId: "7654319",
+      repository: "runsetta" as const,
+      root: "prod" as const,
+    };
+    expect(executorDescription(runsettaPlan)).toContain(
+      ";approved=none;manifest=none;adoption=7654319;expires=",
+    );
+    expect(parseExecutorProvenance(executorDescription(runsettaPlan), "runsetta"))
+      .toEqual(runsettaPlan);
+    expect(() => executorDescription({ ...plan, root: "exposure" })).toThrow(
+      "Only Runsetta plan provenance may name the exposure root",
+    );
+
+    const invalidV2 = [
+      description.replace(`manifest=${manifest}`, "manifest=none"),
+      description.replace("approved=7654320", "approved=none"),
+      executorDescription(plan).replace("approved=none", "approved=7654320"),
+      executorDescription(plan).replace("manifest=none", `manifest=${manifest}`),
+      description.replace("adoption=7654319", "adoption=none"),
+      description.replace(";adoption=7654319", ""),
+      executorDescription(plan).replace("adoption=none", "adoption=7654319"),
+      executorDescription(plan).replace("root=bootstrap", "root=exposure"),
+      description.replace("root=prod", "root=exposure"),
+      description.replace("run=7654321", `run=${"9".repeat(21)}`),
+    ];
+    for (const invalid of invalidV2) {
+      expect(() => parseExecutorProvenance(invalid, invalid.includes("repository=runsetta")
+        ? "runsetta"
+        : "cdbentley")).toThrow();
+    }
+    expect(() => executorDescription({ ...apply, runId: "9".repeat(21) }))
+      .toThrow("decimal length bound");
+  });
+
+  test("executor provenance v1 recovery accepts only legacy and the precise stranded adoption shape", () => {
+    const expiresAt = "2026-08-26T23:00:00.000Z";
+
+    const legacy =
+      "pbt-v1;repository=cdbentley;run=7654321;root=prod;mode=apply;" +
+      `approved=7654320;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(legacy, "cdbentley")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "7654320",
+      exposureAdoptionRunId: "",
+      mode: "apply",
+    });
+
+    const strandedManifestlessAdoption =
+      "pbt-v1;repository=runsetta;run=7654321;root=prod;mode=apply;" +
+      `approved=7654320;adoption=7654319;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(strandedManifestlessAdoption, "runsetta")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "7654320",
+      exposureAdoptionRunId: "7654319",
+      mode: "apply",
+      repository: "runsetta",
+      root: "prod",
+    });
+    const strandedManifestlessPlan =
+      "pbt-v1;repository=runsetta;run=7654321;root=prod;mode=plan;" +
+      `approved=none;adoption=7654319;expires=${expiresAt}`;
+    expect(parseExecutorProvenance(strandedManifestlessPlan, "runsetta")).toMatchObject({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      exposureAdoptionRunId: "7654319",
+      mode: "plan",
+      repository: "runsetta",
+      root: "prod",
+    });
+
+    for (const invalid of [
+      strandedManifestlessAdoption.replace("repository=runsetta", "repository=cdbentley"),
+      strandedManifestlessAdoption.replace("root=prod", "root=bootstrap"),
+      strandedManifestlessAdoption.replace("mode=apply", "mode=plan"),
+      strandedManifestlessAdoption.replace(";adoption=7654319", ";manifest=none;adoption=7654319"),
+      strandedManifestlessAdoption.replace("run=7654321", `run=${"9".repeat(21)}`),
+      `pbt-v1;repository=cdbentley;run=7654321;root=exposure;mode=plan;` +
+      `approved=none;expires=${expiresAt}`,
+    ]) {
+      expect(() => parseExecutorProvenance(
+        invalid,
+        invalid.includes("repository=runsetta") ? "runsetta" : "cdbentley",
+      )).toThrow();
+    }
+  });
+
+  test("Runsetta prod apply creates and disables an exact v2 executor", async () => {
+    const manifest = "d".repeat(64);
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: manifest,
+      APPROVED_PLAN_RUN_ID: "7654320",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+      EXPOSURE_ADOPTION_RUN_ID: "7654319",
+      GITHUB_RUN_ID_EXACT: "7654321",
+      TARGET_REPOSITORY: "runsetta",
+      TERRAFORM_ROOT: "prod",
+    });
+    const expiresAt = new Date("2026-08-26T23:00:00.000Z");
+    const accountId = "gha-pbt-33333333333333333333";
+    const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
+    const uniqueId = "333333333333333333333";
+    const calls: Array<{ method: string; path: string }> = [];
+    let account: Record<string, unknown> | undefined;
+    let attempted = false;
+    let rejected = false;
+    let armedUniqueId: string | undefined;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = decodeURIComponent(url.pathname);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path });
+      if (path.endsWith(`/serviceAccounts/${email}`) && method === "GET") {
+        return new Response("", { status: 404 });
+      }
+      if (path === "/v1/projects/runsetta/serviceAccounts" && method === "POST") {
+        const request = JSON.parse(String(init?.body)) as {
+          accountId: string;
+          serviceAccount: { description: string; displayName: string };
+        };
+        expect(request.accountId).toBe(accountId);
+        expect(request.serviceAccount.description).toContain(
+          `;approved=7654320;manifest=${manifest};adoption=7654319;`,
+        );
+        account = {
+          description: request.serviceAccount.description,
+          disabled: false,
+          displayName: request.serviceAccount.displayName,
+          email,
+          etag: "executor-etag-1",
+          name: `projects/runsetta/serviceAccounts/${email}`,
+          projectId: "runsetta",
+          uniqueId,
+        };
+        return Response.json(account);
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}:disable`) && method === "POST") {
+        account = { ...account!, disabled: true };
+        return Response.json({});
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}`) && method === "GET") {
+        return Response.json(account);
+      }
+      return new Response("", { status: 400 });
+    };
+    const created = await createEphemeralExecutor(
+      "runsetta",
+      accountId,
+      invocation,
+      expiresAt,
+      "google-owner-access-token-value",
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      async () => {
+        attempted = true;
+      },
+      () => {
+        rejected = true;
+      },
+      (identity) => {
+        armedUniqueId = identity.uniqueId;
+      },
+    );
+    expect(attempted).toBeTrue();
+    expect(rejected).toBeFalse();
+    expect(armedUniqueId).toBe(uniqueId);
+    expect(created.disabled).toBeTrue();
+    expect(created.description).toStartWith("pbt-v2;");
+    const disableIndex = calls.findIndex(({ path, method }) =>
+      method === "POST" && path.endsWith(`/${uniqueId}:disable`)
+    );
+    const readbackIndex = calls.findIndex(({ path, method }, index) =>
+      index > disableIndex && method === "GET" && path.endsWith(`/${uniqueId}`)
+    );
+    expect(disableIndex).toBeGreaterThanOrEqual(0);
+    expect(readbackIndex).toBeGreaterThan(disableIndex);
   });
 
   test("normal bridge budget reserves in-process cleanup before the wrapper deadline", async () => {
@@ -5388,6 +5616,116 @@ describe("protected owner Terraform bridge", () => {
     expect(fixture.accountDeleted()).toBeTrue();
   });
 
+  test("fresh recovery deletes a disabled v1 Runsetta adoption executor", async () => {
+    const runId = "7654321";
+    const uniqueId = "333333333333333333333";
+    const accountId = randomExecutorAccountId(
+      deterministicArtifactHex("runsetta", runId, "service-account"),
+    );
+    const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
+    const account = {
+      description:
+        `pbt-v1;repository=runsetta;run=${runId};root=prod;mode=apply;` +
+        "approved=7654320;adoption=7654319;expires=2026-08-26T23:00:00.000Z",
+      disabled: false,
+      displayName: "Protected Terraform Executor",
+      email,
+      etag: "executor-etag-1",
+      name: `projects/runsetta/serviceAccounts/${email}`,
+      projectId: "runsetta",
+      uniqueId,
+    };
+    const calls: Array<{ method: string; path: string }> = [];
+    const policies = new Map<string, IamPolicy>();
+    let policyGeneration = 1;
+    let exists = true;
+    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = new URL(String(input));
+      const path = decodeURIComponent(url.pathname);
+      const method = init?.method ?? "GET";
+      calls.push({ method, path });
+      if (path === "/v1/projects/runsetta/serviceAccounts" && method === "GET") {
+        return Response.json({ accounts: exists ? [account] : [] });
+      }
+      if (path === "/v1/projects/runsetta/roles" && method === "GET") {
+        return Response.json({ roles: [] });
+      }
+      if (
+        (path.endsWith(`/serviceAccounts/${uniqueId}:disable`) ||
+          path.endsWith(`/serviceAccounts/${email}:disable`)) &&
+        method === "POST"
+      ) {
+        account.disabled = true;
+        return Response.json({});
+      }
+      if (/^\/v1\/projects\/runsetta\/roles\/pbt_[rm]_[0-9a-f]{20}$/.test(path) &&
+        method === "GET") {
+        return new Response("", { status: 404 });
+      }
+      if (path.endsWith(`/serviceAccounts/${uniqueId}/keys`) && method === "GET") {
+        return Response.json({ keys: [] });
+      }
+      const policyMatch = /^(.*):(get|set)IamPolicy$/.exec(path);
+      if (policyMatch !== null && method === "POST") {
+        const key = `${url.hostname}${policyMatch[1]}`;
+        const current = policies.get(key) ?? {
+          bindings: [],
+          etag: `policy-etag-${policyGeneration}`,
+          version: 1,
+        };
+        policies.set(key, current);
+        if (policyMatch[2] === "get") return Response.json(current);
+        const requested = (JSON.parse(String(init?.body)) as { policy: IamPolicy }).policy;
+        if (requested.etag !== current.etag) return new Response("", { status: 412 });
+        policyGeneration += 1;
+        const updated = { ...requested, etag: `policy-etag-${policyGeneration}` };
+        policies.set(key, updated);
+        return Response.json(updated);
+      }
+      if (
+        path.endsWith(`/serviceAccounts/${uniqueId}`) ||
+        path.endsWith(`/serviceAccounts/${email}`)
+      ) {
+        if (!exists) return new Response("", { status: 404 });
+        if (method === "DELETE") {
+          exists = false;
+          return new Response("{}");
+        }
+        if (method === "GET") return Response.json(account);
+      }
+      return new Response("", { status: 400 });
+    };
+    const recoveryInvocation = validateRecoveryInvocation({
+      ...validRecoveryEnvironment(),
+      GITHUB_RUN_ID_EXACT: runId,
+      TARGET_REPOSITORY: "runsetta",
+    });
+    await inventoryBridgeArtifacts(
+      "runsetta",
+      "google-owner-access-token-value",
+      fetcher,
+      async () => undefined,
+      Date.now() + 60_000,
+      recoveryInvocation,
+    );
+    expect(account.disabled).toBeTrue();
+    expect(exists).toBeFalse();
+    const disableIndex = calls.findIndex(({ method, path }) =>
+      method === "POST" && path.endsWith(":disable")
+    );
+    const policyIndex = calls.findIndex(({ method, path }) =>
+      method === "POST" && path.endsWith(":getIamPolicy")
+    );
+    const deleteIndex = calls.findIndex(({ method, path }) =>
+      method === "DELETE" && path.endsWith(`/${uniqueId}`)
+    );
+    expect(disableIndex).toBeGreaterThanOrEqual(0);
+    expect(policyIndex).toBeGreaterThan(disableIndex);
+    expect(deleteIndex).toBeGreaterThan(policyIndex);
+    expect(calls.some(({ path }) => path.endsWith(":setIamPolicy"))).toBeTrue();
+    expect([...policies.values()].every((policy) => policy.bindings.length === 0)).toBeTrue();
+  });
+
   test("orphan custom-role deletion fails fast on HTTP 403 without retry backoff", async () => {
     const fixture = abruptLossFixture({ roleDeleteForbidden: true });
     let failure: unknown;
@@ -5579,7 +5917,7 @@ describe("protected owner Terraform bridge", () => {
     const randomEmail = `${accountId}@cdbentley.iam.gserviceaccount.com`;
     const leaseExpiresAt = new Date(Date.now() + 47 * 60_000);
     const account = {
-      description: `pbt-v1;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;expires=${leaseExpiresAt.toISOString()}`,
+      description: `pbt-v2;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;manifest=none;adoption=none;expires=${leaseExpiresAt.toISOString()}`,
       disabled: true,
       displayName: "Protected Terraform Executor",
       email: randomEmail,
@@ -6746,7 +7084,7 @@ function executorLifecycleFixture(
   const accountId = "gha-pbt-0123456789abcdefabcd";
   const email = `${accountId}@cdbentley.iam.gserviceaccount.com`;
   const account = {
-    description: `pbt-v1;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;expires=${leaseExpiresAt.toISOString()}`,
+    description: `pbt-v2;repository=cdbentley;run=123456;root=bootstrap;mode=plan;approved=none;manifest=none;adoption=none;expires=${leaseExpiresAt.toISOString()}`,
     disabled: false,
     displayName: "Protected Terraform Executor",
     email,

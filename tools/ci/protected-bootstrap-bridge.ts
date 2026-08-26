@@ -25,7 +25,10 @@ const OWNER_MEMBER = "user:CollinBentley1@gmail.com";
 const EXECUTOR_ACCOUNT_PREFIX = "gha-pbt-";
 const EXECUTOR_ROLE_PREFIX = "pbt_";
 const EXECUTOR_DISPLAY_NAME = "Protected Terraform Executor";
-const EXECUTOR_DESCRIPTION_VERSION = "pbt-v1";
+const EXECUTOR_DESCRIPTION_VERSION = "pbt-v2";
+const LEGACY_EXECUTOR_DESCRIPTION_VERSION = "pbt-v1";
+const EXECUTOR_DESCRIPTION_MAX_BYTES = 256;
+const EXECUTOR_PROVENANCE_NUMERIC_MAX_DIGITS = 20;
 const TERRAFORM_SANDBOX_IMAGE =
   "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b";
 const TERRAFORM_VERSION = "1.14.5";
@@ -628,7 +631,7 @@ interface ServiceAccountListEntry {
   readonly value: Record<string, unknown>;
 }
 
-interface ExecutorProvenance {
+export interface ExecutorProvenance {
   readonly approvedManifestSha256: string;
   readonly approvedPlanRunId: string;
   readonly expiresAt: Date;
@@ -7609,66 +7612,97 @@ function executorProvenance(
   };
 }
 
-function executorDescription(provenance: ExecutorProvenance): string {
-  numeric(provenance.runId, "executor provenance run ID");
-  if (provenance.root === "exposure" && provenance.mode !== "plan") {
-    throw new Error("Exposure executor provenance cannot name an apply.");
+export function executorDescription(provenance: ExecutorProvenance): string {
+  const runId = executorProvenanceNumeric(provenance.runId, "executor provenance run ID");
+  repositoryName(provenance.repository);
+  rootName(provenance.root);
+  executionMode(provenance.mode);
+  if (
+    provenance.root === "exposure" &&
+    (provenance.repository !== "runsetta" || provenance.mode !== "plan")
+  ) {
+    throw new Error("Only Runsetta plan provenance may name the exposure root.");
   }
   if (provenance.mode === "apply") {
-    numeric(provenance.approvedPlanRunId, "executor provenance approved plan run ID");
+    executorProvenanceNumeric(
+      provenance.approvedPlanRunId,
+      "executor provenance approved plan run ID",
+    );
     hash(provenance.approvedManifestSha256, "executor provenance approved manifest digest");
   } else if (
     provenance.approvedPlanRunId !== "" || provenance.approvedManifestSha256 !== ""
   ) {
     throw new Error("Plan executor provenance cannot name an approved run.");
   }
-  return [
+  const adoptionRequired = provenance.repository === "runsetta" && provenance.root === "prod";
+  if ((provenance.exposureAdoptionRunId !== "") !== adoptionRequired) {
+    throw new Error("Executor provenance has malformed exposure-adoption authority.");
+  }
+  if (provenance.exposureAdoptionRunId !== "") {
+    executorProvenanceNumeric(
+      provenance.exposureAdoptionRunId,
+      "executor provenance exposure adoption run ID",
+    );
+  }
+  if (!Number.isFinite(provenance.expiresAt.getTime())) {
+    throw new Error("Executor provenance expiry is invalid.");
+  }
+  const description = [
     EXECUTOR_DESCRIPTION_VERSION,
     `repository=${provenance.repository}`,
-    `run=${provenance.runId}`,
+    `run=${runId}`,
     `root=${provenance.root}`,
     `mode=${provenance.mode}`,
     `approved=${provenance.approvedPlanRunId === "" ? "none" : provenance.approvedPlanRunId}`,
-    ...(provenance.exposureAdoptionRunId === ""
-      ? []
-      : [`adoption=${provenance.exposureAdoptionRunId}`]),
+    `manifest=${provenance.approvedManifestSha256 === "" ? "none" : provenance.approvedManifestSha256}`,
+    `adoption=${provenance.exposureAdoptionRunId === "" ? "none" : provenance.exposureAdoptionRunId}`,
     `expires=${provenance.expiresAt.toISOString()}`,
   ].join(";");
+  requireExecutorDescriptionBound(description);
+  return description;
 }
 
-function parseExecutorProvenance(description: string, projectId: string): ExecutorProvenance {
+export function parseExecutorProvenance(
+  description: string,
+  projectId: string,
+): ExecutorProvenance {
+  requireExecutorDescriptionBound(description);
+  if (description.startsWith(`${EXECUTOR_DESCRIPTION_VERSION};`)) {
+    return parseCurrentExecutorProvenance(description, projectId);
+  }
+  if (description.startsWith(`${LEGACY_EXECUTOR_DESCRIPTION_VERSION};`)) {
+    return parseLegacyExecutorProvenance(description, projectId);
+  }
+  throw new Error("An orphan bridge executor has unknown provenance; manual cleanup is required.");
+}
+
+function parseCurrentExecutorProvenance(
+  description: string,
+  projectId: string,
+): ExecutorProvenance {
   const match = new RegExp(
     `^${EXECUTOR_DESCRIPTION_VERSION};repository=(${REPOSITORY_NAMES.join("|")});` +
-      "run=([1-9][0-9]*);root=(bootstrap|prod|exposure);mode=(plan|apply);" +
-      "approved=(none|[1-9][0-9]*)(?:;manifest=(none|[0-9a-f]{64}))?;" +
-      "(?:adoption=(none|[1-9][0-9]*);)?expires=([^;]+)$",
+      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply);" +
+      "approved=(none|[1-9][0-9]{0,19});manifest=(none|[0-9a-f]{64});" +
+      "adoption=(none|[1-9][0-9]{0,19});expires=([^;]+)$",
   ).exec(description);
   if (match === null) {
     throw new Error("An orphan bridge executor has unknown provenance; manual cleanup is required.");
   }
   const repository = repositoryName(match[1]!);
   exact(REPOSITORIES[repository].projectId, projectId, "executor provenance project");
-  const runId = numeric(match[2]!, "executor provenance run ID");
+  const runId = executorProvenanceNumeric(match[2]!, "executor provenance run ID");
   const root = rootName(match[3]!);
   const mode = match[4] === "plan" ? "plan" : "apply";
   const approvedPlanRunId = match[5] === "none"
     ? ""
-    : numeric(match[5]!, "executor provenance approved plan run ID");
-  const approvedManifestSha256 = match[6] === undefined || match[6] === "none"
+    : executorProvenanceNumeric(match[5]!, "executor provenance approved plan run ID");
+  const approvedManifestSha256 = match[6] === "none"
     ? ""
     : hash(match[6]!, "executor provenance approved manifest digest");
-  const exposureAdoptionRunId = match[7] === undefined || match[7] === "none"
+  const exposureAdoptionRunId = match[7] === "none"
     ? ""
-    : numeric(match[7]!, "executor provenance exposure adoption run ID");
-  if (
-    (mode === "apply") !== (approvedPlanRunId !== "") ||
-    (mode === "plan" && approvedManifestSha256 !== "") ||
-    (root === "exposure" && mode !== "plan") ||
-    (match[7] !== undefined &&
-      ((repository === "runsetta" && root === "prod") !== (exposureAdoptionRunId !== "")))
-  ) {
-    throw new Error("An orphan bridge executor has malformed approval provenance; manual cleanup is required.");
-  }
+    : executorProvenanceNumeric(match[7]!, "executor provenance exposure adoption run ID");
   const expiresAt = new Date(match[8]!);
   if (!Number.isFinite(expiresAt.getTime()) || expiresAt.toISOString() !== match[8]) {
     throw new Error("An orphan bridge executor has malformed expiry provenance; manual cleanup is required.");
@@ -7683,22 +7717,90 @@ function parseExecutorProvenance(description: string, projectId: string): Execut
     root,
     runId,
   } as const;
-  const expectedDescription = match[7] === undefined
-    ? [
-        EXECUTOR_DESCRIPTION_VERSION,
-        `repository=${provenance.repository}`,
-        `run=${provenance.runId}`,
-        `root=${provenance.root}`,
-        `mode=${provenance.mode}`,
-        `approved=${provenance.approvedPlanRunId === "" ? "none" : provenance.approvedPlanRunId}`,
-        `expires=${provenance.expiresAt.toISOString()}`,
-      ].join(";")
-    : executorDescription(provenance);
-  exact(expectedDescription, description, "executor provenance encoding");
+  exact(executorDescription(provenance), description, "executor provenance encoding");
   return provenance;
 }
 
-async function createEphemeralExecutor(
+function parseLegacyExecutorProvenance(
+  description: string,
+  projectId: string,
+): ExecutorProvenance {
+  const match = new RegExp(
+    `^${LEGACY_EXECUTOR_DESCRIPTION_VERSION};repository=(${REPOSITORY_NAMES.join("|")});` +
+      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply);" +
+      "approved=(none|[1-9][0-9]{0,19});" +
+      "(?:adoption=([1-9][0-9]{0,19});)?expires=([^;]+)$",
+  ).exec(description);
+  if (match === null) {
+    throw new Error("An orphan bridge executor has unknown legacy provenance; manual cleanup is required.");
+  }
+  const repository = repositoryName(match[1]!);
+  exact(REPOSITORIES[repository].projectId, projectId, "legacy executor provenance project");
+  const runId = executorProvenanceNumeric(match[2]!, "legacy executor provenance run ID");
+  const root = rootName(match[3]!);
+  const mode = match[4] === "plan" ? "plan" : "apply";
+  const approvedPlanRunId = match[5] === "none"
+    ? ""
+    : executorProvenanceNumeric(match[5]!, "legacy executor approved plan run ID");
+  const exposureAdoptionRunId = match[6] === undefined
+    ? ""
+    : executorProvenanceNumeric(match[6], "legacy executor exposure adoption run ID");
+  if (
+    (mode === "apply") !== (approvedPlanRunId !== "") ||
+    (root === "exposure" && (repository !== "runsetta" || mode !== "plan")) ||
+    (exposureAdoptionRunId !== "" &&
+      !(repository === "runsetta" && root === "prod"))
+  ) {
+    throw new Error(
+      "An orphan bridge executor has malformed legacy approval provenance; manual cleanup is required.",
+    );
+  }
+  const expiresAt = new Date(match[7]!);
+  if (!Number.isFinite(expiresAt.getTime()) || expiresAt.toISOString() !== match[7]) {
+    throw new Error(
+      "An orphan bridge executor has malformed legacy expiry provenance; manual cleanup is required.",
+    );
+  }
+  const provenance = {
+    approvedManifestSha256: "",
+    approvedPlanRunId,
+    expiresAt,
+    exposureAdoptionRunId,
+    mode,
+    repository,
+    root,
+    runId,
+  } as const;
+  const expectedDescription = [
+    LEGACY_EXECUTOR_DESCRIPTION_VERSION,
+    `repository=${repository}`,
+    `run=${runId}`,
+    `root=${root}`,
+    `mode=${mode}`,
+    `approved=${approvedPlanRunId === "" ? "none" : approvedPlanRunId}`,
+    ...(exposureAdoptionRunId === "" ? [] : [`adoption=${exposureAdoptionRunId}`]),
+    `expires=${expiresAt.toISOString()}`,
+  ].join(";");
+  exact(expectedDescription, description, "legacy executor provenance encoding");
+  return provenance;
+}
+
+function executorProvenanceNumeric(value: string, label: string): string {
+  const parsed = numeric(value, label);
+  if (parsed.length > EXECUTOR_PROVENANCE_NUMERIC_MAX_DIGITS) {
+    throw new Error(`${label} escaped its decimal length bound.`);
+  }
+  return parsed;
+}
+
+function requireExecutorDescriptionBound(description: string): void {
+  requiredString(description, "executor provenance description");
+  if (Buffer.byteLength(description, "utf8") > EXECUTOR_DESCRIPTION_MAX_BYTES) {
+    throw new Error("Executor provenance description escaped Google's byte bound.");
+  }
+}
+
+export async function createEphemeralExecutor(
   projectId: string,
   accountId: string,
   invocation: Invocation,
