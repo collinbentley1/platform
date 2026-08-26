@@ -191,6 +191,9 @@ jobs:
             fi
             is_pull_request=true
             expected='["Socket Security: Project Report","Socket Security: Pull Request Alerts"]'
+          elif [ "$GITHUB_EVENT_NAME" != "push" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Socket verification accepts only pull requests or a push to refs/heads/main." >&2
+            exit 1
           fi
           response="$RUNNER_TEMP/socket-check-runs.json"
           for _ in $(seq 1 60); do
@@ -220,19 +223,21 @@ jobs:
                     .number == $pr and
                     .head.sha == $head and .head.repo.id == $head_repo and
                     .base.sha == $base and .base.repo.id == $repo);
+                def has_exact_alert_title($run; $name):
+                  $name != "Socket Security: Pull Request Alerts" or
+                  (($run.output.title | type) == "string" and
+                   ($run.output.title | startswith("Pull Request #\($pr) Alerts:")));
                 def has_fork_pull_request_fallback($run; $name):
                   $head_repo != $repo and
                   (($run.pull_requests // []) | type) == "array" and
-                  (($run.pull_requests // []) | length) == 0 and
-                  ($name != "Socket Security: Pull Request Alerts" or
-                    (($run.output.title | type) == "string" and
-                     ($run.output.title | startswith("Pull Request #\($pr) Alerts:"))));
+                  (($run.pull_requests // []) | length) == 0;
                 def is_current($run; $name):
                   $run.name == $name and
                   $run.app.id == 156372 and
                   $run.head_sha == $head and
                   (if $is_pr then
                     started_epoch($run) >= $fresh_after and
+                    has_exact_alert_title($run; $name) and
                     (has_exact_pull_request($run) or has_fork_pull_request_fallback($run; $name))
                   else true end);
                 if ((.check_runs | type) != "array" or

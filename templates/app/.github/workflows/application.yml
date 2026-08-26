@@ -2,10 +2,14 @@ name: Application
 
 on:
   pull_request:
+    types:
+      - edited
+      - opened
+      - reopened
+      - synchronize
   push:
     branches:
       - main
-  workflow_dispatch:
 
 permissions: {}
 
