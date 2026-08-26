@@ -4,7 +4,7 @@ locals {
   # platform code: neither a workflow caller nor a consumer repository can
   # choose a Terraform address or a remote object ID.
   runsetta_domain_mapping_imports = var.repository_id == "711292980" ? {
-    "runsetta.com" = "locations/us-east4/namespaces/runsetta/domainmappings/runsetta.com"
+    "runsetta.com"     = "locations/us-east4/namespaces/runsetta/domainmappings/runsetta.com"
     "www.runsetta.com" = "locations/us-east4/namespaces/runsetta/domainmappings/www.runsetta.com"
   } : {}
 }
