@@ -31,7 +31,9 @@ import {
   ExecutorLeaseManager,
   ensureExposureStateInitialized,
   exposureControllerCreateLeaseOrUndefined,
+  bridgeRolePermissionsRecognized,
   buildDenyAdminLease,
+  denyAdminSuppliedPermissions,
   executorControlPermissions,
   requireDenyAdminRoleContract,
   executorCustomRolePermissions,
@@ -248,6 +250,57 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).not.toContain("gcloud ");
     expect(workflow).not.toContain("terraform apply");
     expect(workflow).not.toContain("terraform show");
+  });
+
+  test("recovery recognizes the mutation role it actually creates", () => {
+    // Regression: the deny-admin split changed what createEphemeralRole builds
+    // (45 permissions) without changing what the recovery recognizer expected
+    // (48). Every bootstrap mutation role -- and the tombstone Google retains
+    // for days after deletion -- would have been unrecognised, so recovery
+    // would refuse to delete it and fail with "manual cleanup is required".
+    for (const repository of ["cdbentley", "runsetta", "healthmcp", "critical-history"] as const) {
+      for (const phase of ["read", "mutation"] as const) {
+        const created = executorCustomRolePermissions(repository, "bootstrap", phase);
+        expect(
+          bridgeRolePermissionsRecognized(created, repository, "bootstrap", phase),
+        ).toBeTrue();
+        // A role from a build predating the split must stay cleanable too.
+        expect(
+          bridgeRolePermissionsRecognized(
+            executorControlPermissions(repository, "bootstrap", phase),
+            repository,
+            "bootstrap",
+            phase,
+          ),
+        ).toBeTrue();
+      }
+      // prod is unaffected by the split but must still recognize itself.
+      expect(
+        bridgeRolePermissionsRecognized(
+          executorCustomRolePermissions(repository, "prod", "mutation"),
+          repository,
+          "prod",
+          "mutation",
+        ),
+      ).toBeTrue();
+    }
+    // An unrelated matrix is still rejected.
+    expect(
+      bridgeRolePermissionsRecognized(["iam.roles.create"], "cdbentley", "bootstrap", "mutation"),
+    ).toBeFalse();
+  });
+
+  test("deny-admin supplies exactly what the custom role cannot carry", () => {
+    // Derived from the matrix, never hard-coded, so a permission added to the
+    // control matrix later cannot silently skip the supply check.
+    expect([...denyAdminSuppliedPermissions()].toSorted()).toEqual([
+      "iam.denypolicies.create",
+      "iam.denypolicies.delete",
+      "iam.denypolicies.update",
+    ]);
+    // iam.denypolicies.replace is listed as custom-role-unsupported but is not
+    // in the control matrix, so nothing has to supply it.
+    expect(denyAdminSuppliedPermissions()).not.toContain("iam.denypolicies.replace");
   });
 
   test("deny-admin role contract is pinned and drift fails closed", async () => {
