@@ -136,6 +136,26 @@ const STORAGE_BACKEND_ROLE_PERMISSIONS = {
     "storage.objects.list",
   ],
 } as const;
+// roles/iam.denyAdmin supplies the deny-policy write authority that cannot live
+// in a project custom role. It is granted to the ephemeral executor, so it is
+// pinned exactly like the storage backend roles: if Google adds a permission
+// the executor would silently gain it, and if Google removes one the executor
+// would silently lose authority the permission proof still demands. Either way
+// the run must fail rather than proceed. Verified live 2026-08-27.
+const DENY_ADMIN_ROLE_PERMISSIONS: readonly string[] = [
+  "cloudasset.assets.listResource",
+  "iam.denypolicies.create",
+  "iam.denypolicies.delete",
+  "iam.denypolicies.get",
+  "iam.denypolicies.list",
+  "iam.denypolicies.update",
+  "policyanalyzer.resourceAuthorizationActivities.query",
+  "policysimulator.accessPolicySimulationResults.list",
+  "policysimulator.accessPolicySimulations.create",
+  "policysimulator.accessPolicySimulations.get",
+  "policysimulator.accessPolicySimulations.list",
+];
+
 const STORAGE_BACKEND_ROLE_STAGES = {
   "roles/storage.objectCreator": "GA",
   "roles/storage.objectViewer": "GA",
@@ -1500,6 +1520,29 @@ export function buildExecutorProjectLeases(
   }];
 }
 
+// Google marks these NOT_SUPPORTED for project custom roles, so including them
+// in the ephemeral executor role makes roles.create reject the whole role with
+// HTTP 400. They are still REQUIRED authority for a bootstrap apply, because
+// terraform/modules/bootstrap/preview-runtime-deny.tf declares the preview
+// runtime deny policy unconditionally. The executor therefore receives them
+// from the predefined roles/iam.denyAdmin as a separate expiring lease, while
+// executorControlPermissions -- and so the permission-convergence proof --
+// continues to require them. Verified against the live testable-permission
+// catalog: create/delete/update/replace are NOT_SUPPORTED, get/list are
+// SUPPORTED.
+const CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS: readonly string[] = [
+  "iam.denypolicies.create",
+  "iam.denypolicies.delete",
+  "iam.denypolicies.replace",
+  "iam.denypolicies.update",
+];
+
+// The predefined role that supplies them. It also carries cloudasset and
+// policysimulator READ permissions, which the executor does not need and never
+// probes; there is no narrower predefined role with deny-write authority
+// (roles/iam.denyReviewer is get/list only).
+const DENY_ADMIN_ROLE = "roles/iam.denyAdmin";
+
 const V0513_ATTESTATION_RULES_READ_PERMISSION =
   "iam.workloadIdentityPools.getAttestationRules";
 const V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256 = {
@@ -1640,17 +1683,29 @@ export function executorControlPermissions(
     : [...(root === "bootstrap" ? bootstrapRead : prodRead), ...mutation])].toSorted();
 }
 
-function bridgeRolePermissionsRecognized(
+export function bridgeRolePermissionsRecognized(
   observed: readonly string[],
   repository: RepositoryName,
   root: TerraformRoot,
   phase: "mutation" | "read",
 ): boolean {
   const observedJson = canonicalJson([...observed].toSorted());
+  // Compare against what createEphemeralRole actually creates. These diverge
+  // for bootstrap/mutation, where the deny-policy writes cannot live in a
+  // custom role and are supplied by roles/iam.denyAdmin instead. Recognising
+  // against the control matrix would leave every mutation role -- including
+  // its retained tombstone -- unrecognised, so recovery would refuse to delete
+  // it and report "manual cleanup is required".
   const currentJson = canonicalJson([
-    ...executorControlPermissions(repository, root, phase),
+    ...executorCustomRolePermissions(repository, root, phase),
   ].toSorted());
   if (observedJson === currentJson) return true;
+  // Also accept the full control matrix, so a role created by a build that
+  // predates the split is still recognised and cleanable.
+  const controlJson = canonicalJson([
+    ...executorControlPermissions(repository, root, phase),
+  ].toSorted());
+  if (observedJson === controlJson) return true;
   if (root !== "bootstrap") return false;
   // Google retains deleted custom-role tombstones, and abrupt v0.5.12 loss can
   // also leave an active role. The frozen digests recognize only those exact
@@ -1658,6 +1713,44 @@ function bridgeRolePermissionsRecognized(
   // creation and permission convergence use executorControlPermissions alone.
   return createHash("sha256").update(observedJson).digest("hex") ===
     V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256[phase];
+}
+
+// Permissions the ephemeral custom role may carry: the full control matrix
+// minus anything Google refuses to grant through a custom role. The difference
+// is supplied by DENY_ADMIN_ROLE, so the executor's effective authority is
+// unchanged and executorControlPermissions remains the single source of truth
+// for what the permission proof demands.
+export function executorCustomRolePermissions(
+  repository: RepositoryName,
+  root: TerraformRoot,
+  phase: "mutation" | "read",
+): readonly string[] {
+  const unsupported = new Set(CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS);
+  return executorControlPermissions(repository, root, phase)
+    .filter((permission) => !unsupported.has(permission));
+}
+
+// Expiring project lease granting the deny-policy write authority that cannot
+// live in a custom role. Bootstrap apply only; recorded through the same
+// record-and-add path as every other lease, so cleanup and recovery remove it
+// without a new grammar.
+export function buildDenyAdminLease(
+  repository: RepositoryName,
+  runId: string,
+  expiresAt: Date,
+  executorServiceAccountEmail: string,
+): IamBinding {
+  numeric(runId, "GitHub run ID");
+  const contract = REPOSITORIES[repository];
+  return {
+    condition: expiringCondition(
+      `codex-executor-denyadmin-${runId}`,
+      `Temporary deny-policy write lease for ${repository}.`,
+      expiresAt,
+    ),
+    members: [executorMember(contract.projectId, executorServiceAccountEmail)],
+    role: DENY_ADMIN_ROLE,
+  };
 }
 
 export function buildTokenCreatorLease(
@@ -5102,6 +5195,13 @@ export class ExecutorLeaseManager {
         invocation.ownerAccessToken,
         this.#fetcher,
       );
+      // Deliberately here, in acquire, and NOT in elevate: elevate runs after
+      // consumeApproval has written the immutable consumed/<planRunId>.json,
+      // so a transient read failure or benign Google drift there would burn the
+      // approved plan -- the exact cost this change exists to avoid.
+      if (invocation.terraformRoot === "bootstrap") {
+        await requireDenyAdminRoleContract(invocation.ownerAccessToken, this.#fetcher);
+      }
 
       const projectLeases = [
         ...(readRole === undefined
@@ -5312,7 +5412,7 @@ export class ExecutorLeaseManager {
         mutationRoleId,
         invocation.terraformRoot,
         "mutation",
-        executorControlPermissions(invocation.repository, invocation.terraformRoot, "mutation"),
+        executorCustomRolePermissions(invocation.repository, invocation.terraformRoot, "mutation"),
         invocation.ownerAccessToken,
         this.#fetcher,
         async (intent) => {
@@ -5347,6 +5447,12 @@ export class ExecutorLeaseManager {
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               buildMarkerMutationLease(
+                invocation.repository,
+                invocation.githubRunId,
+                leaseExpiresAt,
+                this.#account.email,
+              ),
+              buildDenyAdminLease(
                 invocation.repository,
                 invocation.githubRunId,
                 leaseExpiresAt,
@@ -6845,6 +6951,12 @@ function orphanPolicySurfaces(
                   provenance.expiresAt,
                   account.email,
                 ),
+                buildDenyAdminLease(
+                  provenance.repository,
+                  provenance.runId,
+                  provenance.expiresAt,
+                  account.email,
+                ),
               ]
             : []),
         ]
@@ -6978,7 +7090,7 @@ function deterministicRecoveryRole(
     deleted: true,
     description: `Protected Terraform ${provenance.root} ${phase} single-run control role.`,
     etag: "recovery-only-missing-role",
-    includedPermissions: executorControlPermissions(
+    includedPermissions: executorCustomRolePermissions(
       provenance.repository,
       provenance.root,
       phase,
@@ -9694,6 +9806,61 @@ export async function waitForControlPermissions(
 }
 
 type StorageBackendRoleName = keyof typeof STORAGE_BACKEND_ROLE_PERMISSIONS;
+
+// Prove roles/iam.denyAdmin still carries exactly its pinned contract, and in
+// particular still grants every permission that was removed from the custom
+// role because Google refuses it there. Called before the lease is granted.
+export async function requireDenyAdminRoleContract(
+  token: string,
+  fetcher: Fetcher,
+): Promise<void> {
+  const response = await fetcher(`https://iam.googleapis.com/v1/${DENY_ADMIN_ROLE}`, {
+    headers: executorHeaders(token),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`${DENY_ADMIN_ROLE} contract read failed with HTTP ${response.status}.`);
+  }
+  const role = record(await boundedJson(response, 256 * 1024), `${DENY_ADMIN_ROLE} contract`);
+  exact(role.name, DENY_ADMIN_ROLE, `${DENY_ADMIN_ROLE} contract name`);
+  exact(role.stage, "GA", `${DENY_ADMIN_ROLE} contract stage`);
+  const permissions = array(
+    role.includedPermissions,
+    `${DENY_ADMIN_ROLE} contract permissions`,
+  ).map((permission) => requiredString(permission, `${DENY_ADMIN_ROLE} contract permission`));
+  if (new Set(permissions).size !== permissions.length) {
+    throw new Error(`${DENY_ADMIN_ROLE} permission inventory contains duplicates.`);
+  }
+  exact(
+    JSON.stringify([...permissions].toSorted()),
+    JSON.stringify([...DENY_ADMIN_ROLE_PERMISSIONS].toSorted()),
+    `${DENY_ADMIN_ROLE} contract permissions`,
+  );
+  // Belt and braces: every permission the control matrix demands but the custom
+  // role cannot carry must actually be supplied here, or the executor silently
+  // lacks authority the proof still requires. Deliberately derived from the
+  // matrix rather than special-casing individual permissions: hard-coding an
+  // exemption would silently disable this check for whatever was exempted.
+  const supplied = new Set(permissions);
+  for (const permission of denyAdminSuppliedPermissions()) {
+    if (!supplied.has(permission)) {
+      throw new Error(
+        `${DENY_ADMIN_ROLE} no longer supplies ${permission}, which the executor custom role cannot carry.`,
+      );
+    }
+  }
+}
+
+// The permissions the deny-admin lease is responsible for supplying: those the
+// control matrix demands for a bootstrap mutation but a custom role may not
+// hold. Empty if the matrices ever converge.
+export function denyAdminSuppliedPermissions(): readonly string[] {
+  const unsupported = new Set(CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS);
+  return REPOSITORY_NAMES.flatMap((repository) =>
+    executorControlPermissions(repository, "bootstrap", "mutation")
+      .filter((permission) => unsupported.has(permission))
+  ).filter((permission, index, all) => all.indexOf(permission) === index);
+}
 
 export async function requireStorageBackendRoleContracts(
   token: string,
