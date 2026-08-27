@@ -21,6 +21,7 @@ import {
   buildTokenCreatorLease,
   canonicalJson,
   canonicalRunsettaExposureState,
+  commandFailureMessage,
   consumePlanReceipt,
   createEphemeralExecutor,
   deadlineFetcher,
@@ -66,6 +67,7 @@ import {
   runProtectedBootstrap,
   runProtectedRecovery,
   storageV2TestIamPermissions,
+  terraformFailureEnvelope,
   terraformSandboxCreateArguments,
   TerraformSandboxExecutor,
   validateInvocation,
@@ -585,7 +587,7 @@ describe("protected owner Terraform bridge", () => {
       "all four protected production results exist",
       "merge the four receipt-bound cutover trees",
       "read-only edge continuity proof from step 9",
-      "there is no v0.5.12 exposure apply",
+      "there is no v0.5.13 exposure apply",
       "leave the existing public, zero-tag bootstrap exposure byte-for-byte unchanged",
       "production convergence plan is empty",
       "prerequisite infrastructure exposure proof may admit the public zero-tag state only",
@@ -1888,6 +1890,18 @@ describe("protected owner Terraform bridge", () => {
       "pbt_m_fedcba9876543210fedc",
     );
     expect(() => randomExecutorAccountId("0".repeat(19))).toThrow("randomness");
+    const attestationReadPermission = "iam.workloadIdentityPools.getAttestationRules";
+    expect(
+      executorControlPermissions("cdbentley", "bootstrap", "read")
+        .filter((permission) => permission === attestationReadPermission),
+    ).toEqual([attestationReadPermission]);
+    expect(
+      executorControlPermissions("cdbentley", "bootstrap", "mutation")
+        .filter((permission) => permission === attestationReadPermission),
+    ).toEqual([attestationReadPermission]);
+    expect(executorControlPermissions("cdbentley", "prod", "read")).not.toContain(
+      attestationReadPermission,
+    );
     const prod = executorControlPermissions("healthmcp", "prod", "mutation");
     for (const forbidden of [
       "artifactregistry.files.download",
@@ -2167,6 +2181,147 @@ describe("protected owner Terraform bridge", () => {
     expect(canonicalJson({ z: 1, a: [2, 1] })).toBe('{"a":[2,1],"z":1}');
   });
 
+  test("Terraform JSON UI failures expose only a bounded allowlisted classification", () => {
+    const secret = "operator-secret-sentinel";
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      JSON.stringify({
+        "@level": "error",
+        "@module": "terraform.ui",
+        diagnostic: {
+          address: "module.bootstrap.google_iam_workload_identity_pool.github",
+          detail:
+            `googleapi: Error 403: Permission 'iam.workloadIdentityPools.getAttestationRules' denied by iam.googleapis.com for ${secret}`,
+          severity: "error",
+          snippet: { code: `token = ${secret}` },
+          summary: `Failed to read ${secret}`,
+        },
+        type: "diagnostic",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        outputs: { secret: { value: secret } },
+        type: "outputs",
+      }),
+    ].join("\n");
+
+    const rendered = terraformFailureEnvelope(stdout, "", 1);
+    expect(JSON.parse(rendered)).toEqual({
+      classes: ["permission-denied"],
+      diagnosticCount: 1,
+      diagnosticsTruncated: false,
+      exitCode: 1,
+      httpStatuses: [403],
+      jsonUi: "valid",
+      resourceTypes: ["google_iam_workload_identity_pool"],
+      schemaVersion: 1,
+      services: ["iam.googleapis.com"],
+    });
+    expect(rendered).not.toContain(secret);
+    expect(rendered).not.toContain("getAttestationRules");
+    expect(rendered).not.toContain("module.bootstrap");
+  });
+
+  test("Terraform failure fallback classifies strict stderr without echoing it", () => {
+    const secret = "stderr-secret-sentinel";
+    const rendered = terraformFailureEnvelope(
+      `not-json ${secret}`,
+      `googleapi: Error 429: quota exceeded for ${secret}`,
+      1,
+    );
+    expect(JSON.parse(rendered)).toEqual({
+      classes: ["rate-limited"],
+      diagnosticCount: 0,
+      diagnosticsTruncated: false,
+      exitCode: 1,
+      httpStatuses: [429],
+      jsonUi: "invalid",
+      resourceTypes: [],
+      schemaVersion: 1,
+      services: [],
+    });
+    expect(rendered).not.toContain(secret);
+    expect(rendered).not.toContain("quota exceeded");
+  });
+
+  test("explicit command diagnostic policy survives display-label drift", () => {
+    const secret = "policy-secret-sentinel";
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      JSON.stringify({
+        "@level": "error",
+        diagnostic: {
+          detail: `googleapi: Error 403: permission denied for ${secret}`,
+          severity: "error",
+          summary: `Failed for ${secret}`,
+        },
+        type: "diagnostic",
+      }),
+    ].join("\n");
+    const renamedTerraform = commandFailureMessage({
+      diagnosticPolicy: "terraform-safe",
+      env: {},
+      label: "renamed protected engine",
+    }, stdout, `stderr ${secret}`, 1);
+    expect(renamedTerraform).toStartWith("renamed protected engine failed: {");
+    expect(renamedTerraform).toContain('"classes":["permission-denied"]');
+    expect(renamedTerraform).not.toContain(secret);
+
+    const nonTerraform = commandFailureMessage({
+      diagnosticPolicy: "redacted-stderr",
+      env: { OWNER_ACCESS_TOKEN: secret },
+      label: "terraform-looking display label",
+    }, stdout, `ordinary failure ${secret}`, 1);
+    expect(nonTerraform).toBe(
+      "terraform-looking display label failed: ordinary failure [REDACTED]",
+    );
+
+    const invalidPolicy = commandFailureMessage({
+      diagnosticPolicy: "invalid" as never,
+      env: {},
+      label: "runtime policy drift",
+    }, stdout, `ordinary failure ${secret}`, 1);
+    expect(invalidPolicy).toBe(
+      "runtime policy drift failed: protected diagnostic policy was invalid.",
+    );
+    expect(invalidPolicy).not.toContain(secret);
+  });
+
+  test("Terraform JSON UI never reports an unparsed truncated stream as valid", () => {
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      "malformed-unparsed-middle-line",
+      ...Array.from({ length: 128 }, (_, index) =>
+        JSON.stringify({ "@level": "info", type: "progress", index })
+      ),
+    ].join("\n");
+    const envelope = JSON.parse(terraformFailureEnvelope(stdout, "", 1)) as {
+      diagnosticsTruncated: boolean;
+      jsonUi: string;
+    };
+    expect(envelope.jsonUi).toBe("truncated");
+    expect(envelope.diagnosticsTruncated).toBeTrue();
+  });
+
   test("controller has deadlines, unconditional exact cleanup, and no owner token in Terraform", async () => {
     const controller = await readFile(
       join(root, "tools/ci/protected-bootstrap-bridge.ts"),
@@ -2244,6 +2399,11 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(15 + 2 * 5 + 8).toBe(minuteConstant("APPLY_INTERNAL_OPERATION_MINUTES"));
     expect(controller).toContain('stdin: `${executorToken}\\n`');
+    expect(controller).toContain('diagnosticPolicy: "terraform-safe"');
+    expect(controller).toContain(
+      "throw new Error(commandFailureMessage(options, stdout, stderr, exitCode));",
+    );
+    expect(controller).not.toContain("label.startsWith");
     expect(controller).not.toContain("GOOGLE_OAUTH_ACCESS_TOKEN: invocation.ownerAccessToken");
     expect(controller).toContain('delete process.env[name]');
     expect(controller).toContain("deadlineFetcher(fetch");
@@ -2413,6 +2573,7 @@ describe("protected owner Terraform bridge", () => {
       },
     }));
     const planArgv = terraformArgv.find((args) => args[0] === "plan");
+    expect(planArgv).toContain("-json");
     expect(planArgv).toContain("-refresh=false");
     expect(terraformArgv.map((args) => args[0])).toEqual(["init", "plan"]);
     expect(events).toContain("publish:adoption");
@@ -2498,6 +2659,7 @@ describe("protected owner Terraform bridge", () => {
       },
     });
     await runProtectedBootstrap(invocation, dependencies);
+    expect(planArguments).toContain("-json");
     expect(planArguments).toContain("-var=repository_id=1255553151");
     expect(planArguments).toContain(`-var=active_workflow_sha=${platformSha}`);
     expect(planArguments).toContain("-var=legacy_compatibility_mode=true");
@@ -3598,8 +3760,17 @@ describe("protected owner Terraform bridge", () => {
       EXECUTION_MODE: "apply",
     });
     const events: string[] = [];
+    const terraformArgv: Array<readonly string[]> = [];
     const dependencies = fakeDependencies(events, {
       planJson: JSON.stringify(raw),
+      runTerraform: async (_invocation, _session, _directory, args) => {
+        terraformArgv.push(args);
+        events.push(
+          args[0] === "plan" && args.includes("-detailed-exitcode")
+            ? "terraform:audit"
+            : `terraform:${args[0]}`,
+        );
+      },
       verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
     });
     await runProtectedBootstrap(invocation, dependencies);
@@ -3614,6 +3785,12 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("markers:post"));
     expect(events.filter((event) => event === "consume")).toHaveLength(1);
     expect(events).toContain("release");
+    const auditArgv = terraformArgv.find((args) =>
+      args[0] === "plan" && args.includes("-detailed-exitcode")
+    );
+    expect(auditArgv).toBeDefined();
+    expect(auditArgv).toContain("-json");
+    expect(auditArgv).toContain("-detailed-exitcode");
   });
 
   test("Runsetta production revalidates adoption through elevation and reaches apply", async () => {
@@ -4871,6 +5048,11 @@ describe("protected owner Terraform bridge", () => {
     expect(bootstrapPermissions).toContain("iam.denypolicies.get");
     expect(bootstrapPermissions).toContain("iam.denypolicies.list");
     expect(bootstrapPermissions).toContain("iam.denypolicies.update");
+    expect(
+      bootstrapPermissions.filter((permission) =>
+        permission === "iam.workloadIdentityPools.getAttestationRules"
+      ),
+    ).toEqual(["iam.workloadIdentityPools.getAttestationRules"]);
     expect(bootstrapPermissions).toContain("serviceusage.services.disable");
     expect(bootstrapPermissions).toContain("serviceusage.services.enable");
 
@@ -5596,6 +5778,89 @@ describe("protected owner Terraform bridge", () => {
     expect(foreign.roleDeleted()).toBeFalse();
     expect(foreign.accountDisabled()).toBeTrue();
     expect(foreign.accountDeleted()).toBeFalse();
+  });
+
+  test("orphan inventory contains only exact v0.5.12 bootstrap role matrices", async () => {
+    const attestationReadPermission = "iam.workloadIdentityPools.getAttestationRules";
+    const fixture = (
+      phase: "mutation" | "read",
+      initiallyDeleted: boolean,
+      includedPermissions: readonly string[],
+    ) => {
+      const role = {
+        deleted: initiallyDeleted,
+        description: `Protected Terraform bootstrap ${phase} single-run control role.`,
+        etag: "v0512-role-etag",
+        includedPermissions: [...includedPermissions],
+        name: `projects/cdbentley/roles/pbt_${phase === "read" ? "r" : "m"}_44444444444444444444`,
+        stage: "GA",
+        title: `Protected Terraform ${phase === "read" ? "Read" : "Mutation"}`,
+      };
+      let deleteCalls = 0;
+      const fetcher = async (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        const url = new URL(String(input));
+        const path = decodeURIComponent(url.pathname);
+        const method = init?.method ?? "GET";
+        if (path === "/v1/projects/cdbentley/serviceAccounts" && method === "GET") {
+          return Response.json({ accounts: [] });
+        }
+        if (path === "/v1/projects/cdbentley/roles" && method === "GET") {
+          return Response.json({ roles: [role] });
+        }
+        if (path === `/v1/${role.name}`) {
+          if (method === "DELETE") {
+            deleteCalls += 1;
+            role.deleted = true;
+          }
+          return Response.json(role);
+        }
+        return new Response("", { status: 500 });
+      };
+      return { deleteCalls: () => deleteCalls, fetcher, role };
+    };
+
+    for (const phase of ["read", "mutation"] as const) {
+      const currentPermissions = executorControlPermissions("cdbentley", "bootstrap", phase);
+      const v0512Permissions = currentPermissions.filter((permission) =>
+        permission !== attestationReadPermission
+      );
+      expect(currentPermissions).toContain(attestationReadPermission);
+      expect(v0512Permissions).not.toContain(attestationReadPermission);
+      for (const initiallyDeleted of [false, true]) {
+        const exact = fixture(phase, initiallyDeleted, v0512Permissions);
+        await inventoryBridgeArtifacts(
+          "cdbentley",
+          "google-owner-access-token-value",
+          exact.fetcher,
+          async () => undefined,
+          Date.now() + 60_000,
+        );
+        expect(exact.role.deleted).toBeTrue();
+        expect(exact.deleteCalls()).toBe(initiallyDeleted ? 0 : 1);
+      }
+    }
+
+    const v0512ReadPermissions = executorControlPermissions("cdbentley", "bootstrap", "read")
+      .filter((permission) => permission !== attestationReadPermission);
+    const arbitraryMatrices = [
+      v0512ReadPermissions.filter((permission) => permission !== "iam.workloadIdentityPools.get"),
+      [...v0512ReadPermissions, "iam.workloadIdentityPools.setAttestationRules"],
+    ];
+    for (const permissions of arbitraryMatrices) {
+      const altered = fixture("read", false, permissions);
+      await expect(inventoryBridgeArtifacts(
+        "cdbentley",
+        "google-owner-access-token-value",
+        altered.fetcher,
+        async () => undefined,
+        Date.now() + 60_000,
+      )).rejects.toThrow("permissions matrix drifted");
+      expect(altered.role.deleted).toBeFalse();
+      expect(altered.deleteCalls()).toBe(0);
+    }
   });
 
   test("abrupt-loss recovery preserves unrelated v3 conditions while fencing and deleting exact leases", async () => {
