@@ -31,7 +31,10 @@ import {
   ExecutorLeaseManager,
   ensureExposureStateInitialized,
   exposureControllerCreateLeaseOrUndefined,
+  buildDenyAdminLease,
   executorControlPermissions,
+  requireDenyAdminRoleContract,
+  executorCustomRolePermissions,
   executorDescription,
   fencePolicyMutations,
   formatBridgeBreadcrumb,
@@ -245,6 +248,104 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).not.toContain("gcloud ");
     expect(workflow).not.toContain("terraform apply");
     expect(workflow).not.toContain("terraform show");
+  });
+
+  test("deny-admin role contract is pinned and drift fails closed", async () => {
+    const live = [
+      "cloudasset.assets.listResource",
+      "iam.denypolicies.create",
+      "iam.denypolicies.delete",
+      "iam.denypolicies.get",
+      "iam.denypolicies.list",
+      "iam.denypolicies.update",
+      "policyanalyzer.resourceAuthorizationActivities.query",
+      "policysimulator.accessPolicySimulationResults.list",
+      "policysimulator.accessPolicySimulations.create",
+      "policysimulator.accessPolicySimulations.get",
+      "policysimulator.accessPolicySimulations.list",
+    ];
+    const roleFetcher = (permissions: readonly string[], stage = "GA") =>
+      (async () =>
+        new Response(
+          JSON.stringify({
+            includedPermissions: permissions,
+            name: "roles/iam.denyAdmin",
+            stage,
+          }),
+          { headers: { "content-type": "application/json" }, status: 200 },
+        )) as unknown as typeof fetch;
+
+    // Exact contract passes.
+    await requireDenyAdminRoleContract("token", roleFetcher(live));
+
+    // Losing a permission the executor needs must fail: silent authority loss.
+    await expect(
+      requireDenyAdminRoleContract(
+        "token",
+        roleFetcher(live.filter((p) => p !== "iam.denypolicies.create")),
+      ),
+    ).rejects.toThrow();
+
+    // Gaining one must also fail: silent authority increase for the executor.
+    await expect(
+      requireDenyAdminRoleContract("token", roleFetcher([...live, "iam.roles.create"])),
+    ).rejects.toThrow();
+
+    // A stage change is drift too.
+    await expect(
+      requireDenyAdminRoleContract("token", roleFetcher(live, "BETA")),
+    ).rejects.toThrow();
+
+    // Duplicates are rejected outright.
+    await expect(
+      requireDenyAdminRoleContract("token", roleFetcher([...live, "iam.denypolicies.get"])),
+    ).rejects.toThrow();
+
+    // A non-200 read fails closed rather than assuming the contract holds.
+    await expect(
+      requireDenyAdminRoleContract(
+        "token",
+        (async () => new Response("", { status: 403 })) as unknown as typeof fetch,
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("deny-admin lease is exact, expiring, and executor-scoped", () => {
+    const expiresAt = new Date("2026-08-27T21:00:00.000Z");
+    const lease = buildDenyAdminLease(
+      "cdbentley",
+      "33104268060",
+      expiresAt,
+      "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+    );
+    expect(lease.role).toBe("roles/iam.denyAdmin");
+    expect(lease.members).toEqual([
+      "serviceAccount:gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+    ]);
+    expect(lease.condition?.title).toBe("codex-executor-denyadmin-33104268060");
+    // Must expire, like every other lease.
+    expect(lease.condition?.expression).toContain(
+      "request.time < timestamp('2026-08-27T21:00:00.000Z')",
+    );
+    // A non-numeric run id is rejected, so the condition title cannot be forged.
+    expect(() =>
+      buildDenyAdminLease(
+        "cdbentley",
+        "not-a-run-id",
+        expiresAt,
+        "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      )
+    ).toThrow();
+    // The member must be a real ephemeral executor identity, not an arbitrary
+    // service account: gha-pbt- plus exactly 20 hex characters.
+    expect(() =>
+      buildDenyAdminLease(
+        "cdbentley",
+        "33104268060",
+        expiresAt,
+        "attacker@cdbentley.iam.gserviceaccount.com",
+      )
+    ).toThrow();
   });
 
   test("workflow pins downloads and runs no third-party host action", async () => {
@@ -5055,6 +5156,39 @@ describe("protected owner Terraform bridge", () => {
     ).toEqual(["iam.workloadIdentityPools.getAttestationRules"]);
     expect(bootstrapPermissions).toContain("serviceusage.services.disable");
     expect(bootstrapPermissions).toContain("serviceusage.services.enable");
+
+    // Google marks the deny-policy WRITE permissions NOT_SUPPORTED for project
+    // custom roles, so roles.create rejects the entire role with HTTP 400 if
+    // they are included. They must still be demanded by the permission proof,
+    // because the bootstrap root declares the preview runtime deny policy
+    // unconditionally; the executor receives them from roles/iam.denyAdmin.
+    const denyWrites = [
+      "iam.denypolicies.create",
+      "iam.denypolicies.delete",
+      "iam.denypolicies.replace",
+      "iam.denypolicies.update",
+    ];
+    const controlMatrix = executorControlPermissions("cdbentley", "bootstrap", "mutation");
+    const customRoleMatrix = executorCustomRolePermissions("cdbentley", "bootstrap", "mutation");
+    for (const permission of denyWrites) {
+      expect(customRoleMatrix).not.toContain(permission);
+    }
+    // Reads stay in the custom role: get/list ARE custom-role supported.
+    expect(customRoleMatrix).toContain("iam.denypolicies.get");
+    expect(customRoleMatrix).toContain("iam.denypolicies.list");
+    // The ONLY difference is the unsupported set -- nothing else was dropped.
+    expect(controlMatrix.filter((p) => !customRoleMatrix.includes(p)).sort())
+      .toEqual(denyWrites.filter((p) => controlMatrix.includes(p)).sort());
+    // The proof still demands the write authority.
+    expect(controlMatrix).toContain("iam.denypolicies.create");
+    expect(controlMatrix).toContain("iam.denypolicies.delete");
+    expect(controlMatrix).toContain("iam.denypolicies.update");
+    // Read phase is unaffected: it never held a write permission.
+    expect(executorCustomRolePermissions("cdbentley", "bootstrap", "read"))
+      .toEqual(executorControlPermissions("cdbentley", "bootstrap", "read"));
+    // Non-bootstrap roots carry no deny permissions at all.
+    expect(executorCustomRolePermissions("healthmcp", "prod", "mutation"))
+      .toEqual(executorControlPermissions("healthmcp", "prod", "mutation"));
 
     const prod = validateInvocation({ ...validEnvironment(), TERRAFORM_ROOT: "prod" });
     const urls: string[] = [];
