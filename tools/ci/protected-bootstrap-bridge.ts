@@ -78,6 +78,10 @@ const MINIMUM_PRE_APPLY_MINUTES = 15;
 const APPROVAL_FRESHNESS_MINUTES = 6 * 60;
 const MAX_PLAN_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_PLAN_JSON_BYTES = 32 * 1024 * 1024;
+const MAX_COMMAND_STDERR_BYTES = 256 * 1024;
+const MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES = 256 * 1024;
+const MAX_TERRAFORM_DIAGNOSTICS = 8;
+const MAX_TERRAFORM_UI_TAIL_LINES = 128;
 const MAX_REVIEW_MANIFEST_BYTES = 800 * 1024;
 const MAX_EXPOSURE_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_EXPOSURE_HEALTH_BYTES = 4 * 1024;
@@ -491,6 +495,27 @@ const EXPOSURE_RESOURCE_TYPES = new Set([
   "google_compute_url_map",
 ]);
 
+const TERRAFORM_DIAGNOSTIC_RESOURCE_TYPES = new Set([
+  ...BOOTSTRAP_RESOURCE_TYPES,
+  ...PROD_RESOURCE_TYPES,
+  ...EXPOSURE_RESOURCE_TYPES,
+]);
+
+const TERRAFORM_DIAGNOSTIC_SERVICES = [
+  "artifactregistry.googleapis.com",
+  "cloudresourcemanager.googleapis.com",
+  "datastore.googleapis.com",
+  "firestore.googleapis.com",
+  "iam.googleapis.com",
+  "iamcredentials.googleapis.com",
+  "orgpolicy.googleapis.com",
+  "run.googleapis.com",
+  "secretmanager.googleapis.com",
+  "serviceusage.googleapis.com",
+  "storage.googleapis.com",
+  "sts.googleapis.com",
+] as const;
+
 const RUNSETTA_EXPOSURE_IMPORTS: ReadonlyMap<string, string> = new Map([
   [
     'module.domains.google_cloud_run_domain_mapping.site["runsetta.com"]',
@@ -828,11 +853,14 @@ export interface ReviewManifestResult {
 
 export type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+export type CommandDiagnosticPolicy = "redacted-stderr" | "terraform-safe";
+
 export interface CommandRequest {
   readonly argv: readonly string[];
   readonly capture?: boolean;
   readonly cwd: string;
   readonly deadlineMs: number;
+  readonly diagnosticPolicy: CommandDiagnosticPolicy;
   readonly env: Readonly<Record<string, string>>;
   readonly ignoreFailure?: boolean;
   readonly stdin?: string;
@@ -1472,6 +1500,13 @@ export function buildExecutorProjectLeases(
   }];
 }
 
+const V0513_ATTESTATION_RULES_READ_PERMISSION =
+  "iam.workloadIdentityPools.getAttestationRules";
+const V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256 = {
+  mutation: "6d2e97c830d53859f1040ac1090bd53303fa23d7743e3f2855095972369eca77",
+  read: "cd250d221ea684765f6c2c04dbd806e8b6ce094666455ae50dedcc20564f86e4",
+} as const;
+
 export function executorControlPermissions(
   repository: RepositoryName,
   root: TerraformRoot,
@@ -1489,6 +1524,7 @@ export function executorControlPermissions(
     "iam.serviceAccounts.getIamPolicy",
     "iam.serviceAccounts.list",
     "iam.workloadIdentityPools.get",
+    V0513_ATTESTATION_RULES_READ_PERMISSION,
     "iam.workloadIdentityPools.list",
     "iam.workloadIdentityPoolProviders.get",
     "iam.workloadIdentityPoolProviders.list",
@@ -1602,6 +1638,26 @@ export function executorControlPermissions(
   return [...new Set(phase === "read"
     ? root === "bootstrap" ? bootstrapRead : prodRead
     : [...(root === "bootstrap" ? bootstrapRead : prodRead), ...mutation])].toSorted();
+}
+
+function bridgeRolePermissionsRecognized(
+  observed: readonly string[],
+  repository: RepositoryName,
+  root: TerraformRoot,
+  phase: "mutation" | "read",
+): boolean {
+  const observedJson = canonicalJson([...observed].toSorted());
+  const currentJson = canonicalJson([
+    ...executorControlPermissions(repository, root, phase),
+  ].toSorted());
+  if (observedJson === currentJson) return true;
+  if (root !== "bootstrap") return false;
+  // Google retains deleted custom-role tombstones, and abrupt v0.5.12 loss can
+  // also leave an active role. The frozen digests recognize only those exact
+  // prior matrices so cleanup can remove their leases and roles. Current role
+  // creation and permission convergence use executorControlPermissions alone.
+  return createHash("sha256").update(observedJson).digest("hex") ===
+    V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256[phase];
 }
 
 export function buildTokenCreatorLease(
@@ -2929,6 +2985,7 @@ export async function runProtectedBootstrap(
       terraformDirectory,
       [
         "plan",
+        "-json",
         "-input=false",
         "-lock=false",
         "-no-color",
@@ -3095,6 +3152,7 @@ export async function runProtectedBootstrap(
       terraformDirectory,
       [
         "plan",
+        "-json",
         "-detailed-exitcode",
         "-input=false",
         "-lock=false",
@@ -3742,6 +3800,7 @@ async function verifyTransitionCapability(invocation: Invocation): Promise<Platf
     {
       cwd: invocation.platformRoot,
       deadlineMs: Date.now() + 60_000,
+      diagnosticPolicy: "redacted-stderr",
       env: environment,
       label: "transition ancestry verification",
     },
@@ -3796,6 +3855,7 @@ async function runDoctor(
     {
       cwd: invocation.platformRoot,
       deadlineMs: Date.now() + 5 * 60_000,
+      diagnosticPolicy: "redacted-stderr",
       env: {
         HOME: invocation.runnerTemp,
         PATH: required(process.env, "PATH"),
@@ -4025,7 +4085,13 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
     invocation: Invocation,
     argv: readonly string[],
     deadlineMs: number,
-    options: { readonly capture?: boolean; readonly ignoreFailure?: boolean; readonly stdin?: string; readonly label: string },
+    options: {
+      readonly capture?: boolean;
+      readonly diagnosticPolicy: CommandDiagnosticPolicy;
+      readonly ignoreFailure?: boolean;
+      readonly stdin?: string;
+      readonly label: string;
+    },
   ) => command(["/usr/bin/docker", ...argv], {
     ...options,
     cwd: invocation.runnerTemp,
@@ -4043,29 +4109,33 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
         spec.invocation,
         terraformSandboxCreateArguments(spec, uid, gid),
         deadlineMs,
-        { label: "create Terraform sandbox" },
+        { diagnosticPolicy: "redacted-stderr", label: "create Terraform sandbox" },
       );
     },
     start: (containerName, invocation, executorToken, deadlineMs, capture) =>
       runDocker(invocation, ["start", "--attach", "--interactive", containerName], deadlineMs, {
         capture,
+        diagnosticPolicy: "terraform-safe",
         label: "terraform sandbox",
         stdin: `${executorToken}\n`,
       }),
     kill: async (containerName, invocation, deadlineMs) => {
       await runDocker(invocation, ["kill", "--signal=KILL", containerName], deadlineMs, {
+        diagnosticPolicy: "redacted-stderr",
         ignoreFailure: true,
         label: "kill Terraform sandbox",
       });
     },
     wait: async (containerName, invocation, deadlineMs) => {
       await runDocker(invocation, ["wait", containerName], deadlineMs, {
+        diagnosticPolicy: "redacted-stderr",
         ignoreFailure: true,
         label: "wait for Terraform sandbox",
       });
     },
     remove: async (containerName, invocation, deadlineMs) => {
       await runDocker(invocation, ["rm", "--force", containerName], deadlineMs, {
+        diagnosticPolicy: "redacted-stderr",
         ignoreFailure: true,
         label: "remove Terraform sandbox",
       });
@@ -4073,7 +4143,11 @@ function dockerTerraformSandboxDriver(): TerraformSandboxDriver {
         invocation,
         ["ps", "--all", "--filter", `name=^/${containerName}$`, "--format", "{{.Names}}"],
         deadlineMs,
-        { capture: true, label: "prove Terraform sandbox removal" },
+        {
+          capture: true,
+          diagnosticPolicy: "redacted-stderr",
+          label: "prove Terraform sandbox removal",
+        },
       );
       if (survivors.trim() !== "") {
         throw new Error(`Terraform sandbox ${containerName} survived kill/wait/remove.`);
@@ -4337,17 +4411,277 @@ async function inspectPlanFile(planPath: string): Promise<void> {
   await chmod(planPath, 0o600);
 }
 
+type TerraformDiagnosticClass =
+  | "api-disabled"
+  | "api-error"
+  | "authentication"
+  | "backend-state"
+  | "configuration"
+  | "conflict"
+  | "network"
+  | "not-found"
+  | "permission-denied"
+  | "prevent-destroy"
+  | "provider-plugin"
+  | "rate-limited"
+  | "state-move"
+  | "unknown";
+
+function terraformDiagnosticClass(value: string): TerraformDiagnosticClass {
+  const text = value.slice(0, MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES).toLowerCase();
+  if (
+    text.includes("service_disabled") ||
+    text.includes("accessnotconfigured") ||
+    text.includes("api has not been used") ||
+    text.includes("api is disabled") ||
+    text.includes("service is disabled")
+  ) return "api-disabled";
+  if (
+    text.includes("permission_denied") ||
+    text.includes("permission denied") ||
+    text.includes("permission is required") ||
+    /\bpermission\b.{0,160}\bdenied\b/.test(text) ||
+    (text.includes("does not have") && text.includes("access")) ||
+    text.includes("http 403") ||
+    text.includes("error 403") ||
+    /\bforbidden\b/.test(text)
+  ) return "permission-denied";
+  if (
+    text.includes("unauthenticated") ||
+    text.includes("invalid credential") ||
+    text.includes("invalid authentication") ||
+    (text.includes("oauth token") && text.includes("invalid")) ||
+    text.includes("http 401") ||
+    text.includes("error 401")
+  ) return "authentication";
+  if (
+    text.includes("resource_exhausted") ||
+    text.includes("rate limit") ||
+    text.includes("quota exceeded") ||
+    text.includes("too many requests")
+  ) return "rate-limited";
+  if (
+    text.includes("failed to load plugin schemas") ||
+    text.includes("failed to instantiate provider") ||
+    text.includes("plugin did not respond") ||
+    text.includes("incompatible api version") ||
+    text.includes("unrecognized remote plugin")
+  ) return "provider-plugin";
+  if (text.includes("prevent_destroy") || text.includes("prevent destroy")) {
+    return "prevent-destroy";
+  }
+  if (
+    text.includes("moved object") ||
+    text.includes("moved resource instance") ||
+    text.includes("moved from")
+  ) return "state-move";
+  if (
+    text.includes("state snapshot") ||
+    text.includes("state lock") ||
+    text.includes("failed to load state") ||
+    text.includes("backend initialization") ||
+    text.includes("backend configuration")
+  ) return "backend-state";
+  if (
+    text.includes("unsupported argument") ||
+    text.includes("missing required") ||
+    text.includes("reference to undeclared") ||
+    text.includes("invalid value") ||
+    text.includes("invalid expression") ||
+    text.includes("cycle:")
+  ) return "configuration";
+  if (
+    text.includes("name resolution") ||
+    text.includes("no such host") ||
+    text.includes("tls handshake") ||
+    text.includes("connection refused") ||
+    text.includes("connection reset") ||
+    text.includes("deadline exceeded") ||
+    text.includes("i/o timeout")
+  ) return "network";
+  if (text.includes("already exists") || text.includes("http 409") || text.includes("error 409")) {
+    return "conflict";
+  }
+  if (text.includes("not_found") || text.includes("not found") || text.includes("http 404")) {
+    return "not-found";
+  }
+  if (text.includes("googleapi:") || text.includes("api error") || text.includes("http 5")) {
+    return "api-error";
+  }
+  return "unknown";
+}
+
+function terraformHttpStatuses(value: string): readonly number[] {
+  const statuses = new Set<number>();
+  const text = value.slice(0, MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES);
+  for (const match of text.matchAll(
+    /(?:HTTP(?:\s+status)?|StatusCode|googleapi:\s*Error)\s*[:=]?\s*(400|401|403|404|409|412|429|5[0-9]{2})\b/gi,
+  )) {
+    statuses.add(Number(match[1]));
+  }
+  return [...statuses].toSorted((left, right) => left - right);
+}
+
+function terraformUiTailLines(value: string): {
+  readonly lines: readonly string[];
+  readonly truncated: boolean;
+} {
+  const lines: string[] = [];
+  let cursor = value.length;
+  let scanned = 0;
+  while (cursor > 0 && scanned < MAX_TERRAFORM_UI_TAIL_LINES) {
+    const separator = value.lastIndexOf("\n", cursor - 1);
+    let line = value.slice(separator + 1, cursor);
+    if (line.endsWith("\r")) line = line.slice(0, -1);
+    if (line !== "") lines.push(line);
+    cursor = separator < 0 ? 0 : separator;
+    scanned += 1;
+  }
+  return { lines: lines.toReversed(), truncated: cursor > 0 };
+}
+
+/**
+ * Produce a finite operator-facing classification without returning any raw
+ * Terraform UI, provider diagnostic, resource value, address, or identifier.
+ */
+export function terraformFailureEnvelope(
+  stdout: string,
+  stderr: string,
+  exitCode: number,
+): string {
+  let jsonUi: "absent" | "invalid" | "truncated" | "valid" = stdout === ""
+    ? "absent"
+    : "invalid";
+  let diagnosticsTruncated = false;
+  const errorDiagnostics: Array<Record<string, unknown>> = [];
+  const firstLineEnd = stdout.indexOf("\n");
+  let firstLine = stdout.slice(0, firstLineEnd < 0 ? stdout.length : firstLineEnd);
+  if (firstLine.endsWith("\r")) firstLine = firstLine.slice(0, -1);
+  if (firstLine !== "" && firstLine.length <= MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES) {
+    try {
+      const version = JSON.parse(firstLine) as Record<string, unknown>;
+      if (
+        version.type === "version" &&
+        version["@module"] === "terraform.ui" &&
+        version.terraform === TERRAFORM_VERSION &&
+        typeof version.ui === "string" &&
+        /^1(?:\.|$)/.test(version.ui)
+      ) jsonUi = "valid";
+    } catch {
+      jsonUi = "invalid";
+    }
+  }
+
+  const tail = terraformUiTailLines(stdout);
+  diagnosticsTruncated = tail.truncated;
+  if (tail.truncated && jsonUi === "valid") jsonUi = "truncated";
+  for (const line of tail.lines) {
+    if (line.length > MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES) {
+      diagnosticsTruncated = true;
+      jsonUi = "invalid";
+      continue;
+    }
+    let message: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        jsonUi = "invalid";
+        continue;
+      }
+      message = parsed as Record<string, unknown>;
+    } catch {
+      jsonUi = "invalid";
+      continue;
+    }
+    if (message.type !== "diagnostic" || message["@level"] !== "error") continue;
+    const diagnostic = message.diagnostic;
+    if (diagnostic === null || typeof diagnostic !== "object" || Array.isArray(diagnostic)) {
+      jsonUi = "invalid";
+      continue;
+    }
+    const record = diagnostic as Record<string, unknown>;
+    if (record.severity === "error") errorDiagnostics.push(record);
+  }
+
+  if (errorDiagnostics.length > MAX_TERRAFORM_DIAGNOSTICS) diagnosticsTruncated = true;
+  const selected = errorDiagnostics.slice(-MAX_TERRAFORM_DIAGNOSTICS);
+  const classes = new Set<TerraformDiagnosticClass>();
+  const httpStatuses = new Set<number>();
+  const resourceTypes = new Set<string>();
+  const services = new Set<string>();
+  const classificationTexts = [stderr.slice(0, MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES)];
+  for (const diagnostic of selected) {
+    const summary = typeof diagnostic.summary === "string" ? diagnostic.summary : "";
+    const detail = typeof diagnostic.detail === "string" ? diagnostic.detail : "";
+    classificationTexts.push(`${summary}\n${detail}`.slice(0, MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES));
+    const address = typeof diagnostic.address === "string"
+      ? diagnostic.address.slice(0, 4_096)
+      : "";
+    const addressParts = new Set(address.split(/[^a-z0-9_]+/));
+    for (const resourceType of TERRAFORM_DIAGNOSTIC_RESOURCE_TYPES) {
+      if (addressParts.has(resourceType)) resourceTypes.add(resourceType);
+    }
+  }
+  for (const text of classificationTexts) {
+    classes.add(terraformDiagnosticClass(text));
+    for (const status of terraformHttpStatuses(text)) httpStatuses.add(status);
+    const lower = text.toLowerCase();
+    for (const service of TERRAFORM_DIAGNOSTIC_SERVICES) {
+      if (lower.includes(service)) services.add(service);
+    }
+  }
+  if (classes.size > 1) classes.delete("unknown");
+
+  return canonicalJson({
+    classes: [...classes].toSorted(),
+    diagnosticCount: Math.min(errorDiagnostics.length, MAX_TERRAFORM_DIAGNOSTICS),
+    diagnosticsTruncated,
+    exitCode: Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255 ? exitCode : -1,
+    httpStatuses: [...httpStatuses].toSorted((left, right) => left - right),
+    jsonUi,
+    resourceTypes: [...resourceTypes].toSorted(),
+    schemaVersion: 1,
+    services: [...services].toSorted(),
+  });
+}
+
+async function boundedCommandText(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes: number,
+  kill: () => void,
+  label: string,
+): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maximumBytes) {
+        kill();
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`${label} exceeded its protected output bound.`);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const output = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(output);
+}
+
 async function command(
   argv: readonly string[],
-  options: {
-    readonly capture?: boolean;
-    readonly cwd: string;
-    readonly deadlineMs: number;
-    readonly env: Readonly<Record<string, string>>;
-    readonly ignoreFailure?: boolean;
-    readonly stdin?: string;
-    readonly label: string;
-  },
+  options: Omit<CommandRequest, "argv">,
 ): Promise<string> {
   assertBeforeDeadline(Date.now(), options.deadlineMs, options.label);
   const child = Bun.spawn([...argv], {
@@ -4357,6 +4691,13 @@ async function command(
     stderr: "pipe",
     stdout: "pipe",
   });
+  const kill = () => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // A concurrently completed process needs no further containment.
+    }
+  };
   if (options.stdin !== undefined) {
     const stdin = child.stdin;
     if (stdin === undefined || typeof stdin === "number") {
@@ -4370,7 +4711,7 @@ async function command(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      kill();
       reject(new Error(`${options.label} exceeded the protected operation deadline.`));
     }, remainingMs);
   });
@@ -4381,8 +4722,18 @@ async function command(
     [exitCode, stdout, stderr] = await Promise.race([
       Promise.all([
         child.exited,
-        new Response(child.stdout).text(),
-        new Response(child.stderr).text(),
+        boundedCommandText(
+          child.stdout,
+          MAX_PLAN_JSON_BYTES,
+          kill,
+          `${options.label} stdout`,
+        ),
+        boundedCommandText(
+          child.stderr,
+          MAX_COMMAND_STDERR_BYTES,
+          kill,
+          `${options.label} stderr`,
+        ),
       ]),
       timeout,
     ]);
@@ -4390,10 +4741,7 @@ async function command(
     if (timer !== undefined) clearTimeout(timer);
   }
   if (exitCode !== 0 && options.ignoreFailure !== true) {
-    const diagnostic = options.label.startsWith("terraform ")
-      ? ""
-      : redactDiagnostic(stderr, options.env);
-    throw new Error(`${options.label} failed${diagnostic === "" ? "." : `: ${diagnostic}`}`);
+    throw new Error(commandFailureMessage(options, stdout, stderr, exitCode));
   }
   return options.capture === true ? stdout : "";
 }
@@ -4411,6 +4759,23 @@ function redactDiagnostic(
   return result;
 }
 
+export function commandFailureMessage(
+  request: Pick<CommandRequest, "diagnosticPolicy" | "env" | "label">,
+  stdout: string,
+  stderr: string,
+  exitCode: number,
+): string {
+  let diagnostic: string;
+  if (request.diagnosticPolicy === "terraform-safe") {
+    diagnostic = terraformFailureEnvelope(stdout, stderr, exitCode);
+  } else if (request.diagnosticPolicy === "redacted-stderr") {
+    diagnostic = redactDiagnostic(stderr, request.env);
+  } else {
+    return `${request.label} failed: protected diagnostic policy was invalid.`;
+  }
+  return `${request.label} failed${diagnostic === "" ? "." : `: ${diagnostic}`}`;
+}
+
 export async function verifyLocalSource(
   root: string,
   expectedSha: string,
@@ -4424,6 +4789,7 @@ export async function verifyLocalSource(
       capture: true,
       cwd: root,
       deadlineMs: Date.now() + 60_000,
+      diagnosticPolicy: "redacted-stderr",
       env,
       label: "git commit verification",
     })
@@ -4434,6 +4800,7 @@ export async function verifyLocalSource(
       capture: true,
       cwd: root,
       deadlineMs: Date.now() + 60_000,
+      diagnosticPolicy: "redacted-stderr",
       env,
       label: "git tree verification",
     })
@@ -4448,6 +4815,7 @@ export async function verifyLocalSource(
       capture: true,
       cwd: root,
       deadlineMs: Date.now() + 60_000,
+      diagnosticPolicy: "redacted-stderr",
       env,
       label: "git cleanliness verification",
     },
@@ -7491,8 +7859,7 @@ function bridgeRoleContract(
   exact(role.title, `Protected Terraform ${phase === "read" ? "Read" : "Mutation"}`, "bridge role title");
   const repository = REPOSITORY_NAMES.find((name) => REPOSITORIES[name].projectId === projectId);
   if (repository === undefined) throw new Error("Bridge role project escaped the repository map.");
-  const expected = executorControlPermissions(repository, root, phase);
-  if (canonicalJson([...role.includedPermissions].toSorted()) !== canonicalJson([...expected].toSorted())) {
+  if (!bridgeRolePermissionsRecognized(role.includedPermissions, repository, root, phase)) {
     throw new Error("An orphan bridge role permissions matrix drifted.");
   }
   return { phase, root };
