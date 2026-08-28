@@ -9800,6 +9800,10 @@ export async function waitForControlPermissions(
         );
         if (!response.ok &&
           !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
+          // A prod elevation adds the runtime actAs leases immediately before
+          // this scan, so their 403 is the same propagating grant the project
+          // probe above already waits out -- and this runs post-consumption too.
+          if (expected !== "none" && response.status === 403) return false;
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
         }
         if (!response.ok) continue;

@@ -5061,6 +5061,79 @@ describe("protected owner Terraform bridge", () => {
     expect(source).toContain("knownExecutorBindingsRemain(original, forbiddenMemberEmail, grantedExecutorLeases)");
   });
 
+  test("every control-plane probe waits out a propagating 403", async () => {
+    // This projection runs during elevation, i.e. after consumeApproval has
+    // already burned the approved plan, so a grant that has merely not
+    // propagated yet must not abort it.
+    const bootstrap = validateInvocation(validEnvironment());
+    let projectAttempts = 0;
+    let clock = 0;
+    await waitForControlPermissions(
+      bootstrap,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input, init) => {
+        const url = String(input);
+        const permissions =
+          (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions;
+        if (url.includes("cloudresourcemanager")) {
+          projectAttempts += 1;
+          if (projectAttempts <= 2) return new Response("", { status: 403 });
+        }
+        return Response.json({ permissions });
+      },
+      async () => {
+        clock += 1_000;
+      },
+      300_000,
+      () => clock,
+    );
+    expect(projectAttempts).toBeGreaterThan(2);
+
+    // A prod elevation adds the three runtime actAs leases immediately before
+    // this scan, so their propagation 403 has exactly the same standing.
+    const prod = validateInvocation({ ...validEnvironment(), TERRAFORM_ROOT: "prod" });
+    let runtimeAttempts = 0;
+    let prodClock = 0;
+    await waitForControlPermissions(
+      prod,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input, init) => {
+        const url = String(input);
+        const permissions =
+          (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions;
+        if (url.includes("iam.googleapis.com")) {
+          runtimeAttempts += 1;
+          if (runtimeAttempts <= 3) return new Response("", { status: 403 });
+          return Response.json({
+            permissions: permissions.filter(
+              (permission) => permission === "iam.serviceAccounts.actAs",
+            ),
+          });
+        }
+        return Response.json({ permissions });
+      },
+      async () => {
+        prodClock += 1_000;
+      },
+      300_000,
+      () => prodClock,
+    );
+    expect(runtimeAttempts).toBeGreaterThan(3);
+
+    // Only 403 is propagation. Anything else is still fatal, immediately.
+    await expect(waitForControlPermissions(
+      bootstrap,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async () => new Response("", { status: 500 }),
+      async () => undefined,
+      300_000,
+      () => 0,
+    )).rejects.toThrow("Project permission test failed with HTTP 500");
+  });
+
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
     expect(Buffer.from(encodeStorageTestIamPermissionsRequest("r", ["p"])).toString("hex"))
       .toBe("0a0172120170");
