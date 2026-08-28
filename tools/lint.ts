@@ -1275,6 +1275,42 @@ rejectContains(
 );
 
 const infrastructure = await read(".github/workflows/infrastructure.yml");
+
+// Every Google credential this platform mints must be bounded to the mutator
+// lifetime the capability manifest declares. The protected bridge's freeze proof
+// waits out the longest token a consumer could hold before it mutates IAM, and
+// GCP offers no way to cap that centrally: no organization policy reduces the
+// 1-hour default, and an already-issued token cannot be revoked short of
+// disabling the service account. The bound is therefore only as good as what
+// these workflows request, so it is asserted here rather than assumed.
+//
+// This includes the steps whose token is discarded (`create_credentials_file`
+// and `export_environment_variables` both false, used only to prove WIF trust
+// resolves). An unused 1-hour token still widens the drain the bridge must wait
+// out, because the freeze proof bounds what a consumer *could* hold, not what it
+// chose to use.
+for (
+  const [path, workflow] of [
+    [".github/workflows/cleanup-preview.yml", cleanupPreview],
+    [".github/workflows/deploy-preview.yml", deployPreview],
+    [".github/workflows/deploy-prod.yml", deployProd],
+    [".github/workflows/infrastructure.yml", infrastructure],
+    [".github/workflows/reconcile-previews.yml", reconcilePreviews],
+  ] as const
+) {
+  const lines = workflow.split("\n");
+  for (const [index, line] of lines.entries()) {
+    if (!line.includes("google-github-actions/auth@")) continue;
+    const step = lines.slice(index, index + 14).join("\n");
+    if (!/\n\s+access_token_lifetime: 300s(\n|$)/.test(step)) {
+      failures.push(
+        `${path}: the google-github-actions/auth step at line ${
+          index + 1
+        } must declare \`access_token_lifetime: 300s\`; an unbounded token widens the protected freeze drain.`,
+      );
+    }
+  }
+}
 checkRequiredCheckEventGuards([
   {
     jobs: ["verify"],
