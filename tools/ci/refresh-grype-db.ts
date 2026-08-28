@@ -86,7 +86,6 @@ if (snapshotMoved && schemaVersion !== current.schemaVersion) {
 
 const sha = checksum.slice("sha256:".length);
 const oldManifestText = await Bun.file(MANIFEST).text();
-const oldManifestSha = createHash("sha256").update(oldManifestText).digest("hex");
 const oldPath = current.url!.slice(BASE.length).split("?")[0]!;
 
 if (snapshotMoved) {
@@ -112,17 +111,23 @@ if (snapshotMoved) {
 }
 
 // Derived digests are reconciled unconditionally, so a half-applied refresh is
-// repaired rather than reported as already current.
+// repaired rather than reported as already current. Rewrite the pin at its own
+// assignment rather than by substituting a value computed from the manifest:
+// when the manifest is already current but these files are not, the "previous"
+// digest is no longer recoverable from it, and matching on the old value would
+// fail exactly in the case this repair exists for.
 const manifestSha = createHash("sha256")
   .update(await Bun.file(MANIFEST).text())
   .digest("hex");
+const MANIFEST_PIN = /GRYPE_DB_MANIFEST_SHA256=[0-9a-f]{64}/g;
 for (const file of [LINT, CONTRACT] as const) {
   const text = await Bun.file(file).text();
-  if (text.includes(manifestSha)) continue;
-  if (!text.includes(oldManifestSha)) {
-    fail(`${file} pins neither the current nor the previous manifest digest.`);
+  const pins = text.match(MANIFEST_PIN) ?? [];
+  if (pins.length !== 1) {
+    fail(`${file} must pin the manifest digest exactly once; found ${pins.length}.`);
   }
-  await Bun.write(file, text.replaceAll(oldManifestSha, manifestSha));
+  const replaced = text.replace(MANIFEST_PIN, `GRYPE_DB_MANIFEST_SHA256=${manifestSha}`);
+  if (replaced !== text) await Bun.write(file, replaced);
 }
 
 // The capability manifest hashes the contract script, so it moves with it.
