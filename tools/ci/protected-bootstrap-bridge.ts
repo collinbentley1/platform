@@ -5831,15 +5831,24 @@ export class ExecutorLeaseManager {
                 this.#fetcher,
               ),
             );
+            // This proves the executor holds no policy before deletion. An
+            // absent account satisfies that: there is no account, so there is no
+            // policy. Reading it with the strict variant instead made 404 an
+            // error -- and because 404 is classified retryable, a permanently
+            // absent account burned the entire IAM consistency window before
+            // failing a run whose work had already succeeded.
             const policy = await this.#retryIamConsistency(
               "executor cleanup policy read",
-              () => getServiceAccountPolicy(
+              () => getServiceAccountPolicyIfPresent(
                 observed,
                 invocation.ownerAccessToken,
                 this.#fetcher,
               ),
             );
-            if (policy.bindings.length !== 0 || policy.auditConfigs !== undefined) {
+            if (
+              policy !== undefined &&
+              (policy.bindings.length !== 0 || policy.auditConfigs !== undefined)
+            ) {
               throw new Error("The executor retained an IAM policy before deletion.");
             }
             const projectPolicy = await getPolicy(

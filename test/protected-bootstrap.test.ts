@@ -5161,6 +5161,27 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
+  test("cleanup proves no retained policy with a read that tolerates absence", async () => {
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
+    // Structural: the release path is reachable in tests only through the
+    // lifecycle fixture, which cannot distinguish this read from the fence
+    // reads that precede it -- the fence is a CAS retry loop and reads the same
+    // policy an unbounded number of times.
+    //
+    // `observed` comes from `getExecutor`, which already tolerates absence, so
+    // an account can be inventoried and gone by the time this read runs. That
+    // 404 is the proof this read is looking for -- no account, no retained
+    // policy -- and because 404 is classified retryable, the strict variant
+    // spent the whole IAM consistency window on it before failing a run whose
+    // work had already succeeded.
+    expect(source).toContain(
+      '"executor cleanup policy read",\n              () => getServiceAccountPolicyIfPresent(',
+    );
+    expect(source).toContain(
+      "policy !== undefined &&\n              (policy.bindings.length !== 0 || policy.auditConfigs !== undefined)",
+    );
+  });
+
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
     expect(Buffer.from(encodeStorageTestIamPermissionsRequest("r", ["p"])).toString("hex"))
       .toBe("0a0172120170");
