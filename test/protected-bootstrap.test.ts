@@ -5134,6 +5134,33 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow("Project permission test failed with HTTP 500");
   });
 
+  test("the token drain is derived from the verified capability in every mode", async () => {
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
+    // Structural, because `prepare` is stubbed in the dependency harness and the
+    // selection itself is therefore never executed here.
+    //
+    // `verifyTransitionCapability` returns the verified active capability even
+    // when no transition is in flight, so there is nothing a legacy branch could
+    // supply that the bridge has not already proven. The former branch discarded
+    // that proof for a 3600s assumption.
+    expect(source).toContain(
+      "const tokenDrainSeconds = capability.maxMutatorTokenLifetimeSeconds;",
+    );
+    expect(source).not.toContain("LEGACY_MUTATOR_TOKEN_SECONDS");
+    // One reviewed lifetime, asserted wherever a drain crosses a trust boundary.
+    expect(source).toContain("const MUTATOR_TOKEN_SECONDS = 300;");
+    for (
+      const guard of [
+        "identity.tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS",
+        "proof.tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS",
+        "tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS",
+        "value !== MUTATOR_TOKEN_SECONDS",
+      ]
+    ) {
+      expect(source).toContain(guard);
+    }
+  });
+
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
     expect(Buffer.from(encodeStorageTestIamPermissionsRequest("r", ["p"])).toString("hex"))
       .toBe("0a0172120170");
@@ -7376,7 +7403,7 @@ function identity(): PlanIdentity {
     repository: "cdbentley",
     repositoryId: "1255553151",
     terraformRoot: "prod",
-    tokenDrainSeconds: 3600,
+    tokenDrainSeconds: 300,
     transitionWorkflowSha: "",
   };
 }
@@ -7386,7 +7413,7 @@ function preparation(overrides: Partial<PreparationResult> = {}): PreparationRes
     consumerTreeSha,
     dhiParityId: "a".repeat(50),
     maxMutatorTokenLifetimeSeconds: 300,
-    tokenDrainSeconds: 3600,
+    tokenDrainSeconds: 300,
     ...overrides,
   };
 }
@@ -7403,7 +7430,7 @@ function executionProof(overrides: Partial<ExecutionProof> = {}): ExecutionProof
 
 function freezeSnapshot(
   observedAtMs: number,
-  tokenDrainSeconds = 3600,
+  tokenDrainSeconds = 300,
 ): ExecutionProof["freezeProof"] {
   return {
     observedAt: new Date(observedAtMs).toISOString(),
