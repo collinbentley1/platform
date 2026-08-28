@@ -4864,15 +4864,23 @@ describe("protected owner Terraform bridge", () => {
       async () => undefined,
       denied,
     );
+    // A PERMISSION_DENIED answer is a grant that has not propagated yet, so the
+    // loop keeps re-scanning and only the deadline ends it. Throwing on the
+    // first denial threw away four of the five available minutes.
+    let deniedClock = 0;
     await expect(waitForStatePermissions(
       state,
       invocation,
       "short-lived-executor-access-token-value",
       "read",
       grantedBucketFetcher,
-      async () => undefined,
+      async () => {
+        deniedClock += 1_000;
+      },
       denied,
-    )).rejects.toThrow("denied the executor credential");
+      30_000,
+      () => deniedClock,
+    )).rejects.toThrow("did not propagate before the deadline");
     await expect(waitForStatePermissions(
       state,
       invocation,
@@ -4888,6 +4896,107 @@ describe("protected owner Terraform bridge", () => {
         }),
       },
     )).rejects.toThrow("Denied storage object permission RPC returned permissions");
+  });
+
+  test("state permission convergence separates propagation from an unusable credential", async () => {
+    const state = {
+      bucket: "cdbentley-tfstate-882468538648-bootstrap",
+      prefix: "cdbentley/bootstrap",
+    };
+    const invocation = validateInvocation(validEnvironment());
+    // Mirrors the granted read shape the exact-probe test pins: only
+    // `storage.objects.get` on the plan/state paths, nothing elsewhere.
+    const grantedRead = (permissions: readonly string[], resource: string) =>
+      resource.includes("/.protected-bootstrap/plans/") || resource.endsWith("default.tfstate")
+        ? permissions.filter((permission) => permission === "storage.objects.get")
+        : [];
+    const grantedBucketFetcher = async (input: URL | string): Promise<Response> => {
+      const requested = new URL(String(input)).searchParams.getAll("permissions");
+      return Response.json({ kind: "storage#testIamPermissionsResponse", permissions: requested });
+    };
+
+    // UNAUTHENTICATED will never heal, so it fails fast and names the reason
+    // instead of spending the whole convergence budget first.
+    let unauthClock = 0;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      grantedBucketFetcher,
+      async () => {
+        unauthClock += 1_000;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        testObjectPermissions: async () => ({ denied: true, permissions: [], status: 16 }),
+      },
+      300_000,
+      () => unauthClock,
+    )).rejects.toThrow("unauthenticated");
+    expect(unauthClock).toBe(0);
+
+    // The run-22 case: PERMISSION_DENIED on the first scans, then the grant
+    // lands. This must converge, not abort.
+    let settleClock = 0;
+    let attempts = 0;
+    await waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      grantedBucketFetcher,
+      async () => {
+        settleClock += 1_000;
+      },
+      {
+        testObjectOverwrite: async ({ objectName }) =>
+          objectName.includes("/.protected-bootstrap/plans/"),
+        testObjectPermissions: async ({ permissions, resource }) => {
+          attempts += 1;
+          return attempts <= 3
+            ? { denied: true, permissions: [], status: 7 }
+            : { denied: false, permissions: grantedRead(permissions, resource) };
+        },
+      },
+      300_000,
+      () => settleClock,
+    );
+    expect(attempts).toBeGreaterThan(3);
+
+    // A bucket-level 403 is the same propagating condition and must also retry
+    // rather than throw `Bucket permission test failed with HTTP 403`.
+    let bucketClock = 0;
+    let bucketAttempts = 0;
+    await waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input: URL | string): Promise<Response> => {
+        bucketAttempts += 1;
+        if (bucketAttempts <= 2) return new Response("", { status: 403 });
+        const requested = new URL(String(input)).searchParams.getAll("permissions");
+        return Response.json({
+          kind: "storage#testIamPermissionsResponse",
+          permissions: requested,
+        });
+      },
+      async () => {
+        bucketClock += 1_000;
+      },
+      {
+        testObjectOverwrite: async ({ objectName }) =>
+          objectName.includes("/.protected-bootstrap/plans/"),
+        testObjectPermissions: async ({ permissions, resource }) => ({
+          denied: false,
+          permissions: grantedRead(permissions, resource),
+        }),
+      },
+      300_000,
+      () => bucketClock,
+    );
+    expect(bucketAttempts).toBeGreaterThan(2);
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
@@ -5047,11 +5156,13 @@ describe("protected owner Terraform bridge", () => {
       expect(await probeStorageObjectPermissions(request, options)).toEqual({
         denied: true,
         permissions: [],
+        status: 7,
       });
       mode = "unauthenticated";
       expect(await probeStorageObjectPermissions(request, options)).toEqual({
         denied: true,
         permissions: [],
+        status: 16,
       });
       mode = "not-found";
       await expect(probeStorageObjectPermissions(request, options)).rejects.toThrow(

@@ -8939,6 +8939,9 @@ export interface StorageObjectPermissionProbeRequest {
 export interface StorageObjectPermissionProbeResult {
   readonly denied: boolean;
   readonly permissions: readonly string[];
+  // Set only when `denied`, so the caller can tell a grant that has not
+  // propagated yet from a credential that will never work.
+  readonly status?: number;
 }
 
 export interface StorageObjectOverwriteProbeRequest {
@@ -8962,6 +8965,12 @@ export interface StoragePermissionRpcOptions {
   readonly connect?: (authority: string) => ClientHttp2Session;
   readonly timeoutMs?: number;
 }
+
+// gRPC canonical codes the storage permission RPC can answer a probe with.
+// PERMISSION_DENIED is the ordinary shape of an IAM grant that has not
+// propagated yet; UNAUTHENTICATED means the credential itself is unusable.
+const STORAGE_RPC_PERMISSION_DENIED = 7;
+const STORAGE_RPC_UNAUTHENTICATED = 16;
 
 class StoragePermissionGrpcStatusError extends Error {
   constructor(readonly status: number) {
@@ -9270,8 +9279,9 @@ export async function probeStorageObjectPermissions(
     };
   } catch (error) {
     if (error instanceof StoragePermissionGrpcStatusError &&
-      (error.status === 7 || error.status === 16)) {
-      return { denied: true, permissions: [] };
+      (error.status === STORAGE_RPC_PERMISSION_DENIED ||
+        error.status === STORAGE_RPC_UNAUTHENTICATED)) {
+      return { denied: true, permissions: [], status: error.status };
     }
     throw error;
   }
@@ -9579,6 +9589,10 @@ export async function waitForStatePermissions(
     );
     if (!bucketResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(bucketResponse))) {
+      // 403 while waiting for a grant to appear is exactly what this loop
+      // exists to absorb. Throwing discards the rest of the convergence
+      // budget; report "not converged yet" and let the deadline decide.
+      if (expected !== "none" && bucketResponse.status === 403) return false;
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
     }
     const requiredBucketPermissions = ["storage.objects.list"];
@@ -9620,7 +9634,16 @@ export async function waitForStatePermissions(
         now,
       );
       if (objectResult.denied && expected !== "none") {
-        throw new Error("Storage object permission RPC denied the executor credential.");
+        // UNAUTHENTICATED will not heal, so fail fast and name the reason.
+        // PERMISSION_DENIED is a grant still propagating: the convergence loop
+        // already re-scans until the deadline, and a hard throw here threw away
+        // four of the five available minutes on a run that would have settled.
+        if (objectResult.status === STORAGE_RPC_UNAUTHENTICATED) {
+          throw new Error(
+            "Storage object permission RPC rejected the executor credential as unauthenticated.",
+          );
+        }
+        return false;
       }
       if (objectResult.denied && objectResult.permissions.length !== 0) {
         throw new Error("Denied storage object permission RPC returned permissions.");
