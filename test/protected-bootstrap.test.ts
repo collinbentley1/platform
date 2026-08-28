@@ -5053,7 +5053,7 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("elevation passes acquire's recorded leases to the executor-binding guard", async () => {
-    const source = await Bun.file("tools/ci/protected-bootstrap-bridge.ts").text();
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
     // Structural, because no fixture drives acquire -> elevate against stateful
     // IAM yet; that missing integration is what let the self-collision ship.
     expect(source).toContain("this.#projectMutation = await this.#recordAndAdd(");
