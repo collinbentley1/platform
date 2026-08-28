@@ -2246,6 +2246,70 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
+  test("provider sensitivity on the parity marker admits only the declared bytes", () => {
+    // Terraform flags `google_storage_bucket_object.content` from the provider
+    // schema on every plan. `resourceChange` models `after_sensitive` as an
+    // empty map, so before this test nothing exercised the shape a real plan
+    // actually has -- and the bridge aborted on its own parity marker the first
+    // time it reached a live `terraform plan`.
+    const marker = () => {
+      const change = resourceChange(
+        "module.bootstrap.google_storage_bucket_object.deployment_parity_transition",
+        "google_storage_bucket_object",
+        null,
+        {
+          bucket: "cdbentley-deployment-parity-state",
+          content: "{\"version\":1}\n",
+          content_type: "application/json",
+          metadata: { "repository-id": "1255553151", state: "clear", version: "1" },
+          name: "deployment-parity-transition",
+        },
+      );
+      change.change.actions = ["create"];
+      change.change.after_sensitive = { content: true };
+      return change;
+    };
+    const initialIdentity: PlanIdentity = {
+      ...identity(),
+      legacyCompatibilityMode: true,
+      markerProof: markers("absent"),
+      terraformRoot: "bootstrap",
+    };
+
+    expect(buildReviewManifest(plan([marker()]), initialIdentity).canonical).toContain(
+      "google_storage_bucket_object.deployment_parity_transition",
+    );
+
+    const rewritten = marker();
+    (rewritten.change.after as Record<string, unknown>).content = "{\"version\":2}\n";
+    expect(() => buildReviewManifest(plan([rewritten]), initialIdentity)).toThrow(
+      "sensitive with a value the platform does not declare",
+    );
+
+    // Sensitive and unknown at plan time: the value is absent from `after`, so
+    // the exemption must fail closed rather than admit an unreviewable write.
+    const unknown = marker();
+    delete (unknown.change.after as Record<string, unknown>).content;
+    expect(() => buildReviewManifest(plan([unknown]), initialIdentity)).toThrow(
+      "sensitive with a value the platform does not declare",
+    );
+
+    // The exemption is bound to one attribute, not to the resource type.
+    const otherAttribute = marker();
+    otherAttribute.change.after_sensitive = { content: true, metadata: true };
+    expect(() => buildReviewManifest(plan([otherAttribute]), initialIdentity)).toThrow(
+      "contains a sensitive value",
+    );
+
+    // A sensitive marker nested under the exempt attribute is not the exempt
+    // scalar and must still abort.
+    const nested = marker();
+    nested.change.after_sensitive = { content: { inner: true } };
+    expect(() => buildReviewManifest(plan([nested]), initialIdentity)).toThrow(
+      "contains a sensitive value",
+    );
+  });
+
   test("manifest rejects secrets, imports, foreign modules, providers, and resource types", () => {
     const sensitive = resourceChange(
       "module.site.google_cloud_run_v2_service.preview",

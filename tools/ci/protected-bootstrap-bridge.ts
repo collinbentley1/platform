@@ -11802,8 +11802,20 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
       if (delta.generated_config !== undefined) {
         throw new Error("Terraform generated configuration is outside this bridge.");
       }
-      rejectSensitive(delta.before_sensitive, `${label} before-sensitive map`);
-      rejectSensitive(delta.after_sensitive, `${label} after-sensitive map`);
+      rejectSensitiveAttributes(
+        delta.before_sensitive,
+        delta.before,
+        type,
+        address,
+        `${label} before-sensitive map`,
+      );
+      rejectSensitiveAttributes(
+        delta.after_sensitive,
+        delta.after,
+        type,
+        address,
+        `${label} after-sensitive map`,
+      );
       const actions = array(delta.actions, `${label} actions`).map((action) =>
         requiredString(action, `${label} action`),
       );
@@ -12129,6 +12141,74 @@ function safeName(value: string, label: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Terraform derives `before_sensitive` / `after_sensitive` from the provider
+// schema alone, so an attribute is flagged for its declared type rather than for
+// the bytes this plan actually carries. `google_storage_bucket_object.content`
+// is flagged unconditionally, which means the deployment-parity transition
+// marker -- whose bytes are a constant written in the clear in
+// terraform/modules/bootstrap/main.tf -- trips the same wire a real credential
+// would, and no bootstrap plan can ever be reviewed.
+//
+// Exempt exactly one attribute of exactly one resource type, and only when the
+// planned bytes equal the constant declared here. A sensitive marker on any
+// other attribute, on any other type, or on these bytes changed to anything the
+// platform did not declare, still aborts the run. The exemption deliberately
+// carries the expected value instead of merely naming the attribute: it can
+// only ever admit a value this file already discloses, so it cannot be widened
+// into "trust the provider's judgement" by a later edit.
+//
+// Scoping to one attribute rather than one type is load-bearing. Other marks
+// in this tree would carry real credentials if they ever materialized --
+// `google_certificate_manager_certificate.self_managed.pem_private_key`, and
+// `google_compute_backend_service.iap.oauth2_client_secret`, which enabling IAP
+// out of band would pull into a refreshed `before`. Those must keep aborting.
+// `customer_encryption.encryption_key` sits on the exempt type itself and is
+// still refused, because only `content` is named here.
+const SENSITIVE_MARKER_EXEMPTIONS: ReadonlyMap<string, ReadonlyMap<string, string>> = new Map([
+  ["google_storage_bucket_object", new Map([["content", '{"version":1}\n']])],
+]);
+
+// Reject sensitive markers attribute by attribute, so an exemption can be bound
+// to one attribute name rather than to a whole resource. Anything that is not a
+// plain top-level map -- `true`, `false`, an array, a nested structure -- falls
+// through to the unconditional walk.
+function rejectSensitiveAttributes(
+  sensitive: unknown,
+  planned: unknown,
+  resourceType: string,
+  address: string,
+  label: string,
+): void {
+  const exemptions = SENSITIVE_MARKER_EXEMPTIONS.get(resourceType);
+  if (
+    exemptions === undefined ||
+    sensitive === null ||
+    typeof sensitive !== "object" ||
+    Array.isArray(sensitive)
+  ) {
+    rejectSensitive(sensitive, label);
+    return;
+  }
+  const plannedAttributes =
+    planned !== null && typeof planned === "object" && !Array.isArray(planned)
+      ? (planned as Record<string, unknown>)
+      : {};
+  for (const [attribute, marker] of Object.entries(sensitive as Record<string, unknown>)) {
+    const declared = exemptions.get(attribute);
+    if (declared !== undefined && marker === true) {
+      // A sensitive attribute whose value is unknown at plan time is absent from
+      // `planned`, so this comparison fails closed rather than admitting it.
+      if (plannedAttributes[attribute] !== declared) {
+        throw new Error(
+          `${address} marks ${attribute} sensitive with a value the platform does not declare.`,
+        );
+      }
+      continue;
+    }
+    rejectSensitive(marker, label);
+  }
 }
 
 function rejectSensitive(value: unknown, label: string): void {
