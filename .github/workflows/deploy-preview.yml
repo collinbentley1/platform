@@ -595,6 +595,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
   publish-canary:
     name: Prove exact preview publisher WIF trust
@@ -648,6 +649,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
   publish:
     name: Publish verified preview OCI image
@@ -806,6 +808,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Authenticate preview publisher
         id: auth
@@ -1064,6 +1067,7 @@ jobs:
           service_account: ${{ steps.app.outputs.parity_service_account }}
           create_credentials_file: true
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Prove exact live production DHI parity under the deployment lock
         id: parity
@@ -1638,6 +1642,7 @@ jobs:
           service_account: ${{ steps.app.outputs.parity_service_account }}
           create_credentials_file: true
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Re-prove unchanged production and its OCI graph before traffic commit
         if: steps.deploy.outcome == 'success' && steps.post-parity-auth.outcome == 'success'
@@ -1778,6 +1783,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Prove every preview runtime remains access-free before traffic mutation
         id: iam-audit
@@ -2070,6 +2076,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Authenticate the dedicated preview runtime IAM auditor for invalidation
         id: iam-audit-auth
@@ -2082,6 +2089,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Prove every preview runtime remains access-free before invalidation
         id: iam-audit

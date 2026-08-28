@@ -555,6 +555,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Authenticate the metadata-only Terraform convergence reader
         id: terraform_auth

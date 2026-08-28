@@ -371,6 +371,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Authenticate the dedicated preview runtime IAM auditor for cleanup
         id: iam-audit-auth
@@ -384,6 +385,7 @@ jobs:
           token_format: access_token
           create_credentials_file: false
           export_environment_variables: false
+          access_token_lifetime: 300s
 
       - name: Prove every preview runtime remains access-free before cleanup
         id: iam-audit
