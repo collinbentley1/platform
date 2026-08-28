@@ -4969,6 +4969,10 @@ export class ExecutorLeaseManager {
   #elevated = false;
   #invocation: Invocation | undefined;
   #mutations: PolicyMutationRecord[] = [];
+  // The acquire-phase target-project record. Elevation re-reads that same
+  // policy and must be able to tell its own read leases apart from authority
+  // nobody granted.
+  #projectMutation: PolicyMutationRecord | undefined;
   #policyCleanupComplete = false;
   #roleIntents = new Map<string, EphemeralRoleIntent>();
   #roles: ProjectCustomRole[] = [];
@@ -5241,7 +5245,7 @@ export class ExecutorLeaseManager {
         ),
       ];
       this.#telemetry.phase("executor.project-leases");
-      await this.#recordAndAdd(
+      this.#projectMutation = await this.#recordAndAdd(
         `project ${contract.projectId}`,
         projectLeases,
         () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
@@ -5464,6 +5468,7 @@ export class ExecutorLeaseManager {
       () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
       (policy) => setPolicy(contract.projectId, invocation.ownerAccessToken, policy, this.#fetcher),
       this.#account.email,
+      this.#projectMutation?.leases ?? [],
     );
     if (invocation.terraformRoot === "prod") {
       for (const [email, lease] of Object.entries(buildRuntimeActAsLeases(
@@ -5503,10 +5508,19 @@ export class ExecutorLeaseManager {
     get: () => Promise<IamPolicy>,
     set: (policy: IamPolicy) => Promise<IamPolicy | undefined>,
     forbiddenMemberEmail?: string,
+    // Leases this bridge is known to have granted the executor already. Absent
+    // (acquire), the executor must hold no project authority at all. Present
+    // (elevation), it may hold exactly these and nothing else -- the guard is
+    // still "no authority nobody granted", which is what it was protecting.
+    grantedExecutorLeases?: readonly IamBinding[],
   ): Promise<PolicyMutationRecord> {
     const original = await get();
     if (forbiddenMemberEmail !== undefined) {
-      requireNoExecutorProjectBindings(original, forbiddenMemberEmail);
+      if (grantedExecutorLeases === undefined) {
+        requireNoExecutorProjectBindings(original, forbiddenMemberEmail);
+      } else {
+        knownExecutorBindingsRemain(original, forbiddenMemberEmail, grantedExecutorLeases);
+      }
     }
     const record: PolicyMutationRecord = {
       get,
@@ -6072,14 +6086,14 @@ function requireContainsExactBindings(
   }
 }
 
-function requireNoExecutorProjectBindings(policy: IamPolicy, email: string): void {
+export function requireNoExecutorProjectBindings(policy: IamPolicy, email: string): void {
   const member = `serviceAccount:${email}`;
   if (policy.bindings.some((binding) => binding.members.includes(member))) {
     throw new Error("The dedicated executor has a standing project IAM binding.");
   }
 }
 
-function knownExecutorBindingsRemain(
+export function knownExecutorBindingsRemain(
   policy: IamPolicy,
   email: string,
   knownLeases: readonly IamBinding[],
@@ -9740,6 +9754,11 @@ export async function waitForControlPermissions(
     );
     if (!projectResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(projectResponse))) {
+      // Same propagating-grant case the state probe already tolerates: 403 here
+      // means the mutation lease has not landed yet, and this projection runs
+      // after the plan has been consumed, so throwing burns the approved plan
+      // over a condition the convergence budget exists to wait out.
+      if (expected !== "none" && projectResponse.status === 403) return false;
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
     let projectMatches = true;

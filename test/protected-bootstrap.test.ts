@@ -29,6 +29,7 @@ import {
   deterministicArtifactHex,
   encodeStorageTestIamPermissionsRequest,
   ExecutorLeaseManager,
+  knownExecutorBindingsRemain,
   ensureExposureStateInitialized,
   exposureControllerCreateLeaseOrUndefined,
   bridgeRolePermissionsRecognized,
@@ -52,6 +53,7 @@ import {
   proveExposure,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
+  requireNoExecutorProjectBindings,
   randomExecutorAccountId,
   randomExecutorRoleId,
   readConsumerWorkflowPin,
@@ -4997,6 +4999,66 @@ describe("protected owner Terraform bridge", () => {
       () => bucketClock,
     );
     expect(bucketAttempts).toBeGreaterThan(2);
+  });
+
+  test("elevation admits the leases acquire granted and nothing else", () => {
+    const email = "gha-pbt-0123456789ab@cdbentley.iam.gserviceaccount.com";
+    const member = `serviceAccount:${email}`;
+    const acquireLease = {
+      condition: {
+        description: "codex executor read lease",
+        expression: 'request.time < timestamp("2026-08-28T06:00:00Z")',
+        title: "codex-executor-read-33139552461",
+      },
+      members: [member],
+      role: "projects/cdbentley/roles/pbt_read_33139552461",
+    };
+    const granted = { bindings: [acquireLease], version: 3 };
+
+    // Acquire's guard: a freshly created executor must hold nothing at all.
+    expect(() => requireNoExecutorProjectBindings({ bindings: [], version: 3 }, email)).not.toThrow();
+    expect(() => requireNoExecutorProjectBindings(granted, email))
+      .toThrow("standing project IAM binding");
+
+    // Elevation's guard: the executor legitimately still holds the acquire
+    // leases, so absolute absence is the wrong question. Asking it there made
+    // every apply throw *after* consumeApproval had already burned the plan.
+    expect(knownExecutorBindingsRemain(granted, email, [acquireLease])).toBeTrue();
+
+    // The security property is unchanged: authority nobody granted still fails.
+    const smuggled = {
+      bindings: [acquireLease, { members: [member], role: "roles/owner" }],
+      version: 3,
+    };
+    expect(() => knownExecutorBindingsRemain(smuggled, email, [acquireLease]))
+      .toThrow("retained unknown standing project authority");
+
+    // A lease whose condition was altered is not the lease that was granted.
+    const rewritten = {
+      bindings: [{
+        ...acquireLease,
+        condition: { ...acquireLease.condition, expression: "true" },
+      }],
+      version: 3,
+    };
+    expect(() => knownExecutorBindingsRemain(rewritten, email, [acquireLease]))
+      .toThrow("retained unknown standing project authority");
+
+    // Bindings for other members are none of this guard's business.
+    expect(knownExecutorBindingsRemain(
+      { bindings: [{ members: ["serviceAccount:other@x.iam.gserviceaccount.com"], role: "roles/viewer" }], version: 3 },
+      email,
+      [],
+    )).toBeFalse();
+  });
+
+  test("elevation passes acquire's recorded leases to the executor-binding guard", async () => {
+    const source = await Bun.file("tools/ci/protected-bootstrap-bridge.ts").text();
+    // Structural, because no fixture drives acquire -> elevate against stateful
+    // IAM yet; that missing integration is what let the self-collision ship.
+    expect(source).toContain("this.#projectMutation = await this.#recordAndAdd(");
+    expect(source).toContain("this.#projectMutation?.leases ?? []");
+    expect(source).toContain("knownExecutorBindingsRemain(original, forbiddenMemberEmail, grantedExecutorLeases)");
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
