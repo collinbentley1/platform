@@ -176,7 +176,13 @@ const BRIDGE_TELEMETRY_INTERVAL_MS = 15_000;
 // freshness.
 const RECOVERY_STABLE_EMPTY_MS = RECOVERY_STABLE_EMPTY_MINUTES * 60_000;
 const RECOVERY_STABLE_EMPTY_INTERVAL_MS = RECOVERY_SCAN_INTERVAL_MINUTES * 60_000;
-const LEGACY_MUTATOR_TOKEN_SECONDS = 3_600;
+// The single reviewed mutator-token lifetime. Every `google-github-actions/auth`
+// step in this repository declares it, `tools/lint.ts` refuses a step that does
+// not, and the capability manifest's requiredFiles digests cover those very
+// workflow files -- so `verifyPlatformCapability` proves the value rather than
+// trusting it. Consumers mint no tokens of their own; they call these reusable
+// workflows, and `prepare()` proves each consumer pins this exact platform SHA.
+const MUTATOR_TOKEN_SECONDS = 300;
 const TOKEN_DRAIN_SKEW_SECONDS = 120;
 const POST_MUTATION_DRAIN_SECONDS = 300 + TOKEN_DRAIN_SKEW_SECONDS;
 const CAPABILITY_MANIFEST_PATH = "platform-capabilities/preview-deployment-parity-v1.json";
@@ -1869,11 +1875,11 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
   if (!/^[0-9a-z]{50}$/.test(identity.dhiParityId)) {
     throw new Error("Review identity DHI parity ID is malformed.");
   }
-  if (identity.maxMutatorTokenLifetimeSeconds !== 300) {
+  if (identity.maxMutatorTokenLifetimeSeconds !== MUTATOR_TOKEN_SECONDS) {
     throw new Error("Review identity mutator-token lifetime drifted.");
   }
   if (
-    ![300, LEGACY_MUTATOR_TOKEN_SECONDS].includes(identity.tokenDrainSeconds) ||
+    identity.tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS ||
     identity.tokenDrainSeconds < identity.maxMutatorTokenLifetimeSeconds
   ) {
     throw new Error("Review identity token-drain window drifted.");
@@ -2744,8 +2750,8 @@ function normalizedFreezeProof(
   expectedDrainSeconds: number,
 ): ConsumerFreezeProof {
   exact(proof.tokenDrainSeconds, expectedDrainSeconds, "freeze-proof token-drain window");
-  if (![300, LEGACY_MUTATOR_TOKEN_SECONDS].includes(proof.tokenDrainSeconds)) {
-    throw new Error("Freeze proof token-drain window escaped the reviewed values.");
+  if (proof.tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS) {
+    throw new Error("Freeze proof token-drain window escaped the reviewed value.");
   }
   const observedAtMs = Date.parse(proof.observedAt);
   if (!Number.isFinite(observedAtMs) || new Date(observedAtMs).toISOString() !== proof.observedAt) {
@@ -2827,7 +2833,7 @@ function freezeProofFromJson(value: unknown, expectedDrainSeconds: number): Cons
         proof.tokenDrainSeconds,
         "freeze proof token-drain window",
         1,
-        LEGACY_MUTATOR_TOKEN_SECONDS,
+        MUTATOR_TOKEN_SECONDS,
       ),
     },
     expectedDrainSeconds,
@@ -3522,7 +3528,7 @@ export async function proveConsumerFreeze(
   fetcher: Fetcher,
   nowMs = Date.now(),
 ): Promise<ConsumerFreezeProof> {
-  if (![300, LEGACY_MUTATOR_TOKEN_SECONDS].includes(tokenDrainSeconds)) {
+  if (tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS) {
     throw new Error("The consumer token-drain window escaped the reviewed values.");
   }
   if (!Number.isFinite(nowMs)) throw new Error("The consumer freeze time is invalid.");
@@ -3729,11 +3735,11 @@ export async function verifyPlatformCapability(root: string): Promise<PlatformCa
     manifest.maxMutatorTokenLifetimeSeconds,
     "deployment-parity mutator token lifetime",
     1,
-    LEGACY_MUTATOR_TOKEN_SECONDS,
+    MUTATOR_TOKEN_SECONDS,
   );
   exact(
     maxMutatorTokenLifetimeSeconds,
-    300,
+    MUTATOR_TOKEN_SECONDS,
     "deployment-parity mutator token lifetime",
   );
   const marker = record(manifest.marker, "deployment-parity marker contract");
@@ -4340,9 +4346,11 @@ function defaultBridgeDependencies(
         );
       }
       const capability = await verifyTransitionCapability(invocation);
-      const tokenDrainSeconds = invocation.transitionWorkflowSha === ""
-        ? LEGACY_MUTATOR_TOKEN_SECONDS
-        : capability.maxMutatorTokenLifetimeSeconds;
+      // `verifyTransitionCapability` returns the verified active capability even
+      // when no transition is in flight, so this is a proven value in every
+      // mode. The former legacy branch discarded it for a 3600s assumption the
+      // bridge had already disproved.
+      const tokenDrainSeconds = capability.maxMutatorTokenLifetimeSeconds;
       await proveConsumerFreeze(
         invocation.githubActionsToken,
         tokenDrainSeconds,
@@ -11298,10 +11306,10 @@ function planReceipt(value: unknown): PlanReceipt {
       receipt.tokenDrainSeconds,
       "receipt token-drain window",
       1,
-      LEGACY_MUTATOR_TOKEN_SECONDS,
+      MUTATOR_TOKEN_SECONDS,
     );
-    if (![300, LEGACY_MUTATOR_TOKEN_SECONDS].includes(value)) {
-      throw new Error("Receipt token-drain window escaped the reviewed values.");
+    if (value !== MUTATOR_TOKEN_SECONDS) {
+      throw new Error("Receipt token-drain window escaped the reviewed value.");
     }
     return value;
   })();
@@ -11331,9 +11339,9 @@ function planReceipt(value: unknown): PlanReceipt {
         receipt.maxMutatorTokenLifetimeSeconds,
         "receipt mutator-token lifetime",
         1,
-        LEGACY_MUTATOR_TOKEN_SECONDS,
+        MUTATOR_TOKEN_SECONDS,
       );
-      exact(value, 300, "receipt mutator-token lifetime");
+      exact(value, MUTATOR_TOKEN_SECONDS, "receipt mutator-token lifetime");
       return value;
     })(),
     markerProof,
