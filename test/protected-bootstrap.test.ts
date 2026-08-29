@@ -53,6 +53,7 @@ import {
   proveExposure,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
+  requireNoUserManagedKeys,
   requireNoExecutorProjectBindings,
   randomExecutorAccountId,
   randomExecutorRoleId,
@@ -5172,6 +5173,58 @@ describe("protected owner Terraform bridge", () => {
     expect(source).toContain(
       "policy !== undefined &&\n              (policy.bindings.length !== 0 || policy.auditConfigs !== undefined)",
     );
+  });
+
+  test("the key inventory stays strict; only absence-confirmed cleanup tolerates 404", async () => {
+    const account = {
+      description: "Protected Terraform Executor",
+      disabled: false,
+      displayName: "Protected Terraform Executor",
+      email: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      etag: "account-etag-1",
+      name:
+        "projects/cdbentley/serviceAccounts/gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      oauth2ClientId: "123456789",
+      projectId: "cdbentley",
+      uniqueId: "123456789012345678901",
+    };
+    const token = "short-lived-owner-access-token-value";
+
+    // The shared verifier has four callers. Three of them -- the post-create
+    // check in `acquire` and both orphan-recovery checks -- need 404 to remain a
+    // propagation error, or a transient answer stands in for the zero-key proof
+    // and an account with a user-managed key could be deleted uninventoried.
+    await expect(requireNoUserManagedKeys(account, token, async () => new Response("", { status: 404 })))
+      .rejects.toThrow("Executor key inventory failed with HTTP 404");
+
+    // A present account with no user-managed keys passes.
+    await requireNoUserManagedKeys(account, token, async () => Response.json({}));
+
+    // A present account holding one fails.
+    await expect(requireNoUserManagedKeys(
+      account,
+      token,
+      async () =>
+        Response.json({
+          keys: [{
+            keyType: "USER_MANAGED",
+            name: `${account.name}/keys/abcdef0123456789abcdef0123456789abcdef01`,
+          }],
+        }),
+    )).rejects.toThrow();
+
+    // Every other status still fails.
+    await expect(requireNoUserManagedKeys(account, token, async () => new Response("", { status: 500 })))
+      .rejects.toThrow("Executor key inventory failed with HTTP 500");
+
+    // Only the cleanup caller tolerates 404, and only after re-reading the
+    // account and finding it gone. Structural: the release path is reachable in
+    // tests only through the lifecycle fixture, which cannot drive this branch
+    // without also driving the fence reads that precede it.
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
+    expect(source).toContain('"executor cleanup key inventory",');
+    expect(source).toContain("if (!(error instanceof Error) || !/HTTP 404\\b/.test(error.message)) throw error;");
+    expect(source).toContain("if (present !== undefined) throw error;");
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
