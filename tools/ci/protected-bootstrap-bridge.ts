@@ -111,16 +111,26 @@ const APPLY_CLEANUP_OVERHEAD_SECONDS = WRAPPER_CLEANUP_LEAD_SECONDS +
 // pre-elevation reserve 239 seconds short: such a run passed validation and
 // then failed twelve minutes later at assertPreElevationTime, after acquiring
 // and elevating an executor. The floor now rejects it at the budget check.
-const APPLY_SETUP_TOLERANCE_SECONDS = 45;
+const APPLY_SETUP_TOLERANCE_SECONDS = 20;
 const MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS = APPLY_INTERNAL_OPERATION_MINUTES * 60 +
   APPLY_CLEANUP_OVERHEAD_SECONDS - APPLY_SETUP_TOLERANCE_SECONDS;
-// The worst pre-elevation instant the design reviews: executor acquisition
-// consuming its entire IAM convergence window, then the plan re-read consuming
-// its whole bound. assertPreElevationTime must still pass there at the budget
-// floor, or the floor is admitting runs that cannot finish.
-const WORST_CASE_PLAN_REREAD_MINUTES = 7;
-const WORST_CASE_PRE_ELEVATION_SECONDS =
-  (PRE_ELEVATION_CONVERGENCE_MINUTES + WORST_CASE_PLAN_REREAD_MINUTES) * 60;
+// The whole pre-elevation path, modelled from the phase timeline of protected
+// plan run 33230835879 (cdbentley bootstrap, 2026-08-29). Bridge start to the
+// instant an apply reaches assertPreElevationTime measured 253 seconds there:
+// prepare 36s, executor acquisition 177s, permission proof 32s, and Terraform
+// init, plan, and read 8s combined.
+//
+// Acquisition carries its own hard bound, so it is modelled at that bound
+// rather than at what it measured. The rest are modelled near three times
+// measured. Modelling only the bounded operations understates the path: it
+// omits prepare, the freeze and marker proofs, and all Terraform work, which
+// together measured 76 of those 253 seconds.
+const MODELLED_PREPARE_SECONDS = 90;
+const MODELLED_PERMISSION_PROOF_SECONDS = 90;
+const MODELLED_TERRAFORM_SECONDS = 120;
+const MODELLED_PRE_ELEVATION_SECONDS = MODELLED_PREPARE_SECONDS +
+  PRE_ELEVATION_CONVERGENCE_MINUTES * 60 + MODELLED_PERMISSION_PROOF_SECONDS +
+  MODELLED_TERRAFORM_SECONDS;
 const IAM_RETRY_INITIAL_MS = 1_000;
 const IAM_RETRY_MAX_MS = 32_000;
 const IAM_RETRY_MAX_ATTEMPTS = 16;
@@ -374,14 +384,18 @@ if (
       FRESH_RECOVERY_JOB_TIMEOUT_MINUTES >= GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS / 60 ||
   FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES * 60 < OWNER_TOKEN_EXPIRY_MARGIN_SECONDS ||
   EXECUTOR_TOKEN_MINUTES < APPLY_INTERNAL_OPERATION_MINUTES + 1 ||
-  // The floor must leave assertPreElevationTime satisfiable at the worst
-  // pre-elevation instant, or validation admits runs that cannot finish.
+  // The floor must leave the modelled pre-elevation path room to finish and
+  // still satisfy assertPreElevationTime. This does not prove that every apply
+  // fits: assertPreElevationTime is the guard, and it fails closed before the
+  // approval is consumed and before any executor is elevated. What it asserts
+  // is that the floor keeps that guard's headroom above the path measured in
+  // production, so lowering the floor cannot quietly cross it.
   Math.min(
       APPLY_INTERNAL_OPERATION_MINUTES * 60,
       MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS - APPLY_CLEANUP_OVERHEAD_SECONDS,
-    ) <=
-    WORST_CASE_PRE_ELEVATION_SECONDS +
-      (MINIMUM_PRE_APPLY_MINUTES + PRE_ELEVATION_CONVERGENCE_MINUTES) * 60
+    ) -
+      (MINIMUM_PRE_APPLY_MINUTES + PRE_ELEVATION_CONVERGENCE_MINUTES) * 60 <
+    MODELLED_PRE_ELEVATION_SECONDS
 ) {
   throw new Error("The apply token or fresh-recovery envelope escaped its reviewed bound.");
 }

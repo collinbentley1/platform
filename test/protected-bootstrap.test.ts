@@ -203,7 +203,7 @@ describe("protected owner Terraform bridge", () => {
     // The apply floor is the ceiling less the reviewed setup tolerance; a
     // 34-minute floor admitted runs 239 seconds short of the pre-elevation
     // envelope, which only failed twelve minutes into the run.
-    expect(workflow).toContain("bridge_minimum_seconds=$((39 * 60 - 45))");
+    expect(workflow).toContain("bridge_minimum_seconds=$((39 * 60 - 20))");
     expect(workflow).not.toContain("bridge_minimum_seconds=$((34 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((39 * 60))");
     expect(workflow).toContain(
@@ -3238,18 +3238,18 @@ describe("protected owner Terraform bridge", () => {
     expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
     expect(events).toContain("terraform:apply");
     expect(events).toContain("publish:post");
-    for (const budget of ["2294", "2341"]) {
+    for (const budget of ["2319", "2341"]) {
       expect(() => validateInvocation({
         ...validEnvironment(),
         APPROVED_MANIFEST_SHA256: review.sha256,
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: budget,
         EXECUTION_MODE: "apply",
-      })).toThrow("2295..2340 second apply range");
+      })).toThrow("2320..2340 second apply range");
     }
   });
 
-  test("the apply budget floor still reaches elevation at the worst reviewed instant", async () => {
+  test("the apply budget floor admits the whole modelled pre-elevation path", async () => {
     const startedAt = 1_800_000_000_000;
     let now = startedAt;
     const raw = plan([]);
@@ -3257,20 +3257,29 @@ describe("protected owner Terraform bridge", () => {
       ...identity(),
       terraformRoot: "bootstrap",
     });
-    // 2295 is the floor: 39 minutes of job envelope less the 45-second setup
-    // tolerance. The retired 34-minute floor is replayed below.
-    const invocation = validateInvocation({
-      ...validEnvironment(),
-      APPROVED_MANIFEST_SHA256: review.sha256,
-      APPROVED_PLAN_RUN_ID: "123455",
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2295",
-      EXECUTION_MODE: "apply",
-    });
-    const events: string[] = [];
-    const worstCase = (sink: string[]) => ({
-      acquireExecutor: async (_invocation, _expiresAt, _deadline) => {
+    // The model the bridge derives its floor from, and the run it came from.
+    // Modelling only acquisition and the plan re-read understates the path:
+    // prepare, the freeze and marker proofs, and Terraform are real work that
+    // happens before assertPreElevationTime, and they measured 76 of the 253
+    // seconds run 33230835879 spent reaching that point.
+    const MODELLED = {
+      prepare: 90_000,
+      acquire: 5 * 60_000,
+      freeze: 45_000,
+      markers: 45_000,
+      terraformInit: 40_000,
+      terraformPlan: 40_000,
+      planRead: 30_000,
+      inspect: 10_000,
+    };
+    const modelledTotal = Object.values(MODELLED).reduce((a, b) => a + b, 0);
+    expect(modelledTotal).toBe(600_000);
+
+    let elevatedAtMs = 0;
+    const walk = (sink: string[]) => ({
+      acquireExecutor: async () => {
         sink.push("acquire");
-        now += 5 * 60_000 - 1_000;
+        now += MODELLED.acquire;
         return {
           accessToken: "short-lived-executor-access-token-value",
           executorEmail,
@@ -3280,32 +3289,89 @@ describe("protected owner Terraform bridge", () => {
       },
       elevateExecutor: async () => {
         sink.push("elevate");
+        elevatedAtMs = now;
         now += 5 * 60_000 - 1_000;
+      },
+      inspectPlan: async () => {
+        sink.push("inspect");
+        now += MODELLED.inspect;
       },
       now: () => now,
       planJson: JSON.stringify(raw),
+      prepare: async () => {
+        sink.push("prepare");
+        now += MODELLED.prepare;
+        return preparation();
+      },
+      proveFreeze: async (_invocation, tokenDrainSeconds) => {
+        sink.push("freeze");
+        now += MODELLED.freeze;
+        return freezeSnapshot(now, tokenDrainSeconds);
+      },
+      proveMarkers: async (_invocation, _session, requireTargetClear) => {
+        sink.push(`markers:${requireTargetClear ? "post" : "pre"}`);
+        now += MODELLED.markers;
+        return markers();
+      },
       readPlanJson: async () => {
-        now += 7 * 60_000;
+        now += MODELLED.planRead;
         return JSON.stringify(raw);
+      },
+      runTerraform: async (_invocation, _session, _directory, args) => {
+        const phase = args[0] === "plan" && args.includes("-detailed-exitcode")
+          ? "audit"
+          : args[0];
+        sink.push(`terraform:${phase}`);
+        // Only the pre-elevation init and plan are charged against the model;
+        // the post-elevation apply and audit run inside the reserve.
+        if (phase === "init") now += MODELLED.terraformInit;
+        if (phase === "plan") now += MODELLED.terraformPlan;
       },
       verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
         now = mutationCompletedAtMs + 7 * 60_000;
       },
     });
-    await runProtectedBootstrap(invocation, fakeDependencies(events, worstCase(events)));
-    expect(events).toContain("elevate");
-    expect(events).toContain("terraform:apply");
 
-    // The retired floor fails, and only after acquiring and elevating an
-    // executor -- which is precisely why the floor moved.
+    // 2320 is the floor: 39 minutes of job envelope less the 20-second setup
+    // tolerance. The whole modelled path must still reach elevation there.
+    const atFloor: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+        EXECUTION_MODE: "apply",
+      }),
+      fakeDependencies(atFloor, walk(atFloor)),
+    );
+    expect(atFloor).toContain("elevate");
+    expect(atFloor).toContain("terraform:apply");
+    // The walk really did spend the modelled path before elevating, so this
+    // test cannot silently stop covering it.
+    expect(elevatedAtMs - startedAt).toBeGreaterThanOrEqual(modelledTotal);
+
+    // The retired 34-minute floor fails, and only after acquiring an executor
+    // -- twelve modelled minutes in, with IAM already mutated. That late,
+    // post-acquisition failure is what moving the floor prevents.
     now = startedAt;
     const retired: string[] = [];
     await expect(runProtectedBootstrap(
-      { ...invocation, operationBudgetSeconds: 34 * 60 },
-      fakeDependencies(retired, worstCase(retired)),
+      {
+        ...validateInvocation({
+          ...validEnvironment(),
+          APPROVED_MANIFEST_SHA256: review.sha256,
+          APPROVED_PLAN_RUN_ID: "123455",
+          BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+          EXECUTION_MODE: "apply",
+        }),
+        operationBudgetSeconds: 34 * 60,
+      },
+      fakeDependencies(retired, walk(retired)),
     )).rejects.toThrow("converge elevation and apply");
     expect(retired).toContain("acquire");
+    expect(retired).not.toContain("elevate");
     expect(retired).not.toContain("terraform:apply");
   });
 

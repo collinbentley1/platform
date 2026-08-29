@@ -427,7 +427,7 @@ jobs:
           #
           # The apply budget shortens by one second per second of setup, and
           # its floor is what still leaves the reviewed pre-elevation envelope
-          # satisfiable: 39 minutes less the 45-second setup tolerance the
+          # satisfiable: 39 minutes less the 20-second setup tolerance the
           # bridge derives. The previous 34-minute floor admitted five setup
           # minutes, 239 seconds short of that envelope, so such a run passed
           # this check and failed twelve minutes later having already acquired
@@ -440,7 +440,7 @@ jobs:
               ;;
             apply)
               bridge_reserve_seconds=$((2 * 60))
-              bridge_minimum_seconds=$((39 * 60 - 45))
+              bridge_minimum_seconds=$((39 * 60 - 20))
               bridge_maximum_seconds=$((39 * 60))
               ;;
             *) exit 1 ;;
