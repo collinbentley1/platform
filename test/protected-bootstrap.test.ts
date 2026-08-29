@@ -53,6 +53,7 @@ import {
   proveExposure,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
+  requireNoUserManagedKeys,
   requireNoExecutorProjectBindings,
   randomExecutorAccountId,
   randomExecutorRoleId,
@@ -5172,6 +5173,56 @@ describe("protected owner Terraform bridge", () => {
     expect(source).toContain(
       "policy !== undefined &&\n              (policy.bindings.length !== 0 || policy.auditConfigs !== undefined)",
     );
+  });
+
+  test("the cleanup key inventory treats an absent executor as holding no keys", async () => {
+    const account = {
+      description: "Protected Terraform Executor",
+      disabled: false,
+      displayName: "Protected Terraform Executor",
+      email: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      etag: "account-etag-1",
+      name: "projects/cdbentley/serviceAccounts/gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      oauth2ClientId: "123456789",
+      projectId: "cdbentley",
+      uniqueId: "123456789012345678901",
+    };
+
+    // `getExecutor` already tolerates absence, so the account can be
+    // inventoried and gone before cleanup reads its keys. No account holds no
+    // keys, which is exactly what this read proves.
+    await requireNoUserManagedKeys(
+      account,
+      "short-lived-owner-access-token-value",
+      async () => new Response("", { status: 404 }),
+    );
+
+    // A present account with no user-managed keys still passes.
+    await requireNoUserManagedKeys(
+      account,
+      "short-lived-owner-access-token-value",
+      async () => Response.json({}),
+    );
+
+    // A present account that holds one still fails.
+    await expect(requireNoUserManagedKeys(
+      account,
+      "short-lived-owner-access-token-value",
+      async () =>
+        Response.json({
+          keys: [{
+            keyType: "USER_MANAGED",
+            name: `${account.name}/keys/abcdef0123456789abcdef0123456789abcdef01`,
+          }],
+        }),
+    )).rejects.toThrow();
+
+    // Every other status is still fatal.
+    await expect(requireNoUserManagedKeys(
+      account,
+      "short-lived-owner-access-token-value",
+      async () => new Response("", { status: 500 }),
+    )).rejects.toThrow("Executor key inventory failed with HTTP 500");
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {

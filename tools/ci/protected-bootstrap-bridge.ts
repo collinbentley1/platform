@@ -8645,7 +8645,7 @@ async function deleteExecutorByUniqueId(
   return "deleted";
 }
 
-async function requireNoUserManagedKeys(
+export async function requireNoUserManagedKeys(
   account: ServiceAccount,
   token: string,
   fetcher: Fetcher,
@@ -8653,6 +8653,14 @@ async function requireNoUserManagedKeys(
   const url = new URL(`${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}/keys`);
   url.searchParams.set("keyTypes", "USER_MANAGED");
   const response = await fetcher(url, { headers: googleHeaders(token), redirect: "error" });
+  // An absent account holds no keys, which is what this proves. `getExecutor`
+  // already tolerates absence, so the account can be inventoried and gone by the
+  // time cleanup reads its keys -- and because 404 is classified retryable, the
+  // strict read spent the whole IAM consistency window on a condition that can
+  // never resolve. This mirrors the neighbouring policy read and the file's own
+  // convention: `getProjectCustomRole` takes `allowMissing`, `deleteExecutor`
+  // answers "missing".
+  if (response.status === 404) return;
   if (!response.ok) throw new Error(`Executor key inventory failed with HTTP ${response.status}.`);
   const value = record(await boundedJson(response, 256 * 1024), "executor key inventory");
   exactKeys(value, new Set(["keys", "nextPageToken"]), "executor key inventory");
