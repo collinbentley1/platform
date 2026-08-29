@@ -200,7 +200,11 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain("bridge_reserve_seconds=$((16 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((25 * 60))");
     expect(workflow).toContain("bridge_reserve_seconds=$((2 * 60))");
-    expect(workflow).toContain("bridge_minimum_seconds=$((34 * 60))");
+    // The apply floor is the ceiling less the reviewed setup tolerance; a
+    // 34-minute floor admitted runs 239 seconds short of the pre-elevation
+    // envelope, which only failed twelve minutes into the run.
+    expect(workflow).toContain("bridge_minimum_seconds=$((39 * 60 - 45))");
+    expect(workflow).not.toContain("bridge_minimum_seconds=$((34 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((39 * 60))");
     expect(workflow).toContain(
       "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))",
@@ -3234,15 +3238,75 @@ describe("protected owner Terraform bridge", () => {
     expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
     expect(events).toContain("terraform:apply");
     expect(events).toContain("publish:post");
-    for (const budget of ["2039", "2341"]) {
+    for (const budget of ["2294", "2341"]) {
       expect(() => validateInvocation({
         ...validEnvironment(),
         APPROVED_MANIFEST_SHA256: review.sha256,
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: budget,
         EXECUTION_MODE: "apply",
-      })).toThrow("2040..2340 second apply range");
+      })).toThrow("2295..2340 second apply range");
     }
+  });
+
+  test("the apply budget floor still reaches elevation at the worst reviewed instant", async () => {
+    const startedAt = 1_800_000_000_000;
+    let now = startedAt;
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, {
+      ...identity(),
+      terraformRoot: "bootstrap",
+    });
+    // 2295 is the floor: 39 minutes of job envelope less the 45-second setup
+    // tolerance. The retired 34-minute floor is replayed below.
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: review.sha256,
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2295",
+      EXECUTION_MODE: "apply",
+    });
+    const events: string[] = [];
+    const worstCase = (sink: string[]) => ({
+      acquireExecutor: async (_invocation, _expiresAt, _deadline) => {
+        sink.push("acquire");
+        now += 5 * 60_000 - 1_000;
+        return {
+          accessToken: "short-lived-executor-access-token-value",
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          tokenExpiresAtMs: startedAt + 35 * 60_000,
+        };
+      },
+      elevateExecutor: async () => {
+        sink.push("elevate");
+        now += 5 * 60_000 - 1_000;
+      },
+      now: () => now,
+      planJson: JSON.stringify(raw),
+      readPlanJson: async () => {
+        now += 7 * 60_000;
+        return JSON.stringify(raw);
+      },
+      verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
+        now = mutationCompletedAtMs + 7 * 60_000;
+      },
+    });
+    await runProtectedBootstrap(invocation, fakeDependencies(events, worstCase(events)));
+    expect(events).toContain("elevate");
+    expect(events).toContain("terraform:apply");
+
+    // The retired floor fails, and only after acquiring and elevating an
+    // executor -- which is precisely why the floor moved.
+    now = startedAt;
+    const retired: string[] = [];
+    await expect(runProtectedBootstrap(
+      { ...invocation, operationBudgetSeconds: 34 * 60 },
+      fakeDependencies(retired, worstCase(retired)),
+    )).rejects.toThrow("converge elevation and apply");
+    expect(retired).toContain("acquire");
+    expect(retired).not.toContain("terraform:apply");
   });
 
   test("owner token introspection requires exact cloud scope and enough recovery lifetime", async () => {

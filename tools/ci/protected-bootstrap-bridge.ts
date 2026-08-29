@@ -91,13 +91,36 @@ const CLEANUP_RETRY_INTERVAL_MS = 2_000;
 const IAM_CONSISTENCY_MAX_WAIT_MS = 5 * 60_000;
 const PRE_ELEVATION_CONVERGENCE_MINUTES = IAM_CONSISTENCY_MAX_WAIT_MS / 60_000;
 const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
-// A minimum accepted apply has 28 primary-work minutes after the wrapper's
-// one-minute cleanup lead and the controller's five-minute exact-cleanup
-// reserve: 15 minutes after WIF mutation, five minutes for that mutation to
-// converge, five minutes for read-permission convergence, and three minutes
-// for bounded non-IAM preparation. The 39-minute maximum raises the latter to
-// eight minutes when setup consumed none of the job envelope.
-const MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS = 34 * 60;
+// The apply budget is the job envelope minus runner setup and the same-job
+// tail, so it shortens by one second for every second of setup. What it must
+// still buy is the whole reviewed internal operation window, less the
+// wrapper's one-minute cleanup lead and the controller's five-minute
+// exact-cleanup reserve.
+const WRAPPER_CLEANUP_LEAD_SECONDS = 60;
+const EXACT_CLEANUP_RESERVE_SECONDS = 5 * 60;
+const APPLY_CLEANUP_OVERHEAD_SECONDS = WRAPPER_CLEANUP_LEAD_SECONDS +
+  EXACT_CLEANUP_RESERVE_SECONDS;
+// How much of that window setup may consume. The worst pre-elevation instant
+// this design reviews -- executor acquisition using its entire five-minute IAM
+// convergence window, then the plan re-read using its whole seven-minute bound
+// -- needs 20 further minutes for elevation convergence and the post-mutation
+// apply, and that only fits while setup stays inside this tolerance. Setup
+// measured 6 to 9 seconds across the four protected plan runs of 2026-08-29.
+//
+// The previous 34-minute floor admitted five setup minutes, which leaves the
+// pre-elevation reserve 239 seconds short: such a run passed validation and
+// then failed twelve minutes later at assertPreElevationTime, after acquiring
+// and elevating an executor. The floor now rejects it at the budget check.
+const APPLY_SETUP_TOLERANCE_SECONDS = 45;
+const MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS = APPLY_INTERNAL_OPERATION_MINUTES * 60 +
+  APPLY_CLEANUP_OVERHEAD_SECONDS - APPLY_SETUP_TOLERANCE_SECONDS;
+// The worst pre-elevation instant the design reviews: executor acquisition
+// consuming its entire IAM convergence window, then the plan re-read consuming
+// its whole bound. assertPreElevationTime must still pass there at the budget
+// floor, or the floor is admitting runs that cannot finish.
+const WORST_CASE_PLAN_REREAD_MINUTES = 7;
+const WORST_CASE_PRE_ELEVATION_SECONDS =
+  (PRE_ELEVATION_CONVERGENCE_MINUTES + WORST_CASE_PLAN_REREAD_MINUTES) * 60;
 const IAM_RETRY_INITIAL_MS = 1_000;
 const IAM_RETRY_MAX_MS = 32_000;
 const IAM_RETRY_MAX_ATTEMPTS = 16;
@@ -350,7 +373,15 @@ if (
   APPLY_MAIN_STEP_TIMEOUT_MINUTES + APPLY_MAIN_JOB_TAIL_MINUTES +
       FRESH_RECOVERY_JOB_TIMEOUT_MINUTES >= GOOGLE_USER_ACCESS_TOKEN_MAX_SECONDS / 60 ||
   FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES * 60 < OWNER_TOKEN_EXPIRY_MARGIN_SECONDS ||
-  EXECUTOR_TOKEN_MINUTES < APPLY_INTERNAL_OPERATION_MINUTES + 1
+  EXECUTOR_TOKEN_MINUTES < APPLY_INTERNAL_OPERATION_MINUTES + 1 ||
+  // The floor must leave assertPreElevationTime satisfiable at the worst
+  // pre-elevation instant, or validation admits runs that cannot finish.
+  Math.min(
+      APPLY_INTERNAL_OPERATION_MINUTES * 60,
+      MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS - APPLY_CLEANUP_OVERHEAD_SECONDS,
+    ) <=
+    WORST_CASE_PRE_ELEVATION_SECONDS +
+      (MINIMUM_PRE_APPLY_MINUTES + PRE_ELEVATION_CONVERGENCE_MINUTES) * 60
 ) {
   throw new Error("The apply token or fresh-recovery envelope escaped its reviewed bound.");
 }
@@ -3005,13 +3036,13 @@ export async function runProtectedBootstrap(
   telemetry = bestEffortTelemetry(telemetry);
   const startedAtMs = dependencies.now();
   const wrapperDeadlineMs = startedAtMs + invocation.operationBudgetSeconds * 1_000;
-  const cleanupDeadlineMs = wrapperDeadlineMs - 60_000;
+  const cleanupDeadlineMs = wrapperDeadlineMs - WRAPPER_CLEANUP_LEAD_SECONDS * 1_000;
   const internalOperationMinutes = invocation.mode === "plan"
     ? PLAN_INTERNAL_OPERATION_MINUTES
     : APPLY_INTERNAL_OPERATION_MINUTES;
   const operationDeadlineMs = Math.min(
     startedAtMs + internalOperationMinutes * 60_000,
-    cleanupDeadlineMs - 5 * 60_000,
+    cleanupDeadlineMs - EXACT_CLEANUP_RESERVE_SECONDS * 1_000,
   );
   if (operationDeadlineMs <= startedAtMs) {
     throw new Error("Bridge operation budget cannot cover primary work plus exact cleanup.");

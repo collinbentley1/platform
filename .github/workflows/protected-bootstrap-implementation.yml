@@ -423,8 +423,15 @@ jobs:
           # Plan keeps its complete sixteen-minute same-job recovery tail.
           # Apply keeps two minutes for opportunistic same-job containment and
           # relies on the independently authenticated eighteen-minute fresh
-          # recovery job after a late failure. Its minimum admits at most five
-          # setup minutes while preserving both IAM windows and apply reserve.
+          # recovery job after a late failure.
+          #
+          # The apply budget shortens by one second per second of setup, and
+          # its floor is what still leaves the reviewed pre-elevation envelope
+          # satisfiable: 39 minutes less the 45-second setup tolerance the
+          # bridge derives. The previous 34-minute floor admitted five setup
+          # minutes, 239 seconds short of that envelope, so such a run passed
+          # this check and failed twelve minutes later having already acquired
+          # and elevated an executor. Setup measures 6 to 9 seconds here.
           case "$EXECUTION_MODE" in
             plan)
               bridge_reserve_seconds=$((16 * 60))
@@ -433,7 +440,7 @@ jobs:
               ;;
             apply)
               bridge_reserve_seconds=$((2 * 60))
-              bridge_minimum_seconds=$((34 * 60))
+              bridge_minimum_seconds=$((39 * 60 - 45))
               bridge_maximum_seconds=$((39 * 60))
               ;;
             *) exit 1 ;;
