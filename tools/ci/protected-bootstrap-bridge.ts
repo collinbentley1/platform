@@ -5825,11 +5825,29 @@ export class ExecutorLeaseManager {
             }
             await this.#retryIamConsistency(
               "executor cleanup key inventory",
-              () => requireNoUserManagedKeys(
-                observed,
-                invocation.ownerAccessToken,
-                this.#fetcher,
-              ),
+              async () => {
+                try {
+                  await requireNoUserManagedKeys(
+                    observed,
+                    invocation.ownerAccessToken,
+                    this.#fetcher,
+                  );
+                } catch (error) {
+                  // A 404 here is only proof of no keys once the account is
+                  // proven gone. Re-read it: absent satisfies the check, and a
+                  // still-present account keeps the 404 a propagation error so
+                  // the loop retries rather than skipping the proof.
+                  if (!(error instanceof Error) || !/HTTP 404\b/.test(error.message)) throw error;
+                  const present = await getExecutor(
+                    contract.projectId,
+                    observed.uniqueId,
+                    invocation.ownerAccessToken,
+                    this.#fetcher,
+                    true,
+                  );
+                  if (present !== undefined) throw error;
+                }
+              },
             );
             // This proves the executor holds no policy before deletion. An
             // absent account satisfies that: there is no account, so there is no
@@ -8645,6 +8663,13 @@ async function deleteExecutorByUniqueId(
   return "deleted";
 }
 
+// Strict on purpose. Three of its four callers -- the post-create check in
+// `acquire` and both orphan-recovery checks -- need a 404 to stay a propagation
+// error, because this file classifies IAM 404s as retryable: tolerating one
+// there would let a transient answer stand in for the zero-key proof and permit
+// deleting an account whose user-managed key was never inventoried. Only the
+// cleanup caller, which can independently confirm the account is gone, treats
+// absence as satisfying it.
 export async function requireNoUserManagedKeys(
   account: ServiceAccount,
   token: string,
@@ -8653,14 +8678,6 @@ export async function requireNoUserManagedKeys(
   const url = new URL(`${serviceAccountIdentifierUrl(account.projectId, account.uniqueId)}/keys`);
   url.searchParams.set("keyTypes", "USER_MANAGED");
   const response = await fetcher(url, { headers: googleHeaders(token), redirect: "error" });
-  // An absent account holds no keys, which is what this proves. `getExecutor`
-  // already tolerates absence, so the account can be inventoried and gone by the
-  // time cleanup reads its keys -- and because 404 is classified retryable, the
-  // strict read spent the whole IAM consistency window on a condition that can
-  // never resolve. This mirrors the neighbouring policy read and the file's own
-  // convention: `getProjectCustomRole` takes `allowMissing`, `deleteExecutor`
-  // answers "missing".
-  if (response.status === 404) return;
   if (!response.ok) throw new Error(`Executor key inventory failed with HTTP ${response.status}.`);
   const value = record(await boundedJson(response, 256 * 1024), "executor key inventory");
   exactKeys(value, new Set(["keys", "nextPageToken"]), "executor key inventory");

@@ -5175,39 +5175,35 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
-  test("the cleanup key inventory treats an absent executor as holding no keys", async () => {
+  test("the key inventory stays strict; only absence-confirmed cleanup tolerates 404", async () => {
     const account = {
       description: "Protected Terraform Executor",
       disabled: false,
       displayName: "Protected Terraform Executor",
       email: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
       etag: "account-etag-1",
-      name: "projects/cdbentley/serviceAccounts/gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      name:
+        "projects/cdbentley/serviceAccounts/gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
       oauth2ClientId: "123456789",
       projectId: "cdbentley",
       uniqueId: "123456789012345678901",
     };
+    const token = "short-lived-owner-access-token-value";
 
-    // `getExecutor` already tolerates absence, so the account can be
-    // inventoried and gone before cleanup reads its keys. No account holds no
-    // keys, which is exactly what this read proves.
-    await requireNoUserManagedKeys(
-      account,
-      "short-lived-owner-access-token-value",
-      async () => new Response("", { status: 404 }),
-    );
+    // The shared verifier has four callers. Three of them -- the post-create
+    // check in `acquire` and both orphan-recovery checks -- need 404 to remain a
+    // propagation error, or a transient answer stands in for the zero-key proof
+    // and an account with a user-managed key could be deleted uninventoried.
+    await expect(requireNoUserManagedKeys(account, token, async () => new Response("", { status: 404 })))
+      .rejects.toThrow("Executor key inventory failed with HTTP 404");
 
-    // A present account with no user-managed keys still passes.
-    await requireNoUserManagedKeys(
-      account,
-      "short-lived-owner-access-token-value",
-      async () => Response.json({}),
-    );
+    // A present account with no user-managed keys passes.
+    await requireNoUserManagedKeys(account, token, async () => Response.json({}));
 
-    // A present account that holds one still fails.
+    // A present account holding one fails.
     await expect(requireNoUserManagedKeys(
       account,
-      "short-lived-owner-access-token-value",
+      token,
       async () =>
         Response.json({
           keys: [{
@@ -5217,12 +5213,18 @@ describe("protected owner Terraform bridge", () => {
         }),
     )).rejects.toThrow();
 
-    // Every other status is still fatal.
-    await expect(requireNoUserManagedKeys(
-      account,
-      "short-lived-owner-access-token-value",
-      async () => new Response("", { status: 500 }),
-    )).rejects.toThrow("Executor key inventory failed with HTTP 500");
+    // Every other status still fails.
+    await expect(requireNoUserManagedKeys(account, token, async () => new Response("", { status: 500 })))
+      .rejects.toThrow("Executor key inventory failed with HTTP 500");
+
+    // Only the cleanup caller tolerates 404, and only after re-reading the
+    // account and finding it gone. Structural: the release path is reachable in
+    // tests only through the lifecycle fixture, which cannot drive this branch
+    // without also driving the fence reads that precede it.
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
+    expect(source).toContain('"executor cleanup key inventory",');
+    expect(source).toContain("if (!(error instanceof Error) || !/HTTP 404\\b/.test(error.message)) throw error;");
+    expect(source).toContain("if (present !== undefined) throw error;");
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
