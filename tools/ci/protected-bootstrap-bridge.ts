@@ -9665,15 +9665,19 @@ export async function waitForStatePermissions(
         now,
       );
       if (objectResult.denied && expected !== "none") {
-        // UNAUTHENTICATED will not heal, so fail fast and name the reason.
-        // PERMISSION_DENIED is a grant still propagating: the convergence loop
-        // already re-scans until the deadline, and a hard throw here threw away
-        // four of the five available minutes on a run that would have settled.
-        if (objectResult.status === STORAGE_RPC_UNAUTHENTICATED) {
-          throw new Error(
-            "Storage object permission RPC rejected the executor credential as unauthenticated.",
-          );
-        }
+        // Both denial codes are transient here, and the bridge is what makes
+        // them so. PERMISSION_DENIED is a lease still propagating.
+        // UNAUTHENTICATED is the executor's own disable/re-enable cycle: the
+        // token is minted before `executor.disable`, and disabling a service
+        // account rejects its existing tokens until it is re-enabled and that
+        // re-enable propagates. `executor.final-enable` immediately precedes
+        // this projection, so a token minted minutes earlier is routinely
+        // rejected for the first seconds of it.
+        //
+        // Neither can be distinguished from a genuinely unusable credential by
+        // its code alone, and the convergence loop already bounds the wait: a
+        // credential that never becomes usable fails on the deadline with the
+        // lease-propagation message instead of aborting the run outright.
         return false;
       }
       if (objectResult.denied && objectResult.permissions.length !== 0) {
