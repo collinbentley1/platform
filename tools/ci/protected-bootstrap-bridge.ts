@@ -9585,19 +9585,30 @@ export async function waitForStatePermissions(
     ...(invocation.mode === "apply"
       ? [{
           bucket: state.bucket,
-          // `consumeApproval` writes this before elevation runs, so by the time
-          // the mutation projection probes it the object exists. Demanding
-          // provable `storage.objects.create` on it would demand the executor
-          // prove it can overwrite an immutable receipt -- the one thing the
-          // create-only receipt lease exists to prevent. `storage.objects.create`
-          // is observable only through the effective-overwrite probe, which GCS
-          // answers by requiring create *and* delete on a live object, so the
-          // executor's `roles/storage.objectCreator` grant can never satisfy it
-          // and the projection could not converge. Read-only is what is actually
-          // required of an already-consumed receipt, and it matches how the plan
-          // receipt above is already downgraded for apply.
+          // This receipt changes state across the run, so what must be provable
+          // about it changes too, and the projection -- not the mode -- is what
+          // distinguishes them.
+          //
+          // The "read" projection runs inside `acquire`, before
+          // `consumeApproval`. The object is still absent and the receipt lease
+          // already grants `roles/storage.objectCreator`, so create is both
+          // provable and required: this run is about to write it.
+          //
+          // The "mutation" projection runs inside `elevate`, after
+          // `consumeApproval` has written it. Requiring create there would
+          // require the executor to prove it can overwrite an immutable receipt
+          // -- the one thing the create-without-delete lease exists to prevent.
+          // `storage.objects.create` is excluded from
+          // STORAGE_OBJECT_RPC_PERMISSIONS, so it is observable only through the
+          // effective-overwrite probe, and GCS answers that on a live object by
+          // requiring delete as well. Demanding it could never converge, and the
+          // deadline would land after the plan was already consumed.
           name: receiptObjectName(state, "consumed", invocation.approvedPlanRunId),
-          required: expected === "none" ? noAccess : readOnly,
+          required: expected === "none"
+            ? noAccess
+            : expected === "mutation"
+            ? readOnly
+            : createRead,
         }, {
           bucket: state.bucket,
           // Still absent at elevation, so create remains both provable and

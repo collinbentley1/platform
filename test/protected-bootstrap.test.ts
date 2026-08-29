@@ -5227,7 +5227,7 @@ describe("protected owner Terraform bridge", () => {
     expect(source).toContain("if (present !== undefined) throw error;");
   });
 
-  test("the mutation projection converges when the consumed receipt already exists", async () => {
+  test("the consumed receipt is creatable before consumption and read-only after", async () => {
     // `consumeApproval` writes consumed/<planRunId>.json before elevation, so by
     // the time the mutation projection probes it the object exists and the
     // executor holds create-without-delete on it, deliberately, so the receipt
@@ -5293,6 +5293,46 @@ describe("protected owner Terraform bridge", () => {
     // It probed the object that matters, and did not need it to be overwritable.
     expect(overwritten).toContain(consumed);
     expect(overwritten).toContain(results);
+
+    // The "read" projection runs inside `acquire`, before `consumeApproval`.
+    // The receipt is still absent and the lease already grants objectCreator, so
+    // the probe reports create -- and requiring read-only there would treat that
+    // as forbidden and hang until the deadline, failing every apply before it
+    // could ever reach consumption.
+    let readClock = 0;
+    await waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input: URL | string): Promise<Response> => {
+        const requested = new URL(String(input)).searchParams.getAll("permissions");
+        return Response.json({
+          kind: "storage#testIamPermissionsResponse",
+          permissions: requested,
+        });
+      },
+      async () => {
+        readClock += 1_000;
+      },
+      {
+        // Only the two receipts this run will write are absent and leased to the
+        // executor as creator. The plan receipt already exists, and the read
+        // projection holds no write lease on the state objects at all.
+        testObjectOverwrite: async ({ objectName }) =>
+          objectName === consumed || objectName === results,
+        // The lock object is reachable only by the mutation projection, so the
+        // read projection must observe nothing at all on it.
+        testObjectPermissions: async ({ permissions, resource }) => ({
+          denied: false,
+          permissions: resource.endsWith("default.tflock")
+            ? []
+            : permissions.filter((permission) => permission === "storage.objects.get"),
+        }),
+      },
+      300_000,
+      () => readClock,
+    );
   });
 
   test("Storage permission protobuf is bounded, exact, and rejects unknown response fields", () => {
