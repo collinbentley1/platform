@@ -5090,7 +5090,31 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(runtimeAttempts).toBeGreaterThan(3);
 
-    // Only 403 is propagation. Anything else is still fatal, immediately.
+    // 401 is the same transient: the executor's re-enable immediately precedes
+    // this projection, and a token minted before the disable is rejected until
+    // it propagates.
+    let unauthClock = 0;
+    let unauthAttempts = 0;
+    await waitForControlPermissions(
+      bootstrap,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input, init) => {
+        unauthAttempts += 1;
+        if (unauthAttempts <= 2) return new Response("", { status: 401 });
+        const permissions =
+          (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions;
+        return Response.json({ permissions });
+      },
+      async () => {
+        unauthClock += 1_000;
+      },
+      300_000,
+      () => unauthClock,
+    );
+    expect(unauthAttempts).toBeGreaterThan(2);
+
+    // Only 401 and 403 are transient. Anything else is still fatal, immediately.
     await expect(waitForControlPermissions(
       bootstrap,
       "short-lived-executor-access-token-value",
