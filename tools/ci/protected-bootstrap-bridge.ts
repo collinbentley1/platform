@@ -9585,10 +9585,23 @@ export async function waitForStatePermissions(
     ...(invocation.mode === "apply"
       ? [{
           bucket: state.bucket,
+          // `consumeApproval` writes this before elevation runs, so by the time
+          // the mutation projection probes it the object exists. Demanding
+          // provable `storage.objects.create` on it would demand the executor
+          // prove it can overwrite an immutable receipt -- the one thing the
+          // create-only receipt lease exists to prevent. `storage.objects.create`
+          // is observable only through the effective-overwrite probe, which GCS
+          // answers by requiring create *and* delete on a live object, so the
+          // executor's `roles/storage.objectCreator` grant can never satisfy it
+          // and the projection could not converge. Read-only is what is actually
+          // required of an already-consumed receipt, and it matches how the plan
+          // receipt above is already downgraded for apply.
           name: receiptObjectName(state, "consumed", invocation.approvedPlanRunId),
-          required: expected === "none" ? noAccess : createRead,
+          required: expected === "none" ? noAccess : readOnly,
         }, {
           bucket: state.bucket,
+          // Still absent at elevation, so create remains both provable and
+          // necessary: this run publishes it.
           name: receiptObjectName(state, "results", invocation.githubRunId),
           required: expected === "none" ? noAccess : createRead,
         }]
