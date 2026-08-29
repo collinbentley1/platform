@@ -9621,9 +9621,11 @@ export async function waitForStatePermissions(
     if (!bucketResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(bucketResponse))) {
       // 403 while waiting for a grant to appear is exactly what this loop
-      // exists to absorb. Throwing discards the rest of the convergence
-      // budget; report "not converged yet" and let the deadline decide.
-      if (expected !== "none" && bucketResponse.status === 403) return false;
+      // exists to absorb, and 401 is the executor's own disable/re-enable cycle
+      // -- `permissionDenialProvesNoUsableCredential` already treats the two as
+      // one class. Throwing discards the rest of the convergence budget; report
+      // "not converged yet" and let the deadline decide.
+      if (expected !== "none" && transientPermissionDenial(bucketResponse)) return false;
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
     }
     const requiredBucketPermissions = ["storage.objects.list"];
@@ -9665,15 +9667,19 @@ export async function waitForStatePermissions(
         now,
       );
       if (objectResult.denied && expected !== "none") {
-        // UNAUTHENTICATED will not heal, so fail fast and name the reason.
-        // PERMISSION_DENIED is a grant still propagating: the convergence loop
-        // already re-scans until the deadline, and a hard throw here threw away
-        // four of the five available minutes on a run that would have settled.
-        if (objectResult.status === STORAGE_RPC_UNAUTHENTICATED) {
-          throw new Error(
-            "Storage object permission RPC rejected the executor credential as unauthenticated.",
-          );
-        }
+        // Both denial codes are transient here, and the bridge is what makes
+        // them so. PERMISSION_DENIED is a lease still propagating.
+        // UNAUTHENTICATED is the executor's own disable/re-enable cycle: the
+        // token is minted before `executor.disable`, and disabling a service
+        // account rejects its existing tokens until it is re-enabled and that
+        // re-enable propagates. `executor.final-enable` immediately precedes
+        // this projection, so a token minted minutes earlier is routinely
+        // rejected for the first seconds of it.
+        //
+        // Neither can be distinguished from a genuinely unusable credential by
+        // its code alone, and the convergence loop already bounds the wait: a
+        // credential that never becomes usable fails on the deadline with the
+        // lease-propagation message instead of aborting the run outright.
         return false;
       }
       if (objectResult.denied && objectResult.permissions.length !== 0) {
@@ -9771,11 +9777,10 @@ export async function waitForControlPermissions(
     );
     if (!projectResponse.ok &&
       !(expected === "none" && permissionDenialProvesNoUsableCredential(projectResponse))) {
-      // Same propagating-grant case the state probe already tolerates: 403 here
-      // means the mutation lease has not landed yet, and this projection runs
-      // after the plan has been consumed, so throwing burns the approved plan
-      // over a condition the convergence budget exists to wait out.
-      if (expected !== "none" && projectResponse.status === 403) return false;
+      // Same transient class the state probe tolerates, and this projection
+      // runs after the plan has been consumed, so throwing burns the approved
+      // plan over a condition the convergence budget exists to wait out.
+      if (expected !== "none" && transientPermissionDenial(projectResponse)) return false;
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
     let projectMatches = true;
@@ -9818,9 +9823,9 @@ export async function waitForControlPermissions(
         if (!response.ok &&
           !(expected === "none" && permissionDenialProvesNoUsableCredential(response))) {
           // A prod elevation adds the runtime actAs leases immediately before
-          // this scan, so their 403 is the same propagating grant the project
-          // probe above already waits out -- and this runs post-consumption too.
-          if (expected !== "none" && response.status === 403) return false;
+          // this scan, so their denial is the same transient the project probe
+          // above waits out -- and this runs post-consumption too.
+          if (expected !== "none" && transientPermissionDenial(response)) return false;
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
         }
         if (!response.ok) continue;
@@ -10952,6 +10957,15 @@ export async function proveExposure(
     terraformRoot: invocation.terraformRoot,
   });
   return proof;
+}
+
+// A denial the convergence loop should wait out rather than abort on. 403 is a
+// grant that has not propagated; 401 is the executor's own disable/re-enable
+// cycle, whose re-enable immediately precedes every permission projection.
+// Neither is distinguishable from a permanent failure by status alone, and the
+// loop already bounds the wait.
+function transientPermissionDenial(response: Response): boolean {
+  return response.status === 401 || response.status === 403;
 }
 
 function permissionDenialProvesNoUsableCredential(response: Response): boolean {

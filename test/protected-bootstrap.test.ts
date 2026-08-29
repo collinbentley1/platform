@@ -4900,14 +4900,12 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow("Denied storage object permission RPC returned permissions");
   });
 
-  test("state permission convergence separates propagation from an unusable credential", async () => {
+  test("state permission convergence waits out both denial codes", async () => {
     const state = {
       bucket: "cdbentley-tfstate-882468538648-bootstrap",
       prefix: "cdbentley/bootstrap",
     };
     const invocation = validateInvocation(validEnvironment());
-    // Mirrors the granted read shape the exact-probe test pins: only
-    // `storage.objects.get` on the plan/state paths, nothing elsewhere.
     const grantedRead = (permissions: readonly string[], resource: string) =>
       resource.includes("/.protected-bootstrap/plans/") || resource.endsWith("default.tfstate")
         ? permissions.filter((permission) => permission === "storage.objects.get")
@@ -4917,9 +4915,42 @@ describe("protected owner Terraform bridge", () => {
       return Response.json({ kind: "storage#testIamPermissionsResponse", permissions: requested });
     };
 
-    // UNAUTHENTICATED will never heal, so it fails fast and names the reason
-    // instead of spending the whole convergence budget first.
-    let unauthClock = 0;
+    // Both denial codes are transient, and the bridge is what makes them so.
+    // UNAUTHENTICATED (16) is the executor's own disable/re-enable cycle: the
+    // token is minted before `executor.disable`, and the re-enable that
+    // immediately precedes this projection has not propagated yet.
+    // PERMISSION_DENIED (7) is a lease still propagating.
+    for (const status of [7, 16]) {
+      let clock = 0;
+      let attempts = 0;
+      await waitForStatePermissions(
+        state,
+        invocation,
+        "short-lived-executor-access-token-value",
+        "read",
+        grantedBucketFetcher,
+        async () => {
+          clock += 1_000;
+        },
+        {
+          testObjectOverwrite: async ({ objectName }) =>
+            objectName.includes("/.protected-bootstrap/plans/"),
+          testObjectPermissions: async ({ permissions, resource }) => {
+            attempts += 1;
+            return attempts <= 3
+              ? { denied: true, permissions: [], status }
+              : { denied: false, permissions: grantedRead(permissions, resource) };
+          },
+        },
+        300_000,
+        () => clock,
+      );
+      expect(attempts).toBeGreaterThan(3);
+    }
+
+    // A denial that never heals still fails, on the deadline rather than on the
+    // first scan, and names propagation rather than the credential.
+    let deadlineClock = 0;
     await expect(waitForStatePermissions(
       state,
       invocation,
@@ -4927,78 +4958,15 @@ describe("protected owner Terraform bridge", () => {
       "read",
       grantedBucketFetcher,
       async () => {
-        unauthClock += 1_000;
+        deadlineClock += 1_000;
       },
       {
         testObjectOverwrite: async () => false,
         testObjectPermissions: async () => ({ denied: true, permissions: [], status: 16 }),
       },
-      300_000,
-      () => unauthClock,
-    )).rejects.toThrow("unauthenticated");
-    expect(unauthClock).toBe(0);
-
-    // The run-22 case: PERMISSION_DENIED on the first scans, then the grant
-    // lands. This must converge, not abort.
-    let settleClock = 0;
-    let attempts = 0;
-    await waitForStatePermissions(
-      state,
-      invocation,
-      "short-lived-executor-access-token-value",
-      "read",
-      grantedBucketFetcher,
-      async () => {
-        settleClock += 1_000;
-      },
-      {
-        testObjectOverwrite: async ({ objectName }) =>
-          objectName.includes("/.protected-bootstrap/plans/"),
-        testObjectPermissions: async ({ permissions, resource }) => {
-          attempts += 1;
-          return attempts <= 3
-            ? { denied: true, permissions: [], status: 7 }
-            : { denied: false, permissions: grantedRead(permissions, resource) };
-        },
-      },
-      300_000,
-      () => settleClock,
-    );
-    expect(attempts).toBeGreaterThan(3);
-
-    // A bucket-level 403 is the same propagating condition and must also retry
-    // rather than throw `Bucket permission test failed with HTTP 403`.
-    let bucketClock = 0;
-    let bucketAttempts = 0;
-    await waitForStatePermissions(
-      state,
-      invocation,
-      "short-lived-executor-access-token-value",
-      "read",
-      async (input: URL | string): Promise<Response> => {
-        bucketAttempts += 1;
-        if (bucketAttempts <= 2) return new Response("", { status: 403 });
-        const requested = new URL(String(input)).searchParams.getAll("permissions");
-        return Response.json({
-          kind: "storage#testIamPermissionsResponse",
-          permissions: requested,
-        });
-      },
-      async () => {
-        bucketClock += 1_000;
-      },
-      {
-        testObjectOverwrite: async ({ objectName }) =>
-          objectName.includes("/.protected-bootstrap/plans/"),
-        testObjectPermissions: async ({ permissions, resource }) => ({
-          denied: false,
-          permissions: grantedRead(permissions, resource),
-        }),
-      },
-      300_000,
-      () => bucketClock,
-    );
-    expect(bucketAttempts).toBeGreaterThan(2);
+      30_000,
+      () => deadlineClock,
+    )).rejects.toThrow("did not propagate before the deadline");
   });
 
   test("elevation admits the leases acquire granted and nothing else", () => {
@@ -5122,7 +5090,31 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(runtimeAttempts).toBeGreaterThan(3);
 
-    // Only 403 is propagation. Anything else is still fatal, immediately.
+    // 401 is the same transient: the executor's re-enable immediately precedes
+    // this projection, and a token minted before the disable is rejected until
+    // it propagates.
+    let unauthClock = 0;
+    let unauthAttempts = 0;
+    await waitForControlPermissions(
+      bootstrap,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input, init) => {
+        unauthAttempts += 1;
+        if (unauthAttempts <= 2) return new Response("", { status: 401 });
+        const permissions =
+          (JSON.parse(String(init?.body)) as { permissions: string[] }).permissions;
+        return Response.json({ permissions });
+      },
+      async () => {
+        unauthClock += 1_000;
+      },
+      300_000,
+      () => unauthClock,
+    );
+    expect(unauthAttempts).toBeGreaterThan(2);
+
+    // Only 401 and 403 are transient. Anything else is still fatal, immediately.
     await expect(waitForControlPermissions(
       bootstrap,
       "short-lived-executor-access-token-value",
