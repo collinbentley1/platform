@@ -541,6 +541,50 @@ const BOOTSTRAP_RESOURCE_TYPES = new Set([
   "google_storage_bucket_iam_member",
 ]);
 
+// Provider-computed attributes that carry no reviewable meaning and that this
+// bridge's own operation is guaranteed to change between a plan and its apply.
+//
+// Google IAM `etag` is the parent policy's version counter, captured at refresh.
+// Acquiring an executor writes the project IAM policy (read-role, storage,
+// receipt, and marker leases land in one setPolicy) and releasing it writes the
+// policy again -- so between a plan run's refresh and its apply run's refresh
+// there are at least two unconditional project-policy writes, from the plan
+// run's release and the apply run's acquire. Every managed project-IAM resource
+// therefore refreshes with a different etag in the apply, one hashed leaf flips
+// `semanticSha256`, and the apply-authorize equality check throws. That made
+// plan -> apply impossible for every root, forever, with no external activity
+// required. Observed live: runs 33281685967 (plan) and 33282187705 (apply),
+// 2026-08-30, with four `SetIamPolicy` calls on the project in between.
+//
+// Marker read leases are granted on all four consumers' project policies, so
+// this also coupled the fleet: any protected run in any repo invalidated every
+// pending plan in the other three.
+//
+// Removing the etag from the digest removes nothing a reviewer can act on. It
+// selects nothing, parameterizes nothing, and gates nothing: an `*_iam_member`
+// apply is a read-modify-write keyed by role and member, both still hashed; an
+// authoritative binding's applied member set comes from config, which is
+// SHA-bound, and from apply-time live state, so plan-time `before` was always
+// advisory. Any write that changes a role, member, condition, existence, or any
+// other managed attribute still flips fields that remain fully hashed and is
+// still refused. A write that leaves only an etag trace changed nothing the
+// plan reads or the apply performs.
+//
+// Prod types are listed now rather than when prod applies begin: a prod apply
+// writes the three runtime service-account policies, and bootstrap manages
+// those same SAs' IAM, so the two roots invalidate each other's plans.
+const PROVIDER_VOLATILE_ATTRIBUTES: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ["google_artifact_registry_repository_iam_member", new Set(["etag"])],
+  ["google_cloud_run_v2_service_iam_member", new Set(["etag"])],
+  ["google_iam_deny_policy", new Set(["etag"])],
+  ["google_project_iam_binding", new Set(["etag"])],
+  ["google_project_iam_member", new Set(["etag"])],
+  ["google_secret_manager_secret_iam_member", new Set(["etag"])],
+  ["google_service_account_iam_member", new Set(["etag"])],
+  ["google_storage_bucket_iam_binding", new Set(["etag"])],
+  ["google_storage_bucket_iam_member", new Set(["etag"])],
+]);
+
 const PROD_RESOURCE_TYPES = new Set([
   "google_artifact_registry_repository",
   "google_artifact_registry_repository_iam_member",
@@ -2091,6 +2135,14 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
         : {}),
       outputChanges,
       relevantAttributesSha256: hashJson(relevantAttributes),
+      // Every published manifest states what its own digest does not bind, so a
+      // reviewer sees the exclusion contract in the step summary and an auditor
+      // can check it from the receipt alone.
+      volatileAttributeExclusions: Object.fromEntries(
+        [...PROVIDER_VOLATILE_ATTRIBUTES.entries()]
+          .map(([type, attributes]) => [type, [...attributes].toSorted()] as const)
+          .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+      ),
       semanticSha256: hashJson({
         checks,
         outputChanges,
@@ -2101,7 +2153,11 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
       }),
       variables,
     },
-    schemaVersion: 2,
+    // 3: `before`/`after` hashes exclude PROVIDER_VOLATILE_ATTRIBUTES, and the
+    // manifest carries `volatileAttributeExclusions`. A version-2 digest can
+    // never equal a version-3 digest over the same plan, which is correct --
+    // no receipt survives the platform SHA advance that ships this anyway.
+    schemaVersion: 3,
     source: {
       approvalMode: identity.terraformRoot === "exposure" ? "adoption" : "plan",
       consumerSha: sha(identity.consumerSha, "consumer SHA"),
@@ -3200,7 +3256,7 @@ export async function runProtectedBootstrap(
         publishProof,
         dependencies.now(),
       );
-      await dependencies.appendSummary(invocation, reviewSummary(invocation, review, undefined));
+      await dependencies.appendSummary(invocation, reviewSummary(invocation, review, { kind: "publishing" }));
       console.log(`Protected Terraform review digest: ${review.sha256}`);
       return;
     }
@@ -3211,6 +3267,18 @@ export async function runProtectedBootstrap(
       approved.sha256 !== review.sha256 ||
       review.sha256 !== invocation.approvedManifestSha256
     ) {
+      // Publish what the apply actually recomputed before refusing. The success
+      // path already publishes its manifest; the refusal path published nothing,
+      // and the receipt stores only a digest, so a mismatch left no way to see
+      // what diverged. Manifests are hash commitments and identity, never raw
+      // plan values, so displaying one on failure discloses nothing new.
+      await dependencies.appendSummary(
+        invocation,
+        reviewSummary(invocation, review, {
+          kind: "refused",
+          planRunId: invocation.approvedPlanRunId,
+        }),
+      );
       throw new Error("The recomputed plan does not match the fresh approved plan receipt.");
     }
     assertPreElevationTime(
@@ -3342,7 +3410,10 @@ export async function runProtectedBootstrap(
     );
     await dependencies.appendSummary(
       invocation,
-      reviewSummary(invocation, review, invocation.approvedPlanRunId),
+      reviewSummary(invocation, review, {
+        kind: "consumed",
+        planRunId: invocation.approvedPlanRunId,
+      }),
     );
   } catch (error) {
     primaryFailure = error;
@@ -11867,6 +11938,28 @@ function bindingEqualsLease(binding: IamBinding, lease: IamBinding): boolean {
   );
 }
 
+function stripProviderVolatile(type: string, value: JsonValue, label: string): JsonValue {
+  const volatile = PROVIDER_VOLATILE_ATTRIBUTES.get(type);
+  if (
+    volatile === undefined || value === null || typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(([key, entry]) => {
+      if (!volatile.has(key)) return true;
+      // Only a scalar may be excluded. If the provider ever gives one of these
+      // names structured content, the exclusion could conceal reviewable data,
+      // so refuse rather than strip it.
+      if (entry !== null && typeof entry !== "string") {
+        throw new Error(`${label} volatile attribute ${key} escaped its scalar shape.`);
+      }
+      return false;
+    }),
+  );
+}
+
 function normalizeChanges(value: unknown, identity: PlanIdentity, label: string): JsonValue[] {
   const root = identity.terraformRoot;
   const allowedTypes = root === "bootstrap"
@@ -12096,10 +12189,14 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         actions,
         address,
         afterIdentitySha256: hashJson(json(delta.after_identity ?? null, `${label} after identity`)),
-        afterSha256: hashJson(json(delta.after ?? null, `${label} after`)),
+        afterSha256: hashJson(
+          stripProviderVolatile(type, json(delta.after ?? null, `${label} after`), `${label} after`),
+        ),
         afterUnknownSha256: hashJson(json(delta.after_unknown ?? false, `${label} after unknown`)),
         beforeIdentitySha256: hashJson(json(delta.before_identity ?? null, `${label} before identity`)),
-        beforeSha256: hashJson(json(delta.before ?? null, `${label} before`)),
+        beforeSha256: hashJson(
+          stripProviderVolatile(type, json(delta.before ?? null, `${label} before`), `${label} before`),
+        ),
         deposedSha256: hashJson(json(change.deposed ?? null, `${label} deposed key`)),
         indexSha256: hashJson(json(change.index ?? null, `${label} index`)),
         importId,
@@ -12391,15 +12488,27 @@ function rejectSensitive(value: unknown, label: string): void {
   }
 }
 
+// Whether the approved plan receipt was spent. A refused apply stops before
+// consumeApproval, so its receipt is still valid and still authorizes a retry;
+// saying otherwise would send an operator to replace a plan they still hold.
+type PlanReceiptDisposition =
+  | { readonly kind: "publishing" }
+  | { readonly kind: "consumed"; readonly planRunId: string }
+  | { readonly kind: "refused"; readonly planRunId: string };
+
 function reviewSummary(
   invocation: Invocation,
   review: ReviewManifestResult,
-  approvedPlanRunId: string | undefined,
+  disposition: PlanReceiptDisposition,
 ): string {
   const exposureAdoption = invocation.terraformRoot === "exposure";
   const heading = exposureAdoption
     ? "Runsetta exposure state adoption complete"
-    : invocation.mode === "plan" ? "Protected Terraform plan" : "Protected Terraform apply";
+    : invocation.mode === "plan"
+    ? "Protected Terraform plan"
+    : disposition.kind === "refused"
+    ? "Protected Terraform apply refused"
+    : "Protected Terraform apply";
   const summary = [
     `## ${heading}`,
     "",
@@ -12412,13 +12521,24 @@ function reviewSummary(
           `- Adoption run: \`${invocation.githubRunId}\` (immutable completion receipt; no Terraform apply exists)`,
           `- Confirmation: \`${RUNSETTA_EXPOSURE_ADOPTION_CONFIRMATION}\``,
         ]
-      : approvedPlanRunId === undefined
+      : disposition.kind === "publishing"
       ? [`- Plan run: \`${invocation.githubRunId}\` (fresh receipt required for apply)`]
-      : [`- Consumed plan run: \`${approvedPlanRunId}\` (single use)`]),
+      : disposition.kind === "refused"
+      ? [
+          `- Approved plan run: \`${disposition.planRunId}\` (NOT consumed; still valid for a retry)`,
+          `- Approved digest: \`${invocation.approvedManifestSha256}\``,
+        ]
+      : [`- Consumed plan run: \`${disposition.planRunId}\` (single use)`]),
     "",
     ...(exposureAdoption
       ? [
           "The trusted controller create-only adopted the exact live Runsetta mappings into canonical state before Terraform ran. Terraform then validated that state with `-refresh=false` and an exact zero-action plan; it did not apply or contact the Domain Mapping API.",
+          "",
+        ]
+      : []),
+    ...(disposition.kind === "refused"
+      ? [
+          "This apply recomputed its own plan and the result did not match the approved receipt, so it stopped before consuming the approval and before elevating any executor. Nothing was applied and the approved plan was not spent. The manifest below is what this run recomputed; compare it with the approved plan run's manifest to see what diverged.",
           "",
         ]
       : []),

@@ -3249,6 +3249,174 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
+  // Two protected runs over an unchanged world. Every apply-path test above
+  // stubs `verifyApproval` to return the digest the apply itself just
+  // recomputed, so the equality check at controller.apply-authorize is
+  // trivially true and could never fail. These build the plan run's manifest
+  // from a DIFFERENT fixture than the apply run reads, related only by the
+  // refresh noise a real apply always sees, and that is the only shape in
+  // which the defect is visible.
+  //
+  // Live: plan run 33281685967 and apply run 33282187705 (2026-08-30). Four
+  // `SetIamPolicy` calls landed on the project between the two refreshes, all
+  // of them the bridge's own executor acquire and release, so the project IAM
+  // etag had necessarily moved and the apply refused its own approved plan.
+  const iamMember = (etag: string, member: string) => ({
+    condition: null,
+    etag,
+    member,
+    project: "cdbentley",
+    role: "roles/viewer",
+  });
+
+  const twoRunFixtures = (planEtag: string, applyEtag: string) => {
+    const changes = (etag: string) => [
+      resourceChange(
+        "module.bootstrap.google_project_iam_member.terraform_convergence_reader",
+        "google_project_iam_member",
+        iamMember(etag, "serviceAccount:tf@cdbentley.iam.gserviceaccount.com"),
+        iamMember(etag, "serviceAccount:tf@cdbentley.iam.gserviceaccount.com"),
+      ),
+    ];
+    const drift = (etag: string) => [
+      resourceChange(
+        "module.bootstrap.google_service_account_iam_member.prod_deploy_wif_repo",
+        "google_service_account_iam_member",
+        iamMember("BwStaleStored", "serviceAccount:prod@cdbentley.iam.gserviceaccount.com"),
+        iamMember(etag, "serviceAccount:prod@cdbentley.iam.gserviceaccount.com"),
+      ),
+    ];
+    return plan(changes(planEtag), drift(applyEtag));
+  };
+
+  test("a plan and its apply agree across the IAM etag churn the bridge itself causes", () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const atPlan = buildReviewManifest(twoRunFixtures("BwPlanEtag01", "BwPlanEtag01"), planIdentity);
+    const atApply = buildReviewManifest(twoRunFixtures("BwApplyEtag9", "BwApplyEtag9"), planIdentity);
+    expect(atApply.sha256).toBe(atPlan.sha256);
+
+    // The exclusion is stated in the manifest the reviewer reads, not only in
+    // the code that applies it.
+    const published = JSON.parse(atPlan.canonical) as {
+      plan: { volatileAttributeExclusions: Record<string, string[]> };
+      schemaVersion: number;
+    };
+    expect(published.schemaVersion).toBe(3);
+    expect(published.plan.volatileAttributeExclusions["google_project_iam_member"]).toEqual(["etag"]);
+    expect(published.plan.volatileAttributeExclusions["google_service_account_iam_member"]).toEqual([
+      "etag",
+    ]);
+    // Prod types are excluded now, because a prod apply writes the runtime
+    // service-account policies whose IAM the bootstrap root manages.
+    for (const type of [
+      "google_artifact_registry_repository_iam_member",
+      "google_cloud_run_v2_service_iam_member",
+      "google_secret_manager_secret_iam_member",
+    ]) {
+      expect(published.plan.volatileAttributeExclusions[type]).toEqual(["etag"]);
+    }
+  });
+
+  test("etag churn alone does not stop an apply from reaching terraform", async () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const atPlanRun = buildReviewManifest(twoRunFixtures("BwPlanEtag01", "BwPlanEtag01"), planIdentity);
+    const atApplyRun = twoRunFixtures("BwApplyEtag9", "BwApplyEtag9");
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: atPlanRun.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+        EXECUTION_MODE: "apply",
+      }),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(atApplyRun),
+        // The receipt digest comes from the PLAN run's fixture, never from what
+        // the apply recomputes. Deriving it from `review.sha256` is what made
+        // every previous apply test tautological.
+        readPlanJson: async () => JSON.stringify(atApplyRun),
+        verifyApproval: async () => ({ canonical: "", sha256: atPlanRun.sha256 }),
+      }),
+    );
+    expect(events).toContain("consume");
+    expect(events).toContain("elevate");
+    expect(events).toContain("terraform:apply");
+  });
+
+  test("a semantic change between plan and apply still refuses, before consuming", async () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const atPlanRun = buildReviewManifest(twoRunFixtures("BwPlanEtag01", "BwPlanEtag01"), planIdentity);
+    // Same etag churn, plus one member substitution: exactly the thing the
+    // digest exists to catch.
+    const tampered = plan(
+      [
+        resourceChange(
+          "module.bootstrap.google_project_iam_member.terraform_convergence_reader",
+          "google_project_iam_member",
+          iamMember("BwApplyEtag9", "serviceAccount:attacker@cdbentley.iam.gserviceaccount.com"),
+          iamMember("BwApplyEtag9", "serviceAccount:attacker@cdbentley.iam.gserviceaccount.com"),
+        ),
+      ],
+      [
+        resourceChange(
+          "module.bootstrap.google_service_account_iam_member.prod_deploy_wif_repo",
+          "google_service_account_iam_member",
+          iamMember("BwStaleStored", "serviceAccount:prod@cdbentley.iam.gserviceaccount.com"),
+          iamMember("BwApplyEtag9", "serviceAccount:prod@cdbentley.iam.gserviceaccount.com"),
+        ),
+      ],
+    );
+    expect(buildReviewManifest(tampered, planIdentity).sha256).not.toBe(atPlanRun.sha256);
+
+    const events: string[] = [];
+    const summaries: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: atPlanRun.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+        EXECUTION_MODE: "apply",
+      }),
+      fakeDependencies(events, {
+        appendSummary: async (_invocation, body) => {
+          events.push("summary");
+          summaries.push(body);
+        },
+        planJson: JSON.stringify(tampered),
+        readPlanJson: async () => JSON.stringify(tampered),
+        verifyApproval: async () => ({ canonical: "", sha256: atPlanRun.sha256 }),
+      }),
+    )).rejects.toThrow("The recomputed plan does not match");
+    expect(events).not.toContain("consume");
+    expect(events).not.toContain("elevate");
+    expect(events).not.toContain("terraform:apply");
+    // The refusal publishes what it recomputed, so the divergence is
+    // diagnosable without a second run -- and it must not claim the approved
+    // plan was spent, because it was not.
+    expect(events).toContain("summary");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toContain("Protected Terraform apply refused");
+    expect(summaries[0]).toContain("NOT consumed; still valid for a retry");
+    expect(summaries[0]).not.toContain("(single use)");
+  });
+
+  test("a volatile exclusion may never hide structured content", () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const structured = plan([
+      resourceChange(
+        "module.bootstrap.google_project_iam_member.terraform_convergence_reader",
+        "google_project_iam_member",
+        { condition: null, etag: { nested: "payload" }, member: "serviceAccount:a@b.iam.gserviceaccount.com", project: "cdbentley", role: "roles/viewer" },
+        null,
+      ),
+    ]);
+    expect(() => buildReviewManifest(structured, planIdentity)).toThrow(
+      "volatile attribute etag escaped its scalar shape",
+    );
+  });
+
   test("the apply budget floor admits the whole modelled pre-elevation path", async () => {
     const startedAt = 1_800_000_000_000;
     let now = startedAt;
@@ -7805,7 +7973,7 @@ function expectServiceAccountIamPolicyRead(
   ]);
 }
 
-function plan(resourceChanges: unknown[]): Record<string, unknown> {
+function plan(resourceChanges: unknown[], resourceDrift: unknown[] = []): Record<string, unknown> {
   return {
     applyable: true,
     checks: [],
@@ -7818,7 +7986,7 @@ function plan(resourceChanges: unknown[]): Record<string, unknown> {
     prior_state: {},
     relevant_attributes: [],
     resource_changes: resourceChanges,
-    resource_drift: [],
+    resource_drift: resourceDrift,
     terraform_version: "1.14.5",
     timestamp: "2026-08-22T21:00:00Z",
     variables: {},
