@@ -1793,7 +1793,7 @@ const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.
 for (const moduleName of ["cloud-run-service", "bootstrap"]) {
   const moduleDirectory = join(root, "terraform/modules", moduleName);
   const approvedEntries = moduleName === "bootstrap"
-    ? [...approvedModuleFiles, ".terraform.lock.hcl", "preview-runtime-deny.tf", "tests"].sort()
+    ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
     : approvedModuleFiles;
   const moduleEntries = (await readdir(moduleDirectory)).sort();
   if (JSON.stringify(moduleEntries) !== JSON.stringify(approvedEntries)) {

@@ -13,7 +13,6 @@ const requiredPaths = [
   ".github/workflows/infrastructure.yml",
   ".github/workflows/reconcile-previews.yml",
   "terraform/modules/bootstrap/main.tf",
-  "terraform/modules/bootstrap/preview-runtime-deny.tf",
   "terraform/modules/bootstrap/variables.tf",
   "terraform/modules/cloud-run-service/main.tf",
   "tools/ci/cloud-run-dhi-parity.sh",

@@ -2436,7 +2436,7 @@ describe("platform scaffold and doctor", () => {
     for (const moduleName of ["cloud-run-service", "bootstrap"]) {
       const moduleDirectory = join(repoRoot, "terraform/modules", moduleName);
       const approvedEntries = moduleName === "bootstrap"
-        ? [...approvedModuleFiles, ".terraform.lock.hcl", "preview-runtime-deny.tf", "tests"].sort()
+        ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
         : approvedModuleFiles;
       expect((await readdir(moduleDirectory)).sort()).toEqual(approvedEntries);
       for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
