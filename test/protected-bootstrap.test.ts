@@ -16,6 +16,8 @@ import {
   buildReceiptLeases,
   githubProofRetryPolicy,
   retryableGithubReadFailure,
+  retryAfterMs,
+  cancellationError,
   buildLegacyCombinedReceiptCreateLease,
   receiptConsumeLeaseTitle,
   elevationPolicyRecord,
@@ -5772,8 +5774,117 @@ describe("protected owner Terraform bridge", () => {
     );
     await expect(
       proveConsumerFreeze(freezeToken, 300, f502, Date.now(), policyWith(late, Date.now() + 5_000)),
-    ).rejects.toThrow(/insufficient time remaining before the operation deadline/);
+    ).rejects.toThrow(/backoff of \d+ms exceeds the operation deadline less its tail reserve/);
     expect(late).toHaveLength(0);
+  });
+
+  test("a Retry-After longer than the budget fails closed rather than retrying early", async () => {
+    // Truncating the server's instruction to whatever budget remains retries
+    // while still limited and discards the only signal the server gave us.
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("slow down", { headers: { "retry-after": "300" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow(/Retry-After of 300000ms exceeds the remaining retry budget/);
+    expect(sleeps).toHaveLength(0);
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
+  });
+
+  test("Retry-After accepts delta-seconds and an HTTP-date, and ignores nonsense", () => {
+    const now = Date.parse("2026-08-30T12:00:00.000Z");
+    const at = (value: string) =>
+      retryAfterMs({ headers: { get: () => value } }, now);
+    expect(at("2")).toBe(2_000);
+    expect(at("  7 ")).toBe(7_000);
+    // HTTP-date form is legal and GitHub may use it.
+    expect(at("Sun, 30 Aug 2026 12:00:30 GMT")).toBe(30_000);
+    // A date already past means retry now, not a negative sleep.
+    expect(at("Sun, 30 Aug 2026 11:59:00 GMT")).toBe(0);
+    // Unparseable falls back to our own backoff rather than guessing.
+    expect(at("soon")).toBeUndefined();
+    expect(retryAfterMs(undefined, now)).toBeUndefined();
+  });
+
+  test("cancellation is terminal however it is raised", async () => {
+    // Only the deadline sentinel was terminal before, so an AbortError or a
+    // DOMException fell through to the transport branch and was retried --
+    // overriding a deliberate decision to stop.
+    expect(cancellationError(new Error("API request reached the protected operation deadline."))).toBeTrue();
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    expect(cancellationError(abort)).toBeTrue();
+    const timeout = new Error("timed out");
+    timeout.name = "TimeoutError";
+    expect(cancellationError(timeout)).toBeTrue();
+    expect(cancellationError(new DOMException("stopped", "AbortError"))).toBeTrue();
+    // An ordinary transport failure is still retryable.
+    expect(cancellationError(new Error("socket hang up"))).toBeFalse();
+
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher(() => {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      return error;
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow("aborted");
+    expect([...counts.values()].every((n) => n === 1)).toBeTrue();
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("zero jitter is an immediate retry, not an exhausted budget", async () => {
+    // Full jitter may legally return 0. Reporting that as exhaustion was both
+    // wrong and misleading evidence.
+    const sleeps: number[] = [];
+    const zeroJitter = githubProofRetryPolicy(
+      () => Date.now() + 10 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+      () => Date.now(),
+      () => 0,
+    );
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n === 1
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), zeroJitter);
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(2);
+    // Retried without sleeping at all.
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("the budget is wall clock, so slow failures exhaust it even without sleeping", async () => {
+    // Accounting only for sleep time meant a "60 second budget" could span far
+    // more wall clock: four attempts each burning a request timeout still
+    // showed room. Elapsed time is what competes with the phase envelope.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 10 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 0,
+    );
+    const { fetcher, counts } = freezeFetcher((path) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      clock += 40_000; // each failed attempt burns real time
+      return new Response("", { status: 502 });
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(/retry budget exhausted/);
+    // Exhausted on elapsed time before the attempt cap could be reached.
+    expect(counts.get(CDBENTLEY_PERMISSIONS)!).toBeLessThan(4);
   });
 
   test("without a policy the reads behave exactly as they did before", async () => {

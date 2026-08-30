@@ -12067,7 +12067,12 @@ export interface GithubProofRetryPolicy {
   readonly now: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
   readonly random: () => number;
-  budgetRemainingMs?: number;
+  // Wall clock, armed at the first retryable failure. A budget that counted
+  // only sleep time was not the budget it advertised: four attempts each
+  // burning a 20s request timeout plus backoff could span well past a minute
+  // while the counter still showed room. Elapsed request time is exactly what
+  // competes with the phase envelope, so the budget has to measure it.
+  retryDeadlineMs?: number;
 }
 
 export function githubProofRetryPolicy(
@@ -12103,12 +12108,39 @@ export function retryableGithubReadFailure(
 // The deadline fetcher's own abort message. A run that has reached the
 // operation deadline is doomed; retrying cannot resurrect it.
 const OPERATION_DEADLINE_MESSAGE = "API request reached the protected operation deadline.";
+
+// Any cancellation is terminal, not just that sentinel. An AbortError or a
+// DOMException reaching here means something above deliberately stopped this
+// request, and retrying it would override that decision -- the opposite of
+// what cancellation means.
+export function cancellationError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message === OPERATION_DEADLINE_MESSAGE) return true;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  return typeof DOMException !== "undefined" && error instanceof DOMException;
+}
 const GITHUB_PROOF_RETRY_BUDGET_MS = 60_000;
 const GITHUB_PROOF_RETRY_ATTEMPTS = 4;
 const GITHUB_PROOF_RETRY_BASE_MS = 1_000;
 const GITHUB_PROOF_RETRY_CAP_MS = 8_000;
 // Never sleep so long that the receipt publish that follows has no runway.
 const GITHUB_PROOF_RETRY_TAIL_RESERVE_MS = 30_000;
+
+// `Retry-After` is delta-seconds or an HTTP-date. Anything else is not a
+// value we will act on, and we fall back to jittered backoff rather than
+// guessing -- the budget and deadline checks still bound the result.
+export function retryAfterMs(
+  response: { headers: { get(name: string): string | null } } | undefined,
+  now: number = Date.now(),
+): number | undefined {
+  const raw = response?.headers.get("retry-after");
+  if (raw === null || raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (/^\d{1,5}$/.test(trimmed)) return Number(trimmed) * 1_000;
+  const when = Date.parse(trimmed);
+  if (!Number.isFinite(when)) return undefined;
+  return Math.max(0, when - now);
+}
 
 async function githubJson(
   url: string,
@@ -12136,9 +12168,9 @@ async function githubJson(
         redirect: "error",
       });
     } catch (error) {
-      // The deadline sentinel is terminal by exact match. A per-request
-      // timeout is retryable, but the deadline check below still gates it.
-      if (error instanceof Error && error.message === OPERATION_DEADLINE_MESSAGE) throw error;
+      // Cancellation is terminal. A per-request timeout raised by the bridge's
+      // own wrapper is retryable, but the deadline checks below still gate it.
+      if (cancellationError(error)) throw error;
       transportError = error;
     }
     if (response !== undefined && response.ok) return boundedJson(response, 4 * 1024 * 1024);
@@ -12173,30 +12205,42 @@ async function githubJson(
     }
     if (attempts >= GITHUB_PROOF_RETRY_ATTEMPTS) throw describe("attempt cap reached");
 
-    if (retry.budgetRemainingMs === undefined) {
-      retry.budgetRemainingMs = GITHUB_PROOF_RETRY_BUDGET_MS;
+    // Armed once, at the first retryable failure. Concurrent reads share the
+    // policy, so this write can race -- benignly, because every racer computes
+    // very nearly the same instant and the value is never decremented
+    // afterwards. A decrementing counter would have been a genuine data race.
+    if (retry.retryDeadlineMs === undefined) {
+      retry.retryDeadlineMs = retry.now() + GITHUB_PROOF_RETRY_BUDGET_MS;
     }
+    if (retry.now() >= retry.retryDeadlineMs) throw describe("retry budget exhausted");
+
+    // Full jitter may legally produce zero. That is an immediate retry, not an
+    // exhausted budget, and conflating them reported the wrong cause.
     const jittered = Math.floor(
       retry.random() *
         Math.min(GITHUB_PROOF_RETRY_BASE_MS * 2 ** (attempts - 1), GITHUB_PROOF_RETRY_CAP_MS),
     );
-    const retryAfter = response?.headers.get("retry-after") ?? null;
-    const requested = retryAfter !== null && /^\d{1,5}$/.test(retryAfter)
-      ? Number(retryAfter) * 1_000
-      : jittered;
-    const sleepMs = Math.min(requested, retry.budgetRemainingMs);
-    if (sleepMs <= 0) throw describe("retry budget exhausted");
-    // A sleep must never outlive the operation deadline, and must leave the
-    // work that follows this proof a runway.
-    if (retry.deadlineMs() - retry.now() < sleepMs + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
-      throw describe("insufficient time remaining before the operation deadline");
+    const serverRequested = retryAfterMs(response, retry.now());
+    const requested = serverRequested ?? jittered;
+    // Name the source. An operator reading this after a burned plan must be
+    // able to tell a server instruction from our own backoff.
+    const source = serverRequested === undefined
+      ? `backoff of ${requested}ms`
+      : `Retry-After of ${requested}ms`;
+    // A server instruction is honoured or the run fails; it is never truncated.
+    // Retrying earlier than asked lands while still limited and discards the
+    // one signal the server gave us.
+    if (requested > retry.retryDeadlineMs - retry.now()) {
+      throw describe(`${source} exceeds the remaining retry budget`);
     }
-    retry.budgetRemainingMs -= sleepMs;
+    if (retry.deadlineMs() - retry.now() < requested + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
+      throw describe(`${source} exceeds the operation deadline less its tail reserve`);
+    }
     console.log(
       `Protected bridge GitHub proof retry path=${path} status=${lastStatus} ` +
-        `attempt=${attempts} sleep_ms=${sleepMs}`,
+        `attempt=${attempts} sleep_ms=${requested}`,
     );
-    await retry.sleep(sleepMs);
+    if (requested > 0) await retry.sleep(requested);
   }
 }
 
