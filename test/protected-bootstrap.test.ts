@@ -342,6 +342,72 @@ describe("protected owner Terraform bridge", () => {
       );
     }
 
+    // The required Cloud Storage access-log delivery group must pass. It is a
+    // managed binding, so Terraform reports it in resource_changes on every
+    // run; rejecting it as a `group:` member would refuse every bootstrap plan.
+    expect(() =>
+      buildReviewManifest(
+        plan([
+          resourceChange(
+            "module.bootstrap.google_storage_bucket_iam_member.terraform_state_access_logs_writer",
+            "google_storage_bucket_iam_member",
+            null,
+            {
+              bucket: "cdbentley-terraform-state-access-logs",
+              member: "group:cloud-storage-analytics@google.com",
+              role: "roles/storage.objectCreator",
+            },
+          ),
+        ]),
+        planIdentity,
+      )
+    ).not.toThrow();
+
+    // A member Terraform resolves only during apply decides nothing at review
+    // time, so an IAM grant that leaves one unresolved is refused.
+    const unknownMember = plan([]) as Record<string, unknown>;
+    unknownMember.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_member.computed",
+      change: {
+        actions: ["create"],
+        after: { project: "cdbentley", role: "roles/viewer" },
+        after_sensitive: {},
+        after_unknown: { member: true },
+        before: null,
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "computed",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_member",
+    }];
+    expect(() => buildReviewManifest(unknownMember, planIdentity)).toThrow(
+      "unresolved until apply",
+    );
+
+    // A non-IAM resource with unknown attributes is unaffected.
+    const unknownElsewhere = plan([]) as Record<string, unknown>;
+    unknownElsewhere.resource_changes = [{
+      address: "module.bootstrap.google_storage_bucket.later",
+      change: {
+        actions: ["create"],
+        after: { project: "cdbentley" },
+        after_sensitive: {},
+        after_unknown: { self_link: true },
+        before: null,
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "later",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_storage_bucket",
+    }];
+    expect(() => buildReviewManifest(unknownElsewhere, planIdentity)).not.toThrow();
+
     // An ordinary grant to an unrelated principal is untouched.
     expect(() =>
       buildReviewManifest(

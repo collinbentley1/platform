@@ -1861,6 +1861,59 @@ const BROAD_MEMBER_LITERALS: ReadonlySet<string> = new Set([
   "allAuthenticatedUsers",
 ]);
 
+// Google's fixed delivery group for Cloud Storage access logs, required by
+// google_storage_bucket_iam_member.terraform_state_access_logs_writer. It is a
+// Google-owned group that cannot contain a principal of ours, and without this
+// exemption the group pattern above rejects every bootstrap plan -- the binding
+// is a managed resource, so Terraform reports it in resource_changes on every
+// run. preview-runtime-iam-contract.sh never had to exempt it because it scans
+// project policies, and this binding lives on a bucket.
+const STORAGE_ACCESS_LOG_DELIVERY_MEMBER = "group:cloud-storage-analytics@google.com";
+
+// IAM grant resources whose member is a principal. A computed member is
+// resolved during apply, so a plan whose `after` omits it decides nothing at
+// review time; these types must therefore have a known member or be refused.
+const IAM_GRANT_RESOURCE_TYPES: ReadonlySet<string> = new Set([
+  "google_artifact_registry_repository_iam_member",
+  "google_cloud_run_v2_service_iam_member",
+  "google_project_iam_binding",
+  "google_project_iam_member",
+  "google_secret_manager_secret_iam_member",
+  "google_service_account_iam_member",
+  "google_storage_bucket_iam_binding",
+  "google_storage_bucket_iam_member",
+]);
+
+// Refuse an IAM grant whose principal Terraform has not resolved at plan time.
+// The reviewer approves `after`; an unresolved member lives in `after_unknown`
+// and could become a preview-runtime principal during apply, which the gate
+// below would never see.
+function rejectUnknownIamMember(
+  type: string,
+  afterUnknown: JsonValue,
+  address: string,
+  label: string,
+): void {
+  if (!IAM_GRANT_RESOURCE_TYPES.has(type)) return;
+  if (afterUnknown === null || typeof afterUnknown !== "object" || Array.isArray(afterUnknown)) {
+    return;
+  }
+  const unresolved = (node: JsonValue | undefined): boolean => {
+    if (node === undefined || node === false || node === null) return false;
+    if (node === true) return true;
+    if (Array.isArray(node)) return node.some((entry) => unresolved(entry));
+    if (typeof node === "object") return Object.values(node).some((entry) => unresolved(entry));
+    return false;
+  };
+  for (const key of ["member", "members"]) {
+    if (unresolved(afterUnknown[key])) {
+      throw new Error(
+        `${label} at ${address} leaves its IAM ${key} unresolved until apply, so the reviewed plan does not determine who is granted access.`,
+      );
+    }
+  }
+}
+
 // The preview runtime must hold no access to storage, secrets, or Firestore in
 // any of the four projects. That was enforced by an IAM deny policy until it
 // proved unbuildable: roles/iam.denyAdmin is not grantable at project scope,
@@ -1888,6 +1941,7 @@ function rejectPreviewRuntimeGrant(
           `${label} at ${address} grants the preview runtime ${node}, which must hold no access.`,
         );
       }
+      if (node === STORAGE_ACCESS_LOG_DELIVERY_MEMBER) return;
       if (
         BROAD_MEMBER_LITERALS.has(node) ||
         BROAD_MEMBER_PATTERNS.some((pattern) => pattern.test(node))
@@ -12055,6 +12109,12 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         type,
         address,
         `${label} after-sensitive map`,
+      );
+      rejectUnknownIamMember(
+        type,
+        json(delta.after_unknown ?? false, `${label} after unknown`),
+        address,
+        `${label} after-unknown map`,
       );
       rejectPreviewRuntimeGrant(
         json(delta.after ?? null, `${label} after`),
