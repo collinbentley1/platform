@@ -3370,6 +3370,7 @@ describe("protected owner Terraform bridge", () => {
     expect(buildReviewManifest(tampered, planIdentity).sha256).not.toBe(atPlanRun.sha256);
 
     const events: string[] = [];
+    const summaries: string[] = [];
     await expect(runProtectedBootstrap(
       validateInvocation({
         ...validEnvironment(),
@@ -3379,6 +3380,10 @@ describe("protected owner Terraform bridge", () => {
         EXECUTION_MODE: "apply",
       }),
       fakeDependencies(events, {
+        appendSummary: async (_invocation, body) => {
+          events.push("summary");
+          summaries.push(body);
+        },
         planJson: JSON.stringify(tampered),
         readPlanJson: async () => JSON.stringify(tampered),
         verifyApproval: async () => ({ canonical: "", sha256: atPlanRun.sha256 }),
@@ -3388,8 +3393,13 @@ describe("protected owner Terraform bridge", () => {
     expect(events).not.toContain("elevate");
     expect(events).not.toContain("terraform:apply");
     // The refusal publishes what it recomputed, so the divergence is
-    // diagnosable without a second run.
+    // diagnosable without a second run -- and it must not claim the approved
+    // plan was spent, because it was not.
     expect(events).toContain("summary");
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toContain("Protected Terraform apply refused");
+    expect(summaries[0]).toContain("NOT consumed; still valid for a retry");
+    expect(summaries[0]).not.toContain("(single use)");
   });
 
   test("a volatile exclusion may never hide structured content", () => {

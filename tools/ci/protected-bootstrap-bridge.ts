@@ -3256,7 +3256,7 @@ export async function runProtectedBootstrap(
         publishProof,
         dependencies.now(),
       );
-      await dependencies.appendSummary(invocation, reviewSummary(invocation, review, undefined));
+      await dependencies.appendSummary(invocation, reviewSummary(invocation, review, { kind: "publishing" }));
       console.log(`Protected Terraform review digest: ${review.sha256}`);
       return;
     }
@@ -3274,7 +3274,10 @@ export async function runProtectedBootstrap(
       // plan values, so displaying one on failure discloses nothing new.
       await dependencies.appendSummary(
         invocation,
-        reviewSummary(invocation, review, invocation.approvedPlanRunId),
+        reviewSummary(invocation, review, {
+          kind: "refused",
+          planRunId: invocation.approvedPlanRunId,
+        }),
       );
       throw new Error("The recomputed plan does not match the fresh approved plan receipt.");
     }
@@ -3407,7 +3410,10 @@ export async function runProtectedBootstrap(
     );
     await dependencies.appendSummary(
       invocation,
-      reviewSummary(invocation, review, invocation.approvedPlanRunId),
+      reviewSummary(invocation, review, {
+        kind: "consumed",
+        planRunId: invocation.approvedPlanRunId,
+      }),
     );
   } catch (error) {
     primaryFailure = error;
@@ -12482,15 +12488,27 @@ function rejectSensitive(value: unknown, label: string): void {
   }
 }
 
+// Whether the approved plan receipt was spent. A refused apply stops before
+// consumeApproval, so its receipt is still valid and still authorizes a retry;
+// saying otherwise would send an operator to replace a plan they still hold.
+type PlanReceiptDisposition =
+  | { readonly kind: "publishing" }
+  | { readonly kind: "consumed"; readonly planRunId: string }
+  | { readonly kind: "refused"; readonly planRunId: string };
+
 function reviewSummary(
   invocation: Invocation,
   review: ReviewManifestResult,
-  approvedPlanRunId: string | undefined,
+  disposition: PlanReceiptDisposition,
 ): string {
   const exposureAdoption = invocation.terraformRoot === "exposure";
   const heading = exposureAdoption
     ? "Runsetta exposure state adoption complete"
-    : invocation.mode === "plan" ? "Protected Terraform plan" : "Protected Terraform apply";
+    : invocation.mode === "plan"
+    ? "Protected Terraform plan"
+    : disposition.kind === "refused"
+    ? "Protected Terraform apply refused"
+    : "Protected Terraform apply";
   const summary = [
     `## ${heading}`,
     "",
@@ -12503,13 +12521,24 @@ function reviewSummary(
           `- Adoption run: \`${invocation.githubRunId}\` (immutable completion receipt; no Terraform apply exists)`,
           `- Confirmation: \`${RUNSETTA_EXPOSURE_ADOPTION_CONFIRMATION}\``,
         ]
-      : approvedPlanRunId === undefined
+      : disposition.kind === "publishing"
       ? [`- Plan run: \`${invocation.githubRunId}\` (fresh receipt required for apply)`]
-      : [`- Consumed plan run: \`${approvedPlanRunId}\` (single use)`]),
+      : disposition.kind === "refused"
+      ? [
+          `- Approved plan run: \`${disposition.planRunId}\` (NOT consumed; still valid for a retry)`,
+          `- Approved digest: \`${invocation.approvedManifestSha256}\``,
+        ]
+      : [`- Consumed plan run: \`${disposition.planRunId}\` (single use)`]),
     "",
     ...(exposureAdoption
       ? [
           "The trusted controller create-only adopted the exact live Runsetta mappings into canonical state before Terraform ran. Terraform then validated that state with `-refresh=false` and an exact zero-action plan; it did not apply or contact the Domain Mapping API.",
+          "",
+        ]
+      : []),
+    ...(disposition.kind === "refused"
+      ? [
+          "This apply recomputed its own plan and the result did not match the approved receipt, so it stopped before consuming the approval and before elevating any executor. Nothing was applied and the approved plan was not spent. The manifest below is what this run recomputed; compare it with the approved plan run's manifest to see what diverged.",
           "",
         ]
       : []),
