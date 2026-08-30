@@ -169,26 +169,6 @@ const STORAGE_BACKEND_ROLE_PERMISSIONS = {
     "storage.objects.list",
   ],
 } as const;
-// roles/iam.denyAdmin supplies the deny-policy write authority that cannot live
-// in a project custom role. It is granted to the ephemeral executor, so it is
-// pinned exactly like the storage backend roles: if Google adds a permission
-// the executor would silently gain it, and if Google removes one the executor
-// would silently lose authority the permission proof still demands. Either way
-// the run must fail rather than proceed. Verified live 2026-08-27.
-const DENY_ADMIN_ROLE_PERMISSIONS: readonly string[] = [
-  "cloudasset.assets.listResource",
-  "iam.denypolicies.create",
-  "iam.denypolicies.delete",
-  "iam.denypolicies.get",
-  "iam.denypolicies.list",
-  "iam.denypolicies.update",
-  "policyanalyzer.resourceAuthorizationActivities.query",
-  "policysimulator.accessPolicySimulationResults.list",
-  "policysimulator.accessPolicySimulations.create",
-  "policysimulator.accessPolicySimulations.get",
-  "policysimulator.accessPolicySimulations.list",
-];
-
 const STORAGE_BACKEND_ROLE_STAGES = {
   "roles/storage.objectCreator": "GA",
   "roles/storage.objectViewer": "GA",
@@ -232,7 +212,6 @@ const CAPABILITY_REQUIRED_FILES = [
   ".github/workflows/infrastructure.yml",
   ".github/workflows/reconcile-previews.yml",
   "terraform/modules/bootstrap/main.tf",
-  "terraform/modules/bootstrap/preview-runtime-deny.tf",
   "terraform/modules/bootstrap/variables.tf",
   "terraform/modules/cloud-run-service/main.tf",
   "tools/ci/cloud-run-dhi-parity.sh",
@@ -526,7 +505,6 @@ export const REPOSITORIES: Readonly<Record<RepositoryName, RepositoryContract>> 
 };
 
 const BOOTSTRAP_RESOURCE_TYPES = new Set([
-  "google_iam_deny_policy",
   "google_iam_workload_identity_pool",
   "google_iam_workload_identity_pool_provider",
   "google_project_iam_binding",
@@ -576,7 +554,6 @@ const BOOTSTRAP_RESOURCE_TYPES = new Set([
 const PROVIDER_VOLATILE_ATTRIBUTES: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["google_artifact_registry_repository_iam_member", new Set(["etag"])],
   ["google_cloud_run_v2_service_iam_member", new Set(["etag"])],
-  ["google_iam_deny_policy", new Set(["etag"])],
   ["google_project_iam_binding", new Set(["etag"])],
   ["google_project_iam_member", new Set(["etag"])],
   ["google_secret_manager_secret_iam_member", new Set(["etag"])],
@@ -1615,31 +1592,24 @@ export function buildExecutorProjectLeases(
   }];
 }
 
-// Google marks these NOT_SUPPORTED for project custom roles, so including them
-// in the ephemeral executor role makes roles.create reject the whole role with
-// HTTP 400. They are still REQUIRED authority for a bootstrap apply, because
-// terraform/modules/bootstrap/preview-runtime-deny.tf declares the preview
-// runtime deny policy unconditionally. The executor therefore receives them
-// from the predefined roles/iam.denyAdmin as a separate expiring lease, while
-// executorControlPermissions -- and so the permission-convergence proof --
-// continues to require them. Verified against the live testable-permission
-// catalog: create/delete/update/replace are NOT_SUPPORTED, get/list are
-// SUPPORTED.
-const CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS: readonly string[] = [
-  "iam.denypolicies.create",
-  "iam.denypolicies.delete",
-  "iam.denypolicies.replace",
-  "iam.denypolicies.update",
-];
-
-// The predefined role that supplies them. It also carries cloudasset and
-// policysimulator READ permissions, which the executor does not need and never
-// probes; there is no narrower predefined role with deny-write authority
-// (roles/iam.denyReviewer is get/list only).
-const DENY_ADMIN_ROLE = "roles/iam.denyAdmin";
 
 const V0513_ATTESTATION_RULES_READ_PERMISSION =
   "iam.workloadIdentityPools.getAttestationRules";
+// Roles created by v0.5.15 through v0.5.26 carry the deny-policy permissions
+// this release removes. Google retains deleted custom-role tombstones, and a
+// crashed run can leave an active role behind, so recovery must still
+// recognise those exact matrices -- otherwise it refuses to delete them and
+// reports that manual cleanup is required. Bootstrap matrices do not vary by
+// repository, so one digest per retired variant covers all four consumers.
+const V0526_BOOTSTRAP_ROLE_PERMISSION_SHA256: readonly string[] = [
+  // read: control and custom were identical, since deny get/list are the two
+  // deny permissions Google does support in a custom role.
+  "9c7d258abc8015eaf1c606aef5d969635e382265ecb89bb99a12ea813a97ebf2",
+  // mutation control matrix, carrying the three deny writes.
+  "6391432f0b98f19d6a19932c6408c57fc9ea99fb3a5e55800b5a7ea8d7ac5241",
+  // mutation custom role, with those three filtered back out.
+  "fd598b2dddd585eb6164b3d5b13c88b45b226ed336f816426db5da8998b6cbc7",
+];
 const V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256 = {
   mutation: "6d2e97c830d53859f1040ac1090bd53303fa23d7743e3f2855095972369eca77",
   read: "cd250d221ea684765f6c2c04dbd806e8b6ce094666455ae50dedcc20564f86e4",
@@ -1654,8 +1624,6 @@ export function executorControlPermissions(
   // Run project role and the direct Domain Mapping API is proven denied.
   if (root === "exposure") return [];
   const bootstrapRead = [
-    "iam.denypolicies.get",
-    "iam.denypolicies.list",
     "iam.roles.get",
     "iam.roles.list",
     "iam.serviceAccounts.get",
@@ -1717,9 +1685,6 @@ export function executorControlPermissions(
   ];
   const mutation = root === "bootstrap"
     ? [
-        "iam.denypolicies.create",
-        "iam.denypolicies.delete",
-        "iam.denypolicies.update",
         "iam.roles.create",
         "iam.roles.delete",
         "iam.roles.undelete",
@@ -1785,12 +1750,13 @@ export function bridgeRolePermissionsRecognized(
   phase: "mutation" | "read",
 ): boolean {
   const observedJson = canonicalJson([...observed].toSorted());
-  // Compare against what createEphemeralRole actually creates. These diverge
-  // for bootstrap/mutation, where the deny-policy writes cannot live in a
-  // custom role and are supplied by roles/iam.denyAdmin instead. Recognising
-  // against the control matrix would leave every mutation role -- including
-  // its retained tombstone -- unrecognised, so recovery would refuse to delete
-  // it and report "manual cleanup is required".
+  // Compare against what createEphemeralRole actually creates. Since the
+  // deny-policy permissions left both matrices these no longer diverge, but
+  // the comparison stays explicit: if a future permission is again refused in
+  // a custom role, recognising against the control matrix alone would leave
+  // every such role -- including its retained tombstone -- unrecognised, and
+  // recovery would refuse to delete it and report that manual cleanup is
+  // required.
   const currentJson = canonicalJson([
     ...executorCustomRolePermissions(repository, root, phase),
   ].toSorted());
@@ -1806,46 +1772,22 @@ export function bridgeRolePermissionsRecognized(
   // also leave an active role. The frozen digests recognize only those exact
   // prior matrices so cleanup can remove their leases and roles. Current role
   // creation and permission convergence use executorControlPermissions alone.
-  return createHash("sha256").update(observedJson).digest("hex") ===
-    V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256[phase];
+  const digest = createHash("sha256").update(observedJson).digest("hex");
+  if (digest === V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256[phase]) return true;
+  return V0526_BOOTSTRAP_ROLE_PERMISSION_SHA256.includes(digest);
 }
 
-// Permissions the ephemeral custom role may carry: the full control matrix
-// minus anything Google refuses to grant through a custom role. The difference
-// is supplied by DENY_ADMIN_ROLE, so the executor's effective authority is
-// unchanged and executorControlPermissions remains the single source of truth
-// for what the permission proof demands.
+// Every permission the executor needs is now grantable through the ephemeral
+// custom role, so this is the control matrix unchanged. It stays a distinct
+// function because the custom role and the permission-convergence proof are
+// separate contracts, and a future permission Google refuses in custom roles
+// must fail here rather than silently widening the role.
 export function executorCustomRolePermissions(
   repository: RepositoryName,
   root: TerraformRoot,
   phase: "mutation" | "read",
 ): readonly string[] {
-  const unsupported = new Set(CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS);
-  return executorControlPermissions(repository, root, phase)
-    .filter((permission) => !unsupported.has(permission));
-}
-
-// Expiring project lease granting the deny-policy write authority that cannot
-// live in a custom role. Bootstrap apply only; recorded through the same
-// record-and-add path as every other lease, so cleanup and recovery remove it
-// without a new grammar.
-export function buildDenyAdminLease(
-  repository: RepositoryName,
-  runId: string,
-  expiresAt: Date,
-  executorServiceAccountEmail: string,
-): IamBinding {
-  numeric(runId, "GitHub run ID");
-  const contract = REPOSITORIES[repository];
-  return {
-    condition: expiringCondition(
-      `codex-executor-denyadmin-${runId}`,
-      `Temporary deny-policy write lease for ${repository}.`,
-      expiresAt,
-    ),
-    members: [executorMember(contract.projectId, executorServiceAccountEmail)],
-    role: DENY_ADMIN_ROLE,
-  };
+  return executorControlPermissions(repository, root, phase);
 }
 
 export function buildTokenCreatorLease(
@@ -1886,6 +1828,170 @@ export function buildRuntimeActAsLeases(
       } satisfies IamBinding,
     ]),
   );
+}
+
+// Every preview runtime principal in the fleet. The retired deny policy named
+// these four explicitly; the plan gate below derives them so a repository added
+// to REPOSITORIES cannot silently escape the check.
+function previewRuntimeMembers(): ReadonlySet<string> {
+  const members = new Set<string>();
+  for (const repository of REPOSITORY_NAMES) {
+    const email = `cloud-run-preview@${REPOSITORIES[repository].projectId}.iam.gserviceaccount.com`;
+    members.add(`serviceAccount:${email}`);
+    // Google renders a soft-deleted principal with this prefix, and it is
+    // restorable, so it is the same identity for this purpose. It also appends
+    // the account's stable identifier -- `deleted:serviceAccount:...?uid=123`
+    // -- which principalWithoutUid strips before this set is consulted.
+    members.add(`deleted:serviceAccount:${email}`);
+  }
+  return members;
+}
+
+// Members that grant the preview runtime access without naming it. Mirrors the
+// `forbidden_member` predicate in tools/ci/preview-runtime-iam-contract.sh, so
+// the preventive gate and the continuous proof refuse the same things: an
+// `allUsers` binding, a group or domain that may contain the runtime, a
+// primitive project role, or a service-account-wide principal set all confer
+// access an exact-membership check would wave through.
+const BROAD_MEMBER_PATTERNS: readonly RegExp[] = [
+  /^(?:deleted:)?(?:group|domain):/,
+  /^project(?:Owner|Editor|Viewer):/,
+  /^principalSet:\/\/cloudresourcemanager\.googleapis\.com\/(?:projects|folders|organizations)\/[^/]+\/type\/ServiceAccount$/,
+];
+const BROAD_MEMBER_LITERALS: ReadonlySet<string> = new Set([
+  "allUsers",
+  "allAuthenticatedUsers",
+]);
+
+// Google's fixed delivery group for Cloud Storage access logs, required by
+// google_storage_bucket_iam_member.terraform_state_access_logs_writer. It is a
+// Google-owned group that cannot contain a principal of ours, and without this
+// exemption the group pattern above rejects every bootstrap plan -- the binding
+// is a managed resource, so Terraform reports it in resource_changes on every
+// run. preview-runtime-iam-contract.sh never had to exempt it because it scans
+// project policies, and this binding lives on a bucket.
+const STORAGE_ACCESS_LOG_DELIVERY_MEMBER = "group:cloud-storage-analytics@google.com";
+
+// IAM grant resources whose member is a principal. A computed member is
+// resolved during apply, so a plan whose `after` omits it decides nothing at
+// review time; these types must therefore have a known member or be refused.
+const IAM_GRANT_RESOURCE_TYPES: ReadonlySet<string> = new Set([
+  "google_artifact_registry_repository_iam_member",
+  "google_cloud_run_v2_service_iam_member",
+  "google_project_iam_binding",
+  "google_project_iam_member",
+  "google_secret_manager_secret_iam_member",
+  "google_service_account_iam_member",
+  "google_storage_bucket_iam_binding",
+  "google_storage_bucket_iam_member",
+]);
+
+// Refuse an IAM grant whose principal Terraform has not resolved at plan time.
+// The reviewer approves `after`; an unresolved member lives in `after_unknown`
+// and could become a preview-runtime principal during apply, which the gate
+// below would never see.
+function rejectUnknownIamMember(
+  type: string,
+  afterUnknown: JsonValue,
+  address: string,
+  label: string,
+): void {
+  if (!IAM_GRANT_RESOURCE_TYPES.has(type)) return;
+  if (afterUnknown === null || typeof afterUnknown !== "object" || Array.isArray(afterUnknown)) {
+    return;
+  }
+  const unresolved = (node: JsonValue | undefined): boolean => {
+    if (node === undefined || node === false || node === null) return false;
+    if (node === true) return true;
+    if (Array.isArray(node)) return node.some((entry) => unresolved(entry));
+    if (typeof node === "object") return Object.values(node).some((entry) => unresolved(entry));
+    return false;
+  };
+  for (const key of ["member", "members"]) {
+    if (unresolved(afterUnknown[key])) {
+      throw new Error(
+        `${label} at ${address} leaves its IAM ${key} unresolved until apply, so the reviewed plan does not determine who is granted access.`,
+      );
+    }
+  }
+}
+
+// The preview runtime must hold no access to storage, secrets, or Firestore in
+// any of the four projects. That was enforced by an IAM deny policy until it
+// proved unbuildable: roles/iam.denyAdmin is not grantable at project scope,
+// iam.denypolicies writes are NOT_SUPPORTED in custom roles, and these projects
+// have no organization or folder parent to grant it at instead, so no principal
+// -- the owner included -- can ever write one here.
+//
+// The continuous control is unchanged and lives outside this bridge:
+// tools/ci/preview-runtime-iam-contract.sh proves zero Policy Analyzer results
+// for these principals across all four projects before every preview traffic
+// commit and hourly from reconcile-previews. What this adds is the preventive
+// half on the one write path the protected pipeline itself controls: no
+// reviewed plan, in any root, may grant these principals anything. The module
+// config grants them nothing today, so the expected match count is zero.
+// Strip the stable identifier Google appends when it serialises a deleted
+// principal, so `deleted:serviceAccount:x@y?uid=123` is recognised as the same
+// identity as `deleted:serviceAccount:x@y`.
+function principalWithoutUid(member: string): string {
+  const marker = member.indexOf("?uid=");
+  return marker === -1 ? member : member.slice(0, marker);
+}
+
+// Refuse a plan that would leave a preview runtime principal holding access,
+// or leave access with a principal broad enough to include one. Called on the
+// `after` state only: `before` describes what is being replaced, and a
+// forbidden principal there is exactly what a corrective plan removes.
+function rejectPreviewRuntimeGrant(
+  type: string,
+  state: JsonValue,
+  address: string,
+  label: string,
+): void {
+  // Only IAM grant resources confer access, and only through their principal
+  // fields. Scanning every string in every resource would refuse a plan for a
+  // Cloud Run container environment variable that merely contains "allUsers",
+  // which grants nothing -- and because this runs before no-op changes are
+  // filtered, that would block every protected plan.
+  if (!IAM_GRANT_RESOURCE_TYPES.has(type)) return;
+  if (state === null || typeof state !== "object" || Array.isArray(state)) return;
+  const principals: string[] = [];
+  const single = state.member;
+  if (single !== undefined && single !== null) {
+    if (typeof single !== "string") {
+      throw new Error(`${label} at ${address} has a non-string IAM member.`);
+    }
+    principals.push(single);
+  }
+  const many = state.members;
+  if (many !== undefined && many !== null) {
+    if (!Array.isArray(many)) {
+      throw new Error(`${label} at ${address} has a non-array IAM member list.`);
+    }
+    for (const entry of many) {
+      if (typeof entry !== "string") {
+        throw new Error(`${label} at ${address} has a non-string IAM member.`);
+      }
+      principals.push(entry);
+    }
+  }
+  const members = previewRuntimeMembers();
+  for (const principal of principals) {
+    if (members.has(principalWithoutUid(principal))) {
+      throw new Error(
+        `${label} at ${address} grants the preview runtime ${principal}, which must hold no access.`,
+      );
+    }
+    if (principal === STORAGE_ACCESS_LOG_DELIVERY_MEMBER) continue;
+    if (
+      BROAD_MEMBER_LITERALS.has(principal) ||
+      BROAD_MEMBER_PATTERNS.some((pattern) => pattern.test(principal))
+    ) {
+      throw new Error(
+        `${label} at ${address} grants ${principal}, which confers access on the preview runtime without naming it.`,
+      );
+    }
+  }
 }
 
 function runtimeServiceAccountEmails(repository: RepositoryName): readonly string[] {
@@ -5352,14 +5458,6 @@ export class ExecutorLeaseManager {
         invocation.ownerAccessToken,
         this.#fetcher,
       );
-      // Deliberately here, in acquire, and NOT in elevate: elevate runs after
-      // consumeApproval has written the immutable consumed/<planRunId>.json,
-      // so a transient read failure or benign Google drift there would burn the
-      // approved plan -- the exact cost this change exists to avoid.
-      if (invocation.terraformRoot === "bootstrap") {
-        await requireDenyAdminRoleContract(invocation.ownerAccessToken, this.#fetcher);
-      }
-
       const projectLeases = [
         ...(readRole === undefined
           ? []
@@ -5604,12 +5702,6 @@ export class ExecutorLeaseManager {
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               buildMarkerMutationLease(
-                invocation.repository,
-                invocation.githubRunId,
-                leaseExpiresAt,
-                this.#account.email,
-              ),
-              buildDenyAdminLease(
                 invocation.repository,
                 invocation.githubRunId,
                 leaseExpiresAt,
@@ -7140,12 +7232,6 @@ function orphanPolicySurfaces(
           ...(provenance.root === "bootstrap"
             ? [
                 buildMarkerMutationLease(
-                  provenance.repository,
-                  provenance.runId,
-                  provenance.expiresAt,
-                  account.email,
-                ),
-                buildDenyAdminLease(
                   provenance.repository,
                   provenance.runId,
                   provenance.expiresAt,
@@ -10069,60 +10155,6 @@ export async function waitForControlPermissions(
 
 type StorageBackendRoleName = keyof typeof STORAGE_BACKEND_ROLE_PERMISSIONS;
 
-// Prove roles/iam.denyAdmin still carries exactly its pinned contract, and in
-// particular still grants every permission that was removed from the custom
-// role because Google refuses it there. Called before the lease is granted.
-export async function requireDenyAdminRoleContract(
-  token: string,
-  fetcher: Fetcher,
-): Promise<void> {
-  const response = await fetcher(`https://iam.googleapis.com/v1/${DENY_ADMIN_ROLE}`, {
-    headers: executorHeaders(token),
-    redirect: "error",
-  });
-  if (!response.ok) {
-    throw new Error(`${DENY_ADMIN_ROLE} contract read failed with HTTP ${response.status}.`);
-  }
-  const role = record(await boundedJson(response, 256 * 1024), `${DENY_ADMIN_ROLE} contract`);
-  exact(role.name, DENY_ADMIN_ROLE, `${DENY_ADMIN_ROLE} contract name`);
-  exact(role.stage, "GA", `${DENY_ADMIN_ROLE} contract stage`);
-  const permissions = array(
-    role.includedPermissions,
-    `${DENY_ADMIN_ROLE} contract permissions`,
-  ).map((permission) => requiredString(permission, `${DENY_ADMIN_ROLE} contract permission`));
-  if (new Set(permissions).size !== permissions.length) {
-    throw new Error(`${DENY_ADMIN_ROLE} permission inventory contains duplicates.`);
-  }
-  exact(
-    JSON.stringify([...permissions].toSorted()),
-    JSON.stringify([...DENY_ADMIN_ROLE_PERMISSIONS].toSorted()),
-    `${DENY_ADMIN_ROLE} contract permissions`,
-  );
-  // Belt and braces: every permission the control matrix demands but the custom
-  // role cannot carry must actually be supplied here, or the executor silently
-  // lacks authority the proof still requires. Deliberately derived from the
-  // matrix rather than special-casing individual permissions: hard-coding an
-  // exemption would silently disable this check for whatever was exempted.
-  const supplied = new Set(permissions);
-  for (const permission of denyAdminSuppliedPermissions()) {
-    if (!supplied.has(permission)) {
-      throw new Error(
-        `${DENY_ADMIN_ROLE} no longer supplies ${permission}, which the executor custom role cannot carry.`,
-      );
-    }
-  }
-}
-
-// The permissions the deny-admin lease is responsible for supplying: those the
-// control matrix demands for a bootstrap mutation but a custom role may not
-// hold. Empty if the matrices ever converge.
-export function denyAdminSuppliedPermissions(): readonly string[] {
-  const unsupported = new Set(CUSTOM_ROLE_UNSUPPORTED_PERMISSIONS);
-  return REPOSITORY_NAMES.flatMap((repository) =>
-    executorControlPermissions(repository, "bootstrap", "mutation")
-      .filter((permission) => unsupported.has(permission))
-  ).filter((permission, index, all) => all.indexOf(permission) === index);
-}
 
 export async function requireStorageBackendRoleContracts(
   token: string,
@@ -12109,6 +12141,30 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         address,
         `${label} after-sensitive map`,
       );
+      // Planned changes only, and only the state the apply leaves behind.
+      //
+      // `before` describes what is being replaced, so a forbidden principal
+      // there is what a corrective plan REMOVES -- an authoritative binding
+      // drops it from members, or the grant is deleted outright. Drift is the
+      // same situation one step earlier: an out-of-band grant appears in
+      // `resource_drift.after` as refreshed live state while the corrective
+      // empty member set appears in `resource_changes.after`. Gating either
+      // would refuse the plan that fixes the problem and leave the grant in
+      // place until someone cleaned it up by hand.
+      if (label === "resource change") {
+        rejectUnknownIamMember(
+          type,
+          json(delta.after_unknown ?? false, `${label} after unknown`),
+          address,
+          `${label} after-unknown map`,
+        );
+        rejectPreviewRuntimeGrant(
+          type,
+          json(delta.after ?? null, `${label} after`),
+          address,
+          `${label} after state`,
+        );
+      }
       const actions = array(delta.actions, `${label} actions`).map((action) =>
         requiredString(action, `${label} action`),
       );

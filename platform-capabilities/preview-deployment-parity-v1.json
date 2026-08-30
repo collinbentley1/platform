@@ -15,7 +15,6 @@
     ".github/workflows/infrastructure.yml": "sha256:25d224b5009d8b587b515a8678dd434f9d29b03846974f13cf235d35ad21ad22",
     ".github/workflows/reconcile-previews.yml": "sha256:0172ca48e6e14ce3cf01b19aa4345fb08d3c3ea9f252e4aa144a7877fa2e76a2",
     "terraform/modules/bootstrap/main.tf": "sha256:defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270",
-    "terraform/modules/bootstrap/preview-runtime-deny.tf": "sha256:e2b4799cddc80b105e519fe69459cff174fc7df02961f17d3bfb4a4966a3a98b",
     "terraform/modules/bootstrap/variables.tf": "sha256:f7310af1189e80b819e2fbdb59c70eb0b1a55f2eebf1a9c1013bafd7b5b7b8ed",
     "terraform/modules/cloud-run-service/main.tf": "sha256:349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",
     "tools/ci/cloud-run-dhi-parity.sh": "sha256:bb3b759148c081b0135378046db1b09c32f710733bca9a96c00fa34d1815ce32",

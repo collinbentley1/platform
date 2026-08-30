@@ -33,10 +33,8 @@ import {
   ensureExposureStateInitialized,
   exposureControllerCreateLeaseOrUndefined,
   bridgeRolePermissionsRecognized,
-  buildDenyAdminLease,
-  denyAdminSuppliedPermissions,
+  REPOSITORY_NAMES,
   executorControlPermissions,
-  requireDenyAdminRoleContract,
   executorCustomRolePermissions,
   executorDescription,
   fencePolicyMutations,
@@ -118,7 +116,6 @@ const capabilityFiles = [
   ".github/workflows/infrastructure.yml",
   ".github/workflows/reconcile-previews.yml",
   "terraform/modules/bootstrap/main.tf",
-  "terraform/modules/bootstrap/preview-runtime-deny.tf",
   "terraform/modules/bootstrap/variables.tf",
   "terraform/modules/cloud-run-service/main.tf",
   "tools/ci/cloud-run-dhi-parity.sh",
@@ -297,115 +294,340 @@ describe("protected owner Terraform bridge", () => {
     ).toBeFalse();
   });
 
-  test("deny-admin supplies exactly what the custom role cannot carry", () => {
-    // Derived from the matrix, never hard-coded, so a permission added to the
-    // control matrix later cannot silently skip the supply check.
-    expect([...denyAdminSuppliedPermissions()].toSorted()).toEqual([
-      "iam.denypolicies.create",
-      "iam.denypolicies.delete",
-      "iam.denypolicies.update",
-    ]);
-    // iam.denypolicies.replace is listed as custom-role-unsupported but is not
-    // in the control matrix, so nothing has to supply it.
-    expect(denyAdminSuppliedPermissions()).not.toContain("iam.denypolicies.replace");
-  });
+  test("the plan gate refuses preview-runtime access however it is conferred", () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const withMember = (member: string) =>
+      plan([
+        resourceChange(
+          "module.bootstrap.google_project_iam_member.some_grant",
+          "google_project_iam_member",
+          null,
+          { member, project: "cdbentley", role: "roles/viewer" },
+        ),
+      ]);
 
-  test("deny-admin role contract is pinned and drift fails closed", async () => {
-    const live = [
-      "cloudasset.assets.listResource",
-      "iam.denypolicies.create",
-      "iam.denypolicies.delete",
-      "iam.denypolicies.get",
-      "iam.denypolicies.list",
-      "iam.denypolicies.update",
-      "policyanalyzer.resourceAuthorizationActivities.query",
-      "policysimulator.accessPolicySimulationResults.list",
-      "policysimulator.accessPolicySimulations.create",
-      "policysimulator.accessPolicySimulations.get",
-      "policysimulator.accessPolicySimulations.list",
-    ];
-    const roleFetcher = (permissions: readonly string[], stage = "GA") =>
-      (async () =>
-        new Response(
-          JSON.stringify({
-            includedPermissions: permissions,
-            name: "roles/iam.denyAdmin",
-            stage,
-          }),
-          { headers: { "content-type": "application/json" }, status: 200 },
-        )) as unknown as typeof fetch;
-
-    // Exact contract passes.
-    await requireDenyAdminRoleContract("token", roleFetcher(live));
-
-    // Losing a permission the executor needs must fail: silent authority loss.
-    await expect(
-      requireDenyAdminRoleContract(
-        "token",
-        roleFetcher(live.filter((p) => p !== "iam.denypolicies.create")),
-      ),
-    ).rejects.toThrow();
-
-    // Gaining one must also fail: silent authority increase for the executor.
-    await expect(
-      requireDenyAdminRoleContract("token", roleFetcher([...live, "iam.roles.create"])),
-    ).rejects.toThrow();
-
-    // A stage change is drift too.
-    await expect(
-      requireDenyAdminRoleContract("token", roleFetcher(live, "BETA")),
-    ).rejects.toThrow();
-
-    // Duplicates are rejected outright.
-    await expect(
-      requireDenyAdminRoleContract("token", roleFetcher([...live, "iam.denypolicies.get"])),
-    ).rejects.toThrow();
-
-    // A non-200 read fails closed rather than assuming the contract holds.
-    await expect(
-      requireDenyAdminRoleContract(
-        "token",
-        (async () => new Response("", { status: 403 })) as unknown as typeof fetch,
-      ),
-    ).rejects.toThrow();
-  });
-
-  test("deny-admin lease is exact, expiring, and executor-scoped", () => {
-    const expiresAt = new Date("2026-08-27T21:00:00.000Z");
-    const lease = buildDenyAdminLease(
+    // Named directly, in every project, live and soft-deleted.
+    for (const project of [
       "cdbentley",
-      "33104268060",
-      expiresAt,
-      "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
-    );
-    expect(lease.role).toBe("roles/iam.denyAdmin");
-    expect(lease.members).toEqual([
-      "serviceAccount:gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
-    ]);
-    expect(lease.condition?.title).toBe("codex-executor-denyadmin-33104268060");
-    // Must expire, like every other lease.
-    expect(lease.condition?.expression).toContain(
-      "request.time < timestamp('2026-08-27T21:00:00.000Z')",
-    );
-    // A non-numeric run id is rejected, so the condition title cannot be forged.
+      "runsetta",
+      "medlock-1025243085",
+      "critical-history-16823277",
+    ]) {
+      const email = `cloud-run-preview@${project}.iam.gserviceaccount.com`;
+      for (const member of [`serviceAccount:${email}`, `deleted:serviceAccount:${email}`]) {
+        expect(() => buildReviewManifest(withMember(member), planIdentity)).toThrow(
+          "must hold no access",
+        );
+      }
+    }
+
+    // Conferred without being named. These mirror the forbidden_member
+    // predicate in tools/ci/preview-runtime-iam-contract.sh: a preventive gate
+    // that accepted them would let the protected bridge introduce effective
+    // preview-runtime access and leave only the detective proof to catch it.
+    for (const member of [
+      "allUsers",
+      "allAuthenticatedUsers",
+      "group:everyone@example.com",
+      "deleted:group:old@example.com",
+      "domain:example.com",
+      "projectEditor:cdbentley",
+      "projectOwner:cdbentley",
+      "projectViewer:cdbentley",
+      "principalSet://cloudresourcemanager.googleapis.com/projects/cdbentley/type/ServiceAccount",
+      "principalSet://cloudresourcemanager.googleapis.com/organizations/1234/type/ServiceAccount",
+    ]) {
+      expect(() => buildReviewManifest(withMember(member), planIdentity)).toThrow(
+        "without naming it",
+      );
+    }
+
+    // The required Cloud Storage access-log delivery group must pass. It is a
+    // managed binding, so Terraform reports it in resource_changes on every
+    // run; rejecting it as a `group:` member would refuse every bootstrap plan.
     expect(() =>
-      buildDenyAdminLease(
-        "cdbentley",
-        "not-a-run-id",
-        expiresAt,
-        "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+      buildReviewManifest(
+        plan([
+          resourceChange(
+            "module.bootstrap.google_storage_bucket_iam_member.terraform_state_access_logs_writer",
+            "google_storage_bucket_iam_member",
+            null,
+            {
+              bucket: "cdbentley-terraform-state-access-logs",
+              member: "group:cloud-storage-analytics@google.com",
+              role: "roles/storage.objectCreator",
+            },
+          ),
+        ]),
+        planIdentity,
       )
-    ).toThrow();
-    // The member must be a real ephemeral executor identity, not an arbitrary
-    // service account: gha-pbt- plus exactly 20 hex characters.
+    ).not.toThrow();
+
+    // A member Terraform resolves only during apply decides nothing at review
+    // time, so an IAM grant that leaves one unresolved is refused.
+    const unknownMember = plan([]) as Record<string, unknown>;
+    unknownMember.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_member.computed",
+      change: {
+        actions: ["create"],
+        after: { project: "cdbentley", role: "roles/viewer" },
+        after_sensitive: {},
+        after_unknown: { member: true },
+        before: null,
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "computed",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_member",
+    }];
+    expect(() => buildReviewManifest(unknownMember, planIdentity)).toThrow(
+      "unresolved until apply",
+    );
+
+    // A non-IAM resource with unknown attributes is unaffected.
+    const unknownElsewhere = plan([]) as Record<string, unknown>;
+    unknownElsewhere.resource_changes = [{
+      address: "module.bootstrap.google_storage_bucket.later",
+      change: {
+        actions: ["create"],
+        after: { project: "cdbentley" },
+        after_sensitive: {},
+        after_unknown: { self_link: true },
+        before: null,
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "later",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_storage_bucket",
+    }];
+    expect(() => buildReviewManifest(unknownElsewhere, planIdentity)).not.toThrow();
+
+    // Deleted principals carry Google's stable identifier. Stripping it is what
+    // makes the restorable account recognisable as the same identity.
+    for (const project of ["cdbentley", "runsetta"]) {
+      expect(() =>
+        buildReviewManifest(
+          withMember(
+            `deleted:serviceAccount:cloud-run-preview@${project}.iam.gserviceaccount.com?uid=123456789012345678901`,
+          ),
+          planIdentity,
+        )
+      ).toThrow("must hold no access");
+    }
+
+    // Only IAM grant resources confer access, and only through their principal
+    // fields. A container environment value that merely contains "allUsers"
+    // grants nothing, and because this runs before no-op changes are filtered,
+    // refusing it would block every protected plan that carries the service.
+    const envValue = plan([]) as Record<string, unknown>;
+    envValue.resource_changes = [{
+      address: "module.site.google_cloud_run_v2_service.site",
+      change: {
+        actions: ["no-op"],
+        after: {
+          template: [{ containers: [{ env: [{ name: "AUDIENCE", value: "allUsers" }] }] }],
+        },
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          template: [{ containers: [{ env: [{ name: "AUDIENCE", value: "group:x@y.com" }] }] }],
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.site",
+      name: "site",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_cloud_run_v2_service",
+    }];
     expect(() =>
-      buildDenyAdminLease(
-        "cdbentley",
-        "33104268060",
-        expiresAt,
-        "attacker@cdbentley.iam.gserviceaccount.com",
+      buildReviewManifest(envValue, { ...identity(), terraformRoot: "prod" as const })
+    ).not.toThrow();
+
+    // A plan that REMOVES a forbidden principal must be allowed: that is the
+    // corrective apply. Refusing it would leave the grant in place permanently.
+    const removal = plan([]) as Record<string, unknown>;
+    removal.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_binding.viewers",
+      change: {
+        actions: ["update"],
+        after: {
+          members: ["serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com"],
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          members: [
+            "serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com",
+            "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+            "allUsers",
+          ],
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "viewers",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_binding",
+    }];
+    expect(() => buildReviewManifest(removal, planIdentity)).not.toThrow();
+
+    // Deleting the grant outright is likewise allowed.
+    const deletion = plan([]) as Record<string, unknown>;
+    deletion.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_member.stale",
+      change: {
+        actions: ["delete"],
+        after: null,
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          member: "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "stale",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_member",
+    }];
+    expect(() => buildReviewManifest(deletion, planIdentity)).not.toThrow();
+
+    // An out-of-band grant shows up as refreshed live state in resource_drift
+    // while the corrective empty member set is the planned change. Gating
+    // drift would refuse the plan that fixes it.
+    const drifted = plan(
+      [
+        resourceChange(
+          "module.bootstrap.google_project_iam_binding.viewers",
+          "google_project_iam_binding",
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+        ),
+      ],
+      [
+        resourceChange(
+          "module.bootstrap.google_project_iam_binding.viewers",
+          "google_project_iam_binding",
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+          {
+            members: ["serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com"],
+            project: "cdbentley",
+            role: "roles/viewer",
+          },
+        ),
+      ],
+    );
+    expect(() => buildReviewManifest(drifted, planIdentity)).not.toThrow();
+
+    // An ordinary grant to an unrelated principal is untouched.
+    expect(() =>
+      buildReviewManifest(
+        withMember("serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com"),
+        planIdentity,
       )
-    ).toThrow();
+    ).not.toThrow();
+    // A similarly-named principal in no project of ours is not matched.
+    expect(() =>
+      buildReviewManifest(
+        withMember("serviceAccount:cloud-run-preview@someone-else.iam.gserviceaccount.com"),
+        planIdentity,
+      )
+    ).not.toThrow();
+  });
+
+  test("no deny-policy authority survives anywhere in the bridge", async () => {
+    const controller = await readFile(
+      join(root, "tools/ci/protected-bootstrap-bridge.ts"),
+      "utf8",
+    );
+    // roles/iam.denyAdmin is not grantable at project scope, iam.denypolicies
+    // writes are NOT_SUPPORTED in custom roles, and these projects have no
+    // organization or folder parent to grant it at instead. The lease could
+    // therefore never be created -- apply run 33291080180 died on exactly
+    // that setPolicy -- so the executor must never again ask for it.
+    // Assert on code, not prose: the comment explaining why this authority is
+    // gone is worth keeping.
+    expect(controller).not.toContain('"roles/iam.denyAdmin"');
+    expect(controller).not.toContain("buildDenyAdminLease");
+    expect(controller).not.toContain("requireDenyAdminRoleContract");
+    expect(controller).not.toContain('"iam.denypolicies.');
+    expect(controller).not.toContain('"google_iam_deny_policy"');
+    for (const repository of REPOSITORY_NAMES) {
+      for (const phase of ["read", "mutation"] as const) {
+        for (const root of ["bootstrap", "prod"] as const) {
+          const control = executorControlPermissions(repository, root, phase);
+          expect(control.some((p) => p.startsWith("iam.denypolicies."))).toBeFalse();
+          // Nothing is filtered out of the custom role any more, so the two
+          // contracts must agree exactly.
+          expect(executorCustomRolePermissions(repository, root, phase)).toEqual(control);
+        }
+      }
+    }
+  });
+
+  test("roles created before the deny permissions were removed stay recoverable", () => {
+    // Google retains deleted custom-role tombstones and a crashed run can
+    // leave an active role, so recovery must still recognise the retired
+    // matrices or it refuses to delete them and reports that manual cleanup
+    // is required. These are the v0.5.26 bootstrap matrices.
+    const retired = {
+      read: [
+        "iam.denypolicies.get", "iam.denypolicies.list", "iam.roles.get", "iam.roles.list",
+        "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy",
+        "iam.serviceAccounts.list", "iam.workloadIdentityPools.get",
+        "iam.workloadIdentityPools.getAttestationRules", "iam.workloadIdentityPools.list",
+        "iam.workloadIdentityPoolProviders.get", "iam.workloadIdentityPoolProviders.list",
+        "resourcemanager.projects.get", "resourcemanager.projects.getIamPolicy",
+        "serviceusage.services.get", "serviceusage.services.list",
+        "serviceusage.services.use", "storage.buckets.get",
+        "storage.buckets.getIamPolicy", "storage.buckets.list",
+      ],
+    };
+    for (const repository of REPOSITORY_NAMES) {
+      expect(
+        bridgeRolePermissionsRecognized(retired.read, repository, "bootstrap", "read"),
+      ).toBeTrue();
+      // Two retired mutation variants: the control matrix carried the deny
+      // reads and writes, and the custom role carried the reads only, because
+      // get/list are the two deny permissions Google supports in a custom role.
+      const denyReads = ["iam.denypolicies.get", "iam.denypolicies.list"];
+      const denyWrites = [
+        "iam.denypolicies.create",
+        "iam.denypolicies.delete",
+        "iam.denypolicies.update",
+      ];
+      for (const extra of [[...denyReads, ...denyWrites], denyReads]) {
+        const retiredMutation = [
+          ...executorControlPermissions(repository, "bootstrap", "mutation"),
+          ...extra,
+        ];
+        expect(
+          bridgeRolePermissionsRecognized(retiredMutation, repository, "bootstrap", "mutation"),
+        ).toBeTrue();
+      }
+    }
+    // An unrelated matrix is still rejected.
+    expect(
+      bridgeRolePermissionsRecognized(["iam.roles.create"], "cdbentley", "bootstrap", "mutation"),
+    ).toBeFalse();
   });
 
   test("workflow pins downloads and runs no third-party host action", async () => {
@@ -6077,11 +6299,9 @@ describe("protected owner Terraform bridge", () => {
       fetcher,
       async () => undefined,
     );
-    expect(bootstrapPermissions).toContain("iam.denypolicies.create");
-    expect(bootstrapPermissions).toContain("iam.denypolicies.delete");
-    expect(bootstrapPermissions).toContain("iam.denypolicies.get");
-    expect(bootstrapPermissions).toContain("iam.denypolicies.list");
-    expect(bootstrapPermissions).toContain("iam.denypolicies.update");
+    // The proof must no longer demand ANY deny-policy authority: the executor
+    // can never hold it, so probing for it would never converge.
+    expect(bootstrapPermissions.some((p) => p.startsWith("iam.denypolicies."))).toBeFalse();
     expect(
       bootstrapPermissions.filter((permission) =>
         permission === "iam.workloadIdentityPools.getAttestationRules"
@@ -6090,38 +6310,18 @@ describe("protected owner Terraform bridge", () => {
     expect(bootstrapPermissions).toContain("serviceusage.services.disable");
     expect(bootstrapPermissions).toContain("serviceusage.services.enable");
 
-    // Google marks the deny-policy WRITE permissions NOT_SUPPORTED for project
-    // custom roles, so roles.create rejects the entire role with HTTP 400 if
-    // they are included. They must still be demanded by the permission proof,
-    // because the bootstrap root declares the preview runtime deny policy
-    // unconditionally; the executor receives them from roles/iam.denyAdmin.
-    const denyWrites = [
-      "iam.denypolicies.create",
-      "iam.denypolicies.delete",
-      "iam.denypolicies.replace",
-      "iam.denypolicies.update",
-    ];
-    const controlMatrix = executorControlPermissions("cdbentley", "bootstrap", "mutation");
-    const customRoleMatrix = executorCustomRolePermissions("cdbentley", "bootstrap", "mutation");
-    for (const permission of denyWrites) {
-      expect(customRoleMatrix).not.toContain(permission);
+    // Nothing is filtered out of the ephemeral custom role any more, so the
+    // control matrix and the custom role must agree exactly in every root and
+    // phase. Any future divergence means Google refused a permission in a
+    // custom role, which must fail loudly rather than silently widen the role.
+    for (const repository of REPOSITORY_NAMES) {
+      for (const root_ of ["bootstrap", "prod"] as const) {
+        for (const phase of ["read", "mutation"] as const) {
+          expect(executorCustomRolePermissions(repository, root_, phase))
+            .toEqual(executorControlPermissions(repository, root_, phase));
+        }
+      }
     }
-    // Reads stay in the custom role: get/list ARE custom-role supported.
-    expect(customRoleMatrix).toContain("iam.denypolicies.get");
-    expect(customRoleMatrix).toContain("iam.denypolicies.list");
-    // The ONLY difference is the unsupported set -- nothing else was dropped.
-    expect(controlMatrix.filter((p) => !customRoleMatrix.includes(p)).sort())
-      .toEqual(denyWrites.filter((p) => controlMatrix.includes(p)).sort());
-    // The proof still demands the write authority.
-    expect(controlMatrix).toContain("iam.denypolicies.create");
-    expect(controlMatrix).toContain("iam.denypolicies.delete");
-    expect(controlMatrix).toContain("iam.denypolicies.update");
-    // Read phase is unaffected: it never held a write permission.
-    expect(executorCustomRolePermissions("cdbentley", "bootstrap", "read"))
-      .toEqual(executorControlPermissions("cdbentley", "bootstrap", "read"));
-    // Non-bootstrap roots carry no deny permissions at all.
-    expect(executorCustomRolePermissions("healthmcp", "prod", "mutation"))
-      .toEqual(executorControlPermissions("healthmcp", "prod", "mutation"));
 
     const prod = validateInvocation({ ...validEnvironment(), TERRAFORM_ROOT: "prod" });
     const urls: string[] = [];
@@ -6889,13 +7089,32 @@ describe("protected owner Terraform bridge", () => {
       return { deleteCalls: () => deleteCalls, fetcher, role };
     };
 
+    // The v0.5.12 matrix is no longer "current minus the attestation read":
+    // the deny-policy permissions left the matrix when roles/iam.denyAdmin
+    // proved ungrantable at project scope, so it is current, plus the deny
+    // permissions of that era, minus the attestation read.
+    const denyReads = ["iam.denypolicies.get", "iam.denypolicies.list"];
+    const denyWrites = [
+      "iam.denypolicies.create",
+      "iam.denypolicies.delete",
+      "iam.denypolicies.update",
+    ];
+    const v0512Matrix = (phase: "read" | "mutation"): readonly string[] =>
+      [
+        ...executorControlPermissions("cdbentley", "bootstrap", phase),
+        ...(phase === "read" ? denyReads : [...denyReads, ...denyWrites]),
+      ].filter((permission) => permission !== attestationReadPermission);
+
     for (const phase of ["read", "mutation"] as const) {
       const currentPermissions = executorControlPermissions("cdbentley", "bootstrap", phase);
-      const v0512Permissions = currentPermissions.filter((permission) =>
-        permission !== attestationReadPermission
-      );
+      const v0512Permissions = v0512Matrix(phase);
       expect(currentPermissions).toContain(attestationReadPermission);
       expect(v0512Permissions).not.toContain(attestationReadPermission);
+      // The frozen digest is the authority; if this derivation drifts from it
+      // the recognition test below is testing nothing.
+      expect(
+        bridgeRolePermissionsRecognized(v0512Permissions, "cdbentley", "bootstrap", phase),
+      ).toBeTrue();
       for (const initiallyDeleted of [false, true]) {
         const exact = fixture(phase, initiallyDeleted, v0512Permissions);
         await inventoryBridgeArtifacts(
@@ -6910,8 +7129,7 @@ describe("protected owner Terraform bridge", () => {
       }
     }
 
-    const v0512ReadPermissions = executorControlPermissions("cdbentley", "bootstrap", "read")
-      .filter((permission) => permission !== attestationReadPermission);
+    const v0512ReadPermissions = v0512Matrix("read");
     const arbitraryMatrices = [
       v0512ReadPermissions.filter((permission) => permission !== "iam.workloadIdentityPools.get"),
       [...v0512ReadPermissions, "iam.workloadIdentityPools.setAttestationRules"],

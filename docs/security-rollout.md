@@ -857,13 +857,34 @@ the recovery object and stop; never rerun from empty state.
 12. Use Policy Analyzer across the canary service account, project, parent
     folder, and organization. Rule out project roles and every alternate
     external-principal, public, group, domain, inherited, or custom grant that
-    could mint its tokens. The project deny policy is a preventive guard for
-    Google-supported, explicitly enumerated in-scope permissions only; it is not
-    an absolute-zero-access claim (`iam.denypolicies.*` itself is not supported
-    in deny rules). Admission also requires bracketed direct project-policy and
+    could mint its tokens. Admission requires bracketed direct project-policy and
     cross-project Policy Analyzer results proving no effective preview-runtime
-    allow. Either guard failing or returning incomplete evidence keeps previews
-    sealed.
+    allow; failing or incomplete evidence keeps previews sealed.
+
+    There is no project deny policy, and there cannot be one here. An IAM deny
+    policy is written with `iam.denypolicies.*`, which is `NOT_SUPPORTED` in
+    project custom roles and is carried only by `roles/iam.denyAdmin` -- a role
+    that is not grantable at project scope. These four projects have no
+    organization or folder parent to grant it at instead, so no principal, the
+    owner included, can write one. `roles/owner` carries only
+    `iam.denypolicies.get` and `.list`. Bootstrap apply run 33291080180 died on
+    exactly that `setIamPolicy`, with `Role roles/iam.denyAdmin is not
+    supported for this resource`.
+
+    The preventive half now lives on the one write path this platform controls:
+    the protected bridge refuses any reviewed plan, in any root, whose state
+    grants a `cloud-run-preview@*` principal anything at all. The continuous
+    half is `tools/ci/preview-runtime-iam-contract.sh`, unchanged, which proves
+    zero Policy Analyzer results for those principals across all four projects
+    before every preview traffic commit and hourly from reconciliation.
+
+    The residual gap versus a deny policy is real and worth stating: a deny
+    policy refused the request at evaluation time, always. These controls are
+    preventive on our own write path and detective everywhere else, so an
+    out-of-band grant made with the owner credential is live until the next
+    proof -- and exploitable only by code already running as that preview
+    identity in the interval. Closing it properly requires giving the projects
+    an organization parent; see `docs/followup-organization-parent.md`.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
     `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
     the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload
