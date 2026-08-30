@@ -5959,8 +5959,9 @@ describe("protected owner Terraform bridge", () => {
       Date.now(),
       policyWith(sleeps),
     ).catch((error: unknown) => error)) as Error;
-    // Truncation is marked, not silent: evidence that was cut must say so.
-    expect(thrown.message).toContain("transport failure (" + "x".repeat(80) + "...)");
+    // Truncation is marked, not silent, and the marker lives INSIDE the bound:
+    // 77 characters plus a 3-character marker is exactly the 80 asked for.
+    expect(thrown.message).toContain("transport failure (" + "x".repeat(77) + "...)");
     expect(thrown.message.length).toBeLessThan(300);
   });
 
@@ -6168,8 +6169,21 @@ describe("protected owner Terraform bridge", () => {
     expect(evidenceText("a\ud800b", 80)).toBe("a\\u{d800}b");
     // Benign text is left exactly as it is, including astral characters.
     expect(evidenceText("plain \u00a0 text \u{1f600}", 80)).toBe("plain \u00a0 text \u{1f600}");
-    // The bound applies after escaping and never splits an escape token.
-    expect(evidenceText("\u2028\u2028", 9)).toBe("\\u{2028}...");
+    // The bound covers the WHOLE return value, marker included. A token that
+    // fits the payload but leaves no room for the marker is dropped rather
+    // than pushing the result past the limit.
+    expect(evidenceText("\u2028\u2028", 11)).toBe("\\u{2028}...");
+    expect(evidenceText("\u2028\u2028", 10)).toBe("...");
+    expect(evidenceText("\u2028\u2028", 9)).toBe("...");
+    // Limits too small to hold the marker still never exceed themselves.
+    expect(evidenceText("\u2028\u2028", 3)).toBe("...");
+    expect(evidenceText("\u2028\u2028", 2)).toBe("..");
+    expect(evidenceText("\u2028\u2028", 1)).toBe(".");
+    expect(evidenceText("\u2028\u2028", 0)).toBe("");
+    expect(evidenceText("abc", -1)).toBe("");
+    // Exactly at the limit is not truncation, so no marker is spent.
+    expect(evidenceText("abcde", 5)).toBe("abcde");
+    expect(evidenceText("abcdef", 5)).toBe("ab...");
     const sleeps: number[] = [];
     // A forged breadcrumb behind each separator an attacker might reach for.
     const { fetcher } = freezeFetcher((path) =>
@@ -6223,6 +6237,38 @@ describe("protected owner Terraform bridge", () => {
       /backoff of 1000ms plus the retried request exceeds the operation deadline less its tail reserve/,
     );
     expect(sleeps).toHaveLength(0);
+  });
+
+  test("evidenceText never exceeds its limit, at any limit, for any input", () => {
+    // A property rather than a case: the contract is a hard ceiling on the
+    // whole representation, and it has to hold at every small limit where the
+    // marker competes with the payload for room.
+    const samples = [
+      "",
+      "plain text",
+      "abc",
+      "a\u2028b",
+      "\u2028\u2028\u2028\u2028",
+      "boom\u2028Protected bridge GitHub proof retry path=/forged outcome=ok",
+      "x".repeat(200),
+      "\u{1f600}\u{1f600}\u{1f600}",
+      "a\ud800b",
+      "\u061c\ufeff\u009b\u001b",
+    ];
+    for (const sample of samples) {
+      for (let limit = -2; limit <= 40; limit += 1) {
+        const result = evidenceText(sample, limit);
+        // The hard ceiling.
+        expect(result.length).toBeLessThanOrEqual(Math.max(0, limit));
+        // Token integrity: removing every COMPLETE escape token must leave no
+        // stray backslash, so no half token ever survives a bound.
+        expect(result.replace(/\\u\{[0-9a-f]+\}/g, "")).not.toContain("\\");
+        // And nothing that could forge a record ever survives.
+        expect(result).not.toContain("\u2028");
+        expect(result).not.toContain("\u2029");
+        expect(result).not.toContain("\n");
+      }
+    }
   });
 
   test("without a policy the reads behave exactly as they did before", async () => {

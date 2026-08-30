@@ -12137,23 +12137,39 @@ const OPERATION_DEADLINE_MESSAGE = "API request reached the protected operation 
 // corrupt any JSON encoding of this evidence downstream.
 const EVIDENCE_FORGERY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
 
+// The whole returned representation, marker included, is <= maximumLength.
+// An earlier version bounded only the payload and then appended the marker, so
+// a limit of 9 could return 11 characters -- a caller budgeting a log line got
+// more than it asked for, which is the same class of defect as unbounded
+// evidence, just smaller.
+const EVIDENCE_TRUNCATION_MARKER = "...";
+
 export function evidenceText(value: string, maximumLength: number): string {
-  let escaped = "";
+  if (maximumLength <= 0) return "";
+  const tokens: string[] = [];
+  let length = 0;
   let truncated = false;
   for (const character of value) {
     const token = EVIDENCE_FORGERY.test(character)
       ? `\\u{${character.codePointAt(0)?.toString(16) ?? "fffd"}}`
       : character;
-    // The bound applies to the ESCAPED text, and never splits a token: half an
-    // escape sequence is neither readable nor faithful.
-    if (escaped.length + token.length > maximumLength) {
+    // Only whole tokens are ever admitted, so no bound can leave half an
+    // escape sequence behind.
+    if (length + token.length > maximumLength) {
       truncated = true;
       break;
     }
-    escaped += token;
+    tokens.push(token);
+    length += token.length;
   }
-  // Say that it was cut. Silently truncated evidence is evidence that misleads.
-  return truncated ? `${escaped}...` : escaped;
+  if (!truncated) return tokens.join("");
+  const budget = maximumLength - EVIDENCE_TRUNCATION_MARKER.length;
+  // A limit too small to hold the marker still says something was cut, as far
+  // as the limit allows, rather than exceeding it.
+  if (budget <= 0) return EVIDENCE_TRUNCATION_MARKER.slice(0, maximumLength);
+  // Make room by dropping WHOLE tokens from the end.
+  while (length > budget) length -= tokens.pop()?.length ?? 0;
+  return tokens.join("") + EVIDENCE_TRUNCATION_MARKER;
 }
 
 export function cancellationError(error: unknown): boolean {
