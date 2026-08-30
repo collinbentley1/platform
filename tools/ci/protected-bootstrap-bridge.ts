@@ -12067,12 +12067,18 @@ export interface GithubProofRetryPolicy {
   readonly now: () => number;
   readonly sleep: (milliseconds: number) => Promise<void>;
   readonly random: () => number;
-  // Wall clock, armed at the first retryable failure. A budget that counted
-  // only sleep time was not the budget it advertised: four attempts each
-  // burning a 20s request timeout plus backoff could span well past a minute
-  // while the counter still showed room. Elapsed request time is exactly what
-  // competes with the phase envelope, so the budget has to measure it.
-  retryDeadlineMs?: number;
+  // Retry-attributable time spent on this composite operation: the elapsed
+  // time of FAILED attempts plus the backoff granted after them. Counting only
+  // sleep was not the budget it advertised -- four attempts each burning a 20s
+  // request timeout could span well past a minute while the counter showed
+  // room; elapsed request time is what competes with the phase envelope. But
+  // counting all wall clock was worse: successful reads drained it, so a blip
+  // on the first repository could refuse a blip on the fourth its first retry.
+  // Only the time this layer ADDS belongs here. Concurrent reads share one
+  // policy and accumulate into it, which double-counts overlapping spend --
+  // conservative in the right direction: a sustained multi-read outage
+  // exhausts fast, a simultaneous blip costs almost nothing.
+  retryCostMs: number;
 }
 
 export function githubProofRetryPolicy(
@@ -12081,12 +12087,14 @@ export function githubProofRetryPolicy(
   now: () => number = Date.now,
   random: () => number = Math.random,
 ): GithubProofRetryPolicy {
-  return { deadlineMs, now, random, sleep };
+  return { deadlineMs, now, random, retryCostMs: 0, sleep };
 }
 
 // Retryable: transport failure, any 5xx, 429, and the 403 shapes GitHub uses
-// for a SECONDARY rate limit. Everything else -- 401, a plain 403, 404 -- is
-// terminal on the first occurrence.
+// for rate limiting -- both the SECONDARY limit (Retry-After, or "secondary
+// rate limit"/"abuse" in the body) and the PRIMARY quota
+// (x-ratelimit-remaining: 0, paired with x-ratelimit-reset). Everything else
+// -- 401, a plain 403, 404 -- is terminal on the first occurrence.
 //
 // Deliberately NOT `transientPermissionDenial`, which treats 401/403 as
 // retryable in the storage permission probe for reasons specific to IAM
@@ -12119,12 +12127,41 @@ export function cancellationError(error: unknown): boolean {
   if (error.name === "AbortError" || error.name === "TimeoutError") return true;
   return typeof DOMException !== "undefined" && error instanceof DOMException;
 }
+// What the server asked for, and which header asked. GitHub paces two
+// different ways: the SECONDARY limit sends Retry-After; the PRIMARY quota
+// sends x-ratelimit-remaining: 0 with an epoch x-ratelimit-reset and usually
+// no Retry-After. Reading only the first burned three doomed jittered retries
+// against a quota that resets in minutes, then died as "attempt cap reached"
+// -- evidence naming the wrong cause. Read both; honour or fail closed.
+export function serverRequestedDelay(
+  response: Response | undefined,
+  now: number,
+): { readonly ms: number; readonly source: string } | undefined {
+  if (response === undefined) return undefined;
+  const retryAfter = retryAfterMs(response, now);
+  if (retryAfter !== undefined) {
+    return { ms: retryAfter, source: `Retry-After of ${retryAfter}ms` };
+  }
+  if (response.headers.get("x-ratelimit-remaining")?.trim() !== "0") return undefined;
+  const reset = response.headers.get("x-ratelimit-reset")?.trim() ?? "";
+  if (!/^\d{1,10}$/.test(reset)) return undefined;
+  const ms = Math.max(0, Number(reset) * 1_000 - now);
+  return { ms, source: `x-ratelimit-reset in ${ms}ms` };
+}
+
 const GITHUB_PROOF_RETRY_BUDGET_MS = 60_000;
 const GITHUB_PROOF_RETRY_ATTEMPTS = 4;
 const GITHUB_PROOF_RETRY_BASE_MS = 1_000;
+// Headroom only: at a 4-attempt cap the largest exponent yields 4000ms, so
+// this never binds today. It bounds the pacing if the attempt cap ever rises.
 const GITHUB_PROOF_RETRY_CAP_MS = 8_000;
 // Never sleep so long that the receipt publish that follows has no runway.
-const GITHUB_PROOF_RETRY_TAIL_RESERVE_MS = 30_000;
+// Runway left for the work that follows a retry inside the same phase. The
+// costliest tail is the post-consume freeze proof followed by the receipt
+// publish, and that publish is two requests -- the upload and the
+// byte-equivalence readback -- at up to 20s each. A 30s reserve could not
+// cover it. Raising it only tightens retries near the deadline.
+const GITHUB_PROOF_RETRY_TAIL_RESERVE_MS = 60_000;
 
 // `Retry-After` is delta-seconds or an HTTP-date. Anything else is not a
 // value we will act on, and we fall back to jittered backoff rather than
@@ -12136,7 +12173,12 @@ export function retryAfterMs(
   const raw = response?.headers.get("retry-after");
   if (raw === null || raw === undefined) return undefined;
   const trimmed = raw.trim();
-  if (/^\d{1,5}$/.test(trimmed)) return Number(trimmed) * 1_000;
+  // Any non-negative delta-seconds. A {1,5} bound sent a 6-digit value down
+  // the HTTP-date path, where Date.parse yields NaN, so an enormous server
+  // instruction silently became a 1-8s jitter -- the server's instruction
+  // ignored, the same sin as truncating it. The affordability gate below is
+  // what refuses values we cannot afford; the parser must not pre-empt it.
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
   const when = Date.parse(trimmed);
   if (!Number.isFinite(when)) return undefined;
   return Math.max(0, when - now);
@@ -12161,6 +12203,7 @@ async function githubJson(
   let lastOutcome = "no attempt completed";
   for (;;) {
     attempts += 1;
+    const attemptStartedMs = retry === undefined ? 0 : retry.now();
     let response: Response | undefined;
     let transportError: unknown;
     try {
@@ -12209,18 +12252,24 @@ async function githubJson(
         throw new Error(`GitHub freeze proof failed with HTTP ${response.status}.`);
       }
       if (transportError !== undefined && retry === undefined) throw transportError;
-      throw describe(retryable ? "no retry budget" : "not retryable");
+      throw describe("not retryable");
     }
     if (attempts >= GITHUB_PROOF_RETRY_ATTEMPTS) throw describe("attempt cap reached");
 
-    // Armed once, at the first retryable failure. Concurrent reads share the
-    // policy, so this write can race -- benignly, because every racer computes
-    // very nearly the same instant and the value is never decremented
-    // afterwards. A decrementing counter would have been a genuine data race.
-    if (retry.retryDeadlineMs === undefined) {
-      retry.retryDeadlineMs = retry.now() + GITHUB_PROOF_RETRY_BUDGET_MS;
+    // Charge the failed attempt. Only failed attempts and the backoff granted
+    // after them are retry-attributable: successful reads happen with or
+    // without this layer and are already bounded by the operation deadline.
+    // An armed wall-clock window counted them, so a minute of clean reads
+    // between two unrelated blips refused the second blip its first retry --
+    // reintroducing the very failure this layer exists to prevent.
+    retry.retryCostMs += retry.now() - attemptStartedMs;
+    if (retry.retryCostMs >= GITHUB_PROOF_RETRY_BUDGET_MS) {
+      throw describe(
+        `retry budget exhausted; ${retry.retryCostMs}ms of ` +
+          `${GITHUB_PROOF_RETRY_BUDGET_MS}ms spent on retries`,
+      );
     }
-    if (retry.now() >= retry.retryDeadlineMs) throw describe("retry budget exhausted");
+    const budgetRemainingMs = GITHUB_PROOF_RETRY_BUDGET_MS - retry.retryCostMs;
 
     // Full jitter may legally produce zero. That is an immediate retry, not an
     // exhausted budget, and conflating them reported the wrong cause.
@@ -12228,18 +12277,17 @@ async function githubJson(
       retry.random() *
         Math.min(GITHUB_PROOF_RETRY_BASE_MS * 2 ** (attempts - 1), GITHUB_PROOF_RETRY_CAP_MS),
     );
-    const serverRequested = retryAfterMs(response, retry.now());
-    const requested = serverRequested ?? jittered;
+    const serverRequested = serverRequestedDelay(response, retry.now());
+    const requested = serverRequested?.ms ?? jittered;
     // Name the source. An operator reading this after a burned plan must be
-    // able to tell a server instruction from our own backoff.
-    const source = serverRequested === undefined
-      ? `backoff of ${requested}ms`
-      : `Retry-After of ${requested}ms`;
+    // able to tell a server instruction from our own backoff, and which of
+    // GitHub's two limits spoke.
+    const source = serverRequested?.source ?? `backoff of ${requested}ms`;
     // A server instruction is honoured or the run fails; it is never truncated.
     // Retrying earlier than asked lands while still limited and discards the
     // one signal the server gave us.
-    if (requested > retry.retryDeadlineMs - retry.now()) {
-      throw describe(`${source} exceeds the remaining retry budget`);
+    if (requested > budgetRemainingMs) {
+      throw describe(`${source} exceeds the remaining retry budget of ${budgetRemainingMs}ms`);
     }
     if (retry.deadlineMs() - retry.now() < requested + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
       throw describe(`${source} exceeds the operation deadline less its tail reserve`);
@@ -12248,6 +12296,7 @@ async function githubJson(
       `Protected bridge GitHub proof retry path=${path} outcome=${lastOutcome} ` +
         `attempt=${attempts} sleep_ms=${requested}`,
     );
+    retry.retryCostMs += requested;
     if (requested > 0) await retry.sleep(requested);
   }
 }
