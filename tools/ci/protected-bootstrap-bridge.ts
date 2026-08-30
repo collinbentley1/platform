@@ -9926,7 +9926,16 @@ export async function waitForStatePermissions(
       // -- `permissionDenialProvesNoUsableCredential` already treats the two as
       // one class. Throwing discards the rest of the convergence budget; report
       // "not converged yet" and let the deadline decide.
-      if (expected !== "none" && transientPermissionDenial(bucketResponse)) return false;
+      if (expected !== "none" && transientPermissionDenial(bucketResponse)) {
+        // Publish before returning. A persistent denial is exactly the
+        // never-converging case, and leaving the previous scan's verdict in
+        // place would report a stale mismatch as if it were current.
+        scanUnconverged.push(
+          `bucket ${state.bucket}(denied with HTTP ${bucketResponse.status})`,
+        );
+        unconverged = scanUnconverged;
+        return false;
+      }
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
     }
     const requiredBucketPermissions = ["storage.objects.list"];
@@ -9993,6 +10002,8 @@ export async function waitForStatePermissions(
         // its code alone, and the convergence loop already bounds the wait: a
         // credential that never becomes usable fails on the deadline with the
         // lease-propagation message instead of aborting the run outright.
+        scanUnconverged.push(`${object.name}(denied)`);
+        unconverged = scanUnconverged;
         return false;
       }
       if (objectResult.denied && objectResult.permissions.length !== 0) {
@@ -10099,6 +10110,9 @@ export async function waitForControlPermissions(
   // accumulation across the window.
   let controlUnconverged: string[] = [];
   await waitForPermissionConvergence(async () => {
+    // Scan-local for the same reason as the state scan: a deadline reached
+    // inside a subrequest must not replace the last completed verdict.
+    const scanControlUnconverged: string[] = [];
     const projectResponse = await permissionSubrequest(
       () =>
         permissionFetcher(
@@ -10118,12 +10132,13 @@ export async function waitForControlPermissions(
       // Same transient class the state probe tolerates, and this projection
       // runs after the plan has been consumed, so throwing burns the approved
       // plan over a condition the convergence budget exists to wait out.
-      if (expected !== "none" && transientPermissionDenial(projectResponse)) return false;
+      if (expected !== "none" && transientPermissionDenial(projectResponse)) {
+        scanControlUnconverged.push(`project(denied with HTTP ${projectResponse.status})`);
+        controlUnconverged = scanControlUnconverged;
+        return false;
+      }
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
-    // Scan-local for the same reason as the state scan: a deadline reached
-    // inside a subrequest must not replace the last completed verdict.
-    const scanControlUnconverged: string[] = [];
     let projectMatches = true;
     if (projectResponse.ok) {
       const projectValue = record(
@@ -10179,7 +10194,13 @@ export async function waitForControlPermissions(
           // A prod elevation adds the runtime actAs leases immediately before
           // this scan, so their denial is the same transient the project probe
           // above waits out -- and this runs post-consumption too.
-          if (expected !== "none" && transientPermissionDenial(response)) return false;
+          if (expected !== "none" && transientPermissionDenial(response)) {
+            scanControlUnconverged.push(
+              `runtime ${email}(denied with HTTP ${response.status})`,
+            );
+            controlUnconverged = scanControlUnconverged;
+            return false;
+          }
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
         }
         if (!response.ok) continue;

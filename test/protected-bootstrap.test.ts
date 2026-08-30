@@ -5349,6 +5349,37 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow(/consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/);
   });
 
+  test("a persistent denial is named rather than reported as a stale mismatch", async () => {
+    // A never-converging 403 is the case the denial handling exists for, and
+    // the early return skipped the diagnostic entirely -- so the timeout either
+    // named nothing or, worse, reported a completed earlier scan's verdict as
+    // if it were current.
+    const invocation = validateInvocation(validEnvironment());
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async () => {
+        nowMs += 100;
+        return new Response("", { status: 403 });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        testObjectPermissions: async () => ({ denied: true, permissions: [] }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(
+      new RegExp(`bucket ${state.bucket}\\(denied with HTTP 403\\)`),
+    );
+  });
+
   test("a convergence timeout names a bucket-only mismatch", async () => {
     // The bucket probe consumed the window on its own: every object converges
     // but storage.objects.list never appears. Without the bucket verdict the
