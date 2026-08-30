@@ -87,6 +87,7 @@ import {
   terraformSandboxCreateArguments,
   TerraformSandboxExecutor,
   validateInvocation,
+  verifyAdoptionWorkflowRun,
   validateRecoveryInvocation,
   validateStorageBackendRolePermissionInventory,
   verifyTerraformProviderMirrorLayout,
@@ -2758,6 +2759,68 @@ describe("protected owner Terraform bridge", () => {
     expect(rendered).not.toContain(secret);
     expect(rendered).not.toContain("getAttestationRules");
     expect(rendered).not.toContain("module.bootstrap");
+  });
+
+  test("adoption SHA drift names both SHAs and the remedy", async () => {
+    // Run 33323855236 failed here after a single-use owner token was minted, a
+    // human approved, and an executor was elevated -- because the adoption
+    // receipt had been stale since the release three steps earlier. The check
+    // is correct and unchanged; an adoption performed under an older platform
+    // must not authorize a production apply. What was missing was the remedy:
+    // the adoption is idempotent and simply needs re-running at the new pin.
+    const CURRENT = "9e1501236a3bccaf57f198853dafd8b89591bc5f";
+    const STALE = "4dc090fe6c56650be978b897f4d458b9d5a8ea8e";
+    const invocation = {
+      exposureAdoptionRunId: "100",
+      githubRunId: "200",
+      platformActionsToken: "ghp_" + "a".repeat(36),
+      platformSha: CURRENT,
+    } as unknown as Parameters<typeof verifyAdoptionWorkflowRun>[0];
+    const fetcher = (async () =>
+      Response.json({
+        actor: { id: 16823277 },
+        conclusion: "success",
+        event: "workflow_dispatch",
+        head_branch: "main",
+        head_sha: STALE,
+        id: 100,
+        run_attempt: 1,
+        status: "completed",
+      })) as unknown as Fetcher;
+
+    const thrown = (await verifyAdoptionWorkflowRun(invocation, fetcher)
+      .then(() => undefined, (error: unknown) => error)) as Error;
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.message).toContain(STALE.slice(0, 12));
+    expect(thrown.message).toContain(CURRENT.slice(0, 12));
+    expect(thrown.message).toContain("re-run the runsetta exposure adoption");
+  });
+
+  test("an adoption at the current pin passes the SHA check", async () => {
+    const CURRENT = "9e1501236a3bccaf57f198853dafd8b89591bc5f";
+    const invocation = {
+      exposureAdoptionRunId: "100",
+      githubRunId: "200",
+      platformActionsToken: "ghp_" + "a".repeat(36),
+      platformSha: CURRENT,
+    } as unknown as Parameters<typeof verifyAdoptionWorkflowRun>[0];
+    const fetcher = (async () =>
+      Response.json({
+        actor: { id: 16823277 },
+        conclusion: "success",
+        event: "workflow_dispatch",
+        head_branch: "main",
+        head_sha: CURRENT,
+        id: 100,
+        run_attempt: 1,
+        status: "completed",
+      })) as unknown as Fetcher;
+    const thrown = (await verifyAdoptionWorkflowRun(invocation, fetcher)
+      .then(() => undefined, (error: unknown) => error)) as Error | undefined;
+    // Whatever else this function goes on to check, it is NOT the SHA.
+    if (thrown !== undefined) {
+      expect(thrown.message).not.toContain("platform SHA drifted");
+    }
   });
 
   test("a post-apply audit exit 2 names the shape of the residual diff", () => {

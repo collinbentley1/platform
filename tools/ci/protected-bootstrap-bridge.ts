@@ -11087,7 +11087,7 @@ async function readGenerationBoundObject(
   };
 }
 
-async function verifyAdoptionWorkflowRun(
+export async function verifyAdoptionWorkflowRun(
   invocation: Invocation,
   fetcher: Fetcher,
   retry?: GithubProofRetryPolicy,
@@ -11111,7 +11111,24 @@ async function verifyAdoptionWorkflowRun(
   exact(run.event, "workflow_dispatch", "Runsetta exposure adoption event");
   exact(run.status, "completed", "Runsetta exposure adoption status");
   exact(run.conclusion, "success", "Runsetta exposure adoption conclusion");
-  exact(run.head_sha, invocation.platformSha, "Runsetta exposure adoption platform SHA");
+  // A platform release invalidates the adoption receipt exactly as it
+  // invalidates every other pinned artifact, and this is where that surfaces --
+  // in `proof`, after a single-use owner token has been minted, a human has
+  // approved, and an executor has been elevated. The check itself is right: an
+  // adoption performed under an older, possibly weaker platform must not
+  // authorize a production apply. But the bare "drifted from the reviewed
+  // value" sent an operator hunting a config error when the remedy is simply to
+  // re-run the adoption, which is idempotent and finishes `exact-existing`
+  // against live state.
+  if (run.head_sha !== invocation.platformSha) {
+    throw new Error(
+      "Runsetta exposure adoption platform SHA drifted from the reviewed value: " +
+        `adoption run ${runId} was performed at platform ${String(run.head_sha).slice(0, 12)}, ` +
+        `the reviewed pin is ${invocation.platformSha.slice(0, 12)}. A platform release ` +
+        "invalidates the adoption receipt; re-run the runsetta exposure adoption at the " +
+        "current pin, then dispatch runsetta prod naming the new adoption run.",
+    );
+  }
   exact(run.head_branch, "main", "Runsetta exposure adoption branch");
   exact(
     String(record(run.actor, "Runsetta exposure adoption actor").id),
