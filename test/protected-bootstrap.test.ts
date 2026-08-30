@@ -13,6 +13,8 @@ import {
   buildMarkerMutationLease,
   buildMarkerReadLease,
   buildReceiptLeases,
+  buildLegacyCombinedReceiptCreateLease,
+  receiptConsumeLeaseTitle,
   buildReviewManifest,
   buildRuntimeActAsLeases,
   buildStorageLease,
@@ -5300,6 +5302,171 @@ describe("protected owner Terraform bridge", () => {
       2_000,
       () => nowMs,
     )).rejects.toThrow("state lease did not propagate before the deadline");
+  });
+
+  // Probe answers DERIVED FROM THE LEASES, with no phase or object-name special
+  // cases. That is the seam this defect lived in: every existing probe fake
+  // encodes the author's belief about what the executor holds, and the belief
+  // was wrong -- the acquire-time objectCreator grant on the consumed receipt
+  // persisted into the mutation projection, which forbids create on it, so the
+  // two contradicted each other permanently. Run 33300997122 burned its
+  // approved plan discovering that. Derived probes cannot hold a wrong belief.
+  const derivedProbes = (leases: readonly { role: string; condition?: { expression?: string } | null }[]) => {
+    const permissionsFor = (resource: string): Set<string> => {
+      const held = new Set<string>();
+      for (const lease of leases) {
+        const expression = lease.condition?.expression ?? "";
+        if (!expression.includes(`resource.name == '${resource}'`)) continue;
+        if (lease.role === "roles/storage.objectViewer") held.add("storage.objects.get");
+        if (lease.role === "roles/storage.objectCreator") held.add("storage.objects.create");
+        if (lease.role === "roles/storage.admin" || lease.role === "roles/storage.objectAdmin") {
+          for (const permission of [
+            "storage.objects.create", "storage.objects.delete",
+            "storage.objects.get", "storage.objects.update",
+          ]) held.add(permission);
+        }
+      }
+      return held;
+    };
+    return {
+      // Initiating a resumable upload authorizes against create alone, which is
+      // what run 33300997122 demonstrated.
+      testObjectOverwrite: async ({ bucket, objectName }: { bucket: string; objectName: string }) =>
+        permissionsFor(`projects/_/buckets/${bucket}/objects/${objectName}`).has(
+          "storage.objects.create",
+        ),
+      testObjectPermissions: async ({ permissions, resource }: { permissions: readonly string[]; resource: string }) => ({
+        denied: false,
+        permissions: permissions.filter((permission) => permissionsFor(resource).has(permission)),
+      }),
+    };
+  };
+
+  const applyInvocationFor = (digest: string) =>
+    validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: digest,
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+      EXECUTION_MODE: "apply",
+    });
+
+  const applyReceiptLeases = () =>
+    buildReceiptLeases(
+      "cdbentley", "bootstrap", "123456", new Date("2026-08-30T12:00:00.000Z"),
+      "apply", "123455", executorEmail, "",
+    );
+
+  // Acquire holds only the read lease; elevate adds the mutating storage lease.
+  const acquireStateLeases = () => [
+    ...buildStorageAcquisitionLeases(
+      "cdbentley", "bootstrap", "apply", "123456",
+      new Date("2026-08-30T12:00:00.000Z"), executorEmail,
+    ),
+  ];
+  const elevatedStateLeases = () => [
+    ...acquireStateLeases(),
+    buildStorageLease(
+      "cdbentley", "bootstrap", "123456", new Date("2026-08-30T12:00:00.000Z"),
+      executorEmail, "apply", "123455",
+    ),
+  ];
+
+  const runProjection = (
+    expected: "mutation" | "read",
+    leases: readonly { role: string; condition?: { expression?: string } | null }[],
+  ) => {
+    let nowMs = 1_000;
+    return waitForStatePermissions(
+      REPOSITORIES.cdbentley.state.bootstrap,
+      applyInvocationFor("a".repeat(64)),
+      "short-lived-executor-access-token-value",
+      expected,
+      async (input) => {
+        nowMs += 100;
+        return Response.json({
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      derivedProbes(leases) as never,
+      3_000,
+      () => nowMs,
+    );
+  };
+
+  test("the acquire grant satisfies the read projection, derived from the leases themselves", async () => {
+    // Establishes the harness is faithful rather than permissive: acquire must
+    // converge, and it can only do so because the executor really does hold
+    // create and get on the consumed receipt at that point.
+    await runProjection("read", [...applyReceiptLeases(), ...acquireStateLeases()]);
+  });
+
+  test("elevation converges only once the consumed-receipt create lease is revoked", async () => {
+    const receipts = applyReceiptLeases();
+    const consumeTitle = receiptConsumeLeaseTitle("123456");
+    const consume = receipts.find((lease) => lease.condition?.title === consumeTitle);
+    expect(consume).toBeDefined();
+
+    // v0.5.28 shape: nothing revoked the consumed grant. This reproduces the
+    // live failure from the leases, message for message.
+    await expect(runProjection("mutation", [...receipts, ...elevatedStateLeases()])).rejects.toThrow(
+      /consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/,
+    );
+
+    // v0.5.29 shape: elevate removes exactly that binding and the projection
+    // converges. The result receipt keeps its create grant, which it needs to
+    // publish the post-apply receipt.
+    const elevated = receipts.filter((lease) => lease.condition?.title !== consumeTitle);
+    await runProjection("mutation", [...elevated, ...elevatedStateLeases()]);
+  });
+
+  test("apply receipt leases split the creator scope and leave the reader whole", () => {
+    const leases = applyReceiptLeases();
+    const creators = leases.filter((lease) => lease.role === "roles/storage.objectCreator");
+    expect(creators).toHaveLength(2);
+    const consume = creators.find(
+      (lease) => lease.condition?.title === receiptConsumeLeaseTitle("123456"),
+    )!;
+    const create = creators.find(
+      (lease) => lease.condition?.title !== receiptConsumeLeaseTitle("123456"),
+    )!;
+    // Disjoint: neither creator scope names the other's object.
+    expect(consume.condition!.expression).toContain("/consumed/123455.json");
+    expect(consume.condition!.expression).not.toContain("/results/");
+    expect(create.condition!.expression).toContain("/results/123456.json");
+    expect(create.condition!.expression).not.toContain("/consumed/");
+    // The plan receipt is never creatable during apply.
+    for (const creator of creators) {
+      expect(creator.condition!.expression).not.toContain("/plans/");
+    }
+    // Read scope is unchanged: all three receipts remain readable.
+    const viewer = leases.find((lease) => lease.role === "roles/storage.objectViewer")!;
+    for (const fragment of ["/plans/123455.json", "/consumed/123455.json", "/results/123456.json"]) {
+      expect(viewer.condition!.expression).toContain(fragment);
+    }
+  });
+
+  test("recovery still recognises an orphan left by the pre-revocation shape", () => {
+    // Orphan recovery compares expressions exactly, so a run that died under
+    // v0.5.28 presents one combined creator binding. If the expected set no
+    // longer contains that shape, recovery hard-fails and the protected path
+    // refuses every run until someone cleans up by hand.
+    const legacy = buildLegacyCombinedReceiptCreateLease(
+      "cdbentley", "bootstrap", "123456", new Date("2026-08-30T12:00:00.000Z"),
+      "123455", executorEmail,
+    );
+    expect(legacy.condition.title).toBe("codex-receipt-create-123456");
+    expect(legacy.condition.expression).toContain("/consumed/123455.json");
+    expect(legacy.condition.expression).toContain("/results/123456.json");
+    // It is distinguishable from the current pair: same title as the current
+    // result-only creator, different expression.
+    const current = applyReceiptLeases().find(
+      (lease) => lease.condition?.title === "codex-receipt-create-123456",
+    )!;
+    expect(current.condition!.expression).not.toBe(legacy.condition.expression);
   });
 
   test("a convergence timeout names the object and permissions that never matched", async () => {
