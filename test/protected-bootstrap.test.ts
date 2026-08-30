@@ -451,6 +451,65 @@ describe("protected owner Terraform bridge", () => {
       buildReviewManifest(envValue, { ...identity(), terraformRoot: "prod" as const })
     ).not.toThrow();
 
+    // A plan that REMOVES a forbidden principal must be allowed: that is the
+    // corrective apply. Refusing it would leave the grant in place permanently.
+    const removal = plan([]) as Record<string, unknown>;
+    removal.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_binding.viewers",
+      change: {
+        actions: ["update"],
+        after: {
+          members: ["serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com"],
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          members: [
+            "serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com",
+            "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+            "allUsers",
+          ],
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "viewers",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_binding",
+    }];
+    expect(() => buildReviewManifest(removal, planIdentity)).not.toThrow();
+
+    // Deleting the grant outright is likewise allowed.
+    const deletion = plan([]) as Record<string, unknown>;
+    deletion.resource_changes = [{
+      address: "module.bootstrap.google_project_iam_member.stale",
+      change: {
+        actions: ["delete"],
+        after: null,
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          member: "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com",
+          project: "cdbentley",
+          role: "roles/viewer",
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.bootstrap",
+      name: "stale",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_project_iam_member",
+    }];
+    expect(() => buildReviewManifest(deletion, planIdentity)).not.toThrow();
+
     // An ordinary grant to an unrelated principal is untouched.
     expect(() =>
       buildReviewManifest(

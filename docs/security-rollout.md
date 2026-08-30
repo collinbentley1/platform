@@ -884,7 +884,7 @@ the recovery object and stop; never rerun from empty state.
     out-of-band grant made with the owner credential is live until the next
     proof -- and exploitable only by code already running as that preview
     identity in the interval. Closing it properly requires giving the projects
-    an organization parent; see FOLLOWUP-organization-parent.md.
+    an organization parent; see `docs/followup-organization-parent.md`.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
     `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
     the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload

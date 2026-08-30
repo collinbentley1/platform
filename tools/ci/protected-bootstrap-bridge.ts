@@ -1938,6 +1938,10 @@ function principalWithoutUid(member: string): string {
   return marker === -1 ? member : member.slice(0, marker);
 }
 
+// Refuse a plan that would leave a preview runtime principal holding access,
+// or leave access with a principal broad enough to include one. Called on the
+// `after` state only: `before` describes what is being replaced, and a
+// forbidden principal there is exactly what a corrective plan removes.
 function rejectPreviewRuntimeGrant(
   type: string,
   state: JsonValue,
@@ -12143,17 +12147,16 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         address,
         `${label} after-unknown map`,
       );
+      // Only the state the apply leaves behind is gated. A forbidden principal
+      // in `before` means the plan is REMOVING it -- an authoritative binding
+      // drops it from members, or the grant is deleted outright -- and
+      // refusing that would block the corrective apply and leave the grant in
+      // place permanently.
       rejectPreviewRuntimeGrant(
         type,
         json(delta.after ?? null, `${label} after`),
         address,
         `${label} after state`,
-      );
-      rejectPreviewRuntimeGrant(
-        type,
-        json(delta.before ?? null, `${label} before`),
-        address,
-        `${label} before state`,
       );
       const actions = array(delta.actions, `${label} actions`).map((action) =>
         requiredString(action, `${label} action`),
