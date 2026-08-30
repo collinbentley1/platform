@@ -12121,6 +12121,28 @@ const OPERATION_DEADLINE_MESSAGE = "API request reached the protected operation 
 // DOMException reaching here means something above deliberately stopped this
 // request, and retrying it would override that decision -- the opposite of
 // what cancellation means.
+// Transport error text is attacker-influenced -- a proxy or gateway can put
+// arbitrary bytes in it -- and it goes straight into a log line and an Error
+// message. A newline forges a second log record, and an escape sequence
+// rewrites the reading operator's terminal. Truncation alone does not stop
+// either. Escape the control ranges, the C1 range, and the bidi overrides
+// that can visually reorder what an operator reads, then bound the length.
+export function evidenceText(value: string, maximumLength: number): string {
+  let escaped = "";
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    const control = code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+    const bidi = (code >= 0x200e && code <= 0x200f) ||
+      (code >= 0x202a && code <= 0x202e) ||
+      (code >= 0x2066 && code <= 0x2069);
+    escaped += control || bidi
+      ? `\\u{${code.toString(16)}}`
+      : character;
+    if (escaped.length >= maximumLength) break;
+  }
+  return escaped.slice(0, maximumLength);
+}
+
 export function cancellationError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.message === OPERATION_DEADLINE_MESSAGE) return true;
@@ -12148,6 +12170,11 @@ export function serverRequestedDelay(
   const ms = Math.max(0, Number(reset) * 1_000 - now);
   return { ms, source: `x-ratelimit-reset in ${ms}ms` };
 }
+
+// The ceiling deadlineFetcher puts on any single request. The retry gates
+// reserve it for the attempt that follows a backoff, so it must be the same
+// number in both places.
+export const PROTECTED_MAX_REQUEST_MS = 20_000;
 
 const GITHUB_PROOF_RETRY_BUDGET_MS = 60_000;
 const GITHUB_PROOF_RETRY_ATTEMPTS = 4;
@@ -12221,7 +12248,7 @@ async function githubJson(
       if (cancellationError(error)) throw error;
       transportError = error;
       lastOutcome = `transport failure (${
-        error instanceof Error ? error.message.slice(0, 80) : "unknown"
+        error instanceof Error ? evidenceText(error.message, 80) : "unknown"
       })`;
     }
     if (response !== undefined && response.ok) return boundedJson(response, 4 * 1024 * 1024);
@@ -12286,11 +12313,22 @@ async function githubJson(
     // A server instruction is honoured or the run fails; it is never truncated.
     // Retrying earlier than asked lands while still limited and discards the
     // one signal the server gave us.
-    if (requested > budgetRemainingMs) {
-      throw describe(`${source} exceeds the remaining retry budget of ${budgetRemainingMs}ms`);
+    // Granting a retry costs the backoff AND the attempt that follows it,
+    // which deadlineFetcher caps at PROTECTED_MAX_REQUEST_MS. Checking only the
+    // backoff let a Retry-After exactly equal to the remaining budget pass,
+    // sleep the budget to zero, and then start a request that ran 20s past it;
+    // the same omission let a retry eat into the advertised tail reserve.
+    // Reserving both makes the 60s bound exact rather than 60s plus an overrun.
+    const grantCostMs = requested + PROTECTED_MAX_REQUEST_MS;
+    if (grantCostMs > budgetRemainingMs) {
+      throw describe(
+        `${source} plus the retried request exceeds the remaining retry ` +
+          `budget of ${budgetRemainingMs}ms`,
+      );
     }
-    if (retry.deadlineMs() - retry.now() < requested + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
-      throw describe(`${source} exceeds the operation deadline less its tail reserve`);
+    if (retry.deadlineMs() - retry.now() < grantCostMs + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
+      throw describe(`${source} plus the retried request exceeds the operation deadline ` +
+        `less its tail reserve`);
     }
     console.log(
       `Protected bridge GitHub proof retry path=${path} outcome=${lastOutcome} ` +
@@ -12410,7 +12448,7 @@ export async function requireFreshGoogleOwnerAccessToken(
 export function deadlineFetcher(
   fetcher: Fetcher,
   deadline: () => number,
-  maximumRequestMs = 20_000,
+  maximumRequestMs = PROTECTED_MAX_REQUEST_MS,
   now: () => number = Date.now,
 ): Fetcher {
   return async (input, init = {}) => {

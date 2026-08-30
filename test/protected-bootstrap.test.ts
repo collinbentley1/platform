@@ -18,6 +18,7 @@ import {
   retryableGithubReadFailure,
   retryAfterMs,
   cancellationError,
+  evidenceText,
   buildLegacyCombinedReceiptCreateLease,
   receiptConsumeLeaseTitle,
   elevationPolicyRecord,
@@ -5774,7 +5775,7 @@ describe("protected owner Terraform bridge", () => {
     );
     await expect(
       proveConsumerFreeze(freezeToken, 300, f502, Date.now(), policyWith(late, Date.now() + 5_000)),
-    ).rejects.toThrow(/backoff of \d+ms exceeds the operation deadline less its tail reserve/);
+    ).rejects.toThrow(/backoff of \d+ms plus the retried request exceeds the operation deadline less its tail reserve/);
     expect(late).toHaveLength(0);
   });
 
@@ -5789,7 +5790,7 @@ describe("protected owner Terraform bridge", () => {
     );
     await expect(
       proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
-    ).rejects.toThrow(/Retry-After of 300000ms exceeds the remaining retry budget/);
+    ).rejects.toThrow(/Retry-After of 300000ms plus the retried request exceeds the remaining retry budget/);
     expect(sleeps).toHaveLength(0);
     expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
   });
@@ -6056,7 +6057,7 @@ describe("protected owner Terraform bridge", () => {
     );
     await expect(
       proveConsumerFreeze(freezeToken, 300, fetcher, now, policyWith(sleeps, now + 30 * 60_000)),
-    ).rejects.toThrow(/x-ratelimit-reset in \d+ms exceeds the remaining retry budget of \d+ms/);
+    ).rejects.toThrow(/x-ratelimit-reset in \d+ms plus the retried request exceeds the remaining retry budget of \d+ms/);
     // Refused immediately, naming the reset. No doomed retries.
     expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
     expect(sleeps).toHaveLength(0);
@@ -6109,9 +6110,102 @@ describe("protected owner Terraform bridge", () => {
     );
     await expect(
       proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
-    ).rejects.toThrow(/Retry-After of 40000ms exceeds the remaining retry budget of 20000ms/);
+    ).rejects.toThrow(/Retry-After of 40000ms plus the retried request exceeds the remaining retry budget of 20000ms/);
     // The first wait was granted and charged; the second was refused.
     expect(sleeps).toEqual([40_000]);
+  });
+
+  test("a wait that exactly fills the budget is refused, not slept to zero", async () => {
+    // Granting a retry costs the backoff AND the attempt after it. Checking
+    // only the backoff let a Retry-After exactly equal to the remaining budget
+    // pass, sleep the budget to zero, then start a request that ran 20s past
+    // it -- so the advertised 60s bound was really 60s plus an overrun.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 30 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { headers: { "retry-after": "60" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(
+      /Retry-After of 60000ms plus the retried request exceeds the remaining retry budget/,
+    );
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("a hostile transport error cannot forge a log record", async () => {
+    // Truncation alone does not stop a newline from forging a second log line,
+    // or an escape sequence from rewriting the operator's terminal. Evidence
+    // has to stay one record.
+    expect(evidenceText("a\nb", 80)).toBe("a\\u{a}b");
+    expect(evidenceText("\u001b[2Kfake", 80)).toBe("\\u{1b}[2Kfake");
+    // Bidi controls can visually reorder what an operator reads. Every range
+    // the sanitiser claims to cover gets a representative.
+    expect(evidenceText("real\u202edekaf", 80)).toBe("real\\u{202e}dekaf");
+    expect(evidenceText("a\u200eb", 80)).toBe("a\\u{200e}b");
+    expect(evidenceText("a\u200fb", 80)).toBe("a\\u{200f}b");
+    expect(evidenceText("a\u202ab", 80)).toBe("a\\u{202a}b");
+    expect(evidenceText("a\u2066b", 80)).toBe("a\\u{2066}b");
+    expect(evidenceText("a\u2069b", 80)).toBe("a\\u{2069}b");
+    // C1 range, which some terminals also act on.
+    expect(evidenceText("a\u009bb", 80)).toBe("a\\u{9b}b");
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Error("boom\nProtected bridge GitHub proof retry path=/forged outcome=ok")
+        : Response.json(okBody(path))
+    );
+    const thrown = (await proveConsumerFreeze(
+      freezeToken,
+      300,
+      fetcher,
+      Date.now(),
+      policyWith(sleeps),
+    ).catch((error: unknown) => error)) as Error;
+    expect(thrown.message).toContain("boom\\u{a}Protected bridge");
+    expect(thrown.message).not.toContain("\n");
+  });
+
+  test("the tail reserve covers the retried request, not just its backoff", async () => {
+    // Starting a retry with only "reserve + backoff" left let the request
+    // itself eat the reserve the receipt publish depends on. The reserve has
+    // to sit behind the retried request, not in front of it.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    // Exactly enough for the backoff plus the reserve, and 10s short of also
+    // covering the request that follows.
+    const deadline = clock + 1_000 + 60_000 + 10_000;
+    const policy = githubProofRetryPolicy(
+      () => deadline,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(
+      /backoff of 1000ms plus the retried request exceeds the operation deadline less its tail reserve/,
+    );
+    expect(sleeps).toHaveLength(0);
   });
 
   test("without a policy the reads behave exactly as they did before", async () => {
