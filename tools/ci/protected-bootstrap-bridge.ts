@@ -9733,12 +9733,24 @@ async function permissionSubrequest<T>(
   }
 }
 
+// What the last completed scan saw, so a timeout can say which probe never
+// converged instead of only that none did. Apply run 33296971474 spent the
+// whole five-minute elevation window here and failed with nothing but "The
+// executor state lease did not propagate before the deadline" -- after
+// consuming the approved plan, which is the most expensive moment in the run
+// to be told nothing.
+//
+// This never widens what is accepted. Convergence is still all-or-nothing and
+// the timeout still throws; only the message changes. The values are probe
+// names, permission names, and object paths, all of which already appear in
+// the reviewed manifest and in this file.
 async function waitForPermissionConvergence(
   scan: () => Promise<boolean>,
   sleep: (milliseconds: number) => Promise<void>,
   consistencyDeadlineMs: number,
   timeoutMessage: string,
   now: () => number,
+  describeLastScan: () => string = () => "",
 ): Promise<void> {
   let attempt = 0;
   while (now() < consistencyDeadlineMs) {
@@ -9756,7 +9768,8 @@ async function waitForPermissionConvergence(
     await sleep(Math.min(Math.min(2 ** attempt, 12) * 1_000, remainingMs));
     attempt += 1;
   }
-  throw new Error(timeoutMessage);
+  const detail = describeLastScan();
+  throw new Error(detail === "" ? timeoutMessage : `${timeoutMessage} ${detail}`);
 }
 
 export async function waitForStatePermissions(
@@ -9787,6 +9800,9 @@ export async function waitForStatePermissions(
     20_000,
     now,
   );
+  // Reset at the top of every scan so the timeout reports the LAST attempt,
+  // not an accumulation across the whole window.
+  let unconverged: string[] = [];
   const objects: readonly {
     readonly bucket: string;
     readonly name: string;
@@ -9883,6 +9899,7 @@ export async function waitForStatePermissions(
   ];
   await waitForPermissionConvergence(async () => {
     const observed: boolean[] = [];
+    unconverged = [];
     const bucketUrl = new URL(
       `https://storage.googleapis.com/storage/v1/b/${state.bucket}/iam/testPermissions`,
     );
@@ -9984,19 +10001,39 @@ export async function waitForStatePermissions(
       );
       if (createOrOverwrite) permissions.add("storage.objects.create");
       const forbidden = allObjectPermissions.filter((permission) => !object.required.has(permission));
-      observed.push(
-        expected !== "none"
-          ? [...object.required].every((permission) => permissions.has(permission)) &&
-            forbidden.every((permission) => !permissions.has(permission))
-          : allObjectPermissions.every((permission) => !permissions.has(permission)),
-      );
+      const missing = [...object.required].filter((permission) => !permissions.has(permission));
+      const held = forbidden.filter((permission) => permissions.has(permission));
+      const converged = expected !== "none"
+        ? missing.length === 0 && held.length === 0
+        : allObjectPermissions.every((permission) => !permissions.has(permission));
+      if (!converged) {
+        // Object paths carry the run and plan ids and the state prefix, all of
+        // which are already in the reviewed manifest; permission names are
+        // constants in this file. Nothing here is a secret.
+        unconverged.push(
+          `${object.name}(${
+            [
+              ...(missing.length === 0 ? [] : [`missing ${missing.toSorted().join("+")}`]),
+              ...(held.length === 0 ? [] : [`unexpectedly holds ${held.toSorted().join("+")}`]),
+              ...(expected === "none" && missing.length === 0 && held.length === 0
+                ? [`still holds ${[...permissions].toSorted().join("+")}`]
+                : []),
+            ].join("; ")
+          })`,
+        );
+      }
+      observed.push(converged);
     }
     return observed.every(Boolean);
   }, sleep, consistencyDeadlineMs,
     expected !== "none"
       ? "The executor state lease did not propagate before the deadline."
       : "The executor retained state permissions after exact lease cleanup.",
-    now);
+    now,
+    () =>
+      unconverged.length === 0
+        ? ""
+        : `Unconverged after the final scan: ${unconverged.join(", ")}.`);
 }
 
 export async function waitForControlPermissions(
@@ -10038,8 +10075,11 @@ export async function waitForControlPermissions(
     fetcher,
     () => consistencyDeadlineMs,
     20_000,
-    now,
+    now
   );
+  // Reset per scan, so a timeout reports the last attempt rather than an
+  // accumulation across the window.
+  let controlUnconverged: string[] = [];
   await waitForPermissionConvergence(async () => {
     const projectResponse = await permissionSubrequest(
       () =>
@@ -10063,6 +10103,7 @@ export async function waitForControlPermissions(
       if (expected !== "none" && transientPermissionDenial(projectResponse)) return false;
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
+    controlUnconverged = [];
     let projectMatches = true;
     if (projectResponse.ok) {
       const projectValue = record(
@@ -10075,9 +10116,22 @@ export async function waitForControlPermissions(
           requiredString(entry, "project permission")
         ),
       );
-      projectMatches = projectPermissions.every((permission) =>
-        granted.has(permission) === requiredPermissions.has(permission)
+      const wrong = projectPermissions.filter((permission) =>
+        granted.has(permission) !== requiredPermissions.has(permission)
       );
+      projectMatches = wrong.length === 0;
+      if (!projectMatches) {
+        const absent = wrong.filter((permission) => requiredPermissions.has(permission));
+        const extra = wrong.filter((permission) => !requiredPermissions.has(permission));
+        controlUnconverged.push(
+          `project(${
+            [
+              ...(absent.length === 0 ? [] : [`missing ${absent.toSorted().join("+")}`]),
+              ...(extra.length === 0 ? [] : [`unexpectedly holds ${extra.toSorted().join("+")}`]),
+            ].join("; ")
+          })`,
+        );
+      }
     }
 
     let actAsMatches = true;
@@ -10122,6 +10176,11 @@ export async function waitForControlPermissions(
           runtimePermissions.slice(1).some((permission) => permissions.has(permission))
         ) {
           actAsMatches = false;
+          controlUnconverged.push(
+            `runtime ${email}(actAs=${permissions.has("iam.serviceAccounts.actAs")} expected=${expectedActAs}; holds ${
+              [...permissions].toSorted().join("+") || "nothing"
+            })`,
+          );
         }
       }
     }
@@ -10150,7 +10209,11 @@ export async function waitForControlPermissions(
     expected !== "none"
       ? "The executor control-plane lease did not propagate before the deadline."
       : "The executor token retained control-plane or runtime actAs permissions after cleanup.",
-    now);
+    now,
+    () =>
+      controlUnconverged.length === 0
+        ? ""
+        : `Unconverged after the final scan: ${controlUnconverged.join(", ")}.`);
 }
 
 type StorageBackendRoleName = keyof typeof STORAGE_BACKEND_ROLE_PERMISSIONS;
