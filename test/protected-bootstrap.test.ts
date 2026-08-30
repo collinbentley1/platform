@@ -5959,7 +5959,8 @@ describe("protected owner Terraform bridge", () => {
       Date.now(),
       policyWith(sleeps),
     ).catch((error: unknown) => error)) as Error;
-    expect(thrown.message).toContain("transport failure (" + "x".repeat(80) + ")");
+    // Truncation is marked, not silent: evidence that was cut must say so.
+    expect(thrown.message).toContain("transport failure (" + "x".repeat(80) + "...)");
     expect(thrown.message.length).toBeLessThan(300);
   });
 
@@ -6150,20 +6151,33 @@ describe("protected owner Terraform bridge", () => {
     // has to stay one record.
     expect(evidenceText("a\nb", 80)).toBe("a\\u{a}b");
     expect(evidenceText("\u001b[2Kfake", 80)).toBe("\\u{1b}[2Kfake");
-    // Bidi controls can visually reorder what an operator reads. Every range
-    // the sanitiser claims to cover gets a representative.
+    // Zl and Zp. JavaScript itself treats these as line terminators and many
+    // log readers break records on them, yet they are neither C0/C1 nor bidi,
+    // so an enumerated range list missed them entirely.
+    expect(evidenceText("a\u2028b", 80)).toBe("a\\u{2028}b");
+    expect(evidenceText("a\u2029b", 80)).toBe("a\\u{2029}b");
+    // Cf, one representative per shape: bidi override, the mark an enumerated
+    // list omitted, a zero-width character, and the byte-order mark.
     expect(evidenceText("real\u202edekaf", 80)).toBe("real\\u{202e}dekaf");
-    expect(evidenceText("a\u200eb", 80)).toBe("a\\u{200e}b");
-    expect(evidenceText("a\u200fb", 80)).toBe("a\\u{200f}b");
-    expect(evidenceText("a\u202ab", 80)).toBe("a\\u{202a}b");
-    expect(evidenceText("a\u2066b", 80)).toBe("a\\u{2066}b");
-    expect(evidenceText("a\u2069b", 80)).toBe("a\\u{2069}b");
-    // C1 range, which some terminals also act on.
+    expect(evidenceText("a\u061cb", 80)).toBe("a\\u{61c}b");
+    expect(evidenceText("a\u200bb", 80)).toBe("a\\u{200b}b");
+    expect(evidenceText("a\ufeffb", 80)).toBe("a\\u{feff}b");
+    // Cc, including the C1 range some terminals also act on.
     expect(evidenceText("a\u009bb", 80)).toBe("a\\u{9b}b");
+    // Cs. A lone surrogate would corrupt any JSON encoding of this evidence.
+    expect(evidenceText("a\ud800b", 80)).toBe("a\\u{d800}b");
+    // Benign text is left exactly as it is, including astral characters.
+    expect(evidenceText("plain \u00a0 text \u{1f600}", 80)).toBe("plain \u00a0 text \u{1f600}");
+    // The bound applies after escaping and never splits an escape token.
+    expect(evidenceText("\u2028\u2028", 9)).toBe("\\u{2028}...");
     const sleeps: number[] = [];
+    // A forged breadcrumb behind each separator an attacker might reach for.
     const { fetcher } = freezeFetcher((path) =>
       path === CDBENTLEY_PERMISSIONS
-        ? new Error("boom\nProtected bridge GitHub proof retry path=/forged outcome=ok")
+        ? new Error(
+          "boom\u2028Protected bridge GitHub proof retry path=/forged outcome=ok" +
+            "\u2029second forged record\nthird",
+        )
         : Response.json(okBody(path))
     );
     const thrown = (await proveConsumerFreeze(
@@ -6173,7 +6187,10 @@ describe("protected owner Terraform bridge", () => {
       Date.now(),
       policyWith(sleeps),
     ).catch((error: unknown) => error)) as Error;
-    expect(thrown.message).toContain("boom\\u{a}Protected bridge");
+    expect(thrown.message).toContain("boom\\u{2028}Protected bridge");
+    // Not one of the three separators survives as a real record boundary.
+    expect(thrown.message).not.toContain("\u2028");
+    expect(thrown.message).not.toContain("\u2029");
     expect(thrown.message).not.toContain("\n");
   });
 

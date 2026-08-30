@@ -12123,24 +12123,37 @@ const OPERATION_DEADLINE_MESSAGE = "API request reached the protected operation 
 // what cancellation means.
 // Transport error text is attacker-influenced -- a proxy or gateway can put
 // arbitrary bytes in it -- and it goes straight into a log line and an Error
-// message. A newline forges a second log record, and an escape sequence
-// rewrites the reading operator's terminal. Truncation alone does not stop
-// either. Escape the control ranges, the C1 range, and the bidi overrides
-// that can visually reorder what an operator reads, then bound the length.
+// message. A newline forges a second log record, an escape sequence rewrites
+// the reading operator's terminal, and a bidi control reorders what they read.
+// Truncation alone stops none of it.
+//
+// Escape by Unicode CATEGORY rather than by enumerated ranges. An explicit
+// range list is a denylist and was already incomplete: it missed U+2028 and
+// U+2029, which JavaScript itself treats as line terminators and which many
+// log readers break records on, and U+061C, a bidi control outside the ranges
+// it listed. Cc and Cf cover every control and format character, including all
+// terminal escapes, zero-width characters and bidi overrides; Zl and Zp are
+// the line and paragraph separators; Cs is a lone surrogate, which would
+// corrupt any JSON encoding of this evidence downstream.
+const EVIDENCE_FORGERY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
+
 export function evidenceText(value: string, maximumLength: number): string {
   let escaped = "";
+  let truncated = false;
   for (const character of value) {
-    const code = character.codePointAt(0) ?? 0;
-    const control = code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
-    const bidi = (code >= 0x200e && code <= 0x200f) ||
-      (code >= 0x202a && code <= 0x202e) ||
-      (code >= 0x2066 && code <= 0x2069);
-    escaped += control || bidi
-      ? `\\u{${code.toString(16)}}`
+    const token = EVIDENCE_FORGERY.test(character)
+      ? `\\u{${character.codePointAt(0)?.toString(16) ?? "fffd"}}`
       : character;
-    if (escaped.length >= maximumLength) break;
+    // The bound applies to the ESCAPED text, and never splits a token: half an
+    // escape sequence is neither readable nor faithful.
+    if (escaped.length + token.length > maximumLength) {
+      truncated = true;
+      break;
+    }
+    escaped += token;
   }
-  return escaped.slice(0, maximumLength);
+  // Say that it was cut. Silently truncated evidence is evidence that misleads.
+  return truncated ? `${escaped}...` : escaped;
 }
 
 export function cancellationError(error: unknown): boolean {
