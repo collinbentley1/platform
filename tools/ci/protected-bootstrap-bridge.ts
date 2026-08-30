@@ -1839,7 +1839,9 @@ function previewRuntimeMembers(): ReadonlySet<string> {
     const email = `cloud-run-preview@${REPOSITORIES[repository].projectId}.iam.gserviceaccount.com`;
     members.add(`serviceAccount:${email}`);
     // Google renders a soft-deleted principal with this prefix, and it is
-    // restorable, so it is the same identity for this purpose.
+    // restorable, so it is the same identity for this purpose. It also appends
+    // the account's stable identifier -- `deleted:serviceAccount:...?uid=123`
+    // -- which principalWithoutUid strips before this set is consulted.
     members.add(`deleted:serviceAccount:${email}`);
   }
   return members;
@@ -1928,39 +1930,64 @@ function rejectUnknownIamMember(
 // half on the one write path the protected pipeline itself controls: no
 // reviewed plan, in any root, may grant these principals anything. The module
 // config grants them nothing today, so the expected match count is zero.
+// Strip the stable identifier Google appends when it serialises a deleted
+// principal, so `deleted:serviceAccount:x@y?uid=123` is recognised as the same
+// identity as `deleted:serviceAccount:x@y`.
+function principalWithoutUid(member: string): string {
+  const marker = member.indexOf("?uid=");
+  return marker === -1 ? member : member.slice(0, marker);
+}
+
 function rejectPreviewRuntimeGrant(
-  value: JsonValue,
+  type: string,
+  state: JsonValue,
   address: string,
   label: string,
 ): void {
+  // Only IAM grant resources confer access, and only through their principal
+  // fields. Scanning every string in every resource would refuse a plan for a
+  // Cloud Run container environment variable that merely contains "allUsers",
+  // which grants nothing -- and because this runs before no-op changes are
+  // filtered, that would block every protected plan.
+  if (!IAM_GRANT_RESOURCE_TYPES.has(type)) return;
+  if (state === null || typeof state !== "object" || Array.isArray(state)) return;
+  const principals: string[] = [];
+  const single = state.member;
+  if (single !== undefined && single !== null) {
+    if (typeof single !== "string") {
+      throw new Error(`${label} at ${address} has a non-string IAM member.`);
+    }
+    principals.push(single);
+  }
+  const many = state.members;
+  if (many !== undefined && many !== null) {
+    if (!Array.isArray(many)) {
+      throw new Error(`${label} at ${address} has a non-array IAM member list.`);
+    }
+    for (const entry of many) {
+      if (typeof entry !== "string") {
+        throw new Error(`${label} at ${address} has a non-string IAM member.`);
+      }
+      principals.push(entry);
+    }
+  }
   const members = previewRuntimeMembers();
-  const walk = (node: JsonValue): void => {
-    if (typeof node === "string") {
-      if (members.has(node)) {
-        throw new Error(
-          `${label} at ${address} grants the preview runtime ${node}, which must hold no access.`,
-        );
-      }
-      if (node === STORAGE_ACCESS_LOG_DELIVERY_MEMBER) return;
-      if (
-        BROAD_MEMBER_LITERALS.has(node) ||
-        BROAD_MEMBER_PATTERNS.some((pattern) => pattern.test(node))
-      ) {
-        throw new Error(
-          `${label} at ${address} grants ${node}, which confers access on the preview runtime without naming it.`,
-        );
-      }
-      return;
+  for (const principal of principals) {
+    if (members.has(principalWithoutUid(principal))) {
+      throw new Error(
+        `${label} at ${address} grants the preview runtime ${principal}, which must hold no access.`,
+      );
     }
-    if (Array.isArray(node)) {
-      for (const entry of node) walk(entry);
-      return;
+    if (principal === STORAGE_ACCESS_LOG_DELIVERY_MEMBER) continue;
+    if (
+      BROAD_MEMBER_LITERALS.has(principal) ||
+      BROAD_MEMBER_PATTERNS.some((pattern) => pattern.test(principal))
+    ) {
+      throw new Error(
+        `${label} at ${address} grants ${principal}, which confers access on the preview runtime without naming it.`,
+      );
     }
-    if (node !== null && typeof node === "object") {
-      for (const entry of Object.values(node)) walk(entry);
-    }
-  };
-  walk(value);
+  }
 }
 
 function runtimeServiceAccountEmails(repository: RepositoryName): readonly string[] {
@@ -12117,11 +12144,13 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         `${label} after-unknown map`,
       );
       rejectPreviewRuntimeGrant(
+        type,
         json(delta.after ?? null, `${label} after`),
         address,
         `${label} after state`,
       );
       rejectPreviewRuntimeGrant(
+        type,
         json(delta.before ?? null, `${label} before`),
         address,
         `${label} before state`,

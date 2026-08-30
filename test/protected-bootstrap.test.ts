@@ -408,6 +408,49 @@ describe("protected owner Terraform bridge", () => {
     }];
     expect(() => buildReviewManifest(unknownElsewhere, planIdentity)).not.toThrow();
 
+    // Deleted principals carry Google's stable identifier. Stripping it is what
+    // makes the restorable account recognisable as the same identity.
+    for (const project of ["cdbentley", "runsetta"]) {
+      expect(() =>
+        buildReviewManifest(
+          withMember(
+            `deleted:serviceAccount:cloud-run-preview@${project}.iam.gserviceaccount.com?uid=123456789012345678901`,
+          ),
+          planIdentity,
+        )
+      ).toThrow("must hold no access");
+    }
+
+    // Only IAM grant resources confer access, and only through their principal
+    // fields. A container environment value that merely contains "allUsers"
+    // grants nothing, and because this runs before no-op changes are filtered,
+    // refusing it would block every protected plan that carries the service.
+    const envValue = plan([]) as Record<string, unknown>;
+    envValue.resource_changes = [{
+      address: "module.site.google_cloud_run_v2_service.site",
+      change: {
+        actions: ["no-op"],
+        after: {
+          template: [{ containers: [{ env: [{ name: "AUDIENCE", value: "allUsers" }] }] }],
+        },
+        after_sensitive: {},
+        after_unknown: {},
+        before: {
+          template: [{ containers: [{ env: [{ name: "AUDIENCE", value: "group:x@y.com" }] }] }],
+        },
+        before_sensitive: {},
+        replace_paths: [],
+      },
+      mode: "managed",
+      module_address: "module.site",
+      name: "site",
+      provider_name: "registry.terraform.io/hashicorp/google",
+      type: "google_cloud_run_v2_service",
+    }];
+    expect(() =>
+      buildReviewManifest(envValue, { ...identity(), terraformRoot: "prod" as const })
+    ).not.toThrow();
+
     // An ordinary grant to an unrelated principal is untouched.
     expect(() =>
       buildReviewManifest(
