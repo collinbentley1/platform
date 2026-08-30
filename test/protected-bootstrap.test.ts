@@ -2742,6 +2742,9 @@ describe("protected owner Terraform bridge", () => {
 
     const rendered = terraformFailureEnvelope(stdout, "", 1);
     expect(JSON.parse(rendered)).toEqual({
+      changeActions: [],
+      changeResourceTypes: [],
+      changesObserved: 0,
       classes: ["permission-denied"],
       diagnosticCount: 1,
       diagnosticsTruncated: false,
@@ -2749,12 +2752,135 @@ describe("protected owner Terraform bridge", () => {
       httpStatuses: [403],
       jsonUi: "valid",
       resourceTypes: ["google_iam_workload_identity_pool"],
-      schemaVersion: 1,
+      schemaVersion: 2,
       services: ["iam.googleapis.com"],
     });
     expect(rendered).not.toContain(secret);
     expect(rendered).not.toContain("getAttestationRules");
     expect(rendered).not.toContain("module.bootstrap");
+  });
+
+  test("a post-apply audit exit 2 names the shape of the residual diff", () => {
+    // Run 33319651322 (runsetta prod apply) failed here and the envelope was
+    // {diagnosticCount: 0, resourceTypes: [], classes: ["unknown"]} -- it said
+    // convergence failed while structurally unable to say what failed to
+    // converge, because `plan -detailed-exitcode` exit 2 is a SUCCESS and emits
+    // no error diagnostics. The audit runs only after the plan is burned, so
+    // an unexplained failure costs a fresh plan to learn nothing.
+    const secret = "audit-secret-sentinel";
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        change: {
+          action: "update",
+          resource: {
+            addr: `module.service.google_cloud_run_v2_service.site["${secret}"]`,
+            resource_name: secret,
+            resource_type: "google_cloud_run_v2_service",
+          },
+        },
+        type: "planned_change",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        change: {
+          action: "create",
+          resource: {
+            addr: `module.domains.google_cloud_run_domain_mapping.site["${secret}"]`,
+            resource_type: "google_cloud_run_domain_mapping",
+          },
+        },
+        type: "planned_change",
+      }),
+    ].join("\n");
+
+    const envelope = JSON.parse(terraformFailureEnvelope(stdout, "", 2));
+    expect(envelope.exitCode).toBe(2);
+    expect(envelope.changesObserved).toBe(2);
+    expect(envelope.changeActions).toEqual(["create", "update"]);
+    expect(envelope.changeResourceTypes).toEqual([
+      "google_cloud_run_domain_mapping",
+      "google_cloud_run_v2_service",
+    ]);
+    // Still no diagnostics, which is exactly why the old envelope was empty.
+    expect(envelope.diagnosticCount).toBe(0);
+  });
+
+  test("the residual-diff report leaks no address, name, or value", () => {
+    // The envelope's whole contract is a finite classification carrying no raw
+    // UI, address, or identifier. Widening it to explain an audit failure must
+    // not become a hole in that contract.
+    const secret = "leak-sentinel-do-not-emit";
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        change: {
+          action: "update",
+          resource: {
+            addr: `module.x.google_cloud_run_v2_service.site["${secret}"]`,
+            resource_key: secret,
+            resource_name: secret,
+            resource_type: "google_cloud_run_v2_service",
+          },
+        },
+        type: "planned_change",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        outputs: { token: { value: secret } },
+        type: "outputs",
+      }),
+    ].join("\n");
+    const rendered = terraformFailureEnvelope(stdout, "", 2);
+    expect(rendered).not.toContain(secret);
+    expect(rendered).not.toContain("module.x");
+    expect(rendered).not.toContain("addr");
+  });
+
+  test("an unreviewed resource type or action is not echoed into the envelope", () => {
+    // Both fields are closed vocabularies. An unexpected value is dropped, not
+    // passed through -- otherwise the allowlist would be decorative.
+    const stdout = [
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        terraform: "1.14.5",
+        type: "version",
+        ui: "1.2",
+      }),
+      JSON.stringify({
+        "@level": "info",
+        "@module": "terraform.ui",
+        change: {
+          action: "exfiltrate",
+          resource: { addr: "a.b", resource_type: "attacker_controlled_type" },
+        },
+        type: "planned_change",
+      }),
+    ].join("\n");
+    const envelope = JSON.parse(terraformFailureEnvelope(stdout, "", 2));
+    // Counted, because something did change; but neither value is echoed.
+    expect(envelope.changesObserved).toBe(1);
+    expect(envelope.changeActions).toEqual([]);
+    expect(envelope.changeResourceTypes).toEqual([]);
   });
 
   test("Terraform failure fallback classifies strict stderr without echoing it", () => {
@@ -2765,6 +2891,9 @@ describe("protected owner Terraform bridge", () => {
       1,
     );
     expect(JSON.parse(rendered)).toEqual({
+      changeActions: [],
+      changeResourceTypes: [],
+      changesObserved: 0,
       classes: ["rate-limited"],
       diagnosticCount: 0,
       diagnosticsTruncated: false,
@@ -2772,7 +2901,7 @@ describe("protected owner Terraform bridge", () => {
       httpStatuses: [429],
       jsonUi: "invalid",
       resourceTypes: [],
-      schemaVersion: 1,
+      schemaVersion: 2,
       services: [],
     });
     expect(rendered).not.toContain(secret);

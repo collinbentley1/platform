@@ -82,6 +82,19 @@ const MAX_COMMAND_STDERR_BYTES = 256 * 1024;
 const MAX_TERRAFORM_DIAGNOSTIC_LINE_BYTES = 256 * 1024;
 const MAX_TERRAFORM_DIAGNOSTICS = 8;
 const MAX_TERRAFORM_UI_TAIL_LINES = 128;
+// The closed vocabulary of plan actions. Like the resource-type allowlist,
+// these are structural terms from Terraform's own JSON UI, not identifiers.
+const TERRAFORM_CHANGE_ACTIONS = new Set([
+  "create",
+  "delete",
+  "forget",
+  "import",
+  "move",
+  "noop",
+  "read",
+  "replace",
+  "update",
+]);
 const MAX_REVIEW_MANIFEST_BYTES = 800 * 1024;
 const MAX_EXPOSURE_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_EXPOSURE_HEALTH_BYTES = 4 * 1024;
@@ -5073,6 +5086,23 @@ export function terraformFailureEnvelope(
     : "invalid";
   let diagnosticsTruncated = false;
   const errorDiagnostics: Array<Record<string, unknown>> = [];
+  // A post-apply audit failure is the one case that reports a failure while
+  // carrying no error diagnostics at all: `plan -detailed-exitcode` exits 2 for
+  // "succeeded, changes present", which is a SUCCESS as far as diagnostics are
+  // concerned. Everything below keys off severity === "error", so that envelope
+  // was necessarily {diagnosticCount: 0, resourceTypes: [], classes:
+  // ["unknown"]} -- it said convergence failed while being structurally unable
+  // to say what failed to converge. That is the worst failure to leave
+  // unexplained, because the audit runs only after consumeApproval has already
+  // burned the plan, so the next attempt pays a fresh plan to learn nothing.
+  //
+  // Report the SHAPE of the residual diff and nothing more. Actions come from
+  // a closed vocabulary and resource types from the same allowlist the error
+  // path already uses, so this honours the contract above: no raw UI, no
+  // diagnostic text, no resource value, no address, no identifier.
+  const changeActions = new Set<string>();
+  const changeResourceTypes = new Set<string>();
+  let changesObserved = 0;
   const firstLineEnd = stdout.indexOf("\n");
   let firstLine = stdout.slice(0, firstLineEnd < 0 ? stdout.length : firstLineEnd);
   if (firstLine.endsWith("\r")) firstLine = firstLine.slice(0, -1);
@@ -5110,6 +5140,24 @@ export function terraformFailureEnvelope(
       message = parsed as Record<string, unknown>;
     } catch {
       jsonUi = "invalid";
+      continue;
+    }
+    if (message.type === "planned_change" || message.type === "resource_drift") {
+      const change = message.change;
+      if (change !== null && typeof change === "object" && !Array.isArray(change)) {
+        const entry = change as Record<string, unknown>;
+        changesObserved += 1;
+        if (typeof entry.action === "string" && TERRAFORM_CHANGE_ACTIONS.has(entry.action)) {
+          changeActions.add(entry.action);
+        }
+        const resource = entry.resource;
+        if (resource !== null && typeof resource === "object" && !Array.isArray(resource)) {
+          const type = (resource as Record<string, unknown>).resource_type;
+          if (typeof type === "string" && TERRAFORM_DIAGNOSTIC_RESOURCE_TYPES.has(type)) {
+            changeResourceTypes.add(type);
+          }
+        }
+      }
       continue;
     }
     if (message.type !== "diagnostic" || message["@level"] !== "error") continue;
@@ -5152,6 +5200,14 @@ export function terraformFailureEnvelope(
   if (classes.size > 1) classes.delete("unknown");
 
   return canonicalJson({
+    // "Observed", not "total": the tail scan reads at most
+    // MAX_TERRAFORM_UI_TAIL_LINES lines, so a larger diff is undercounted.
+    // diagnosticsTruncated already says when the scan did not reach the start;
+    // naming this field for what was seen keeps a partial count from reading
+    // as a complete one.
+    changeActions: [...changeActions].toSorted(),
+    changeResourceTypes: [...changeResourceTypes].toSorted(),
+    changesObserved,
     classes: [...classes].toSorted(),
     diagnosticCount: Math.min(errorDiagnostics.length, MAX_TERRAFORM_DIAGNOSTICS),
     diagnosticsTruncated,
@@ -5159,7 +5215,7 @@ export function terraformFailureEnvelope(
     httpStatuses: [...httpStatuses].toSorted((left, right) => left - right),
     jsonUi,
     resourceTypes: [...resourceTypes].toSorted(),
-    schemaVersion: 1,
+    schemaVersion: 2,
     services: [...services].toSorted(),
   });
 }
