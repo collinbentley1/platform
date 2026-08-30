@@ -294,6 +294,70 @@ describe("protected owner Terraform bridge", () => {
     ).toBeFalse();
   });
 
+  test("the plan gate refuses preview-runtime access however it is conferred", () => {
+    const planIdentity = { ...identity(), terraformRoot: "bootstrap" as const };
+    const withMember = (member: string) =>
+      plan([
+        resourceChange(
+          "module.bootstrap.google_project_iam_member.some_grant",
+          "google_project_iam_member",
+          null,
+          { member, project: "cdbentley", role: "roles/viewer" },
+        ),
+      ]);
+
+    // Named directly, in every project, live and soft-deleted.
+    for (const project of [
+      "cdbentley",
+      "runsetta",
+      "medlock-1025243085",
+      "critical-history-16823277",
+    ]) {
+      const email = `cloud-run-preview@${project}.iam.gserviceaccount.com`;
+      for (const member of [`serviceAccount:${email}`, `deleted:serviceAccount:${email}`]) {
+        expect(() => buildReviewManifest(withMember(member), planIdentity)).toThrow(
+          "must hold no access",
+        );
+      }
+    }
+
+    // Conferred without being named. These mirror the forbidden_member
+    // predicate in tools/ci/preview-runtime-iam-contract.sh: a preventive gate
+    // that accepted them would let the protected bridge introduce effective
+    // preview-runtime access and leave only the detective proof to catch it.
+    for (const member of [
+      "allUsers",
+      "allAuthenticatedUsers",
+      "group:everyone@example.com",
+      "deleted:group:old@example.com",
+      "domain:example.com",
+      "projectEditor:cdbentley",
+      "projectOwner:cdbentley",
+      "projectViewer:cdbentley",
+      "principalSet://cloudresourcemanager.googleapis.com/projects/cdbentley/type/ServiceAccount",
+      "principalSet://cloudresourcemanager.googleapis.com/organizations/1234/type/ServiceAccount",
+    ]) {
+      expect(() => buildReviewManifest(withMember(member), planIdentity)).toThrow(
+        "without naming it",
+      );
+    }
+
+    // An ordinary grant to an unrelated principal is untouched.
+    expect(() =>
+      buildReviewManifest(
+        withMember("serviceAccount:gha-terraform@cdbentley.iam.gserviceaccount.com"),
+        planIdentity,
+      )
+    ).not.toThrow();
+    // A similarly-named principal in no project of ours is not matched.
+    expect(() =>
+      buildReviewManifest(
+        withMember("serviceAccount:cloud-run-preview@someone-else.iam.gserviceaccount.com"),
+        planIdentity,
+      )
+    ).not.toThrow();
+  });
+
   test("no deny-policy authority survives anywhere in the bridge", async () => {
     const controller = await readFile(
       join(root, "tools/ci/protected-bootstrap-bridge.ts"),

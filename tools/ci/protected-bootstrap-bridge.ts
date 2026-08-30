@@ -1834,13 +1834,32 @@ export function buildRuntimeActAsLeases(
 // these four explicitly; the plan gate below derives them so a repository added
 // to REPOSITORIES cannot silently escape the check.
 function previewRuntimeMembers(): ReadonlySet<string> {
-  return new Set(
-    REPOSITORY_NAMES.map(
-      (repository) =>
-        `serviceAccount:cloud-run-preview@${REPOSITORIES[repository].projectId}.iam.gserviceaccount.com`,
-    ),
-  );
+  const members = new Set<string>();
+  for (const repository of REPOSITORY_NAMES) {
+    const email = `cloud-run-preview@${REPOSITORIES[repository].projectId}.iam.gserviceaccount.com`;
+    members.add(`serviceAccount:${email}`);
+    // Google renders a soft-deleted principal with this prefix, and it is
+    // restorable, so it is the same identity for this purpose.
+    members.add(`deleted:serviceAccount:${email}`);
+  }
+  return members;
 }
+
+// Members that grant the preview runtime access without naming it. Mirrors the
+// `forbidden_member` predicate in tools/ci/preview-runtime-iam-contract.sh, so
+// the preventive gate and the continuous proof refuse the same things: an
+// `allUsers` binding, a group or domain that may contain the runtime, a
+// primitive project role, or a service-account-wide principal set all confer
+// access an exact-membership check would wave through.
+const BROAD_MEMBER_PATTERNS: readonly RegExp[] = [
+  /^(?:deleted:)?(?:group|domain):/,
+  /^project(?:Owner|Editor|Viewer):/,
+  /^principalSet:\/\/cloudresourcemanager\.googleapis\.com\/(?:projects|folders|organizations)\/[^/]+\/type\/ServiceAccount$/,
+];
+const BROAD_MEMBER_LITERALS: ReadonlySet<string> = new Set([
+  "allUsers",
+  "allAuthenticatedUsers",
+]);
 
 // The preview runtime must hold no access to storage, secrets, or Firestore in
 // any of the four projects. That was enforced by an IAM deny policy until it
@@ -1867,6 +1886,14 @@ function rejectPreviewRuntimeGrant(
       if (members.has(node)) {
         throw new Error(
           `${label} at ${address} grants the preview runtime ${node}, which must hold no access.`,
+        );
+      }
+      if (
+        BROAD_MEMBER_LITERALS.has(node) ||
+        BROAD_MEMBER_PATTERNS.some((pattern) => pattern.test(node))
+      ) {
+        throw new Error(
+          `${label} at ${address} grants ${node}, which confers access on the preview runtime without naming it.`,
         );
       }
       return;
