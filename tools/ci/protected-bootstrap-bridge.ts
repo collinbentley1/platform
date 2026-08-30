@@ -9899,7 +9899,11 @@ export async function waitForStatePermissions(
   ];
   await waitForPermissionConvergence(async () => {
     const observed: boolean[] = [];
-    unconverged = [];
+    // Scan-local. A subrequest that reaches the deadline throws
+    // PermissionConsistencyDeadlineError out of this closure, so publishing as
+    // we go would replace the last COMPLETED scan's verdict with a partial
+    // prefix of an interrupted one -- or with nothing at all.
+    const scanUnconverged: string[] = [];
     const bucketUrl = new URL(
       `https://storage.googleapis.com/storage/v1/b/${state.bucket}/iam/testPermissions`,
     );
@@ -9939,11 +9943,23 @@ export async function waitForStatePermissions(
           requiredString(entry, "bucket permission")
         ),
       );
-      observed.push(
-        expected !== "none"
-          ? requiredBucketPermissions.every((permission) => bucketPermissions.has(permission))
-          : requiredBucketPermissions.every((permission) => !bucketPermissions.has(permission)),
-      );
+      const bucketMissing = expected !== "none"
+        ? requiredBucketPermissions.filter((permission) => !bucketPermissions.has(permission))
+        : [];
+      const bucketHeld = expected === "none"
+        ? requiredBucketPermissions.filter((permission) => bucketPermissions.has(permission))
+        : [];
+      const bucketConverged = bucketMissing.length === 0 && bucketHeld.length === 0;
+      if (!bucketConverged) {
+        scanUnconverged.push(
+          `bucket ${state.bucket}(${
+            bucketMissing.length === 0
+              ? `unexpectedly holds ${bucketHeld.toSorted().join("+")}`
+              : `missing ${bucketMissing.toSorted().join("+")}`
+          })`,
+        );
+      }
+      observed.push(bucketConverged);
     }
 
     for (const object of objects) {
@@ -10010,7 +10026,7 @@ export async function waitForStatePermissions(
         // Object paths carry the run and plan ids and the state prefix, all of
         // which are already in the reviewed manifest; permission names are
         // constants in this file. Nothing here is a secret.
-        unconverged.push(
+        scanUnconverged.push(
           `${object.name}(${
             [
               ...(missing.length === 0 ? [] : [`missing ${missing.toSorted().join("+")}`]),
@@ -10024,6 +10040,8 @@ export async function waitForStatePermissions(
       }
       observed.push(converged);
     }
+    // The scan completed; only now is this a description of a whole attempt.
+    unconverged = scanUnconverged;
     return observed.every(Boolean);
   }, sleep, consistencyDeadlineMs,
     expected !== "none"
@@ -10103,7 +10121,9 @@ export async function waitForControlPermissions(
       if (expected !== "none" && transientPermissionDenial(projectResponse)) return false;
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
-    controlUnconverged = [];
+    // Scan-local for the same reason as the state scan: a deadline reached
+    // inside a subrequest must not replace the last completed verdict.
+    const scanControlUnconverged: string[] = [];
     let projectMatches = true;
     if (projectResponse.ok) {
       const projectValue = record(
@@ -10123,7 +10143,7 @@ export async function waitForControlPermissions(
       if (!projectMatches) {
         const absent = wrong.filter((permission) => requiredPermissions.has(permission));
         const extra = wrong.filter((permission) => !requiredPermissions.has(permission));
-        controlUnconverged.push(
+        scanControlUnconverged.push(
           `project(${
             [
               ...(absent.length === 0 ? [] : [`missing ${absent.toSorted().join("+")}`]),
@@ -10176,7 +10196,7 @@ export async function waitForControlPermissions(
           runtimePermissions.slice(1).some((permission) => permissions.has(permission))
         ) {
           actAsMatches = false;
-          controlUnconverged.push(
+          scanControlUnconverged.push(
             `runtime ${email}(actAs=${permissions.has("iam.serviceAccounts.actAs")} expected=${expectedActAs}; holds ${
               [...permissions].toSorted().join("+") || "nothing"
             })`,
@@ -10204,6 +10224,10 @@ export async function waitForControlPermissions(
         );
       }
     }
+    if (!exposureReadDenied) {
+      scanControlUnconverged.push("exposure Domain Mapping API was reachable");
+    }
+    controlUnconverged = scanControlUnconverged;
     return projectMatches && actAsMatches && exposureReadDenied;
   }, sleep, consistencyDeadlineMs,
     expected !== "none"

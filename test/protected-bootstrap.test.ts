@@ -5349,6 +5349,40 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow(/consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/);
   });
 
+  test("a convergence timeout names a bucket-only mismatch", async () => {
+    // The bucket probe consumed the window on its own: every object converges
+    // but storage.objects.list never appears. Without the bucket verdict the
+    // message falls back to the generic text and names nothing.
+    const invocation = validateInvocation(validEnvironment());
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async () => {
+        nowMs += 100;
+        // Bucket probe answers successfully with no permissions.
+        return Response.json({ kind: "storage#testIamPermissionsResponse", permissions: [] });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        testObjectPermissions: async ({ permissions }) => ({
+          denied: false,
+          permissions: permissions.filter((permission) => permission === "storage.objects.get"),
+        }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(
+      new RegExp(`bucket ${state.bucket}\\(missing storage\\.objects\\.list\\)`),
+    );
+  });
+
   test("a convergence timeout names a missing permission too", async () => {
     const invocation = validateInvocation(validEnvironment());
     let nowMs = 1_000;
