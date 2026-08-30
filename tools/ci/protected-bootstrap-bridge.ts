@@ -9733,12 +9733,24 @@ async function permissionSubrequest<T>(
   }
 }
 
+// What the last completed scan saw, so a timeout can say which probe never
+// converged instead of only that none did. Apply run 33296971474 spent the
+// whole five-minute elevation window here and failed with nothing but "The
+// executor state lease did not propagate before the deadline" -- after
+// consuming the approved plan, which is the most expensive moment in the run
+// to be told nothing.
+//
+// This never widens what is accepted. Convergence is still all-or-nothing and
+// the timeout still throws; only the message changes. The values are probe
+// names, permission names, and object paths, all of which already appear in
+// the reviewed manifest and in this file.
 async function waitForPermissionConvergence(
   scan: () => Promise<boolean>,
   sleep: (milliseconds: number) => Promise<void>,
   consistencyDeadlineMs: number,
   timeoutMessage: string,
   now: () => number,
+  describeLastScan: () => string = () => "",
 ): Promise<void> {
   let attempt = 0;
   while (now() < consistencyDeadlineMs) {
@@ -9756,7 +9768,8 @@ async function waitForPermissionConvergence(
     await sleep(Math.min(Math.min(2 ** attempt, 12) * 1_000, remainingMs));
     attempt += 1;
   }
-  throw new Error(timeoutMessage);
+  const detail = describeLastScan();
+  throw new Error(detail === "" ? timeoutMessage : `${timeoutMessage} ${detail}`);
 }
 
 export async function waitForStatePermissions(
@@ -9787,6 +9800,9 @@ export async function waitForStatePermissions(
     20_000,
     now,
   );
+  // Reset at the top of every scan so the timeout reports the LAST attempt,
+  // not an accumulation across the whole window.
+  let unconverged: string[] = [];
   const objects: readonly {
     readonly bucket: string;
     readonly name: string;
@@ -9883,6 +9899,11 @@ export async function waitForStatePermissions(
   ];
   await waitForPermissionConvergence(async () => {
     const observed: boolean[] = [];
+    // Scan-local. A subrequest that reaches the deadline throws
+    // PermissionConsistencyDeadlineError out of this closure, so publishing as
+    // we go would replace the last COMPLETED scan's verdict with a partial
+    // prefix of an interrupted one -- or with nothing at all.
+    const scanUnconverged: string[] = [];
     const bucketUrl = new URL(
       `https://storage.googleapis.com/storage/v1/b/${state.bucket}/iam/testPermissions`,
     );
@@ -9905,7 +9926,16 @@ export async function waitForStatePermissions(
       // -- `permissionDenialProvesNoUsableCredential` already treats the two as
       // one class. Throwing discards the rest of the convergence budget; report
       // "not converged yet" and let the deadline decide.
-      if (expected !== "none" && transientPermissionDenial(bucketResponse)) return false;
+      if (expected !== "none" && transientPermissionDenial(bucketResponse)) {
+        // Publish before returning. A persistent denial is exactly the
+        // never-converging case, and leaving the previous scan's verdict in
+        // place would report a stale mismatch as if it were current.
+        scanUnconverged.push(
+          `bucket ${state.bucket}(denied with HTTP ${bucketResponse.status})`,
+        );
+        unconverged = scanUnconverged;
+        return false;
+      }
       throw new Error(`Bucket permission test failed with HTTP ${bucketResponse.status}.`);
     }
     const requiredBucketPermissions = ["storage.objects.list"];
@@ -9922,11 +9952,23 @@ export async function waitForStatePermissions(
           requiredString(entry, "bucket permission")
         ),
       );
-      observed.push(
-        expected !== "none"
-          ? requiredBucketPermissions.every((permission) => bucketPermissions.has(permission))
-          : requiredBucketPermissions.every((permission) => !bucketPermissions.has(permission)),
-      );
+      const bucketMissing = expected !== "none"
+        ? requiredBucketPermissions.filter((permission) => !bucketPermissions.has(permission))
+        : [];
+      const bucketHeld = expected === "none"
+        ? requiredBucketPermissions.filter((permission) => bucketPermissions.has(permission))
+        : [];
+      const bucketConverged = bucketMissing.length === 0 && bucketHeld.length === 0;
+      if (!bucketConverged) {
+        scanUnconverged.push(
+          `bucket ${state.bucket}(${
+            bucketMissing.length === 0
+              ? `unexpectedly holds ${bucketHeld.toSorted().join("+")}`
+              : `missing ${bucketMissing.toSorted().join("+")}`
+          })`,
+        );
+      }
+      observed.push(bucketConverged);
     }
 
     for (const object of objects) {
@@ -9960,6 +10002,8 @@ export async function waitForStatePermissions(
         // its code alone, and the convergence loop already bounds the wait: a
         // credential that never becomes usable fails on the deadline with the
         // lease-propagation message instead of aborting the run outright.
+        scanUnconverged.push(`${object.name}(denied)`);
+        unconverged = scanUnconverged;
         return false;
       }
       if (objectResult.denied && objectResult.permissions.length !== 0) {
@@ -9984,19 +10028,41 @@ export async function waitForStatePermissions(
       );
       if (createOrOverwrite) permissions.add("storage.objects.create");
       const forbidden = allObjectPermissions.filter((permission) => !object.required.has(permission));
-      observed.push(
-        expected !== "none"
-          ? [...object.required].every((permission) => permissions.has(permission)) &&
-            forbidden.every((permission) => !permissions.has(permission))
-          : allObjectPermissions.every((permission) => !permissions.has(permission)),
-      );
+      const missing = [...object.required].filter((permission) => !permissions.has(permission));
+      const held = forbidden.filter((permission) => permissions.has(permission));
+      const converged = expected !== "none"
+        ? missing.length === 0 && held.length === 0
+        : allObjectPermissions.every((permission) => !permissions.has(permission));
+      if (!converged) {
+        // Object paths carry the run and plan ids and the state prefix, all of
+        // which are already in the reviewed manifest; permission names are
+        // constants in this file. Nothing here is a secret.
+        scanUnconverged.push(
+          `${object.name}(${
+            [
+              ...(missing.length === 0 ? [] : [`missing ${missing.toSorted().join("+")}`]),
+              ...(held.length === 0 ? [] : [`unexpectedly holds ${held.toSorted().join("+")}`]),
+              ...(expected === "none" && missing.length === 0 && held.length === 0
+                ? [`still holds ${[...permissions].toSorted().join("+")}`]
+                : []),
+            ].join("; ")
+          })`,
+        );
+      }
+      observed.push(converged);
     }
+    // The scan completed; only now is this a description of a whole attempt.
+    unconverged = scanUnconverged;
     return observed.every(Boolean);
   }, sleep, consistencyDeadlineMs,
     expected !== "none"
       ? "The executor state lease did not propagate before the deadline."
       : "The executor retained state permissions after exact lease cleanup.",
-    now);
+    now,
+    () =>
+      unconverged.length === 0
+        ? ""
+        : `Unconverged after the final scan: ${unconverged.join(", ")}.`);
 }
 
 export async function waitForControlPermissions(
@@ -10038,9 +10104,15 @@ export async function waitForControlPermissions(
     fetcher,
     () => consistencyDeadlineMs,
     20_000,
-    now,
+    now
   );
+  // Reset per scan, so a timeout reports the last attempt rather than an
+  // accumulation across the window.
+  let controlUnconverged: string[] = [];
   await waitForPermissionConvergence(async () => {
+    // Scan-local for the same reason as the state scan: a deadline reached
+    // inside a subrequest must not replace the last completed verdict.
+    const scanControlUnconverged: string[] = [];
     const projectResponse = await permissionSubrequest(
       () =>
         permissionFetcher(
@@ -10060,7 +10132,11 @@ export async function waitForControlPermissions(
       // Same transient class the state probe tolerates, and this projection
       // runs after the plan has been consumed, so throwing burns the approved
       // plan over a condition the convergence budget exists to wait out.
-      if (expected !== "none" && transientPermissionDenial(projectResponse)) return false;
+      if (expected !== "none" && transientPermissionDenial(projectResponse)) {
+        scanControlUnconverged.push(`project(denied with HTTP ${projectResponse.status})`);
+        controlUnconverged = scanControlUnconverged;
+        return false;
+      }
       throw new Error(`Project permission test failed with HTTP ${projectResponse.status}.`);
     }
     let projectMatches = true;
@@ -10075,9 +10151,22 @@ export async function waitForControlPermissions(
           requiredString(entry, "project permission")
         ),
       );
-      projectMatches = projectPermissions.every((permission) =>
-        granted.has(permission) === requiredPermissions.has(permission)
+      const wrong = projectPermissions.filter((permission) =>
+        granted.has(permission) !== requiredPermissions.has(permission)
       );
+      projectMatches = wrong.length === 0;
+      if (!projectMatches) {
+        const absent = wrong.filter((permission) => requiredPermissions.has(permission));
+        const extra = wrong.filter((permission) => !requiredPermissions.has(permission));
+        scanControlUnconverged.push(
+          `project(${
+            [
+              ...(absent.length === 0 ? [] : [`missing ${absent.toSorted().join("+")}`]),
+              ...(extra.length === 0 ? [] : [`unexpectedly holds ${extra.toSorted().join("+")}`]),
+            ].join("; ")
+          })`,
+        );
+      }
     }
 
     let actAsMatches = true;
@@ -10105,7 +10194,13 @@ export async function waitForControlPermissions(
           // A prod elevation adds the runtime actAs leases immediately before
           // this scan, so their denial is the same transient the project probe
           // above waits out -- and this runs post-consumption too.
-          if (expected !== "none" && transientPermissionDenial(response)) return false;
+          if (expected !== "none" && transientPermissionDenial(response)) {
+            scanControlUnconverged.push(
+              `runtime ${email}(denied with HTTP ${response.status})`,
+            );
+            controlUnconverged = scanControlUnconverged;
+            return false;
+          }
           throw new Error(`Runtime actAs permission test failed with HTTP ${response.status}.`);
         }
         if (!response.ok) continue;
@@ -10122,6 +10217,11 @@ export async function waitForControlPermissions(
           runtimePermissions.slice(1).some((permission) => permissions.has(permission))
         ) {
           actAsMatches = false;
+          scanControlUnconverged.push(
+            `runtime ${email}(actAs=${permissions.has("iam.serviceAccounts.actAs")} expected=${expectedActAs}; holds ${
+              [...permissions].toSorted().join("+") || "nothing"
+            })`,
+          );
         }
       }
     }
@@ -10145,12 +10245,20 @@ export async function waitForControlPermissions(
         );
       }
     }
+    if (!exposureReadDenied) {
+      scanControlUnconverged.push("exposure Domain Mapping API was reachable");
+    }
+    controlUnconverged = scanControlUnconverged;
     return projectMatches && actAsMatches && exposureReadDenied;
   }, sleep, consistencyDeadlineMs,
     expected !== "none"
       ? "The executor control-plane lease did not propagate before the deadline."
       : "The executor token retained control-plane or runtime actAs permissions after cleanup.",
-    now);
+    now,
+    () =>
+      controlUnconverged.length === 0
+        ? ""
+        : `Unconverged after the final scan: ${controlUnconverged.join(", ")}.`);
 }
 
 type StorageBackendRoleName = keyof typeof STORAGE_BACKEND_ROLE_PERMISSIONS;

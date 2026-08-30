@@ -5302,6 +5302,147 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow("state lease did not propagate before the deadline");
   });
 
+  test("a convergence timeout names the object and permissions that never matched", async () => {
+    // Apply run 33296971474 spent the whole five-minute elevation window in
+    // this probe and failed with nothing but "The executor state lease did not
+    // propagate before the deadline" -- after consuming the approved plan,
+    // which is the most expensive moment in the run to learn nothing. The
+    // per-object verdict was computed and discarded.
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: "a".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+      EXECUTION_MODE: "apply",
+    });
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    const consumed = `${state.prefix}/.protected-bootstrap/consumed/123455.json`;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "mutation",
+      async (input) => {
+        nowMs += 100;
+        return Response.json({
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        // The consumed receipt is live and the executor holds create on it,
+        // which the mutation projection forbids. Everything else converges, so
+        // the message must isolate this one object.
+        testObjectOverwrite: async ({ objectName }) => objectName === consumed,
+        testObjectPermissions: async ({ permissions, resource }) => ({
+          denied: false,
+          permissions: resource.endsWith(consumed)
+            ? permissions.filter((permission) => permission === "storage.objects.get")
+            : permissions,
+        }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(/consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/);
+  });
+
+  test("a persistent denial is named rather than reported as a stale mismatch", async () => {
+    // A never-converging 403 is the case the denial handling exists for, and
+    // the early return skipped the diagnostic entirely -- so the timeout either
+    // named nothing or, worse, reported a completed earlier scan's verdict as
+    // if it were current.
+    const invocation = validateInvocation(validEnvironment());
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async () => {
+        nowMs += 100;
+        return new Response("", { status: 403 });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        testObjectPermissions: async () => ({ denied: true, permissions: [] }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(
+      new RegExp(`bucket ${state.bucket}\\(denied with HTTP 403\\)`),
+    );
+  });
+
+  test("a convergence timeout names a bucket-only mismatch", async () => {
+    // The bucket probe consumed the window on its own: every object converges
+    // but storage.objects.list never appears. Without the bucket verdict the
+    // message falls back to the generic text and names nothing.
+    const invocation = validateInvocation(validEnvironment());
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async () => {
+        nowMs += 100;
+        // Bucket probe answers successfully with no permissions.
+        return Response.json({ kind: "storage#testIamPermissionsResponse", permissions: [] });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        testObjectPermissions: async ({ permissions }) => ({
+          denied: false,
+          permissions: permissions.filter((permission) => permission === "storage.objects.get"),
+        }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(
+      new RegExp(`bucket ${state.bucket}\\(missing storage\\.objects\\.list\\)`),
+    );
+  });
+
+  test("a convergence timeout names a missing permission too", async () => {
+    const invocation = validateInvocation(validEnvironment());
+    let nowMs = 1_000;
+    const state = REPOSITORIES.cdbentley.state.bootstrap;
+    await expect(waitForStatePermissions(
+      state,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input) => {
+        nowMs += 100;
+        return Response.json({
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async (milliseconds) => {
+        nowMs += milliseconds;
+      },
+      {
+        testObjectOverwrite: async () => false,
+        // Nothing is granted anywhere, so the read projection's required
+        // storage.objects.get is missing on the state object.
+        testObjectPermissions: async () => ({ denied: false, permissions: [] }),
+      },
+      2_000,
+      () => nowMs,
+    )).rejects.toThrow(/default\.tfstate\(missing storage\.objects\.get\)/);
+  });
+
   test("state grant and revocation proofs converge beyond seven realistic-latency scans within the shared deadline", async () => {
     const invocation = validateInvocation(validEnvironment());
     const state = {
