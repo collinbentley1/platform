@@ -12141,23 +12141,30 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         address,
         `${label} after-sensitive map`,
       );
-      rejectUnknownIamMember(
-        type,
-        json(delta.after_unknown ?? false, `${label} after unknown`),
-        address,
-        `${label} after-unknown map`,
-      );
-      // Only the state the apply leaves behind is gated. A forbidden principal
-      // in `before` means the plan is REMOVING it -- an authoritative binding
-      // drops it from members, or the grant is deleted outright -- and
-      // refusing that would block the corrective apply and leave the grant in
-      // place permanently.
-      rejectPreviewRuntimeGrant(
-        type,
-        json(delta.after ?? null, `${label} after`),
-        address,
-        `${label} after state`,
-      );
+      // Planned changes only, and only the state the apply leaves behind.
+      //
+      // `before` describes what is being replaced, so a forbidden principal
+      // there is what a corrective plan REMOVES -- an authoritative binding
+      // drops it from members, or the grant is deleted outright. Drift is the
+      // same situation one step earlier: an out-of-band grant appears in
+      // `resource_drift.after` as refreshed live state while the corrective
+      // empty member set appears in `resource_changes.after`. Gating either
+      // would refuse the plan that fixes the problem and leave the grant in
+      // place until someone cleaned it up by hand.
+      if (label === "resource change") {
+        rejectUnknownIamMember(
+          type,
+          json(delta.after_unknown ?? false, `${label} after unknown`),
+          address,
+          `${label} after-unknown map`,
+        );
+        rejectPreviewRuntimeGrant(
+          type,
+          json(delta.after ?? null, `${label} after`),
+          address,
+          `${label} after state`,
+        );
+      }
       const actions = array(delta.actions, `${label} actions`).map((action) =>
         requiredString(action, `${label} action`),
       );

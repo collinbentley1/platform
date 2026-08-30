@@ -510,6 +510,33 @@ describe("protected owner Terraform bridge", () => {
     }];
     expect(() => buildReviewManifest(deletion, planIdentity)).not.toThrow();
 
+    // An out-of-band grant shows up as refreshed live state in resource_drift
+    // while the corrective empty member set is the planned change. Gating
+    // drift would refuse the plan that fixes it.
+    const drifted = plan(
+      [
+        resourceChange(
+          "module.bootstrap.google_project_iam_binding.viewers",
+          "google_project_iam_binding",
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+        ),
+      ],
+      [
+        resourceChange(
+          "module.bootstrap.google_project_iam_binding.viewers",
+          "google_project_iam_binding",
+          { members: [], project: "cdbentley", role: "roles/viewer" },
+          {
+            members: ["serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com"],
+            project: "cdbentley",
+            role: "roles/viewer",
+          },
+        ),
+      ],
+    );
+    expect(() => buildReviewManifest(drifted, planIdentity)).not.toThrow();
+
     // An ordinary grant to an unrelated principal is untouched.
     expect(() =>
       buildReviewManifest(
