@@ -24,6 +24,7 @@ import {
   elevationPolicyRecord,
   addExactBindings,
   buildReviewManifest,
+  disableOrphanExecutor,
   buildRuntimeActAsLeases,
   buildStorageLease,
   buildStorageAcquisitionLeases,
@@ -562,6 +563,151 @@ describe("protected owner Terraform bridge", () => {
         planIdentity,
       )
     ).not.toThrow();
+  });
+
+  test("a Firestore recovery window that slides cannot break plan/apply agreement", () => {
+    // healthmcp prod apply 33341667742 was refused because the manifest it
+    // recomputed differed from the approved one at exactly one path --
+    // plan.drift[3].afterSha256 for module.site.google_firestore_database
+    // .firestore[0] -- with an identical beforeSha256 and every other field
+    // byte-identical. Two live reads 90 seconds apart on an unchanged database
+    // differed in earliest_version_time (which is now minus
+    // version_retention_period) and the etag that moves with it, and in
+    // nothing else. A plan and the apply that follows it therefore can never
+    // agree on this resource's hash.
+    const firestore = (earliest: string, etag: string): JsonValue => ({
+      app_engine_integration_mode: "DISABLED",
+      concurrency_mode: "OPTIMISTIC",
+      delete_protection_state: "DELETE_PROTECTION_ENABLED",
+      earliest_version_time: earliest,
+      etag,
+      location_id: "nam5",
+      name: "(default)",
+      point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_DISABLED",
+      project: "medlock-1025243085",
+      type: "FIRESTORE_NATIVE",
+      version_retention_period: "3600s",
+    });
+    const address = "module.site.google_firestore_database.firestore[0]";
+    const at = (earliest: string, etag: string) =>
+      plan([], [
+        resourceChange(address, "google_firestore_database",
+          firestore("2026-08-30T21:00:00.000000Z", "before-etag"),
+          firestore(earliest, etag)),
+      ]);
+
+    // The two live observations, nine minutes apart as in the real failure.
+    const atPlan = buildReviewManifest(
+      at("2026-08-30T22:46:27.105610Z", "IMvchdrEyZYDMN6HqYm45ZQD"),
+      { ...identity(), terraformRoot: "prod" as const },
+    );
+    const atApply = buildReviewManifest(
+      at("2026-08-30T22:55:31.882041Z", "IMKH+YrFyZYDMN6HqYm45ZQD"),
+      { ...identity(), terraformRoot: "prod" as const },
+    );
+    expect(atApply.sha256).toBe(atPlan.sha256);
+  });
+
+  test("the Firestore exclusion is narrow: real recovery config still moves the digest", () => {
+    // The exclusion must not blind the digest to the settings that govern the
+    // recovery window. version_retention_period and
+    // point_in_time_recovery_enablement are configurable and stay hashed;
+    // only the derived sliding timestamp and its concurrency token are
+    // dropped. Without this, "exclude the volatile fields" could quietly
+    // become "stop checking Firestore".
+    const base = {
+      app_engine_integration_mode: "DISABLED",
+      concurrency_mode: "OPTIMISTIC",
+      delete_protection_state: "DELETE_PROTECTION_ENABLED",
+      earliest_version_time: "2026-08-30T22:46:27.105610Z",
+      etag: "some-etag",
+      location_id: "nam5",
+      name: "(default)",
+      point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_DISABLED",
+      project: "medlock-1025243085",
+      type: "FIRESTORE_NATIVE",
+      version_retention_period: "3600s",
+    };
+    const address = "module.site.google_firestore_database.firestore[0]";
+    const manifest = (after: Record<string, unknown>) =>
+      buildReviewManifest(
+        plan([], [
+          resourceChange(address, "google_firestore_database", base as JsonValue, after as JsonValue),
+        ]),
+        { ...identity(), terraformRoot: "prod" as const },
+      ).sha256;
+
+    const unchanged = manifest({ ...base });
+    // Each of these is a real configuration change and MUST alter the digest.
+    expect(manifest({ ...base, version_retention_period: "7200s" })).not.toBe(unchanged);
+    expect(manifest({
+      ...base,
+      point_in_time_recovery_enablement: "POINT_IN_TIME_RECOVERY_ENABLED",
+    })).not.toBe(unchanged);
+    expect(manifest({ ...base, delete_protection_state: "DELETE_PROTECTION_DISABLED" }))
+      .not.toBe(unchanged);
+    expect(manifest({ ...base, location_id: "us-east1" })).not.toBe(unchanged);
+    expect(manifest({ ...base, type: "DATASTORE_MODE" })).not.toBe(unchanged);
+    // And only the two proven-volatile fields are ignored.
+    expect(manifest({ ...base, earliest_version_time: "2026-01-01T00:00:00.000000Z" }))
+      .toBe(unchanged);
+    expect(manifest({ ...base, etag: "totally-different-etag" })).toBe(unchanged);
+  });
+
+  test("containment retries a propagation 403 instead of abandoning the executor", async () => {
+    // In-job recovery for healthmcp prod apply 33341667742 died on a single
+    // non-retryable HTTP 403 while disabling the executor; the fresh-runner
+    // recovery job did the same work moments later and succeeded, which is a
+    // propagation delay rather than a denial. Only the backstop stopped that
+    // from leaving a live executor behind, so containment must retry.
+    //
+    // The behavioural proof is the sibling test below: a 403 that never clears
+    // now surfaces the CONVERGENCE error, which is only reachable by exhausting
+    // the retry loop. Immediate rethrow produced "failed with HTTP 403".
+    // This test pins the wiring that enables it, since the flag is opt-in and
+    // silently defaults to off.
+    const source = await readFile(join(root, "tools/ci/protected-bootstrap-bridge.ts"), "utf8");
+    const call = source.slice(source.indexOf("export async function disableOrphanExecutor("));
+    const body = call.slice(0, call.indexOf("\n}"));
+    expect(body).toContain("setExecutorDisabled(");
+    // The seventh argument is retryForbidden; containment opts in.
+    expect(/setExecutorDisabled\(\s*account,\s*true,\s*ownerToken,\s*fetcher,\s*sleep,\s*cleanupDeadlineMs,\s*true,/
+      .test(body)).toBeTrue();
+    // And it must stay opt-in: the default is off for every ordinary path.
+    expect(source).toContain("retryForbidden = false,");
+  });
+
+  test("a persistent 403 on containment still fails closed", async () => {
+    // Retrying must not become "eventually give up quietly". A denial that
+    // never clears has to surface, bounded by the consistency deadline.
+    const account = {
+      description: "codex executor",
+      disabled: false,
+      displayName: "codex",
+      email: "gha-pbt-0123456789abcdef0123@medlock-1025243085.iam.gserviceaccount.com",
+      name: "projects/medlock-1025243085/serviceAccounts/gha-pbt-0123456789abcdef0123@medlock-1025243085.iam.gserviceaccount.com",
+      projectId: "medlock-1025243085",
+      uniqueId: "123456789012345678901",
+    } as unknown as Parameters<typeof disableOrphanExecutor>[0];
+    const fetcher = (async () =>
+      new Response("denied", { status: 403 })) as unknown as Fetcher;
+    const thrown = (await disableOrphanExecutor(
+      account,
+      "ya29.owner",
+      fetcher,
+      async () => {},
+      Date.now() + 2_000,
+    ).then(() => undefined, (error: unknown) => error)) as Error;
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown.message).toContain("manual cleanup is required");
+    // The distinguishing evidence: reaching the convergence error means the
+    // loop ran to its deadline. An immediate rethrow of a non-retryable 403
+    // surfaces "Executor disable failed with HTTP 403" instead, which is what
+    // the in-job recovery for run 33341667742 reported.
+    const inner = (thrown as AggregateError).errors?.[0] as Error | undefined;
+    expect(String(inner?.message)).toContain(
+      "did not converge before the IAM consistency deadline",
+    );
   });
 
   test("no deny-policy authority survives anywhere in the bridge", async () => {
