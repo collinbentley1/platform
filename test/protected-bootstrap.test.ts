@@ -2081,6 +2081,77 @@ describe("protected owner Terraform bridge", () => {
     expect(prod).toContain("datastore.databases.update");
   });
 
+  // Terraform fixes the ordering of none of the plan's lists. The digest must
+  // therefore be invariant under permutation of every one of them, not only
+  // resource_changes -- which is all the determinism test below shuffles.
+  //
+  // Live: cdbentley bootstrap plans 33288435770 and 33289064233, eight minutes
+  // apart over an unchanged world at the same platform and consumer SHAs. Every
+  // resource change, every drift entry, `source`, `checksSha256`,
+  // `outputChanges` and `variables` were byte-identical; `relevant_attributes`
+  // came back in a different order and the manifest hashed differently, so the
+  // apply would have refused its own approved plan.
+  test("the digest is invariant under the ordering of every unordered plan list", () => {
+    const attributes = [
+      { attribute: ["etag"], resource: "module.bootstrap.google_project_iam_member.reader" },
+      { attribute: ["member"], resource: "module.bootstrap.google_service_account.prod_deploy" },
+      { attribute: ["role"], resource: "module.bootstrap.google_project_iam_custom_role.deployer" },
+    ];
+    const checks = [
+      { address: { kind: "check", to_display: "check.a" }, problems: [], status: "pass" },
+      { address: { kind: "check", to_display: "check.b" }, problems: [], status: "pass" },
+    ];
+    const changes = [
+      resourceChange(
+        "module.bootstrap.google_project_iam_member.reader",
+        "google_project_iam_member",
+        { etag: "BwOne", member: "serviceAccount:a@cdbentley.iam.gserviceaccount.com", role: "roles/viewer" },
+        { etag: "BwOne", member: "serviceAccount:a@cdbentley.iam.gserviceaccount.com", role: "roles/viewer" },
+      ),
+    ];
+    const drift = [
+      resourceChange(
+        "module.bootstrap.google_service_account_iam_member.prod_deploy_wif_repo",
+        "google_service_account_iam_member",
+        { etag: "BwStale", member: "serviceAccount:b@cdbentley.iam.gserviceaccount.com", role: "roles/iam.workloadIdentityUser" },
+        { etag: "BwFresh", member: "serviceAccount:b@cdbentley.iam.gserviceaccount.com", role: "roles/iam.workloadIdentityUser" },
+      ),
+    ];
+    const build = (attrs: unknown[], chks: unknown[]) => {
+      const raw = plan(changes, drift) as Record<string, unknown>;
+      raw.relevant_attributes = attrs;
+      raw.checks = chks;
+      return buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" as const });
+    };
+    const ordered = build(attributes, checks);
+    const reversed = build([...attributes].reverse(), [...checks].reverse());
+    const rotated = build([attributes[2], attributes[0], attributes[1]], checks);
+    expect(reversed.sha256).toBe(ordered.sha256);
+    expect(rotated.sha256).toBe(ordered.sha256);
+
+    // Ordering is normalized; membership is still bound.
+    const removed = build(attributes.slice(0, 2), checks);
+    expect(removed.sha256).not.toBe(ordered.sha256);
+    const altered = build(
+      [{ attribute: ["etag"], resource: "module.bootstrap.google_project_iam_member.OTHER" }, ...attributes.slice(1)],
+      checks,
+    );
+    expect(altered.sha256).not.toBe(ordered.sha256);
+    const failingCheck = build(attributes, [
+      { address: { kind: "check", to_display: "check.a" }, problems: [], status: "fail" },
+      checks[1],
+    ]);
+    expect(failingCheck.sha256).not.toBe(ordered.sha256);
+
+    // The count is published so a mismatch here is readable off the manifest
+    // rather than requiring a field-by-field diff of two step summaries.
+    const published = JSON.parse(ordered.canonical) as {
+      plan: { relevantAttributesCount: number; checksCount: number };
+    };
+    expect(published.plan.relevantAttributesCount).toBe(3);
+    expect(published.plan.checksCount).toBe(2);
+  });
+
   test("review digest is deterministic and binds exact full change semantics and sources", () => {
     const first = buildReviewManifest(
       plan([

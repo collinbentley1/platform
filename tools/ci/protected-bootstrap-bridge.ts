@@ -2019,8 +2019,21 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
   const changes = normalizeChanges(plan.resource_changes, identity, "resource change");
   const drift = normalizeChanges(plan.resource_drift, identity, "resource drift");
   const outputChanges = normalizeOutputChanges(plan.output_changes);
-  const checks = json(plan.checks ?? [], "Terraform checks");
-  const relevantAttributes = json(
+  // Terraform does not guarantee the ordering of these two lists across runs,
+  // and neither carries meaning in its order. Every other list-valued input to
+  // the digest is already ordered -- `normalizeChanges` sorts by address,
+  // `normalizeOutputChanges` sorts by output name -- so these were the only
+  // remaining channels through which the same plan could hash two ways.
+  //
+  // Observed live: cdbentley bootstrap plans 33288435770 and 33289064233, run
+  // eight minutes apart against an unchanged world at the same platform and
+  // consumer SHAs. Every resource change, every drift entry, `source`,
+  // `checksSha256`, `outputChanges`, and `variables` were byte-identical;
+  // `relevantAttributesSha256` was not, and an apply would have refused its own
+  // approved plan. `checks` matched there but is unordered for the same reason
+  // and is normalized here too rather than waiting for it to bite.
+  const checks = canonicalizeUnorderedList(plan.checks ?? [], "Terraform checks");
+  const relevantAttributes = canonicalizeUnorderedList(
     plan.relevant_attributes ?? [],
     "Terraform relevant attributes",
   );
@@ -2134,6 +2147,11 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
           }
         : {}),
       outputChanges,
+      // Published alongside the hash so a mismatch in this field can be read off
+      // two manifests directly. The exposure branch already publishes a count;
+      // diagnosing plans 33288435770 and 33289064233 required a field-by-field
+      // diff of two step summaries because the general manifest did not.
+      relevantAttributesCount: Array.isArray(relevantAttributes) ? relevantAttributes.length : 0,
       relevantAttributesSha256: hashJson(relevantAttributes),
       // Every published manifest states what its own digest does not bind, so a
       // reviewer sees the exclusion contract in the step summary and an auditor
@@ -2186,6 +2204,17 @@ export function buildReviewManifest(raw: unknown, identity: PlanIdentity): Revie
     canonical,
     sha256: createHash("sha256").update(canonical).digest("hex"),
   };
+}
+
+// Order a list whose ordering Terraform does not fix, by each entry's own
+// canonical encoding. Deterministic, total, and content-preserving: two runs
+// agree, and any change to what is in the list still changes the hash.
+function canonicalizeUnorderedList(value: unknown, label: string): JsonValue {
+  const entries = array(value, label).map((entry) => json(entry, label));
+  return entries
+    .map((entry) => [canonicalJson(entry), entry] as const)
+    .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([, entry]) => entry);
 }
 
 export function canonicalJson(value: JsonValue): string {
