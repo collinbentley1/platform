@@ -3920,6 +3920,10 @@ export async function proveConsumerFreeze(
   tokenDrainSeconds: number,
   fetcher: Fetcher,
   nowMs = Date.now(),
+  // One budget for THIS proof. Created per composite operation so an early
+  // proof cannot spend what a later one needs. Omitted, the reads behave
+  // exactly as they did before this layer existed.
+  retry?: GithubProofRetryPolicy,
 ): Promise<ConsumerFreezeProof> {
   if (tokenDrainSeconds !== MUTATOR_TOKEN_SECONDS) {
     throw new Error("The consumer token-drain window escaped the reviewed values.");
@@ -3931,10 +3935,10 @@ export async function proveConsumerFreeze(
     const contract = REPOSITORIES[repository];
     const base = `https://api.github.com/repos/${PLATFORM_OWNER}/${repository}`;
     const [metadataValue, permissionsValue, activeRuns, recentRuns] = await Promise.all([
-      githubJson(base, token, fetcher),
-      githubJson(`${base}/actions/permissions`, token, fetcher),
-      githubActiveRuns(base, token, fetcher),
-      githubAllRuns(base, token, fetcher),
+      githubJson(base, token, fetcher, retry),
+      githubJson(`${base}/actions/permissions`, token, fetcher, retry),
+      githubActiveRuns(base, token, fetcher, retry),
+      githubAllRuns(base, token, fetcher, retry),
     ]);
     const metadata = record(metadataValue, `${repository} metadata`);
     const owner = record(metadata.owner, `${repository} owner`);
@@ -3993,13 +3997,14 @@ async function githubAllRuns(
   base: string,
   token: string,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
   let page = 1;
   let expectedTotal: number | undefined;
   do {
     const value = record(
-      await githubJson(`${base}/actions/runs?per_page=100&page=${page}`, token, fetcher),
+      await githubJson(`${base}/actions/runs?per_page=100&page=${page}`, token, fetcher, retry),
       "GitHub workflow runs",
     );
     exactKeys(value, new Set(["total_count", "workflow_runs"]), "GitHub workflow runs");
@@ -4028,6 +4033,7 @@ async function githubActiveRuns(
   base: string,
   token: string,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
   for (const status of ["requested", "waiting", "pending", "queued", "in_progress"] as const) {
@@ -4035,7 +4041,7 @@ async function githubActiveRuns(
     let expectedTotal: number | undefined;
     do {
       const url = `${base}/actions/runs?status=${status}&per_page=100&page=${page}`;
-      const value = record(await githubJson(url, token, fetcher), `GitHub ${status} runs`);
+      const value = record(await githubJson(url, token, fetcher, retry), `GitHub ${status} runs`);
       exactKeys(value, new Set(["total_count", "workflow_runs"]), `GitHub ${status} runs`);
       const total = boundedInteger(value.total_count, `GitHub ${status} run count`, 0, MAX_GITHUB_RUNS_PER_STATUS);
       if (expectedTotal === undefined) expectedTotal = total;
@@ -4748,6 +4754,11 @@ function defaultBridgeDependencies(
         invocation.githubActionsToken,
         tokenDrainSeconds,
         api,
+        Date.now(),
+        // A fresh budget per proof. These reads are ~80-120 sequential GETs
+        // across four repositories, and a single transient 502 among them
+        // killed apply run 33305344368 outright.
+        githubProofRetryPolicy(() => apiDeadlineMs),
       );
       await runDoctor(invocation, contract.repositoryId, consumerWorkflowPin);
       return { ...capability, consumerTreeSha, tokenDrainSeconds };
@@ -4760,9 +4771,16 @@ function defaultBridgeDependencies(
         invocation.ownerAccessToken,
         session.exposureAdoptionAudit,
         preparation,
+        githubProofRetryPolicy(() => apiDeadlineMs),
       ),
     proveFreeze: (invocation, tokenDrainSeconds) =>
-      proveConsumerFreeze(invocation.githubActionsToken, tokenDrainSeconds, api),
+      proveConsumerFreeze(
+        invocation.githubActionsToken,
+        tokenDrainSeconds,
+        api,
+        Date.now(),
+        githubProofRetryPolicy(() => apiDeadlineMs),
+      ),
     proveMarkers: (invocation, session, requireTargetClear) =>
       proveDeploymentParityMarkers(
         invocation,
@@ -4826,7 +4844,14 @@ function defaultBridgeDependencies(
       );
     },
     verifyApproval: (invocation, session, proof, nowMs) =>
-      verifyPlanApproval(invocation, session.accessToken, proof, nowMs, api),
+      verifyPlanApproval(
+        invocation,
+        session.accessToken,
+        proof,
+        nowMs,
+        api,
+        githubProofRetryPolicy(() => apiDeadlineMs),
+      ),
     waitForPostMutationDrain: async (invocation, mutationCompletedAtMs, operationDeadlineMs) => {
       if (invocation.terraformRoot !== "bootstrap") return;
       const targetMs = mutationCompletedAtMs +
@@ -11009,6 +11034,7 @@ async function readGenerationBoundObject(
 async function verifyAdoptionWorkflowRun(
   invocation: Invocation,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<void> {
   const runId = invocation.exposureAdoptionRunId;
   if (BigInt(runId) >= BigInt(invocation.githubRunId)) {
@@ -11020,6 +11046,7 @@ async function verifyAdoptionWorkflowRun(
       `${base}/actions/runs/${runId}`,
       invocation.platformActionsToken,
       fetcher,
+      retry,
     ),
     "Runsetta exposure adoption GitHub run",
   );
@@ -11046,6 +11073,7 @@ async function verifyAdoptionWorkflowRun(
       `${base}/actions/workflows/${workflowId}`,
       invocation.platformActionsToken,
       fetcher,
+      retry,
     ),
     "Runsetta exposure adoption workflow",
   );
@@ -11062,8 +11090,9 @@ async function verifyRunsettaExposureAdoptionPrerequisite(
   liveReadToken: string,
   preparation: PreparationResult,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<ExposureProof> {
-  await verifyAdoptionWorkflowRun(invocation, fetcher);
+  await verifyAdoptionWorkflowRun(invocation, fetcher, retry);
   const backend = REPOSITORIES.runsetta.state.exposure;
   const receiptObject = receiptObjectName(
     backend,
@@ -11195,6 +11224,7 @@ export async function proveExposure(
   liveReadToken: string = executorToken,
   adoptionAudit: ExposureAdoptionAudit | undefined = undefined,
   preparation: PreparationResult | undefined = undefined,
+  retry?: GithubProofRetryPolicy,
 ): Promise<ExposureProof | null> {
   if (invocation.terraformRoot === "prod" && invocation.repository === "runsetta") {
     if (preparation === undefined) {
@@ -11206,6 +11236,7 @@ export async function proveExposure(
       liveReadToken,
       preparation,
       fetcher,
+      retry,
     );
   }
   if (invocation.terraformRoot !== "exposure") return null;
@@ -11625,12 +11656,13 @@ export async function verifyPlanApproval(
   proof: ExecutionProof,
   nowMs: number,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<ReviewManifestResult> {
   if (invocation.mode !== "apply") throw new Error("Only apply mode may verify a plan approval.");
   if (invocation.terraformRoot === "exposure") {
     throw new Error("Exposure adoption has no plan approval or apply phase.");
   }
-  await verifyPlanRun(invocation, nowMs, fetcher);
+  await verifyPlanRun(invocation, nowMs, fetcher, retry);
   const contract = REPOSITORIES[invocation.repository];
   const state = contract.state[invocation.terraformRoot];
   const raw = await readObject(
@@ -11916,6 +11948,7 @@ async function verifyPlanRun(
   invocation: Invocation,
   nowMs: number,
   fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
 ): Promise<void> {
   const base = `https://api.github.com/repos/${PLATFORM_REPOSITORY}`;
   const run = record(
@@ -11923,6 +11956,7 @@ async function verifyPlanRun(
       `${base}/actions/runs/${invocation.approvedPlanRunId}`,
       invocation.platformActionsToken,
       fetcher,
+      retry,
     ),
     "approved GitHub plan run",
   );
@@ -11943,6 +11977,7 @@ async function verifyPlanRun(
       `${base}/actions/workflows/${workflowId}`,
       invocation.platformActionsToken,
       fetcher,
+      retry,
     ),
     "approved GitHub workflow",
   );
@@ -12024,20 +12059,313 @@ function receiptObjectName(
   return `${state.prefix}/.protected-bootstrap/${kind}/${runId}.json`;
 }
 
-async function githubJson(url: string, token: string, fetcher: Fetcher): Promise<unknown> {
+// A bounded retry budget for ONE composite proof. Created per composite
+// operation rather than per run, so an early proof cannot drain the budget the
+// post-apply proof will need -- the worst possible allocation.
+export interface GithubProofRetryPolicy {
+  readonly deadlineMs: () => number;
+  readonly now: () => number;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly random: () => number;
+  // Retry-attributable time spent on this composite operation: the elapsed
+  // time of FAILED attempts plus the backoff granted after them. Counting only
+  // sleep was not the budget it advertised -- four attempts each burning a 20s
+  // request timeout could span well past a minute while the counter showed
+  // room; elapsed request time is what competes with the phase envelope. But
+  // counting all wall clock was worse: successful reads drained it, so a blip
+  // on the first repository could refuse a blip on the fourth its first retry.
+  // Only the time this layer ADDS belongs here. Concurrent reads share one
+  // policy and accumulate into it, which double-counts overlapping spend --
+  // conservative in the right direction: a sustained multi-read outage
+  // exhausts fast, a simultaneous blip costs almost nothing.
+  retryCostMs: number;
+}
+
+export function githubProofRetryPolicy(
+  deadlineMs: () => number,
+  sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = Date.now,
+  random: () => number = Math.random,
+): GithubProofRetryPolicy {
+  return { deadlineMs, now, random, retryCostMs: 0, sleep };
+}
+
+// Retryable: transport failure, any 5xx, 429, and the 403 shapes GitHub uses
+// for rate limiting -- both the SECONDARY limit (Retry-After, or "secondary
+// rate limit"/"abuse" in the body) and the PRIMARY quota
+// (x-ratelimit-remaining: 0, paired with x-ratelimit-reset). Everything else
+// -- 401, a plain 403, 404 -- is terminal on the first occurrence.
+//
+// Deliberately NOT `transientPermissionDenial`, which treats 401/403 as
+// retryable in the storage permission probe for reasons specific to IAM
+// propagation and the executor's own disable/re-enable cycle. Generalising
+// that here would retry a GitHub token that is simply wrong.
+export function retryableGithubReadFailure(
+  status: number,
+  headers: { get(name: string): string | null },
+  body: string,
+): boolean {
+  if (status >= 500) return true;
+  if (status === 429) return true;
+  if (status !== 403) return false;
+  if (headers.get("retry-after") !== null) return true;
+  if (headers.get("x-ratelimit-remaining") === "0") return true;
+  return /secondary rate limit|abuse/i.test(body);
+}
+
+// The deadline fetcher's own abort message. A run that has reached the
+// operation deadline is doomed; retrying cannot resurrect it.
+const OPERATION_DEADLINE_MESSAGE = "API request reached the protected operation deadline.";
+
+// Any cancellation is terminal, not just that sentinel. An AbortError or a
+// DOMException reaching here means something above deliberately stopped this
+// request, and retrying it would override that decision -- the opposite of
+// what cancellation means.
+// Transport error text is attacker-influenced -- a proxy or gateway can put
+// arbitrary bytes in it -- and it goes straight into a log line and an Error
+// message. A newline forges a second log record, an escape sequence rewrites
+// the reading operator's terminal, and a bidi control reorders what they read.
+// Truncation alone stops none of it.
+//
+// Escape by Unicode CATEGORY rather than by enumerated ranges. An explicit
+// range list is a denylist and was already incomplete: it missed U+2028 and
+// U+2029, which JavaScript itself treats as line terminators and which many
+// log readers break records on, and U+061C, a bidi control outside the ranges
+// it listed. Cc and Cf cover every control and format character, including all
+// terminal escapes, zero-width characters and bidi overrides; Zl and Zp are
+// the line and paragraph separators; Cs is a lone surrogate, which would
+// corrupt any JSON encoding of this evidence downstream.
+const EVIDENCE_FORGERY = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
+
+// The whole returned representation, marker included, is <= maximumLength.
+// An earlier version bounded only the payload and then appended the marker, so
+// a limit of 9 could return 11 characters -- a caller budgeting a log line got
+// more than it asked for, which is the same class of defect as unbounded
+// evidence, just smaller.
+const EVIDENCE_TRUNCATION_MARKER = "...";
+
+export function evidenceText(value: string, maximumLength: number): string {
+  if (maximumLength <= 0) return "";
+  const tokens: string[] = [];
+  let length = 0;
+  let truncated = false;
+  for (const character of value) {
+    const token = EVIDENCE_FORGERY.test(character)
+      ? `\\u{${character.codePointAt(0)?.toString(16) ?? "fffd"}}`
+      : character;
+    // Only whole tokens are ever admitted, so no bound can leave half an
+    // escape sequence behind.
+    if (length + token.length > maximumLength) {
+      truncated = true;
+      break;
+    }
+    tokens.push(token);
+    length += token.length;
+  }
+  if (!truncated) return tokens.join("");
+  const budget = maximumLength - EVIDENCE_TRUNCATION_MARKER.length;
+  // A limit too small to hold the marker still says something was cut, as far
+  // as the limit allows, rather than exceeding it.
+  if (budget <= 0) return EVIDENCE_TRUNCATION_MARKER.slice(0, maximumLength);
+  // Make room by dropping WHOLE tokens from the end.
+  while (length > budget) length -= tokens.pop()?.length ?? 0;
+  return tokens.join("") + EVIDENCE_TRUNCATION_MARKER;
+}
+
+export function cancellationError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message === OPERATION_DEADLINE_MESSAGE) return true;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  return typeof DOMException !== "undefined" && error instanceof DOMException;
+}
+// What the server asked for, and which header asked. GitHub paces two
+// different ways: the SECONDARY limit sends Retry-After; the PRIMARY quota
+// sends x-ratelimit-remaining: 0 with an epoch x-ratelimit-reset and usually
+// no Retry-After. Reading only the first burned three doomed jittered retries
+// against a quota that resets in minutes, then died as "attempt cap reached"
+// -- evidence naming the wrong cause. Read both; honour or fail closed.
+export function serverRequestedDelay(
+  response: Response | undefined,
+  now: number,
+): { readonly ms: number; readonly source: string } | undefined {
+  if (response === undefined) return undefined;
+  const retryAfter = retryAfterMs(response, now);
+  if (retryAfter !== undefined) {
+    return { ms: retryAfter, source: `Retry-After of ${retryAfter}ms` };
+  }
+  if (response.headers.get("x-ratelimit-remaining")?.trim() !== "0") return undefined;
+  const reset = response.headers.get("x-ratelimit-reset")?.trim() ?? "";
+  if (!/^\d{1,10}$/.test(reset)) return undefined;
+  const ms = Math.max(0, Number(reset) * 1_000 - now);
+  return { ms, source: `x-ratelimit-reset in ${ms}ms` };
+}
+
+// The ceiling deadlineFetcher puts on any single request. The retry gates
+// reserve it for the attempt that follows a backoff, so it must be the same
+// number in both places.
+export const PROTECTED_MAX_REQUEST_MS = 20_000;
+
+const GITHUB_PROOF_RETRY_BUDGET_MS = 60_000;
+const GITHUB_PROOF_RETRY_ATTEMPTS = 4;
+const GITHUB_PROOF_RETRY_BASE_MS = 1_000;
+// Headroom only: at a 4-attempt cap the largest exponent yields 4000ms, so
+// this never binds today. It bounds the pacing if the attempt cap ever rises.
+const GITHUB_PROOF_RETRY_CAP_MS = 8_000;
+// Never sleep so long that the receipt publish that follows has no runway.
+// Runway left for the work that follows a retry inside the same phase. The
+// costliest tail is the post-consume freeze proof followed by the receipt
+// publish, and that publish is two requests -- the upload and the
+// byte-equivalence readback -- at up to 20s each. A 30s reserve could not
+// cover it. Raising it only tightens retries near the deadline.
+const GITHUB_PROOF_RETRY_TAIL_RESERVE_MS = 60_000;
+
+// `Retry-After` is delta-seconds or an HTTP-date. Anything else is not a
+// value we will act on, and we fall back to jittered backoff rather than
+// guessing -- the budget and deadline checks still bound the result.
+export function retryAfterMs(
+  response: { headers: { get(name: string): string | null } } | undefined,
+  now: number = Date.now(),
+): number | undefined {
+  const raw = response?.headers.get("retry-after");
+  if (raw === null || raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  // Any non-negative delta-seconds. A {1,5} bound sent a 6-digit value down
+  // the HTTP-date path, where Date.parse yields NaN, so an enormous server
+  // instruction silently became a 1-8s jitter -- the server's instruction
+  // ignored, the same sin as truncating it. The affordability gate below is
+  // what refuses values we cannot afford; the parser must not pre-empt it.
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  const when = Date.parse(trimmed);
+  if (!Number.isFinite(when)) return undefined;
+  return Math.max(0, when - now);
+}
+
+async function githubJson(
+  url: string,
+  token: string,
+  fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
+): Promise<unknown> {
   if (!url.startsWith("https://api.github.com/repos/collinbentley1/")) {
     throw new Error("GitHub API URL escaped the closed repository allowlist.");
   }
-  const response = await fetcher(url, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    redirect: "error",
-  });
-  if (!response.ok) throw new Error(`GitHub freeze proof failed with HTTP ${response.status}.`);
-  return boundedJson(response, 4 * 1024 * 1024);
+  const path = new URL(url).pathname;
+  let attempts = 0;
+  // The OUTCOME of the most recent attempt, not a status that survives it.
+  // Tracking only an HTTP status left it stale whenever a later attempt failed
+  // in transport, so a 502 followed by two socket errors exhausted while
+  // reporting "HTTP 502" -- naming a cause that was two attempts old, in both
+  // the final error and the retry breadcrumb.
+  let lastOutcome = "no attempt completed";
+  for (;;) {
+    attempts += 1;
+    const attemptStartedMs = retry === undefined ? 0 : retry.now();
+    let response: Response | undefined;
+    let transportError: unknown;
+    try {
+      response = await fetcher(url, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        redirect: "error",
+      });
+    } catch (error) {
+      // Cancellation is terminal. A per-request timeout raised by the bridge's
+      // own wrapper is retryable, but the deadline checks below still gate it.
+      if (cancellationError(error)) throw error;
+      transportError = error;
+      lastOutcome = `transport failure (${
+        error instanceof Error ? evidenceText(error.message, 80) : "unknown"
+      })`;
+    }
+    if (response !== undefined && response.ok) return boundedJson(response, 4 * 1024 * 1024);
+
+    let retryable = transportError !== undefined;
+    if (response !== undefined) {
+      lastOutcome = `HTTP ${response.status}`;
+      let body = "";
+      try {
+        // deadlineFetcher has already buffered the body, so this reads from
+        // memory; a failure to read it simply leaves the body out of the
+        // classification rather than masking the status.
+        body = (await response.clone().text()).slice(0, 64 * 1024);
+      } catch {
+        body = "";
+      }
+      retryable = retryableGithubReadFailure(response.status, response.headers, body);
+    }
+
+    const describe = (reason: string) =>
+      new Error(
+        `GitHub proof read failed after ${attempts} attempt(s): ` +
+          `${lastOutcome} from ${path} (${reason}).`,
+      );
+
+    if (retry === undefined || !retryable) {
+      if (response !== undefined && retry === undefined) {
+        throw new Error(`GitHub freeze proof failed with HTTP ${response.status}.`);
+      }
+      if (transportError !== undefined && retry === undefined) throw transportError;
+      throw describe("not retryable");
+    }
+    if (attempts >= GITHUB_PROOF_RETRY_ATTEMPTS) throw describe("attempt cap reached");
+
+    // Charge the failed attempt. Only failed attempts and the backoff granted
+    // after them are retry-attributable: successful reads happen with or
+    // without this layer and are already bounded by the operation deadline.
+    // An armed wall-clock window counted them, so a minute of clean reads
+    // between two unrelated blips refused the second blip its first retry --
+    // reintroducing the very failure this layer exists to prevent.
+    retry.retryCostMs += retry.now() - attemptStartedMs;
+    if (retry.retryCostMs >= GITHUB_PROOF_RETRY_BUDGET_MS) {
+      throw describe(
+        `retry budget exhausted; ${retry.retryCostMs}ms of ` +
+          `${GITHUB_PROOF_RETRY_BUDGET_MS}ms spent on retries`,
+      );
+    }
+    const budgetRemainingMs = GITHUB_PROOF_RETRY_BUDGET_MS - retry.retryCostMs;
+
+    // Full jitter may legally produce zero. That is an immediate retry, not an
+    // exhausted budget, and conflating them reported the wrong cause.
+    const jittered = Math.floor(
+      retry.random() *
+        Math.min(GITHUB_PROOF_RETRY_BASE_MS * 2 ** (attempts - 1), GITHUB_PROOF_RETRY_CAP_MS),
+    );
+    const serverRequested = serverRequestedDelay(response, retry.now());
+    const requested = serverRequested?.ms ?? jittered;
+    // Name the source. An operator reading this after a burned plan must be
+    // able to tell a server instruction from our own backoff, and which of
+    // GitHub's two limits spoke.
+    const source = serverRequested?.source ?? `backoff of ${requested}ms`;
+    // A server instruction is honoured or the run fails; it is never truncated.
+    // Retrying earlier than asked lands while still limited and discards the
+    // one signal the server gave us.
+    // Granting a retry costs the backoff AND the attempt that follows it,
+    // which deadlineFetcher caps at PROTECTED_MAX_REQUEST_MS. Checking only the
+    // backoff let a Retry-After exactly equal to the remaining budget pass,
+    // sleep the budget to zero, and then start a request that ran 20s past it;
+    // the same omission let a retry eat into the advertised tail reserve.
+    // Reserving both makes the 60s bound exact rather than 60s plus an overrun.
+    const grantCostMs = requested + PROTECTED_MAX_REQUEST_MS;
+    if (grantCostMs > budgetRemainingMs) {
+      throw describe(
+        `${source} plus the retried request exceeds the remaining retry ` +
+          `budget of ${budgetRemainingMs}ms`,
+      );
+    }
+    if (retry.deadlineMs() - retry.now() < grantCostMs + GITHUB_PROOF_RETRY_TAIL_RESERVE_MS) {
+      throw describe(`${source} plus the retried request exceeds the operation deadline ` +
+        `less its tail reserve`);
+    }
+    console.log(
+      `Protected bridge GitHub proof retry path=${path} outcome=${lastOutcome} ` +
+        `attempt=${attempts} sleep_ms=${requested}`,
+    );
+    retry.retryCostMs += requested;
+    if (requested > 0) await retry.sleep(requested);
+  }
 }
 
 async function boundedJson(response: Response, maximumBytes: number): Promise<unknown> {
@@ -12149,7 +12477,7 @@ export async function requireFreshGoogleOwnerAccessToken(
 export function deadlineFetcher(
   fetcher: Fetcher,
   deadline: () => number,
-  maximumRequestMs = 20_000,
+  maximumRequestMs = PROTECTED_MAX_REQUEST_MS,
   now: () => number = Date.now,
 ): Fetcher {
   return async (input, init = {}) => {

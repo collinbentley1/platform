@@ -14,6 +14,11 @@ import {
   buildMarkerMutationLease,
   buildMarkerReadLease,
   buildReceiptLeases,
+  githubProofRetryPolicy,
+  retryableGithubReadFailure,
+  retryAfterMs,
+  cancellationError,
+  evidenceText,
   buildLegacyCombinedReceiptCreateLease,
   receiptConsumeLeaseTitle,
   elevationPolicyRecord,
@@ -5603,6 +5608,679 @@ describe("protected owner Terraform bridge", () => {
       (lease) => lease.condition?.title === "codex-receipt-create-123456",
     )!;
     expect(current.condition!.expression).not.toBe(legacy.condition.expression);
+  });
+
+  // Apply run 33305344368 died at controller.proof on a single transient
+  // `GitHub freeze proof failed with HTTP 502`. proveConsumerFreeze makes
+  // ~80-120 sequential GETs across four repositories and githubJson threw on
+  // the first non-ok response, so one hiccup among a hundred reads killed a
+  // run that had already passed prepare, acquire, and the permission proof.
+  const freezeToken = "ghp_" + "c".repeat(36);
+  const CDBENTLEY_PERMISSIONS = "/repos/collinbentley1/cdbentley/actions/permissions";
+  const okBody = (path: string) => {
+    if (path.endsWith("/actions/permissions")) {
+      return { enabled: false, sha_pinning_required: false };
+    }
+    if (path.includes("/actions/runs")) return { total_count: 0, workflow_runs: [] };
+    // Identity must be the real contract value per repository; the freeze
+    // proof refuses anything else, which is what makes this fixture faithful.
+    const name = path.split("/")[3]!;
+    const repository = REPOSITORY_NAMES.find((candidate) => candidate === name)!;
+    return {
+      full_name: `collinbentley1/${repository}`,
+      id: Number(REPOSITORIES[repository].repositoryId),
+      owner: { id: 16823277 },
+    };
+  };
+  const freezeFetcher = (script: (path: string, n: number) => Response | Error) => {
+    const counts = new Map<string, number>();
+    const seen: { path: string; attempt: number }[] = [];
+    return {
+      counts,
+      seen,
+      fetcher: (async (input: string | URL) => {
+        const path = new URL(String(input)).pathname + new URL(String(input)).search;
+        const n = (counts.get(path) ?? 0) + 1;
+        counts.set(path, n);
+        seen.push({ attempt: n, path });
+        const result = script(path, n);
+        if (result instanceof Error) throw result;
+        return result;
+      }) as unknown as typeof fetch,
+    };
+  };
+  const policyWith = (sleeps: number[], deadlineMs = Date.now() + 10 * 60_000) =>
+    githubProofRetryPolicy(
+      () => deadlineMs,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+      () => Date.now(),
+      () => 1,
+    );
+
+  test("a transient 502 among the freeze reads no longer kills the run", async () => {
+    // The live signature of run 33305344368.
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n === 1
+        ? new Response("bad gateway", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps));
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  test("retries stop at the attempt cap and fail closed with evidence", async () => {
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("bad gateway", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow(
+      /GitHub proof read failed after 4 attempt\(s\): HTTP 502 from \/repos\/collinbentley1\/cdbentley\/actions\/permissions \(attempt cap reached\)/,
+    );
+    // Bounded: never more sleeps than the cap allows.
+    expect(sleeps.length).toBeLessThanOrEqual(3);
+  });
+
+  test("a transport failure is retried and eventually succeeds", async () => {
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n < 3
+        ? new Error("socket hang up")
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps));
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(3);
+    expect(sleeps).toHaveLength(2);
+  });
+
+  test("a secondary rate limit is honoured; a plain 403 is terminal", async () => {
+    // 429 with Retry-After sleeps exactly that long.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n === 1
+        ? new Response("slow down", { headers: { "retry-after": "2" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps));
+    expect(sleeps).toEqual([2_000]);
+
+    // The three secondary-limit shapes GitHub actually uses.
+    expect(retryableGithubReadFailure(403, new Headers({ "retry-after": "1" }), "")).toBeTrue();
+    expect(
+      retryableGithubReadFailure(403, new Headers({ "x-ratelimit-remaining": "0" }), ""),
+    ).toBeTrue();
+    expect(
+      retryableGithubReadFailure(403, new Headers(), "You have exceeded a secondary rate limit"),
+    ).toBeTrue();
+
+    // A plain 403 is a wrong token, not a rate limit. Terminal, first time.
+    expect(retryableGithubReadFailure(403, new Headers(), "Forbidden")).toBeFalse();
+    const bare: number[] = [];
+    const { fetcher: f403, counts } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("Forbidden", { status: 403 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, f403, Date.now(), policyWith(bare)),
+    ).rejects.toThrow(/HTTP 403 .*\(not retryable\)/);
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
+    expect(bare).toHaveLength(0);
+  });
+
+  test("401 and 404 are never retried", async () => {
+    for (const status of [401, 404] as const) {
+      expect(retryableGithubReadFailure(status, new Headers(), "")).toBeFalse();
+      const sleeps: number[] = [];
+      const { fetcher, counts } = freezeFetcher((path) =>
+        path === CDBENTLEY_PERMISSIONS
+          ? new Response("", { status })
+          : Response.json(okBody(path))
+      );
+      await expect(
+        proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+      ).rejects.toThrow(new RegExp(`HTTP ${status} .*\\(not retryable\\)`));
+      expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
+      expect(sleeps).toHaveLength(0);
+    }
+  });
+
+  test("cancellation wins: the deadline sentinel is never retried and no sleep outlives it", async () => {
+    // The deadline fetcher's own abort is terminal by exact match. A doomed
+    // run must not be resurrected by a retry.
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher(() =>
+      new Error("API request reached the protected operation deadline.")
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow("API request reached the protected operation deadline.");
+    expect([...counts.values()].every((n) => n === 1)).toBeTrue();
+    expect(sleeps).toHaveLength(0);
+
+    // And a retryable failure with no time left refuses to sleep past the
+    // deadline rather than stealing the runway that follows the proof.
+    const late: number[] = [];
+    const { fetcher: f502 } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, f502, Date.now(), policyWith(late, Date.now() + 5_000)),
+    ).rejects.toThrow(/backoff of \d+ms plus the retried request exceeds the operation deadline less its tail reserve/);
+    expect(late).toHaveLength(0);
+  });
+
+  test("a Retry-After longer than the budget fails closed rather than retrying early", async () => {
+    // Truncating the server's instruction to whatever budget remains retries
+    // while still limited and discards the only signal the server gave us.
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("slow down", { headers: { "retry-after": "300" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow(/Retry-After of 300000ms plus the retried request exceeds the remaining retry budget/);
+    expect(sleeps).toHaveLength(0);
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
+  });
+
+  test("Retry-After accepts delta-seconds and an HTTP-date, and ignores nonsense", () => {
+    const now = Date.parse("2026-08-30T12:00:00.000Z");
+    const at = (value: string) =>
+      retryAfterMs({ headers: { get: () => value } }, now);
+    expect(at("2")).toBe(2_000);
+    expect(at("  7 ")).toBe(7_000);
+    // HTTP-date form is legal and GitHub may use it.
+    expect(at("Sun, 30 Aug 2026 12:00:30 GMT")).toBe(30_000);
+    // A date already past means retry now, not a negative sleep.
+    expect(at("Sun, 30 Aug 2026 11:59:00 GMT")).toBe(0);
+    // Unparseable falls back to our own backoff rather than guessing.
+    expect(at("soon")).toBeUndefined();
+    expect(retryAfterMs(undefined, now)).toBeUndefined();
+  });
+
+  test("cancellation is terminal however it is raised", async () => {
+    // Only the deadline sentinel was terminal before, so an AbortError or a
+    // DOMException fell through to the transport branch and was retried --
+    // overriding a deliberate decision to stop.
+    expect(cancellationError(new Error("API request reached the protected operation deadline."))).toBeTrue();
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    expect(cancellationError(abort)).toBeTrue();
+    const timeout = new Error("timed out");
+    timeout.name = "TimeoutError";
+    expect(cancellationError(timeout)).toBeTrue();
+    expect(cancellationError(new DOMException("stopped", "AbortError"))).toBeTrue();
+    // An ordinary transport failure is still retryable.
+    expect(cancellationError(new Error("socket hang up"))).toBeFalse();
+
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher(() => {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      return error;
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow("aborted");
+    expect([...counts.values()].every((n) => n === 1)).toBeTrue();
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("zero jitter is an immediate retry, not an exhausted budget", async () => {
+    // Full jitter may legally return 0. Reporting that as exhaustion was both
+    // wrong and misleading evidence.
+    const sleeps: number[] = [];
+    const zeroJitter = githubProofRetryPolicy(
+      () => Date.now() + 10 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+      () => Date.now(),
+      () => 0,
+    );
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n === 1
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), zeroJitter);
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(2);
+    // Retried without sleeping at all.
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("slow FAILED attempts exhaust the budget even without sleeping", async () => {
+    // Accounting only for sleep time meant a "60 second budget" could span far
+    // more wall clock: four attempts each burning a request timeout still
+    // showed room. Failed-attempt time is retry-attributable and must count --
+    // unlike successful reads, which the sibling test above protects.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 10 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 0,
+    );
+    const { fetcher, counts } = freezeFetcher((path) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      clock += 40_000; // each failed attempt burns real time
+      return new Response("", { status: 502 });
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(/retry budget exhausted/);
+    // Exhausted on elapsed time before the attempt cap could be reached.
+    expect(counts.get(CDBENTLEY_PERMISSIONS)!).toBeLessThan(4);
+  });
+
+  const captureLog = async (body: () => Promise<void>): Promise<string[]> => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...parts: unknown[]) => {
+      lines.push(parts.map(String).join(" "));
+    };
+    try {
+      await body();
+    } finally {
+      console.log = original;
+    }
+    return lines;
+  };
+
+  test("exhaustion names the LAST outcome, not a stale HTTP status", async () => {
+    // Tracking only an HTTP status left it stale across a later transport
+    // failure: 502 then two socket errors exhausted while reporting "HTTP 502",
+    // naming a cause two attempts old in both the error and the breadcrumb.
+    // That sends an operator to GitHub's status page for a gateway error that
+    // was already over, while the live fault is the network path.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path, n) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      return n === 1 ? new Response("bad gateway", { status: 502 }) : new Error("socket hang up");
+    });
+    let thrown: unknown;
+    const lines = await captureLog(async () => {
+      thrown = await proveConsumerFreeze(
+        freezeToken,
+        300,
+        fetcher,
+        Date.now(),
+        policyWith(sleeps),
+      ).catch((error: unknown) => error);
+    });
+    expect((thrown as Error).message).toBe(
+      "GitHub proof read failed after 4 attempt(s): " +
+        "transport failure (socket hang up) from " +
+        "/repos/collinbentley1/cdbentley/actions/permissions (attempt cap reached).",
+    );
+    // The stale status must not appear anywhere in the final evidence.
+    expect((thrown as Error).message).not.toContain("502");
+    // Each breadcrumb reports the attempt it actually describes.
+    const outcomes = lines
+      .filter((line) => line.includes("GitHub proof retry"))
+      .map((line) => /outcome=(.*) attempt=(\d+)/.exec(line))
+      .map((match) => [match![2], match![1]]);
+    expect(outcomes).toEqual([
+      ["1", "HTTP 502"],
+      ["2", "transport failure (socket hang up)"],
+      ["3", "transport failure (socket hang up)"],
+    ]);
+  });
+
+  test("a hostile transport error cannot flood the evidence", async () => {
+    // Transport error messages are attacker-influenced in the limit (proxy or
+    // gateway text). Evidence has to stay readable and bounded.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Error("x".repeat(50_000))
+        : Response.json(okBody(path))
+    );
+    const thrown = (await proveConsumerFreeze(
+      freezeToken,
+      300,
+      fetcher,
+      Date.now(),
+      policyWith(sleeps),
+    ).catch((error: unknown) => error)) as Error;
+    // Truncation is marked, not silent, and the marker lives INSIDE the bound:
+    // 77 characters plus a 3-character marker is exactly the 80 asked for.
+    expect(thrown.message).toContain("transport failure (" + "x".repeat(77) + "...)");
+    expect(thrown.message.length).toBeLessThan(300);
+  });
+
+  test("a transport failure followed by an HTTP failure reports the HTTP one", async () => {
+    // The converse direction: the outcome must track forward as well as reset,
+    // so a fix that merely blanked the status on transport errors is not enough.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path, n) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      return n === 1 ? new Error("socket hang up") : new Response("", { status: 503 });
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow(
+      /after 4 attempt\(s\): HTTP 503 from \/repos\/collinbentley1\/cdbentley\/actions\/permissions/,
+    );
+  });
+
+  test("two unrelated blips far apart in one proof both still retry", async () => {
+    // The armed-window budget counted SUCCESSFUL reads against it. One proof
+    // walks all four repositories sequentially (~80-120 GETs), so a blip on
+    // cdbentley armed the window, a minute of clean reads drained it, and a
+    // blip on critical-history died on its first attempt with zero retries
+    // granted -- the exact failure this layer exists to prevent, and the
+    // post-apply freeze proof (never-rerun) is the op most exposed.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 30 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const LAST = "/repos/collinbentley1/critical-history/actions/permissions";
+    const { fetcher, counts } = freezeFetcher((path, n) => {
+      // Every read costs real time, as it does live.
+      clock += 4_000;
+      if ((path === CDBENTLEY_PERMISSIONS || path === LAST) && n === 1) {
+        return new Response("bad gateway", { status: 502 });
+      }
+      return Response.json(okBody(path));
+    });
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy);
+    // Both blips were retried; neither was refused for a budget that
+    // successful reads had drained.
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(2);
+    expect(counts.get(LAST)).toBe(2);
+    expect(sleeps).toHaveLength(2);
+  });
+
+  test("one repository's four concurrent reads share the budget and survive", async () => {
+    // The real simultaneous case: proveConsumerFreeze walks repositories
+    // sequentially but issues each repository's four reads together, so four
+    // chains accumulate into one policy. A simultaneous blip must not exhaust
+    // it -- overlapping spend is double-counted, which is conservative, but
+    // must not be so conservative that a blip kills the proof.
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path.startsWith("/repos/collinbentley1/cdbentley") && n === 1
+        ? new Response("bad gateway", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps));
+    // Every cdbentley URL blipped once, retried once, and succeeded -- the run
+    // listings paginate, so this is more concurrent chains than the four reads
+    // alone. The proof completed rather than exhausting a shared budget.
+    const cdbentley = [...counts.entries()].filter(([path]) =>
+      path.startsWith("/repos/collinbentley1/cdbentley")
+    );
+    expect(cdbentley.length).toBeGreaterThanOrEqual(4);
+    expect(sleeps).toHaveLength(cdbentley.length);
+    expect(cdbentley.every(([, n]) => n === 2)).toBeTrue();
+  });
+
+  test("a primary quota limit fails closed naming its reset, not the attempt cap", async () => {
+    // remaining: 0 with an epoch reset is the PRIMARY quota, and it arrives
+    // without Retry-After. Ignoring the reset burned three doomed jittered
+    // retries and reported "attempt cap reached" -- the wrong cause, and three
+    // wasted attempts of phase time.
+    const now = Date.now();
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", {
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Math.floor(now / 1_000) + 900),
+          },
+          status: 403,
+        })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, now, policyWith(sleeps, now + 30 * 60_000)),
+    ).rejects.toThrow(/x-ratelimit-reset in \d+ms plus the retried request exceeds the remaining retry budget of \d+ms/);
+    // Refused immediately, naming the reset. No doomed retries.
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("a six-digit Retry-After is honoured or refused, never silently dropped", () => {
+    const now = Date.parse("2026-08-30T12:00:00.000Z");
+    // A {1,5} bound sent this to Date.parse, which is NaN, so it became a
+    // 1-8s jitter: the server's instruction ignored.
+    expect(retryAfterMs({ headers: { get: () => "999999" } }, now)).toBe(999_999_000);
+  });
+
+  test("the wrapper's own request timeout stays retryable", async () => {
+    // cancellationError is terminal for AbortError/TimeoutError/DOMException.
+    // deadlineFetcher's per-request timeout is a plain Error and must NOT be
+    // caught by it, or every per-request timeout becomes terminal and this
+    // whole layer dies. Pinning the coupling so a future refactor to
+    // AbortSignal.timeout() fails here rather than in production.
+    expect(cancellationError(new Error("Protected API request timed out before exact cleanup.")))
+      .toBeFalse();
+    const sleeps: number[] = [];
+    const { fetcher, counts } = freezeFetcher((path, n) =>
+      path === CDBENTLEY_PERMISSIONS && n === 1
+        ? new Error("Protected API request timed out before exact cleanup.")
+        : Response.json(okBody(path))
+    );
+    await proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps));
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(2);
+  });
+
+  test("granted backoff accumulates, so a second long wait is refused", async () => {
+    // The budget has to remember what it already granted. Two 40s server waits
+    // cannot both fit in 60s; the second must fail closed rather than push the
+    // phase past its envelope.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 30 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { headers: { "retry-after": "40" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(/Retry-After of 40000ms plus the retried request exceeds the remaining retry budget of 20000ms/);
+    // The first wait was granted and charged; the second was refused.
+    expect(sleeps).toEqual([40_000]);
+  });
+
+  test("a wait that exactly fills the budget is refused, not slept to zero", async () => {
+    // Granting a retry costs the backoff AND the attempt after it. Checking
+    // only the backoff let a Retry-After exactly equal to the remaining budget
+    // pass, sleep the budget to zero, then start a request that ran 20s past
+    // it -- so the advertised 60s bound was really 60s plus an overrun.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    const policy = githubProofRetryPolicy(
+      () => clock + 30 * 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { headers: { "retry-after": "60" }, status: 429 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(
+      /Retry-After of 60000ms plus the retried request exceeds the remaining retry budget/,
+    );
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("a hostile transport error cannot forge a log record", async () => {
+    // Truncation alone does not stop a newline from forging a second log line,
+    // or an escape sequence from rewriting the operator's terminal. Evidence
+    // has to stay one record.
+    expect(evidenceText("a\nb", 80)).toBe("a\\u{a}b");
+    expect(evidenceText("\u001b[2Kfake", 80)).toBe("\\u{1b}[2Kfake");
+    // Zl and Zp. JavaScript itself treats these as line terminators and many
+    // log readers break records on them, yet they are neither C0/C1 nor bidi,
+    // so an enumerated range list missed them entirely.
+    expect(evidenceText("a\u2028b", 80)).toBe("a\\u{2028}b");
+    expect(evidenceText("a\u2029b", 80)).toBe("a\\u{2029}b");
+    // Cf, one representative per shape: bidi override, the mark an enumerated
+    // list omitted, a zero-width character, and the byte-order mark.
+    expect(evidenceText("real\u202edekaf", 80)).toBe("real\\u{202e}dekaf");
+    expect(evidenceText("a\u061cb", 80)).toBe("a\\u{61c}b");
+    expect(evidenceText("a\u200bb", 80)).toBe("a\\u{200b}b");
+    expect(evidenceText("a\ufeffb", 80)).toBe("a\\u{feff}b");
+    // Cc, including the C1 range some terminals also act on.
+    expect(evidenceText("a\u009bb", 80)).toBe("a\\u{9b}b");
+    // Cs. A lone surrogate would corrupt any JSON encoding of this evidence.
+    expect(evidenceText("a\ud800b", 80)).toBe("a\\u{d800}b");
+    // Benign text is left exactly as it is, including astral characters.
+    expect(evidenceText("plain \u00a0 text \u{1f600}", 80)).toBe("plain \u00a0 text \u{1f600}");
+    // The bound covers the WHOLE return value, marker included. A token that
+    // fits the payload but leaves no room for the marker is dropped rather
+    // than pushing the result past the limit.
+    expect(evidenceText("\u2028\u2028", 11)).toBe("\\u{2028}...");
+    expect(evidenceText("\u2028\u2028", 10)).toBe("...");
+    expect(evidenceText("\u2028\u2028", 9)).toBe("...");
+    // Limits too small to hold the marker still never exceed themselves.
+    expect(evidenceText("\u2028\u2028", 3)).toBe("...");
+    expect(evidenceText("\u2028\u2028", 2)).toBe("..");
+    expect(evidenceText("\u2028\u2028", 1)).toBe(".");
+    expect(evidenceText("\u2028\u2028", 0)).toBe("");
+    expect(evidenceText("abc", -1)).toBe("");
+    // Exactly at the limit is not truncation, so no marker is spent.
+    expect(evidenceText("abcde", 5)).toBe("abcde");
+    expect(evidenceText("abcdef", 5)).toBe("ab...");
+    const sleeps: number[] = [];
+    // A forged breadcrumb behind each separator an attacker might reach for.
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Error(
+          "boom\u2028Protected bridge GitHub proof retry path=/forged outcome=ok" +
+            "\u2029second forged record\nthird",
+        )
+        : Response.json(okBody(path))
+    );
+    const thrown = (await proveConsumerFreeze(
+      freezeToken,
+      300,
+      fetcher,
+      Date.now(),
+      policyWith(sleeps),
+    ).catch((error: unknown) => error)) as Error;
+    expect(thrown.message).toContain("boom\\u{2028}Protected bridge");
+    // Not one of the three separators survives as a real record boundary.
+    expect(thrown.message).not.toContain("\u2028");
+    expect(thrown.message).not.toContain("\u2029");
+    expect(thrown.message).not.toContain("\n");
+  });
+
+  test("the tail reserve covers the retried request, not just its backoff", async () => {
+    // Starting a retry with only "reserve + backoff" left let the request
+    // itself eat the reserve the receipt publish depends on. The reserve has
+    // to sit behind the retried request, not in front of it.
+    let clock = 1_000_000;
+    const sleeps: number[] = [];
+    // Exactly enough for the backoff plus the reserve, and 10s short of also
+    // covering the request that follows.
+    const deadline = clock + 1_000 + 60_000 + 10_000;
+    const policy = githubProofRetryPolicy(
+      () => deadline,
+      async (ms) => {
+        sleeps.push(ms);
+        clock += ms;
+      },
+      () => clock,
+      () => 1,
+    );
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policy),
+    ).rejects.toThrow(
+      /backoff of 1000ms plus the retried request exceeds the operation deadline less its tail reserve/,
+    );
+    expect(sleeps).toHaveLength(0);
+  });
+
+  test("evidenceText never exceeds its limit, at any limit, for any input", () => {
+    // A property rather than a case: the contract is a hard ceiling on the
+    // whole representation, and it has to hold at every small limit where the
+    // marker competes with the payload for room.
+    const samples = [
+      "",
+      "plain text",
+      "abc",
+      "a\u2028b",
+      "\u2028\u2028\u2028\u2028",
+      "boom\u2028Protected bridge GitHub proof retry path=/forged outcome=ok",
+      "x".repeat(200),
+      "\u{1f600}\u{1f600}\u{1f600}",
+      "a\ud800b",
+      "\u061c\ufeff\u009b\u001b",
+    ];
+    for (const sample of samples) {
+      for (let limit = -2; limit <= 40; limit += 1) {
+        const result = evidenceText(sample, limit);
+        // The hard ceiling.
+        expect(result.length).toBeLessThanOrEqual(Math.max(0, limit));
+        // Token integrity: removing every COMPLETE escape token must leave no
+        // stray backslash, so no half token ever survives a bound.
+        expect(result.replace(/\\u\{[0-9a-f]+\}/g, "")).not.toContain("\\");
+        // And nothing that could forge a record ever survives.
+        expect(result).not.toContain("\u2028");
+        expect(result).not.toContain("\u2029");
+        expect(result).not.toContain("\n");
+      }
+    }
+  });
+
+  test("without a policy the reads behave exactly as they did before", async () => {
+    const { fetcher, counts } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Response("", { status: 502 })
+        : Response.json(okBody(path))
+    );
+    await expect(proveConsumerFreeze(freezeToken, 300, fetcher)).rejects.toThrow(
+      "GitHub freeze proof failed with HTTP 502.",
+    );
+    expect(counts.get(CDBENTLEY_PERMISSIONS)).toBe(1);
   });
 
   test("a convergence timeout names the object and permissions that never matched", async () => {
