@@ -1476,6 +1476,72 @@ export function buildLegacyCombinedReceiptCreateLease(
   };
 }
 
+// What elevation's single project-policy write adds and removes.
+//
+// Extracted so the removal is testable without a live executor: the probes
+// `#waitForPermissionProjection` uses are not injectable, so `elevate` cannot
+// be driven end to end in process, and the wiring between "which binding must
+// go" and "the CAS write that removes it" is exactly where this defect lived.
+//
+// `recordedLeases` is the acquire record's lease list -- the authority on what
+// was actually granted. The consume lease is located there by title and its
+// absence is fatal: rebuilding the binding here could drift from the grant, and
+// a removal that silently matches nothing would leave the executor holding
+// create on the consumed receipt while the mutation projection forbids it,
+// which is the defect this closes.
+export function elevationPolicyRecord(
+  invocation: Invocation,
+  executorServiceAccountEmail: string,
+  leaseExpiresAt: Date,
+  mutationRoleName: string,
+  recordedLeases: readonly IamBinding[],
+): { readonly leases: readonly IamBinding[]; readonly removals: readonly IamBinding[] } {
+  if (invocation.mode !== "apply") {
+    throw new Error("Only an apply elevates its executor.");
+  }
+  const consumeTitle = receiptConsumeLeaseTitle(invocation.githubRunId);
+  const consumeLease = recordedLeases.find(
+    (lease) => lease.condition?.title === consumeTitle,
+  );
+  if (consumeLease === undefined) {
+    throw new Error(
+      "Elevation could not find the recorded consumed-receipt create lease to revoke.",
+    );
+  }
+  return {
+    leases: [
+      ...buildExecutorProjectLeases(
+        invocation.repository,
+        invocation.githubRunId,
+        leaseExpiresAt,
+        executorServiceAccountEmail,
+        mutationRoleName,
+        "mutation",
+      ),
+      buildStorageLease(
+        invocation.repository,
+        invocation.terraformRoot,
+        invocation.githubRunId,
+        leaseExpiresAt,
+        executorServiceAccountEmail,
+        "apply",
+        invocation.approvedPlanRunId,
+      ),
+      ...(invocation.terraformRoot === "bootstrap"
+        ? [
+            buildMarkerMutationLease(
+              invocation.repository,
+              invocation.githubRunId,
+              leaseExpiresAt,
+              executorServiceAccountEmail,
+            ),
+          ]
+        : []),
+    ],
+    removals: [consumeLease],
+  };
+}
+
 export function receiptConsumeLeaseTitle(runId: string): string {
   numeric(runId, "GitHub run ID");
   return `codex-receipt-consume-${runId}`;
@@ -5280,6 +5346,13 @@ function hardenedGitCommand(): readonly string[] {
   ];
 }
 
+// One policy write's intent. Elevation's revocation is part of the same value
+// as its grants so the two cannot drift apart or be separated by an edit.
+export interface PolicyGrant {
+  readonly leases: readonly IamBinding[];
+  readonly removals?: readonly IamBinding[];
+}
+
 export interface PolicyMutationRecord {
   readonly get: () => Promise<IamPolicy>;
   readonly label: string;
@@ -5469,13 +5542,13 @@ export class ExecutorLeaseManager {
       this.#telemetry.phase("executor.policy");
       await this.#recordAndAdd(
         `executor service account ${account.email}`,
-        [
+        { leases: [
           buildTokenCreatorLease(
             invocation.repository,
             invocation.githubRunId,
             leaseExpiresAt,
           ),
-        ],
+        ] },
         () =>
           this.#retryIamConsistency(
             "post-create executor policy read-modify-write read",
@@ -5581,7 +5654,7 @@ export class ExecutorLeaseManager {
       this.#telemetry.phase("executor.project-leases");
       this.#projectMutation = await this.#recordAndAdd(
         `project ${contract.projectId}`,
-        projectLeases,
+        { leases: projectLeases },
         () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
         (policy) =>
           setPolicy(
@@ -5598,7 +5671,7 @@ export class ExecutorLeaseManager {
         const markerProjectId = REPOSITORIES[markerRepository].projectId;
         await this.#recordAndAdd(
           `marker project ${markerProjectId}`,
-          [
+          { leases: [
             buildMarkerReadLease(
               markerRepository,
               invocation.githubRunId,
@@ -5606,7 +5679,7 @@ export class ExecutorLeaseManager {
               contract.projectId,
               account.email,
             ),
-          ],
+          ] },
           () => getPolicy(markerProjectId, invocation.ownerAccessToken, this.#fetcher),
           (policy) =>
             setPolicy(
@@ -5647,10 +5720,10 @@ export class ExecutorLeaseManager {
         if (initialExposureProof.state.state === "absent") {
           controllerCreateMutation = await this.#recordAndAdd(
             `controller exposure create ${contract.projectId}`,
-            [buildExposureControllerCreateLease(
+            { leases: [buildExposureControllerCreateLease(
               invocation.githubRunId,
               leaseExpiresAt,
-            )],
+            )] },
             () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
             (policy) => setPolicy(
               contract.projectId,
@@ -5745,21 +5818,6 @@ export class ExecutorLeaseManager {
       if (inventory.some((role) => roleIdOrUndefined(role.name) === mutationRoleId)) {
         throw new Error("A cryptographically random mutation-role identifier collided; refusing reuse.");
       }
-    // The acquire record is the authority on what was granted. Find the consume
-    // lease there by title and fail closed if it is missing, rather than
-    // rebuilding the binding -- a reconstructed removal target can drift from
-    // the grant, and a removal that silently matches nothing would leave the
-    // executor holding create on the consumed receipt while the projection
-    // forbids it, which is the defect this exists to close.
-    const consumeLeaseTitle = receiptConsumeLeaseTitle(invocation.githubRunId);
-    const consumeLease = (this.#projectMutation?.leases ?? []).find(
-      (lease) => lease.condition?.title === consumeLeaseTitle,
-    );
-    if (consumeLease === undefined) {
-      throw new Error(
-        "Elevation could not find the recorded consumed-receipt create lease to revoke.",
-      );
-    }
     const mutationRole = await createEphemeralRole(
         contract.projectId,
         mutationRoleId,
@@ -5777,46 +5835,24 @@ export class ExecutorLeaseManager {
           this.#roles.push(created);
         },
     );
+    // One write: the mutation grants and the consumed-receipt revocation
+    // together, so the revocation costs no extra CAS generation and no extra
+    // propagation window. consumeApproval has already written the consumed
+    // receipt, so the executor's need for create on it ended before this point.
+    const elevation = elevationPolicyRecord(
+      invocation,
+      this.#account.email,
+      leaseExpiresAt,
+      mutationRole.name,
+      this.#projectMutation?.leases ?? [],
+    );
     await this.#recordAndAdd(
       `mutation project ${contract.projectId}`,
-      [
-        ...buildExecutorProjectLeases(
-          invocation.repository,
-          invocation.githubRunId,
-          leaseExpiresAt,
-          this.#account.email,
-          mutationRole.name,
-          "mutation",
-        ),
-        buildStorageLease(
-          invocation.repository,
-          invocation.terraformRoot,
-          invocation.githubRunId,
-          leaseExpiresAt,
-          this.#account.email,
-          "apply",
-          invocation.approvedPlanRunId,
-        ),
-        ...(invocation.terraformRoot === "bootstrap"
-          ? [
-              buildMarkerMutationLease(
-                invocation.repository,
-                invocation.githubRunId,
-                leaseExpiresAt,
-                this.#account.email,
-              ),
-            ]
-          : []),
-      ],
+      elevation,
       () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
       (policy) => setPolicy(contract.projectId, invocation.ownerAccessToken, policy, this.#fetcher),
       this.#account.email,
       this.#projectMutation?.leases ?? [],
-      // Revoked in the same write that grants mutation authority: one policy
-      // write, one CAS generation, one propagation transition. consumeApproval
-      // has already written the consumed receipt, so the executor's need for
-      // create on it ended before this point.
-      [consumeLease],
     );
     if (invocation.terraformRoot === "prod") {
       for (const [email, lease] of Object.entries(buildRuntimeActAsLeases(
@@ -5827,7 +5863,7 @@ export class ExecutorLeaseManager {
       ))) {
         await this.#recordAndAdd(
           `runtime service account ${email}`,
-          [lease],
+          { leases: [lease] },
           () => getServiceAccountPolicy(email, invocation.ownerAccessToken, this.#fetcher),
           (policy) =>
             setServiceAccountPolicy(email, invocation.ownerAccessToken, policy, this.#fetcher),
@@ -5850,9 +5886,14 @@ export class ExecutorLeaseManager {
     this.#invocation = undefined;
   }
 
+  // The grant arrives as one value. Leases and removals travelling together is
+  // deliberate: elevation's revocation must ride the same write as its grants,
+  // and a signature that took them as separate arguments let the removal be
+  // dropped at the call site while everything still compiled and every test
+  // still passed.
   async #recordAndAdd(
     label: string,
-    leases: readonly IamBinding[],
+    grant: PolicyGrant,
     get: () => Promise<IamPolicy>,
     set: (policy: IamPolicy) => Promise<IamPolicy | undefined>,
     forbiddenMemberEmail?: string,
@@ -5861,8 +5902,8 @@ export class ExecutorLeaseManager {
     // (elevation), it may hold exactly these and nothing else -- the guard is
     // still "no authority nobody granted", which is what it was protecting.
     grantedExecutorLeases?: readonly IamBinding[],
-    removals?: readonly IamBinding[],
   ): Promise<PolicyMutationRecord> {
+    const { leases, removals } = grant;
     const original = await get();
     if (forbiddenMemberEmail !== undefined) {
       if (grantedExecutorLeases === undefined) {
@@ -6283,7 +6324,7 @@ export class ExecutorLeaseManager {
   }
 }
 
-async function addBindingsWithCas(record: PolicyMutationRecord): Promise<void> {
+export async function addBindingsWithCas(record: PolicyMutationRecord): Promise<void> {
   const removals = record.removals ?? [];
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const current = attempt === 0 ? record.original : await record.get();

@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import {
   addExactLease,
   addExactBindings,
+  addBindingsWithCas,
   addLeaseWithCas,
   buildExecutorProjectLeases,
   buildExposureControllerCreateLease,
@@ -15,6 +16,8 @@ import {
   buildReceiptLeases,
   buildLegacyCombinedReceiptCreateLease,
   receiptConsumeLeaseTitle,
+  elevationPolicyRecord,
+  addExactBindings,
   buildReviewManifest,
   buildRuntimeActAsLeases,
   buildStorageLease,
@@ -5396,6 +5399,139 @@ describe("protected owner Terraform bridge", () => {
       () => nowMs,
     );
   };
+
+  test("elevation's single policy write removes exactly the consume binding and adds mutation authority", async () => {
+    // The projection tests above filter the consume lease out by hand, so they
+    // would still pass if elevate never wired `removals` into the CAS write.
+    // This starts from the policy acquire actually leaves behind, drives the
+    // REAL addBindingsWithCas through the record elevate builds, and inspects
+    // the transition Google would receive.
+    const leaseExpiresAt = new Date("2026-08-30T12:00:00.000Z");
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: "a".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+      EXECUTION_MODE: "apply",
+    });
+    const acquireLeases = [
+      ...buildStorageAcquisitionLeases(
+        "cdbentley", "bootstrap", "apply", "123456", leaseExpiresAt, executorEmail,
+      ),
+      ...buildReceiptLeases(
+        "cdbentley", "bootstrap", "123456", leaseExpiresAt,
+        "apply", "123455", executorEmail, "",
+      ),
+    ];
+    const consumeTitle = receiptConsumeLeaseTitle("123456");
+    const consumeLease = acquireLeases.find((l) => l.condition?.title === consumeTitle)!;
+    expect(consumeLease).toBeDefined();
+
+    // The policy as acquire leaves it: contains the exact consume binding.
+    const acquirePolicy: IamPolicy = addExactBindings(
+      { bindings: [], etag: "acquire-etag-1", version: 3 },
+      acquireLeases,
+    );
+    expect(
+      acquirePolicy.bindings.some((b) => b.condition?.title === consumeTitle),
+    ).toBeTrue();
+
+    const elevation = elevationPolicyRecord(
+      invocation, executorEmail, leaseExpiresAt, "projects/cdbentley/roles/pbt_m_x", acquireLeases,
+    );
+
+    const writes: IamPolicy[] = [];
+    let generation = 1;
+    await addBindingsWithCas({
+      get: async () => acquirePolicy,
+      label: "mutation project cdbentley",
+      leases: elevation.leases,
+      original: acquirePolicy,
+      removals: elevation.removals,
+      set: async (policy) => {
+        expect(policy.etag).toBe(acquirePolicy.etag);
+        writes.push(policy);
+        generation += 1;
+        return { ...policy, etag: `acquire-etag-${generation}` };
+      },
+    });
+
+    // Exactly one etag-advancing write.
+    expect(writes).toHaveLength(1);
+    const written = writes[0]!;
+
+    // The consume binding is gone from that same write.
+    expect(written.bindings.some((b) => b.condition?.title === consumeTitle)).toBeFalse();
+
+    // ONLY it. Every other acquire binding survives, including the result
+    // creator, which is still needed to publish the post-apply receipt.
+    for (const lease of acquireLeases) {
+      if (lease.condition?.title === consumeTitle) continue;
+      expect(
+        written.bindings.some((b) => b.condition?.title === lease.condition?.title),
+      ).toBeTrue();
+    }
+    expect(
+      written.bindings.some((b) => b.condition?.title === "codex-receipt-create-123456"),
+    ).toBeTrue();
+
+    // And mutation authority arrived in the same write.
+    for (const lease of elevation.leases) {
+      expect(
+        written.bindings.some((b) => b.condition?.title === lease.condition?.title),
+      ).toBeTrue();
+    }
+
+    // Cleanup leaves no residue: removing both records' leases from the
+    // post-elevation policy leaves no executor binding at all.
+    const afterCleanup = removeExactBindings(
+      removeExactBindings(written, elevation.leases, acquirePolicy),
+      acquireLeases,
+      acquirePolicy,
+    );
+    expect(() =>
+      requireNoExecutorProjectBindings(afterCleanup, executorEmail)
+    ).not.toThrow();
+  });
+
+  test("elevation refuses to proceed when the acquire record has no consume lease", () => {
+    // A removal that silently matches nothing is the defect, not a fix.
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: "a".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
+      EXECUTION_MODE: "apply",
+    });
+    expect(() =>
+      elevationPolicyRecord(
+        invocation, executorEmail, new Date("2026-08-30T12:00:00.000Z"),
+        "projects/cdbentley/roles/pbt_m_x", [],
+      )
+    ).toThrow("could not find the recorded consumed-receipt create lease");
+  });
+
+  test("a policy write that retains a removed binding is refused", async () => {
+    // Google's returned policy is the committed policy, so a removal that
+    // survives it was not applied.
+    const leaseExpiresAt = new Date("2026-08-30T12:00:00.000Z");
+    const consume = buildReceiptLeases(
+      "cdbentley", "bootstrap", "123456", leaseExpiresAt,
+      "apply", "123455", executorEmail, "",
+    ).find((l) => l.condition?.title === receiptConsumeLeaseTitle("123456"))!;
+    const original: IamPolicy = addExactBindings(
+      { bindings: [], etag: "e1", version: 3 }, [consume],
+    );
+    await expect(addBindingsWithCas({
+      get: async () => original,
+      label: "mutation project cdbentley",
+      leases: [],
+      original,
+      removals: [consume],
+      // A server that echoes the removed binding back.
+      set: async () => original,
+    })).rejects.toThrow("retained the mutation project cdbentley lease that this write removes");
+  });
 
   test("the acquire grant satisfies the read projection, derived from the leases themselves", async () => {
     // Establishes the harness is faithful rather than permissive: acquire must
