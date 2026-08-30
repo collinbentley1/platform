@@ -12153,7 +12153,12 @@ async function githubJson(
   }
   const path = new URL(url).pathname;
   let attempts = 0;
-  let lastStatus = 0;
+  // The OUTCOME of the most recent attempt, not a status that survives it.
+  // Tracking only an HTTP status left it stale whenever a later attempt failed
+  // in transport, so a 502 followed by two socket errors exhausted while
+  // reporting "HTTP 502" -- naming a cause that was two attempts old, in both
+  // the final error and the retry breadcrumb.
+  let lastOutcome = "no attempt completed";
   for (;;) {
     attempts += 1;
     let response: Response | undefined;
@@ -12172,12 +12177,15 @@ async function githubJson(
       // own wrapper is retryable, but the deadline checks below still gate it.
       if (cancellationError(error)) throw error;
       transportError = error;
+      lastOutcome = `transport failure (${
+        error instanceof Error ? error.message.slice(0, 80) : "unknown"
+      })`;
     }
     if (response !== undefined && response.ok) return boundedJson(response, 4 * 1024 * 1024);
 
     let retryable = transportError !== undefined;
     if (response !== undefined) {
-      lastStatus = response.status;
+      lastOutcome = `HTTP ${response.status}`;
       let body = "";
       try {
         // deadlineFetcher has already buffered the body, so this reads from
@@ -12193,7 +12201,7 @@ async function githubJson(
     const describe = (reason: string) =>
       new Error(
         `GitHub proof read failed after ${attempts} attempt(s): ` +
-          `${lastStatus === 0 ? "transport failure" : `HTTP ${lastStatus}`} from ${path} (${reason}).`,
+          `${lastOutcome} from ${path} (${reason}).`,
       );
 
     if (retry === undefined || !retryable) {
@@ -12237,7 +12245,7 @@ async function githubJson(
       throw describe(`${source} exceeds the operation deadline less its tail reserve`);
     }
     console.log(
-      `Protected bridge GitHub proof retry path=${path} status=${lastStatus} ` +
+      `Protected bridge GitHub proof retry path=${path} outcome=${lastOutcome} ` +
         `attempt=${attempts} sleep_ms=${requested}`,
     );
     if (requested > 0) await retry.sleep(requested);

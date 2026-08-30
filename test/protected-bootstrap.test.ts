@@ -5887,6 +5887,95 @@ describe("protected owner Terraform bridge", () => {
     expect(counts.get(CDBENTLEY_PERMISSIONS)!).toBeLessThan(4);
   });
 
+  const captureLog = async (body: () => Promise<void>): Promise<string[]> => {
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (...parts: unknown[]) => {
+      lines.push(parts.map(String).join(" "));
+    };
+    try {
+      await body();
+    } finally {
+      console.log = original;
+    }
+    return lines;
+  };
+
+  test("exhaustion names the LAST outcome, not a stale HTTP status", async () => {
+    // Tracking only an HTTP status left it stale across a later transport
+    // failure: 502 then two socket errors exhausted while reporting "HTTP 502",
+    // naming a cause two attempts old in both the error and the breadcrumb.
+    // That sends an operator to GitHub's status page for a gateway error that
+    // was already over, while the live fault is the network path.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path, n) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      return n === 1 ? new Response("bad gateway", { status: 502 }) : new Error("socket hang up");
+    });
+    let thrown: unknown;
+    const lines = await captureLog(async () => {
+      thrown = await proveConsumerFreeze(
+        freezeToken,
+        300,
+        fetcher,
+        Date.now(),
+        policyWith(sleeps),
+      ).catch((error: unknown) => error);
+    });
+    expect((thrown as Error).message).toBe(
+      "GitHub proof read failed after 4 attempt(s): " +
+        "transport failure (socket hang up) from " +
+        "/repos/collinbentley1/cdbentley/actions/permissions (attempt cap reached).",
+    );
+    // The stale status must not appear anywhere in the final evidence.
+    expect((thrown as Error).message).not.toContain("502");
+    // Each breadcrumb reports the attempt it actually describes.
+    const outcomes = lines
+      .filter((line) => line.includes("GitHub proof retry"))
+      .map((line) => /outcome=(.*) attempt=(\d+)/.exec(line))
+      .map((match) => [match![2], match![1]]);
+    expect(outcomes).toEqual([
+      ["1", "HTTP 502"],
+      ["2", "transport failure (socket hang up)"],
+      ["3", "transport failure (socket hang up)"],
+    ]);
+  });
+
+  test("a hostile transport error cannot flood the evidence", async () => {
+    // Transport error messages are attacker-influenced in the limit (proxy or
+    // gateway text). Evidence has to stay readable and bounded.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path) =>
+      path === CDBENTLEY_PERMISSIONS
+        ? new Error("x".repeat(50_000))
+        : Response.json(okBody(path))
+    );
+    const thrown = (await proveConsumerFreeze(
+      freezeToken,
+      300,
+      fetcher,
+      Date.now(),
+      policyWith(sleeps),
+    ).catch((error: unknown) => error)) as Error;
+    expect(thrown.message).toContain("transport failure (" + "x".repeat(80) + ")");
+    expect(thrown.message.length).toBeLessThan(300);
+  });
+
+  test("a transport failure followed by an HTTP failure reports the HTTP one", async () => {
+    // The converse direction: the outcome must track forward as well as reset,
+    // so a fix that merely blanked the status on transport errors is not enough.
+    const sleeps: number[] = [];
+    const { fetcher } = freezeFetcher((path, n) => {
+      if (path !== CDBENTLEY_PERMISSIONS) return Response.json(okBody(path));
+      return n === 1 ? new Error("socket hang up") : new Response("", { status: 503 });
+    });
+    await expect(
+      proveConsumerFreeze(freezeToken, 300, fetcher, Date.now(), policyWith(sleeps)),
+    ).rejects.toThrow(
+      /after 4 attempt\(s\): HTTP 503 from \/repos\/collinbentley1\/cdbentley\/actions\/permissions/,
+    );
+  });
+
   test("without a policy the reads behave exactly as they did before", async () => {
     const { fetcher, counts } = freezeFetcher((path) =>
       path === CDBENTLEY_PERMISSIONS
