@@ -9580,6 +9580,20 @@ export interface StoragePermissionRpcOptions {
 const STORAGE_RPC_PERMISSION_DENIED = 7;
 const STORAGE_RPC_UNAUTHENTICATED = 16;
 
+// Canonical gRPC statuses that describe the SERVICE failing, not the caller's
+// permissions. Unlike 7 and 16 these are not answers to the probe at all, and
+// this RPC is a read-only permission test, so re-asking is idempotent.
+// UNAVAILABLE is a transient backend outage; DEADLINE_EXCEEDED is the server
+// giving up rather than a verdict on the credential.
+//
+// Deliberately excludes INTERNAL and RESOURCE_EXHAUSTED: the first can mean a
+// genuine server defect worth surfacing, and the second is rate limiting that
+// wants backoff this loop does not implement.
+const STORAGE_RPC_TRANSIENT_SERVICE_STATUSES: ReadonlySet<number> = new Set([
+  4, // DEADLINE_EXCEEDED
+  14, // UNAVAILABLE
+]);
+
 export class StoragePermissionGrpcStatusError extends Error {
   constructor(readonly status: number) {
     super(`Storage object permission RPC failed with gRPC status ${status}.`);
@@ -9876,17 +9890,31 @@ export async function storageV2TestIamPermissions(
   });
 }
 
-// Retryable ONLY for this RPC's two self-declared transient faults. A gRPC
-// status error is an ANSWER, not a fault: PERMISSION_DENIED is the ordinary
-// shape of an IAM grant that has not propagated yet and is already handled by
-// the caller's convergence loop, so retrying it here would both be wrong and
-// double-retry the same condition. Anything else -- a malformed response, a
-// framing error, a validation failure -- is terminal on the first occurrence.
+// Retryable ONLY for this RPC's own transient faults, in two families.
+//
+// TRANSPORT: the timeout, a session error, and a stream abort. All three mean
+// the request did not get an answer. "headers failed" and "trailers failed"
+// are deliberately absent -- those come from header VALIDATION throwing, which
+// is a protocol violation, not a transient fault -- as are every parse, size,
+// and syntax failure.
+//
+// SERVICE: the canonical statuses that describe the service failing rather
+// than answering. PERMISSION_DENIED and UNAUTHENTICATED are NOT here: they are
+// genuine answers, converted to `denied` by the caller and re-probed by the
+// convergence loop, so retrying them here would double-retry the same wait and
+// could disguise a real denial as a fault.
+const STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES: ReadonlySet<string> = new Set([
+  "Storage permission RPC timed out.",
+  "Storage permission RPC transport failed.",
+  "Storage permission RPC transport was aborted.",
+]);
+
 export function retryableStoragePermissionRpcError(error: unknown): boolean {
-  if (error instanceof StoragePermissionGrpcStatusError) return false;
+  if (error instanceof StoragePermissionGrpcStatusError) {
+    return STORAGE_RPC_TRANSIENT_SERVICE_STATUSES.has(error.status);
+  }
   if (!(error instanceof Error)) return false;
-  return error.message === "Storage permission RPC timed out." ||
-    error.message === "Storage permission RPC transport failed.";
+  return STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES.has(error.message);
 }
 
 export async function probeStorageObjectPermissions(

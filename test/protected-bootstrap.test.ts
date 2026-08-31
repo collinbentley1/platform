@@ -806,22 +806,100 @@ describe("protected owner Terraform bridge", () => {
   });
 
   test("only this RPC's own transient faults are retryable", () => {
-    // A gRPC status is an ANSWER, not a fault. PERMISSION_DENIED in particular
-    // is a lease still propagating, already handled by the convergence loop --
-    // retrying it here would be wrong and would double-retry the same wait.
-    expect(retryableStoragePermissionRpcError(
-      new Error("Storage permission RPC timed out."))).toBeTrue();
-    expect(retryableStoragePermissionRpcError(
-      new Error("Storage permission RPC transport failed."))).toBeTrue();
-    for (const status of [7, 16, 5, 3, 13]) {
+    // TRANSPORT: the request never got an answer. Review of PR 56 caught that
+    // the stream-abort path was missing, which left a concrete transport error
+    // terminal on first occurrence and defeated the point of the fix.
+    for (const message of [
+      "Storage permission RPC timed out.",
+      "Storage permission RPC transport failed.",
+      "Storage permission RPC transport was aborted.",
+    ]) {
+      expect(retryableStoragePermissionRpcError(new Error(message))).toBeTrue();
+    }
+
+    // SERVICE: statuses describing the service failing rather than answering.
+    // This RPC is a read-only permission test, so re-asking is idempotent.
+    for (const status of [4, 14]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionGrpcStatusError(status))).toBeTrue();
+    }
+
+    // ANSWERS, never retried here: the caller converts these to `denied` and
+    // the convergence loop re-probes. Retrying would double-retry the same
+    // wait and could disguise a real denial as a transient fault.
+    for (const status of [7, 16]) {
       expect(retryableStoragePermissionRpcError(
         new StoragePermissionGrpcStatusError(status))).toBeFalse();
     }
-    // Anything else is terminal on the first occurrence.
-    expect(retryableStoragePermissionRpcError(
-      new Error("Storage permission RPC returned a malformed frame."))).toBeFalse();
+
+    // Every other status is terminal, including ones that look transient.
+    for (const status of [0, 3, 5, 8, 13]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionGrpcStatusError(status))).toBeFalse();
+    }
+
+    // Header and trailer validation failures are protocol violations, not
+    // transient faults, and must stay terminal even though they read as
+    // transport-shaped.
+    for (const message of [
+      "Storage permission RPC headers failed.",
+      "Storage permission RPC trailers failed.",
+      "Storage permission RPC parse failed.",
+      "Storage permission RPC returned an unrequested permission.",
+      "Storage permission RPC response exceeded its bounded size.",
+    ]) {
+      expect(retryableStoragePermissionRpcError(new Error(message))).toBeFalse();
+    }
     expect(retryableStoragePermissionRpcError(new Error("some other failure"))).toBeFalse();
     expect(retryableStoragePermissionRpcError("not an error")).toBeFalse();
+  });
+
+  test("a transient UNAVAILABLE is retried; a denial is still an answer", async () => {
+    // A gRPC 14 is the backend failing, not a verdict on the credential, and
+    // it reached probeStorageObjectPermissions as a throw that the convergence
+    // loop above could not absorb.
+    let attempts = 0;
+    let status = "14";
+    const server = createHttp2Server();
+    server.on("stream", (stream) => {
+      attempts += 1;
+      if (attempts >= 2) status = "0";
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+        "grpc-status": status,
+      });
+      stream.end(status === "0" ? Buffer.from([0, 0, 0, 0, 0]) : undefined);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    const request = {
+      bucketResource: "projects/_/buckets/example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      permissions: ["storage.objects.get"],
+      resource: "projects/_/buckets/example-bucket/objects/exact/object",
+    } as const;
+    try {
+      const result = await probeStorageObjectPermissions(request, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        timeoutMs: 1_000,
+      });
+      expect(result.denied).toBeFalse();
+      expect(attempts).toBe(2);
+
+      // A denial is an answer: returned immediately, never retried.
+      attempts = 0;
+      status = "7";
+      const denied = await probeStorageObjectPermissions(request, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        timeoutMs: 1_000,
+      });
+      expect(denied).toEqual({ denied: true, permissions: [], status: 7 });
+      expect(attempts).toBe(1);
+    } finally {
+      server.close();
+    }
   });
 
   test("no deny-policy authority survives anywhere in the bridge", async () => {
