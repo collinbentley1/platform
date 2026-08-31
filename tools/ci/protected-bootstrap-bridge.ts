@@ -567,6 +567,25 @@ const BOOTSTRAP_RESOURCE_TYPES = new Set([
 const PROVIDER_VOLATILE_ATTRIBUTES: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["google_artifact_registry_repository_iam_member", new Set(["etag"])],
   ["google_cloud_run_v2_service_iam_member", new Set(["etag"])],
+  // Firestore reports a point-in-time-recovery window that slides with wall
+  // clock: earliest_version_time is (now - version_retention_period), and the
+  // etag moves with it. Two reads 90 seconds apart on an unchanged database
+  // returned different values for exactly these two fields and identical
+  // values for the other sixteen, so a plan and the apply that follows it can
+  // never agree on a drift hash for this resource.
+  //
+  // That is what refused healthmcp prod apply 33341667742: the recomputed
+  // manifest differed from the approved one at exactly
+  // plan.drift[3].afterSha256 for module.site.google_firestore_database
+  // .firestore[0], with an identical beforeSha256 and every other field --
+  // 15 changes, 4 drift entries, checks, relevant attributes, all four marker
+  // generations -- byte-identical.
+  //
+  // Excluding these two hides nothing configurable. version_retention_period
+  // and point_in_time_recovery_enablement stay in the digest, so a real change
+  // to the recovery configuration is still caught; only the derived sliding
+  // timestamp and its concurrency token are dropped.
+  ["google_firestore_database", new Set(["earliest_version_time", "etag"])],
   ["google_project_iam_binding", new Set(["etag"])],
   ["google_project_iam_member", new Set(["etag"])],
   ["google_secret_manager_secret_iam_member", new Set(["etag"])],
@@ -7357,7 +7376,7 @@ async function observeDeterministicExecutorIdentityByEmail(
   };
 }
 
-async function disableOrphanExecutor(
+export async function disableOrphanExecutor(
   account: ServiceAccountIdentity,
   ownerToken: string,
   fetcher: Fetcher,
@@ -7365,6 +7384,15 @@ async function disableOrphanExecutor(
   cleanupDeadlineMs: number,
 ): Promise<ServiceAccount> {
   try {
+    // Containment. In-job recovery for healthmcp prod apply 33341667742 died
+    // here on a single non-retryable HTTP 403 while trying to disable the
+    // executor; the fresh-runner recovery job then did the same work moments
+    // later and succeeded, which is what a propagation delay looks like rather
+    // than a real denial. Giving up instantly is the dangerous direction on
+    // this path: the whole purpose is to disable an executor that may still be
+    // live, and only the backstop job prevented that from mattering. Retrying
+    // a 403 here still fails closed, just at the consistency deadline and with
+    // an aggregate error naming every attempt.
     return await setExecutorDisabled(
       account,
       true,
@@ -7372,6 +7400,7 @@ async function disableOrphanExecutor(
       fetcher,
       sleep,
       cleanupDeadlineMs,
+      true,
     );
   } catch (error) {
     throw new AggregateError(
@@ -9068,6 +9097,12 @@ async function setExecutorDisabled(
   fetcher: Fetcher,
   sleep: (milliseconds: number) => Promise<void>,
   deadlineMs: number,
+  // Opt-in, and only for containment. IAM permission changes are eventually
+  // consistent, so a 403 here can mean "the grant has not propagated yet"
+  // rather than "you may not do this" -- the same reason retryForbidden
+  // already exists on the elevated-session retry above. It is off by default
+  // because on an ordinary path a 403 should surface immediately.
+  retryForbidden = false,
 ): Promise<ServiceAccount> {
   const action = disabled ? "disable" : "enable";
   const consistencyDeadlineMs = Math.min(
@@ -9128,7 +9163,9 @@ async function setExecutorDisabled(
         `Executor ${action} readback remained eventually consistent with the prior state.`,
       );
     } catch (error) {
-      if (!retryableIamConsistencyError(error)) throw error;
+      const contextualPropagationDenial = retryForbidden && error instanceof Error &&
+        /HTTP 403\b/.test(error.message);
+      if (!contextualPropagationDenial && !retryableIamConsistencyError(error)) throw error;
       lastRetryableError = error;
     }
     const remainingMs = consistencyDeadlineMs - Date.now();
