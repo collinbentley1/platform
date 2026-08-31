@@ -9473,19 +9473,24 @@ export async function googleReadWithRetry(
   }
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((milliseconds: number) => Bun.sleep(milliseconds));
+  // An explicit deadline wins; otherwise inherit the one the fetcher was built
+  // with. Without this the backoff sleeps are bounded only by the attempt cap,
+  // so a transient arriving just before an acquisition, recovery, or cleanup
+  // deadline could sleep past it and then ask again.
+  const deadlineMs = options.deadlineMs ?? fetcherDeadlineMs(fetcher);
   let lastTransient: Response | undefined;
   for (let attempt = 0; attempt < GOOGLE_READ_RETRY_ATTEMPTS; attempt += 1) {
     // Never start an attempt the deadline cannot hold. The deadline fetcher
     // enforces this too; checking here avoids burning a backoff sleep first.
-    if (options.deadlineMs !== undefined && options.deadlineMs - now() <= 0) break;
+    if (deadlineMs !== undefined && deadlineMs - now() <= 0) break;
     const response = await fetcher(url, init);
     if (!retryableGoogleReadStatus(response.status)) return response;
     lastTransient = response;
     if (attempt + 1 >= GOOGLE_READ_RETRY_ATTEMPTS) break;
     // Clamped to the deadline so the sleep itself can never overrun the window.
     let delayMs = iamRetryDelayMs(attempt);
-    if (options.deadlineMs !== undefined) {
-      delayMs = Math.min(delayMs, options.deadlineMs - now());
+    if (deadlineMs !== undefined) {
+      delayMs = Math.min(delayMs, deadlineMs - now());
     }
     if (delayMs <= 0) break;
     await sleep(delayMs);
@@ -12831,13 +12836,34 @@ export async function requireFreshGoogleOwnerAccessToken(
   }
 }
 
+// Retry loops layered above a deadline-bounded fetcher need the same deadline,
+// or their backoff sleeps run past it. Threading it through every caller would
+// work until someone adds a caller and forgets; publishing it on the fetcher
+// makes the bound structural, so a new call site inherits it by construction.
+export const PROTECTED_FETCHER_DEADLINE = Symbol.for("protected.fetcherDeadlineMs");
+
+export type DeadlineBoundFetcher = Fetcher & {
+  readonly [PROTECTED_FETCHER_DEADLINE]?: () => number;
+};
+
+// Reads the deadline a fetcher was built with, if it has one. A bare fetcher
+// (tests, or any path that never wrapped) simply has none, and callers fall
+// back to their attempt cap.
+export function fetcherDeadlineMs(fetcher: Fetcher): number | undefined {
+  const accessor = (fetcher as DeadlineBoundFetcher)[PROTECTED_FETCHER_DEADLINE];
+  return accessor === undefined ? undefined : accessor();
+}
+
 export function deadlineFetcher(
   fetcher: Fetcher,
   deadline: () => number,
   maximumRequestMs = PROTECTED_MAX_REQUEST_MS,
   now: () => number = Date.now,
 ): Fetcher {
-  return async (input, init = {}) => {
+  const bound: DeadlineBoundFetcher = Object.assign(async (
+    input: Parameters<Fetcher>[0],
+    init: Parameters<Fetcher>[1] = {},
+  ) => {
     const remainingMs = Math.min(maximumRequestMs, deadline() - now());
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
       throw new Error("API request reached the protected operation deadline.");
@@ -12865,7 +12891,8 @@ export function deadlineFetcher(
       if (timer !== undefined) clearTimeout(timer);
       upstream?.removeEventListener("abort", abortFromUpstream);
     }
-  };
+  }, { [PROTECTED_FETCHER_DEADLINE]: deadline });
+  return bound;
 }
 
 async function bufferApiResponse(

@@ -63,6 +63,7 @@ import {
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
   retryableGoogleReadStatus,
+  fetcherDeadlineMs,
   googleReadWithRetry,
   retryableStoragePermissionRpcError,
   StoragePermissionGrpcStatusError,
@@ -9593,6 +9594,54 @@ describe("protected owner Terraform bridge", () => {
     await expect(googleReadWithRetry("not a url:getIamPolicy", { method: "POST" }, async () => {
       throw new Error("must not reach the network");
     })).rejects.toThrow("refuses a URL it cannot parse");
+  });
+
+  test("a deadline-bound fetcher lends its deadline to the read retry", async () => {
+    // The gap Codex flagged: production call sites pass no retry options, so
+    // without inheritance the backoff is bounded only by the attempt cap and can
+    // sleep past an acquisition, recovery, or cleanup deadline before asking
+    // again. Inheriting from the fetcher makes the bound structural -- a call
+    // site added later cannot forget to thread it.
+    let clock = 0;
+    const deadline = 5;
+    let attempts = 0;
+    const slept: number[] = [];
+    const bound = deadlineFetcher(
+      async () => { attempts += 1; return new Response("", { status: 429 }); },
+      () => deadline,
+      10_000,
+      () => clock,
+    );
+    expect(fetcherDeadlineMs(bound)).toBe(deadline);
+    const response = await googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      bound,
+      { now: () => clock, sleep: async (ms: number) => { slept.push(ms); clock = deadline; } },
+    );
+    expect(response.status).toBe(429);
+    // One attempt, one clamped sleep, then the inherited deadline stops it --
+    // rather than three full backoffs running past the window.
+    expect(attempts).toBe(1);
+    expect(slept).toEqual([deadline]);
+  });
+
+  test("a bare fetcher lends no deadline and an explicit one still wins", async () => {
+    const bare = async () => new Response("", { status: 503 });
+    expect(fetcherDeadlineMs(bare)).toBeUndefined();
+
+    // Explicit option overrides whatever the fetcher carries.
+    const bound = deadlineFetcher(bare, () => 900_000, 10_000, () => 0);
+    expect(fetcherDeadlineMs(bound)).toBe(900_000);
+    let attempts = 0;
+    await expect(googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      Object.assign(async () => { attempts += 1; return new Response("", { status: 503 }); },
+        { [Symbol.for("protected.fetcherDeadlineMs")]: () => 900_000 }),
+      { now: () => 1_000, deadlineMs: 1_000, sleep: async () => { throw new Error("must not sleep"); } },
+    )).rejects.toThrow("reached the protected operation deadline before any attempt");
+    expect(attempts).toBe(0);
   });
 
   test("the retry never sleeps or re-asks past the operation deadline", async () => {
