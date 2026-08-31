@@ -9567,11 +9567,12 @@ export interface StateStoragePermissionProbes {
 export interface StoragePermissionRpcOptions {
   readonly connect?: (authority: string) => ClientHttp2Session;
   readonly timeoutMs?: number;
-  // Deadline-aware retry for this RPC's own transient faults. Both are
-  // optional: without them the probe behaves exactly as it did before, one
-  // attempt and out.
+  // Deadline-aware retry for this RPC's own transient faults. All optional:
+  // without them the probe behaves exactly as it did before, one attempt and
+  // out.
   readonly deadlineMs?: number;
   readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
 // gRPC canonical codes the storage permission RPC can answer a probe with.
@@ -9922,6 +9923,7 @@ export async function probeStorageObjectPermissions(
   options: StoragePermissionRpcOptions = {},
 ): Promise<StorageObjectPermissionProbeResult> {
   const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((milliseconds: number) => Bun.sleep(milliseconds));
   const configuredTimeoutMs = options.timeoutMs ?? STORAGE_PERMISSION_RPC_TIMEOUT_MS;
   let lastTransientError: unknown;
   for (let attempt = 0; attempt < STORAGE_PERMISSION_RPC_ATTEMPTS; attempt += 1) {
@@ -9945,6 +9947,27 @@ export async function probeStorageObjectPermissions(
       }
       if (!retryableStoragePermissionRpcError(error)) throw error;
       lastTransientError = error;
+    }
+
+    // Back off before re-asking. Without this the three attempts fire
+    // back-to-back, so a short UNAVAILABLE or transport outage burns the whole
+    // retry budget in roughly three RPC timeouts while most of the convergence
+    // deadline is still unspent -- and hammers a service that is already
+    // failing. iamRetryDelayMs is the same exponential-with-jitter the IAM
+    // retries use; at a three-attempt cap it yields roughly 1-2s then 2-3s and
+    // never approaches its own 32s ceiling.
+    //
+    // Clamped to the deadline, so the sleep itself can never overrun the
+    // window. If there is no room left to wait, stop and fail closed rather
+    // than sleeping past it; the top of the loop separately refuses an attempt
+    // the deadline cannot hold.
+    if (attempt + 1 < STORAGE_PERMISSION_RPC_ATTEMPTS) {
+      let delayMs = iamRetryDelayMs(attempt);
+      if (options.deadlineMs !== undefined) {
+        delayMs = Math.min(delayMs, options.deadlineMs - now());
+      }
+      if (delayMs <= 0) break;
+      await sleep(delayMs);
     }
   }
   // Fail closed. Exhaustion rethrows the fault that caused it, so the run

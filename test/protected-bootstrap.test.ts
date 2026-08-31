@@ -740,6 +740,7 @@ describe("protected owner Terraform bridge", () => {
         resource: "projects/_/buckets/example-bucket/objects/exact/object",
       }, {
         connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        sleep: async () => {},
         timeoutMs: 250,
       });
       expect(result.denied).toBeFalse();
@@ -768,6 +769,7 @@ describe("protected owner Terraform bridge", () => {
         resource: "projects/_/buckets/example-bucket/objects/exact/object",
       }, {
         connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        sleep: async () => {},
         timeoutMs: 200,
       })).rejects.toThrow("Storage permission RPC timed out.");
       expect(attempts).toBe(3);
@@ -800,6 +802,69 @@ describe("protected owner Terraform bridge", () => {
         timeoutMs: 200,
       })).rejects.toThrow("no attempt budget");
       expect(attempts).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("retries back off, and the backoff can never overrun the deadline", async () => {
+    // Without backoff the three attempts fire back-to-back, so a short outage
+    // burns the whole budget in roughly three RPC timeouts while most of the
+    // convergence deadline is still unspent -- and amplifies load on a service
+    // that is already failing.
+    const slept: number[] = [];
+    let attempts = 0;
+    const server = createHttp2Server();
+    server.on("stream", () => {
+      attempts += 1; // never respond: every attempt times out
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    const request = {
+      bucketResource: "projects/_/buckets/example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      permissions: ["storage.objects.get"],
+      resource: "projects/_/buckets/example-bucket/objects/exact/object",
+    } as const;
+    try {
+      await expect(probeStorageObjectPermissions(request, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        sleep: async (ms) => {
+          slept.push(ms);
+        },
+        timeoutMs: 100,
+      })).rejects.toThrow("Storage permission RPC timed out.");
+      // One backoff between each pair of attempts, never after the last.
+      expect(attempts).toBe(3);
+      expect(slept).toHaveLength(2);
+      // Exponential with jitter, and bounded well below its own 32s ceiling.
+      expect(slept[0]).toBeGreaterThanOrEqual(1_000);
+      expect(slept[1]).toBeGreaterThan(slept[0]!);
+      for (const ms of slept) expect(ms).toBeLessThanOrEqual(4_000);
+
+      // Now with a deadline that leaves less room than the backoff wants: the
+      // sleep is clamped and never overruns, and the probe still fails closed.
+      slept.length = 0;
+      attempts = 0;
+      let clock = 1_000_000;
+      await expect(probeStorageObjectPermissions(request, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        deadlineMs: clock + 1_300,
+        now: () => clock,
+        sleep: async (ms) => {
+          slept.push(ms);
+          clock += ms;
+        },
+        timeoutMs: 100,
+      })).rejects.toThrow("Storage permission RPC timed out.");
+      // Every sleep fitted inside what remained of the deadline.
+      let remaining = 1_300;
+      for (const ms of slept) {
+        expect(ms).toBeLessThanOrEqual(remaining);
+        remaining -= ms;
+      }
+      expect(remaining).toBeGreaterThanOrEqual(0);
     } finally {
       server.close();
     }
