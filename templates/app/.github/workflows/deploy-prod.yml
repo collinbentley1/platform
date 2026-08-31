@@ -21,4 +21,5 @@ jobs:
       attestations: write # Publish provenance and SBOM attestations for the copied digest.
       contents: read
       id-token: write # Exchange only through exact production publish and deploy paths.
+      pull-requests: read # The reusable deploy proves every live preview tag maps to an active PR head.
     uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@__PLATFORM_SHA__
