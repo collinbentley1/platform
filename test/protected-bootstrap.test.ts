@@ -924,6 +924,100 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
+  test("a non-200 carrying a grpc-status stays terminal and fully validated", async () => {
+    // Making bare gateway 5xx retryable must not turn every non-200 into a
+    // transport fault. A 503 that still carries grpc-status 7 is an ANSWER,
+    // and a repeated or malformed status is a defect worth reporting whatever
+    // the HTTP code was -- none of them may consume the retry budget.
+    let attempts = 0;
+    let shape: "denied-on-503" | "repeated-on-502" | "malformed-on-504" | "bare-503" = "denied-on-503";
+    const server = createHttp2Server();
+    server.on("stream", (stream) => {
+      attempts += 1;
+      if (shape === "bare-503") {
+        stream.respond({ ":status": 503, "content-type": "text/html" });
+        stream.end("<html>gateway</html>");
+        return;
+      }
+      if (shape === "denied-on-503") {
+        stream.respond({
+          ":status": 503,
+          "content-type": "application/grpc",
+          "grpc-status": "7",
+        });
+        stream.end();
+        return;
+      }
+      if (shape === "malformed-on-504") {
+        stream.respond({
+          ":status": 504,
+          "content-type": "application/grpc",
+          "grpc-status": "99",
+        });
+        stream.end();
+        return;
+      }
+      // repeated-on-502: a status in BOTH the headers and the trailers, which
+      // is the conflicting shape the validation exists to reject.
+      stream.respond({
+        ":status": 502,
+        "content-type": "application/grpc",
+        "grpc-status": "0",
+      }, { waitForTrailers: true });
+      stream.once("wantTrailers", () => {
+        stream.sendTrailers({ "grpc-status": "7" });
+      });
+      stream.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    const request = {
+      bucketResource: "projects/_/buckets/example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      permissions: ["storage.objects.get"],
+      resource: "projects/_/buckets/example-bucket/objects/exact/object",
+    } as const;
+    const options = {
+      connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+      sleep: async () => {},
+      timeoutMs: 1_000,
+    } as const;
+    try {
+      // A 503 carrying PERMISSION_DENIED: terminal, one attempt, and the HTTP
+      // status is what surfaces -- it is not silently read as a denial.
+      await expect(probeStorageObjectPermissions(request, options))
+        .rejects.toThrow("Storage permission RPC failed with HTTP 503.");
+      expect(attempts).toBe(1);
+
+      // A 504 carrying an out-of-range status: still validated, still terminal.
+      attempts = 0;
+      shape = "malformed-on-504";
+      await expect(probeStorageObjectPermissions(request, options))
+        .rejects.toThrow("Storage permission RPC omitted a valid gRPC status.");
+      expect(attempts).toBe(1);
+
+      // A 502 carrying a status in BOTH headers and trailers: the conflict is
+      // reported, terminal, and never consumes the retry budget. Without this
+      // assertion a mutation removing the repeated-status check survived.
+      attempts = 0;
+      shape = "repeated-on-502";
+      await expect(probeStorageObjectPermissions(request, options))
+        .rejects.toThrow("Storage permission RPC repeated its gRPC status.");
+      expect(attempts).toBe(1);
+
+      // And the bare gateway 503 with no grpc-status anywhere still retries,
+      // so the narrowing did not disable the fix it guards.
+      attempts = 0;
+      shape = "bare-503";
+      await expect(probeStorageObjectPermissions(request, options))
+        .rejects.toThrow("Storage permission RPC failed with HTTP 503.");
+      expect(attempts).toBe(3);
+    } finally {
+      server.close();
+    }
+  });
+
   test("only this RPC's own transient faults are retryable", () => {
     // TRANSPORT: the request never got an answer. Review of PR 56 caught that
     // the stream-abort path was missing, which left a concrete transport error
@@ -960,7 +1054,7 @@ describe("protected owner Terraform bridge", () => {
     // GATEWAY: a bare 5xx carries no grpc-status at all -- the request never
     // reached a service that could answer, which is the same condition as
     // UNAVAILABLE.
-    for (const status of [502, 503, 504]) {
+    for (const status of ["502", "503", "504"]) {
       expect(retryableStoragePermissionRpcError(
         new StoragePermissionHttpStatusError(status))).toBeTrue();
     }
@@ -968,13 +1062,28 @@ describe("protected owner Terraform bridge", () => {
     // RESOURCE_EXHAUSTED are: a real server defect worth surfacing, and rate
     // limiting wanting backoff semantics this loop does not implement. Every
     // 4xx is an answer about the request, not a transport failure.
-    for (const status of [400, 401, 403, 404, 429, 500, 501, 505]) {
+    for (const status of ["400", "401", "403", "404", "429", "500", "501", "505"]) {
       expect(retryableStoragePermissionRpcError(
         new StoragePermissionHttpStatusError(status))).toBeFalse();
     }
     // A response with no :status at all is not evidence of anything transient.
     expect(retryableStoragePermissionRpcError(
       new StoragePermissionHttpStatusError(undefined))).toBeFalse();
+
+    // Only the exact canonical spellings discriminate. Number() coercion would
+    // widen every one of these into the retry class, and would rewrite a
+    // non-numeric status as "HTTP NaN" instead of reporting what was sent.
+    for (const status of ["0503", " 503", "503 ", "+503", "503.0", "5030", "50", "٥٠٣"]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionHttpStatusError(status))).toBeFalse();
+    }
+    // The external text preserves the raw status verbatim.
+    expect(new StoragePermissionHttpStatusError("0503").message)
+      .toBe("Storage permission RPC failed with HTTP 0503.");
+    expect(new StoragePermissionHttpStatusError("not-a-status").message)
+      .toBe("Storage permission RPC failed with HTTP not-a-status.");
+    expect(new StoragePermissionHttpStatusError(undefined).message)
+      .toBe("Storage permission RPC failed with HTTP missing.");
 
     // Header and trailer validation failures are protocol violations, not
     // transient faults, and must stay terminal even though they read as

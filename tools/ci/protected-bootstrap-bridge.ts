@@ -9600,8 +9600,12 @@ const STORAGE_RPC_TRANSIENT_SERVICE_STATUSES: ReadonlySet<number> = new Set([
 // the stream-abort path; keying on a typed status removes that whole class of
 // miss for the HTTP side.
 export class StoragePermissionHttpStatusError extends Error {
-  constructor(readonly status: number | undefined) {
-    super(`Storage permission RPC failed with HTTP ${status ?? "missing"}.`);
+  // The RAW header value, never coerced. Number() would both widen the retry
+  // discriminator -- "0503" and " 503" become 503 -- and destroy the external
+  // text, turning a non-numeric status into "HTTP NaN" instead of reporting
+  // what the server actually sent.
+  constructor(readonly rawStatus: string | undefined) {
+    super(`Storage permission RPC failed with HTTP ${rawStatus ?? "missing"}.`);
     this.name = "StoragePermissionHttpStatusError";
   }
 }
@@ -9613,10 +9617,12 @@ export class StoragePermissionHttpStatusError extends Error {
 // are excluded above: a 500 can be a genuine server defect worth surfacing,
 // and a 429 is rate limiting that wants backoff semantics this loop does not
 // implement. Every 4xx is terminal -- those are answers about the request.
-const STORAGE_RPC_TRANSIENT_HTTP_STATUSES: ReadonlySet<number> = new Set([
-  502, // Bad Gateway
-  503, // Service Unavailable
-  504, // Gateway Timeout
+// Exact canonical spellings. Matching strings rather than parsed numbers is
+// what keeps "0503", " 503", and "503 " out of the retry class.
+const STORAGE_RPC_TRANSIENT_HTTP_STATUSES: ReadonlySet<string> = new Set([
+  "502", // Bad Gateway
+  "503", // Service Unavailable
+  "504", // Gateway Timeout
 ]);
 
 export class StoragePermissionGrpcStatusError extends Error {
@@ -9881,9 +9887,25 @@ export async function storageV2TestIamPermissions(
         if (settled) return;
         try {
           if (responseStatus !== "200") {
-            throw new StoragePermissionHttpStatusError(
-              responseStatus === undefined ? undefined : Number(responseStatus),
-            );
+            // A non-200 that still carries a grpc-status is an ANSWER from the
+            // service, not a gateway swallowing the request, and must stay
+            // terminal and fully validated -- a repeated or malformed status is
+            // a defect worth reporting whatever the HTTP code was. Only a bare
+            // gateway response, with no grpc-status in headers or trailers, is
+            // the transport fault the retry class exists for.
+            if (headerGrpcStatus !== undefined && trailerGrpcStatus !== undefined) {
+              throw new Error("Storage permission RPC repeated its gRPC status.");
+            }
+            const carriedGrpcStatus = trailerGrpcStatus ?? headerGrpcStatus;
+            if (carriedGrpcStatus !== undefined) {
+              if (!/^(?:0|[1-9]|1[0-6])$/.test(carriedGrpcStatus)) {
+                throw new Error("Storage permission RPC omitted a valid gRPC status.");
+              }
+              throw new Error(
+                `Storage permission RPC failed with HTTP ${responseStatus ?? "missing"}.`,
+              );
+            }
+            throw new StoragePermissionHttpStatusError(responseStatus);
           }
           if (responseContentType === undefined ||
             !/^application\/grpc(?:\+proto)?(?:;|$)/.test(responseContentType)) {
@@ -9942,8 +9964,8 @@ export function retryableStoragePermissionRpcError(error: unknown): boolean {
   // reached a service that could answer, which is the same transient condition
   // as UNAVAILABLE and belongs in the same bounded, backed-off retry class.
   if (error instanceof StoragePermissionHttpStatusError) {
-    return error.status !== undefined &&
-      STORAGE_RPC_TRANSIENT_HTTP_STATUSES.has(error.status);
+    return error.rawStatus !== undefined &&
+      STORAGE_RPC_TRANSIENT_HTTP_STATUSES.has(error.rawStatus);
   }
   if (!(error instanceof Error)) return false;
   return STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES.has(error.message);
