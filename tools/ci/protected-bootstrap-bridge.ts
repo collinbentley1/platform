@@ -155,6 +155,16 @@ const ORPHAN_FENCE_DESCRIPTION =
 const MAX_SECRET_BUNDLE_BYTES = 16 * 1024;
 const MAX_STORAGE_PERMISSION_RPC_BYTES = 64 * 1024;
 const STORAGE_PERMISSION_RPC_TIMEOUT_MS = 15_000;
+// healthmcp prod plan 33354517166 died in executor.permission-proof on a single
+// "Storage permission RPC timed out." -- one setTimeout and out, with no retry
+// on a path that had succeeded on every prior invocation. The GitHub proof
+// reads gained a bounded retry in v0.5.30; this dependency had none.
+//
+// Deliberately small. This probe runs inside the permission-convergence window,
+// so attempts here are spent from the same budget the convergence loop needs;
+// three is enough to survive a transient fault without meaningfully narrowing
+// that window.
+const STORAGE_PERMISSION_RPC_ATTEMPTS = 3;
 const GOOGLE_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const GOOGLE_OWNER_TOKENINFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo";
 const GOOGLE_OWNER_SUBJECT_ID = "100549777206682928323";
@@ -9557,6 +9567,12 @@ export interface StateStoragePermissionProbes {
 export interface StoragePermissionRpcOptions {
   readonly connect?: (authority: string) => ClientHttp2Session;
   readonly timeoutMs?: number;
+  // Deadline-aware retry for this RPC's own transient faults. All optional:
+  // without them the probe behaves exactly as it did before, one attempt and
+  // out.
+  readonly deadlineMs?: number;
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
 }
 
 // gRPC canonical codes the storage permission RPC can answer a probe with.
@@ -9565,7 +9581,51 @@ export interface StoragePermissionRpcOptions {
 const STORAGE_RPC_PERMISSION_DENIED = 7;
 const STORAGE_RPC_UNAUTHENTICATED = 16;
 
-class StoragePermissionGrpcStatusError extends Error {
+// Canonical gRPC statuses that describe the SERVICE failing, not the caller's
+// permissions. Unlike 7 and 16 these are not answers to the probe at all, and
+// this RPC is a read-only permission test, so re-asking is idempotent.
+// UNAVAILABLE is a transient backend outage; DEADLINE_EXCEEDED is the server
+// giving up rather than a verdict on the credential.
+//
+// Deliberately excludes INTERNAL and RESOURCE_EXHAUSTED: the first can mean a
+// genuine server defect worth surfacing, and the second is rate limiting that
+// wants backoff this loop does not implement.
+const STORAGE_RPC_TRANSIENT_SERVICE_STATUSES: ReadonlySet<number> = new Set([
+  4, // DEADLINE_EXCEEDED
+  14, // UNAVAILABLE
+]);
+
+// A transport-layer HTTP status carried structurally rather than parsed back
+// out of a message. Review of PR 56 caught the string-matching approach missing
+// the stream-abort path; keying on a typed status removes that whole class of
+// miss for the HTTP side.
+export class StoragePermissionHttpStatusError extends Error {
+  // The RAW header value, never coerced. Number() would both widen the retry
+  // discriminator -- "0503" and " 503" become 503 -- and destroy the external
+  // text, turning a non-numeric status into "HTTP NaN" instead of reporting
+  // what the server actually sent.
+  constructor(readonly rawStatus: string | undefined) {
+    super(`Storage permission RPC failed with HTTP ${rawStatus ?? "missing"}.`);
+    this.name = "StoragePermissionHttpStatusError";
+  }
+}
+
+// Gateway failures where the request never reached a service that could
+// answer -- the HTTP equivalent of gRPC UNAVAILABLE.
+//
+// Excludes 500 and 429 for the same reasons INTERNAL and RESOURCE_EXHAUSTED
+// are excluded above: a 500 can be a genuine server defect worth surfacing,
+// and a 429 is rate limiting that wants backoff semantics this loop does not
+// implement. Every 4xx is terminal -- those are answers about the request.
+// Exact canonical spellings. Matching strings rather than parsed numbers is
+// what keeps "0503", " 503", and "503 " out of the retry class.
+const STORAGE_RPC_TRANSIENT_HTTP_STATUSES: ReadonlySet<string> = new Set([
+  "502", // Bad Gateway
+  "503", // Service Unavailable
+  "504", // Gateway Timeout
+]);
+
+export class StoragePermissionGrpcStatusError extends Error {
   constructor(readonly status: number) {
     super(`Storage object permission RPC failed with gRPC status ${status}.`);
     this.name = "StoragePermissionGrpcStatusError";
@@ -9827,9 +9887,25 @@ export async function storageV2TestIamPermissions(
         if (settled) return;
         try {
           if (responseStatus !== "200") {
-            throw new Error(
-              `Storage permission RPC failed with HTTP ${responseStatus ?? "missing"}.`,
-            );
+            // A non-200 that still carries a grpc-status is an ANSWER from the
+            // service, not a gateway swallowing the request, and must stay
+            // terminal and fully validated -- a repeated or malformed status is
+            // a defect worth reporting whatever the HTTP code was. Only a bare
+            // gateway response, with no grpc-status in headers or trailers, is
+            // the transport fault the retry class exists for.
+            if (headerGrpcStatus !== undefined && trailerGrpcStatus !== undefined) {
+              throw new Error("Storage permission RPC repeated its gRPC status.");
+            }
+            const carriedGrpcStatus = trailerGrpcStatus ?? headerGrpcStatus;
+            if (carriedGrpcStatus !== undefined) {
+              if (!/^(?:0|[1-9]|1[0-6])$/.test(carriedGrpcStatus)) {
+                throw new Error("Storage permission RPC omitted a valid gRPC status.");
+              }
+              throw new Error(
+                `Storage permission RPC failed with HTTP ${responseStatus ?? "missing"}.`,
+              );
+            }
+            throw new StoragePermissionHttpStatusError(responseStatus);
           }
           if (responseContentType === undefined ||
             !/^application\/grpc(?:\+proto)?(?:;|$)/.test(responseContentType)) {
@@ -9861,23 +9937,96 @@ export async function storageV2TestIamPermissions(
   });
 }
 
+// Retryable ONLY for this RPC's own transient faults, in two families.
+//
+// TRANSPORT: the timeout, a session error, and a stream abort. All three mean
+// the request did not get an answer. "headers failed" and "trailers failed"
+// are deliberately absent -- those come from header VALIDATION throwing, which
+// is a protocol violation, not a transient fault -- as are every parse, size,
+// and syntax failure.
+//
+// SERVICE: the canonical statuses that describe the service failing rather
+// than answering. PERMISSION_DENIED and UNAUTHENTICATED are NOT here: they are
+// genuine answers, converted to `denied` by the caller and re-probed by the
+// convergence loop, so retrying them here would double-retry the same wait and
+// could disguise a real denial as a fault.
+const STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES: ReadonlySet<string> = new Set([
+  "Storage permission RPC timed out.",
+  "Storage permission RPC transport failed.",
+  "Storage permission RPC transport was aborted.",
+]);
+
+export function retryableStoragePermissionRpcError(error: unknown): boolean {
+  if (error instanceof StoragePermissionGrpcStatusError) {
+    return STORAGE_RPC_TRANSIENT_SERVICE_STATUSES.has(error.status);
+  }
+  // A bare gateway 5xx carries no grpc-status at all: the request never
+  // reached a service that could answer, which is the same transient condition
+  // as UNAVAILABLE and belongs in the same bounded, backed-off retry class.
+  if (error instanceof StoragePermissionHttpStatusError) {
+    return error.rawStatus !== undefined &&
+      STORAGE_RPC_TRANSIENT_HTTP_STATUSES.has(error.rawStatus);
+  }
+  if (!(error instanceof Error)) return false;
+  return STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES.has(error.message);
+}
+
 export async function probeStorageObjectPermissions(
   request: StorageObjectPermissionProbeRequest,
   options: StoragePermissionRpcOptions = {},
 ): Promise<StorageObjectPermissionProbeResult> {
-  try {
-    return {
-      denied: false,
-      permissions: await storageV2TestIamPermissions(request, options),
-    };
-  } catch (error) {
-    if (error instanceof StoragePermissionGrpcStatusError &&
-      (error.status === STORAGE_RPC_PERMISSION_DENIED ||
-        error.status === STORAGE_RPC_UNAUTHENTICATED)) {
-      return { denied: true, permissions: [], status: error.status };
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((milliseconds: number) => Bun.sleep(milliseconds));
+  const configuredTimeoutMs = options.timeoutMs ?? STORAGE_PERMISSION_RPC_TIMEOUT_MS;
+  let lastTransientError: unknown;
+  for (let attempt = 0; attempt < STORAGE_PERMISSION_RPC_ATTEMPTS; attempt += 1) {
+    // Never start an attempt the deadline cannot hold. Without a deadline the
+    // loop still runs, bounded by the attempt cap alone.
+    let timeoutMs = configuredTimeoutMs;
+    if (options.deadlineMs !== undefined) {
+      timeoutMs = Math.min(configuredTimeoutMs, options.deadlineMs - now());
+      if (timeoutMs <= 0) break;
     }
-    throw error;
+    try {
+      return {
+        denied: false,
+        permissions: await storageV2TestIamPermissions(request, { ...options, timeoutMs }),
+      };
+    } catch (error) {
+      if (error instanceof StoragePermissionGrpcStatusError &&
+        (error.status === STORAGE_RPC_PERMISSION_DENIED ||
+          error.status === STORAGE_RPC_UNAUTHENTICATED)) {
+        return { denied: true, permissions: [], status: error.status };
+      }
+      if (!retryableStoragePermissionRpcError(error)) throw error;
+      lastTransientError = error;
+    }
+
+    // Back off before re-asking. Without this the three attempts fire
+    // back-to-back, so a short UNAVAILABLE or transport outage burns the whole
+    // retry budget in roughly three RPC timeouts while most of the convergence
+    // deadline is still unspent -- and hammers a service that is already
+    // failing. iamRetryDelayMs is the same exponential-with-jitter the IAM
+    // retries use; at a three-attempt cap it yields roughly 1-2s then 2-3s and
+    // never approaches its own 32s ceiling.
+    //
+    // Clamped to the deadline, so the sleep itself can never overrun the
+    // window. If there is no room left to wait, stop and fail closed rather
+    // than sleeping past it; the top of the loop separately refuses an attempt
+    // the deadline cannot hold.
+    if (attempt + 1 < STORAGE_PERMISSION_RPC_ATTEMPTS) {
+      let delayMs = iamRetryDelayMs(attempt);
+      if (options.deadlineMs !== undefined) {
+        delayMs = Math.min(delayMs, options.deadlineMs - now());
+      }
+      if (delayMs <= 0) break;
+      await sleep(delayMs);
+    }
   }
+  // Fail closed. Exhaustion rethrows the fault that caused it, so the run
+  // reports the same cause it always did rather than a new abstraction.
+  throw lastTransientError ??
+    new Error("Storage permission RPC had no attempt budget before its deadline.");
 }
 
 function validateResumableSessionUri(
@@ -10300,7 +10449,10 @@ export async function waitForStatePermissions(
             executorToken,
             permissions: STORAGE_OBJECT_RPC_PERMISSIONS,
             resource,
-          }, { timeoutMs: rpcTimeoutMs }),
+            // The retry inside the probe is bounded by this same deadline, so
+            // surviving a transient RPC fault can never eat the convergence
+            // window the loop above still needs.
+          }, { deadlineMs: consistencyDeadlineMs, now, timeoutMs: rpcTimeoutMs }),
         consistencyDeadlineMs,
         now,
       );
