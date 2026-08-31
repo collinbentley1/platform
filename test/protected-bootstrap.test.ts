@@ -62,6 +62,8 @@ import {
   proveExposure,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
+  retryableStoragePermissionRpcError,
+  StoragePermissionGrpcStatusError,
   requireNoUserManagedKeys,
   requireNoExecutorProjectBindings,
   randomExecutorAccountId,
@@ -708,6 +710,118 @@ describe("protected owner Terraform bridge", () => {
     expect(String(inner?.message)).toContain(
       "did not converge before the IAM consistency deadline",
     );
+  });
+
+  test("a transient storage permission RPC fault is retried, then succeeds", async () => {
+    // healthmcp prod plan 33354517166 died in executor.permission-proof on one
+    // "Storage permission RPC timed out." -- a single setTimeout with no retry,
+    // on a path that had succeeded on every prior invocation.
+    let attempts = 0;
+    const server = createHttp2Server();
+    server.on("stream", (stream) => {
+      attempts += 1;
+      // Hang the first attempt so it times out; answer the second.
+      if (attempts === 1) return;
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/grpc",
+        "grpc-status": "0",
+      });
+      stream.end(Buffer.from([0, 0, 0, 0, 0]));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    try {
+      const result = await probeStorageObjectPermissions({
+        bucketResource: "projects/_/buckets/example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        permissions: ["storage.objects.get"],
+        resource: "projects/_/buckets/example-bucket/objects/exact/object",
+      }, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        timeoutMs: 250,
+      });
+      expect(result.denied).toBeFalse();
+      expect(attempts).toBe(2);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("storage permission RPC retries are bounded and fail closed", async () => {
+    // Exhaustion must surface the same cause the run always reported, not a
+    // new abstraction, and must not retry forever.
+    let attempts = 0;
+    const server = createHttp2Server();
+    server.on("stream", () => {
+      attempts += 1; // never respond
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    try {
+      await expect(probeStorageObjectPermissions({
+        bucketResource: "projects/_/buckets/example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        permissions: ["storage.objects.get"],
+        resource: "projects/_/buckets/example-bucket/objects/exact/object",
+      }, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        timeoutMs: 200,
+      })).rejects.toThrow("Storage permission RPC timed out.");
+      expect(attempts).toBe(3);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("the deadline refuses an attempt it cannot hold", async () => {
+    // A retry must never eat the permission-convergence window the caller
+    // still needs. With no room left, no attempt is made at all.
+    let attempts = 0;
+    const server = createHttp2Server();
+    server.on("stream", () => {
+      attempts += 1;
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    try {
+      await expect(probeStorageObjectPermissions({
+        bucketResource: "projects/_/buckets/example-bucket",
+        executorToken: "short-lived-executor-access-token-value",
+        permissions: ["storage.objects.get"],
+        resource: "projects/_/buckets/example-bucket/objects/exact/object",
+      }, {
+        connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+        deadlineMs: 1_000,
+        now: () => 5_000,
+        timeoutMs: 200,
+      })).rejects.toThrow("no attempt budget");
+      expect(attempts).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("only this RPC's own transient faults are retryable", () => {
+    // A gRPC status is an ANSWER, not a fault. PERMISSION_DENIED in particular
+    // is a lease still propagating, already handled by the convergence loop --
+    // retrying it here would be wrong and would double-retry the same wait.
+    expect(retryableStoragePermissionRpcError(
+      new Error("Storage permission RPC timed out."))).toBeTrue();
+    expect(retryableStoragePermissionRpcError(
+      new Error("Storage permission RPC transport failed."))).toBeTrue();
+    for (const status of [7, 16, 5, 3, 13]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionGrpcStatusError(status))).toBeFalse();
+    }
+    // Anything else is terminal on the first occurrence.
+    expect(retryableStoragePermissionRpcError(
+      new Error("Storage permission RPC returned a malformed frame."))).toBeFalse();
+    expect(retryableStoragePermissionRpcError(new Error("some other failure"))).toBeFalse();
+    expect(retryableStoragePermissionRpcError("not an error")).toBeFalse();
   });
 
   test("no deny-policy authority survives anywhere in the bridge", async () => {
