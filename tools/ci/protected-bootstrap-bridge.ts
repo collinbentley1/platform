@@ -9595,6 +9595,30 @@ const STORAGE_RPC_TRANSIENT_SERVICE_STATUSES: ReadonlySet<number> = new Set([
   14, // UNAVAILABLE
 ]);
 
+// A transport-layer HTTP status carried structurally rather than parsed back
+// out of a message. Review of PR 56 caught the string-matching approach missing
+// the stream-abort path; keying on a typed status removes that whole class of
+// miss for the HTTP side.
+export class StoragePermissionHttpStatusError extends Error {
+  constructor(readonly status: number | undefined) {
+    super(`Storage permission RPC failed with HTTP ${status ?? "missing"}.`);
+    this.name = "StoragePermissionHttpStatusError";
+  }
+}
+
+// Gateway failures where the request never reached a service that could
+// answer -- the HTTP equivalent of gRPC UNAVAILABLE.
+//
+// Excludes 500 and 429 for the same reasons INTERNAL and RESOURCE_EXHAUSTED
+// are excluded above: a 500 can be a genuine server defect worth surfacing,
+// and a 429 is rate limiting that wants backoff semantics this loop does not
+// implement. Every 4xx is terminal -- those are answers about the request.
+const STORAGE_RPC_TRANSIENT_HTTP_STATUSES: ReadonlySet<number> = new Set([
+  502, // Bad Gateway
+  503, // Service Unavailable
+  504, // Gateway Timeout
+]);
+
 export class StoragePermissionGrpcStatusError extends Error {
   constructor(readonly status: number) {
     super(`Storage object permission RPC failed with gRPC status ${status}.`);
@@ -9857,8 +9881,8 @@ export async function storageV2TestIamPermissions(
         if (settled) return;
         try {
           if (responseStatus !== "200") {
-            throw new Error(
-              `Storage permission RPC failed with HTTP ${responseStatus ?? "missing"}.`,
+            throw new StoragePermissionHttpStatusError(
+              responseStatus === undefined ? undefined : Number(responseStatus),
             );
           }
           if (responseContentType === undefined ||
@@ -9913,6 +9937,13 @@ const STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES: ReadonlySet<string> = new Set([
 export function retryableStoragePermissionRpcError(error: unknown): boolean {
   if (error instanceof StoragePermissionGrpcStatusError) {
     return STORAGE_RPC_TRANSIENT_SERVICE_STATUSES.has(error.status);
+  }
+  // A bare gateway 5xx carries no grpc-status at all: the request never
+  // reached a service that could answer, which is the same transient condition
+  // as UNAVAILABLE and belongs in the same bounded, backed-off retry class.
+  if (error instanceof StoragePermissionHttpStatusError) {
+    return error.status !== undefined &&
+      STORAGE_RPC_TRANSIENT_HTTP_STATUSES.has(error.status);
   }
   if (!(error instanceof Error)) return false;
   return STORAGE_RPC_RETRYABLE_TRANSPORT_MESSAGES.has(error.message);

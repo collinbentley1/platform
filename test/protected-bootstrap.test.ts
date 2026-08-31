@@ -64,6 +64,7 @@ import {
   probeStorageObjectPermissions,
   retryableStoragePermissionRpcError,
   StoragePermissionGrpcStatusError,
+  StoragePermissionHttpStatusError,
   requireNoUserManagedKeys,
   requireNoExecutorProjectBindings,
   randomExecutorAccountId,
@@ -870,6 +871,59 @@ describe("protected owner Terraform bridge", () => {
     }
   });
 
+  test("a bare gateway 503 is retried; a 500 stays terminal", async () => {
+    // A load balancer answering 503 with no grpc-status produced
+    // "Storage permission RPC failed with HTTP 503." and was terminal on first
+    // occurrence, even though the request never reached a service that could
+    // answer.
+    let attempts = 0;
+    let httpStatus = 503;
+    const server = createHttp2Server();
+    server.on("stream", (stream) => {
+      attempts += 1;
+      if (attempts >= 2 && httpStatus === 503) {
+        stream.respond({
+          ":status": 200,
+          "content-type": "application/grpc",
+          "grpc-status": "0",
+        });
+        stream.end(Buffer.from([0, 0, 0, 0, 0]));
+        return;
+      }
+      // Bare gateway response: no grpc-status, no grpc content type.
+      stream.respond({ ":status": httpStatus, "content-type": "text/html" });
+      stream.end("<html>error</html>");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("HTTP/2 test server failed.");
+    const request = {
+      bucketResource: "projects/_/buckets/example-bucket",
+      executorToken: "short-lived-executor-access-token-value",
+      permissions: ["storage.objects.get"],
+      resource: "projects/_/buckets/example-bucket/objects/exact/object",
+    } as const;
+    const options = {
+      connect: () => connectHttp2(`http://127.0.0.1:${address.port}`),
+      sleep: async () => {},
+      timeoutMs: 1_000,
+    } as const;
+    try {
+      const result = await probeStorageObjectPermissions(request, options);
+      expect(result.denied).toBeFalse();
+      expect(attempts).toBe(2);
+
+      // A 500 is not a gateway failure and must not consume the budget.
+      attempts = 0;
+      httpStatus = 500;
+      await expect(probeStorageObjectPermissions(request, options))
+        .rejects.toThrow("Storage permission RPC failed with HTTP 500.");
+      expect(attempts).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
   test("only this RPC's own transient faults are retryable", () => {
     // TRANSPORT: the request never got an answer. Review of PR 56 caught that
     // the stream-abort path was missing, which left a concrete transport error
@@ -902,6 +956,25 @@ describe("protected owner Terraform bridge", () => {
       expect(retryableStoragePermissionRpcError(
         new StoragePermissionGrpcStatusError(status))).toBeFalse();
     }
+
+    // GATEWAY: a bare 5xx carries no grpc-status at all -- the request never
+    // reached a service that could answer, which is the same condition as
+    // UNAVAILABLE.
+    for (const status of [502, 503, 504]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionHttpStatusError(status))).toBeTrue();
+    }
+    // 500 and 429 are excluded for the same reasons INTERNAL and
+    // RESOURCE_EXHAUSTED are: a real server defect worth surfacing, and rate
+    // limiting wanting backoff semantics this loop does not implement. Every
+    // 4xx is an answer about the request, not a transport failure.
+    for (const status of [400, 401, 403, 404, 429, 500, 501, 505]) {
+      expect(retryableStoragePermissionRpcError(
+        new StoragePermissionHttpStatusError(status))).toBeFalse();
+    }
+    // A response with no :status at all is not evidence of anything transient.
+    expect(retryableStoragePermissionRpcError(
+      new StoragePermissionHttpStatusError(undefined))).toBeFalse();
 
     // Header and trailer validation failures are protocol violations, not
     // transient faults, and must stay terminal even though they read as
