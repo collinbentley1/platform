@@ -62,6 +62,9 @@ import {
   proveExposure,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
+  retryableGoogleReadStatus,
+  fetcherDeadlineMs,
+  googleReadWithRetry,
   retryableStoragePermissionRpcError,
   StoragePermissionGrpcStatusError,
   StoragePermissionHttpStatusError,
@@ -9499,6 +9502,175 @@ describe("protected owner Terraform bridge", () => {
     expect(calls.some(({ url }) => url.includes(":generateAccessToken"))).toBeFalse();
     expect(calls.some(({ url }) => url.endsWith(":setIamPolicy"))).toBeFalse();
   });
+
+  test("transient Google IAM read statuses are exactly the retryable class", () => {
+    // TRANSIENT: the service asked us to slow down (429) or never answered at
+    // all (502/503/504). Neither is a statement about authority.
+    for (const status of [429, 502, 503, 504]) {
+      expect(retryableGoogleReadStatus(status)).toBeTrue();
+    }
+    // Every other status is an answer about the request, or a server defect
+    // worth surfacing. 500 stays out for the same reason it is out of the
+    // storage permission RPC's retry class.
+    for (const status of [200, 201, 400, 401, 403, 404, 409, 412, 500, 501, 505]) {
+      expect(retryableGoogleReadStatus(status)).toBeFalse();
+    }
+  });
+
+  test("a rate-limited IAM policy read is retried and then succeeds", async () => {
+    // This is run 33390979102's exact failure: a 429 on the project policy read
+    // inside acquire, which used to end the run outright.
+    const slept: number[] = [];
+    let attempts = 0;
+    const response = await googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      async () => {
+        attempts += 1;
+        return attempts < 3 ? new Response("", { status: 429 }) : Response.json({ ok: true });
+      },
+      { now: () => 0, sleep: async (ms: number) => { slept.push(ms); } },
+    );
+    expect(response.status).toBe(200);
+    expect(attempts).toBe(3);
+    expect(slept.length).toBe(2);
+    // Exponential with jitter, so assert the shape rather than exact values.
+    expect(slept[0]!).toBeGreaterThan(0);
+    expect(slept[1]!).toBeGreaterThan(slept[0]!);
+  });
+
+  test("a sustained rate limit stops at the attempt cap and hands back the last response", async () => {
+    let attempts = 0;
+    const response = await googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      async () => { attempts += 1; return new Response("", { status: 429 }); },
+      { now: () => 0, sleep: async () => {} },
+    );
+    // Bounded: real quota exhaustion still ends the run, it just is not decided
+    // on the first sample.
+    expect(attempts).toBe(4);
+    // Returned rather than thrown, so each caller still raises its OWN message.
+    // Throwing here would rewrite the service-account readers' error into one
+    // that names the wrong call and loses which read actually failed.
+    expect(response.status).toBe(429);
+  });
+
+  test("a status that answers the request is never retried", async () => {
+    for (const status of [403, 404, 400, 500]) {
+      let attempts = 0;
+      const response = await googleReadWithRetry(
+        "https://iam.googleapis.com/v1/projects/p/serviceAccounts/a:getIamPolicy",
+        { method: "POST" },
+        async () => { attempts += 1; return new Response("", { status }); },
+        { now: () => 0, sleep: async () => { throw new Error("must not sleep"); } },
+      );
+      expect(response.status).toBe(status);
+      // Returned to the caller untouched, so 404 -> undefined and 403 -> the
+      // absent-or-denied error keep working exactly as before.
+      expect(attempts).toBe(1);
+    }
+  });
+
+  test("the retrying read path refuses any URL that is not an IAM policy read", async () => {
+    // A retried setIamPolicy would be a correctness bug of exactly the kind this
+    // bridge exists to prevent, so the guard fails closed rather than trusting
+    // a future caller to only pass reads.
+    for (const url of [
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:setIamPolicy",
+      "https://iam.googleapis.com/v1/projects/p/serviceAccounts/a:disable",
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicyExtra",
+      // A fragment is not part of the path the server sees. A suffix test on the
+      // raw URL waves this through -- it is a setIamPolicy wearing a read's name.
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:setIamPolicy#:getIamPolicy",
+      // Same trick via the query string.
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:setIamPolicy?x=:getIamPolicy",
+    ]) {
+      await expect(googleReadWithRetry(url, { method: "POST" }, async () => {
+        throw new Error("must not reach the network");
+      })).rejects.toThrow("refuses a URL that is not an IAM policy read");
+    }
+    // A URL that cannot be parsed at all fails closed rather than being trusted.
+    await expect(googleReadWithRetry("not a url:getIamPolicy", { method: "POST" }, async () => {
+      throw new Error("must not reach the network");
+    })).rejects.toThrow("refuses a URL it cannot parse");
+  });
+
+  test("a deadline-bound fetcher lends its deadline to the read retry", async () => {
+    // The gap Codex flagged: production call sites pass no retry options, so
+    // without inheritance the backoff is bounded only by the attempt cap and can
+    // sleep past an acquisition, recovery, or cleanup deadline before asking
+    // again. Inheriting from the fetcher makes the bound structural -- a call
+    // site added later cannot forget to thread it.
+    let clock = 0;
+    const deadline = 5;
+    let attempts = 0;
+    const slept: number[] = [];
+    const bound = deadlineFetcher(
+      async () => { attempts += 1; return new Response("", { status: 429 }); },
+      () => deadline,
+      10_000,
+      () => clock,
+    );
+    expect(fetcherDeadlineMs(bound)).toBe(deadline);
+    const response = await googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      bound,
+      { now: () => clock, sleep: async (ms: number) => { slept.push(ms); clock = deadline; } },
+    );
+    expect(response.status).toBe(429);
+    // One attempt, one clamped sleep, then the inherited deadline stops it --
+    // rather than three full backoffs running past the window.
+    expect(attempts).toBe(1);
+    expect(slept).toEqual([deadline]);
+  });
+
+  test("a bare fetcher lends no deadline and an explicit one still wins", async () => {
+    const bare = async () => new Response("", { status: 503 });
+    expect(fetcherDeadlineMs(bare)).toBeUndefined();
+
+    // Explicit option overrides whatever the fetcher carries.
+    const bound = deadlineFetcher(bare, () => 900_000, 10_000, () => 0);
+    expect(fetcherDeadlineMs(bound)).toBe(900_000);
+    let attempts = 0;
+    await expect(googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      Object.assign(async () => { attempts += 1; return new Response("", { status: 503 }); },
+        { [Symbol.for("protected.fetcherDeadlineMs")]: () => 900_000 }),
+      { now: () => 1_000, deadlineMs: 1_000, sleep: async () => { throw new Error("must not sleep"); } },
+    )).rejects.toThrow("reached the protected operation deadline before any attempt");
+    expect(attempts).toBe(0);
+  });
+
+  test("the retry never sleeps or re-asks past the operation deadline", async () => {
+    // Deadline already spent: no attempt at all, and no sleep.
+    let attempts = 0;
+    await expect(googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      async () => { attempts += 1; return new Response("", { status: 429 }); },
+      { now: () => 1_000, deadlineMs: 1_000, sleep: async () => { throw new Error("must not sleep"); } },
+    )).rejects.toThrow("reached the protected operation deadline before any attempt");
+    expect(attempts).toBe(0);
+
+    // Deadline with only a sliver left: one attempt, and the backoff is clamped
+    // to what remains rather than overrunning the window.
+    const slept: number[] = [];
+    let clock = 0;
+    attempts = 0;
+    const exhausted = await googleReadWithRetry(
+      "https://cloudresourcemanager.googleapis.com/v1/projects/p:getIamPolicy",
+      { method: "POST" },
+      async () => { attempts += 1; return new Response("", { status: 503 }); },
+      { now: () => clock, deadlineMs: 5, sleep: async (ms: number) => { slept.push(ms); clock = 5; } },
+    );
+    expect(exhausted.status).toBe(503);
+    expect(attempts).toBe(1);
+    expect(slept).toEqual([5]);
+  });
+
 });
 
 function fakeDependencies(

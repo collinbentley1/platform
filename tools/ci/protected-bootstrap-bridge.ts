@@ -9286,11 +9286,11 @@ async function getServiceAccountPolicy(
   // Unlike Resource Manager's getIamPolicy RPC, the IAM service-account
   // method requires an empty body and carries GetPolicyOptions in the query.
   url.searchParams.set("options.requestedPolicyVersion", "3");
-  const response = await fetcher(url, {
+  const response = await googleReadWithRetry(url, {
     headers: googleHeaders(token),
     method: "POST",
     redirect: "error",
-  });
+  }, fetcher);
   if (!response.ok) {
     throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
   }
@@ -9304,11 +9304,11 @@ async function getServiceAccountPolicyIfPresent(
 ): Promise<IamPolicy | undefined> {
   const url = new URL(`${serviceAccountPolicyUrl(account)}:getIamPolicy`);
   url.searchParams.set("options.requestedPolicyVersion", "3");
-  const response = await fetcher(url, {
+  const response = await googleReadWithRetry(url, {
     headers: googleHeaders(token),
     method: "POST",
     redirect: "error",
-  });
+  }, fetcher);
   if (response.status === 404) return undefined;
   if (!response.ok) {
     throw new Error(`Service-account IAM getPolicy failed with HTTP ${response.status}.`);
@@ -9324,11 +9324,11 @@ async function getDeterministicExecutorPolicyIfPresent(
   const email = deterministicExecutorEmail(invocation);
   const url = new URL(`${serviceAccountUrl(email)}:getIamPolicy`);
   url.searchParams.set("options.requestedPolicyVersion", "3");
-  const response = await fetcher(url, {
+  const response = await googleReadWithRetry(url, {
     headers: googleHeaders(token),
     method: "POST",
     redirect: "error",
-  });
+  }, fetcher);
   if (response.status === 404) {
     await boundedText(response, 64 * 1024);
     return undefined;
@@ -9409,18 +9409,118 @@ function executorMember(projectId: string, email: string): `serviceAccount:${str
   return `serviceAccount:${email}`;
 }
 
+// Google answers a rate limit with HTTP 429 and a gateway fault with 502, 503,
+// or 504. Both are transient and neither is a statement about authority: the
+// request either never reached a service that could answer, or the service asked
+// us to slow down. Before this retry class a single 429 on an IAM policy read
+// ended a protected run outright -- observed on run 33390979102, where the read
+// failed inside `acquire`, after the executor was already created, and cost the
+// run plus a 55-minute residue wait. The recovery path already converges over
+// transient policy failures; the acquire path had no equivalent.
+//
+// Four attempts with the same exponential-with-jitter backoff the IAM retries
+// use, so a rate limit gets roughly 1-2s, then 2-4s, then 4-8s to clear before
+// the run fails closed. A sustained 429 is real quota exhaustion and still ends
+// the run, just not on the first sample.
+//
+// 429 is deliberately IN this class and deliberately OUT of the storage
+// permission RPC's class, which is not a contradiction: that loop excluded it
+// for "wanting backoff semantics this loop does not implement", and this loop
+// implements exactly those semantics. 500 stays out of both -- a real server
+// defect is worth surfacing rather than papering over with a retry.
+const GOOGLE_READ_RETRY_ATTEMPTS = 4;
+const GOOGLE_READ_TRANSIENT_HTTP_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504]);
+
+// Retrying is only ever sound for a request that cannot change state. Every
+// caller below posts to a `:getIamPolicy` endpoint -- Google's IAM API uses POST
+// for these reads -- and the pathname check below is what stops the retry class
+// from silently covering a mutation if a future caller reaches for the helper. A
+// retried setIamPolicy would be a correctness bug of exactly the kind this
+// bridge exists to prevent, so it fails closed rather than trusting the caller.
+const GOOGLE_READ_ONLY_URL_SUFFIX = ":getIamPolicy";
+
+export function retryableGoogleReadStatus(status: number): boolean {
+  return GOOGLE_READ_TRANSIENT_HTTP_STATUSES.has(status);
+}
+
+export interface GoogleReadRetryOptions {
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly deadlineMs?: number;
+}
+
+// Performs an idempotent IAM policy read, retrying ONLY the transient statuses.
+// Every other status -- 200, 403, 404, 400 -- is returned to the caller
+// untouched, so each caller keeps its own status semantics unchanged.
+export async function googleReadWithRetry(
+  url: string | URL,
+  init: RequestInit,
+  fetcher: Fetcher,
+  options: GoogleReadRetryOptions = {},
+): Promise<Response> {
+  // Compare the parsed pathname, never the raw string. A suffix test on the raw
+  // URL is defeated by `...:setIamPolicy#:getIamPolicy`, because a fragment is
+  // not part of the path the server ever sees -- so the guard would wave through
+  // exactly the mutation it exists to stop. A URL this cannot parse fails closed.
+  let path: string;
+  try {
+    path = new URL(typeof url === "string" ? url : url.toString()).pathname;
+  } catch {
+    throw new Error("The retrying Google read path refuses a URL it cannot parse.");
+  }
+  if (!path.endsWith(GOOGLE_READ_ONLY_URL_SUFFIX)) {
+    throw new Error("The retrying Google read path refuses a URL that is not an IAM policy read.");
+  }
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? ((milliseconds: number) => Bun.sleep(milliseconds));
+  // An explicit deadline wins; otherwise inherit the one the fetcher was built
+  // with. Without this the backoff sleeps are bounded only by the attempt cap,
+  // so a transient arriving just before an acquisition, recovery, or cleanup
+  // deadline could sleep past it and then ask again.
+  const deadlineMs = options.deadlineMs ?? fetcherDeadlineMs(fetcher);
+  let lastTransient: Response | undefined;
+  for (let attempt = 0; attempt < GOOGLE_READ_RETRY_ATTEMPTS; attempt += 1) {
+    // Never start an attempt the deadline cannot hold. The deadline fetcher
+    // enforces this too; checking here avoids burning a backoff sleep first.
+    if (deadlineMs !== undefined && deadlineMs - now() <= 0) break;
+    const response = await fetcher(url, init);
+    if (!retryableGoogleReadStatus(response.status)) return response;
+    lastTransient = response;
+    if (attempt + 1 >= GOOGLE_READ_RETRY_ATTEMPTS) break;
+    // Clamped to the deadline so the sleep itself can never overrun the window.
+    let delayMs = iamRetryDelayMs(attempt);
+    if (deadlineMs !== undefined) {
+      delayMs = Math.min(delayMs, deadlineMs - now());
+    }
+    if (delayMs <= 0) break;
+    await sleep(delayMs);
+  }
+  // Hand the exhausted transient back rather than throwing here, so every caller
+  // keeps its own error message and status handling. Throwing a generic message
+  // would have rewritten the three service-account readers' "Service-account IAM
+  // getPolicy failed with HTTP ..." into something that names the wrong call.
+  //
+  // Only the zero-attempt case has no response to return: the deadline was
+  // already spent before the first ask.
+  if (lastTransient === undefined) {
+    throw new Error("The IAM policy read reached the protected operation deadline before any attempt.");
+  }
+  return lastTransient;
+}
+
 async function googleJson(
   url: string,
   token: string,
   body: JsonValue,
   fetcher: Fetcher,
+  options: GoogleReadRetryOptions = {},
 ): Promise<unknown> {
-  const response = await fetcher(url, {
+  const response = await googleReadWithRetry(url, {
     body: JSON.stringify(body),
     headers: googleHeaders(token),
     method: "POST",
     redirect: "error",
-  });
+  }, fetcher, options);
   if (!response.ok) throw new Error(`Google API request failed with HTTP ${response.status}.`);
   return boundedJson(response, 2 * 1024 * 1024);
 }
@@ -12736,13 +12836,34 @@ export async function requireFreshGoogleOwnerAccessToken(
   }
 }
 
+// Retry loops layered above a deadline-bounded fetcher need the same deadline,
+// or their backoff sleeps run past it. Threading it through every caller would
+// work until someone adds a caller and forgets; publishing it on the fetcher
+// makes the bound structural, so a new call site inherits it by construction.
+export const PROTECTED_FETCHER_DEADLINE = Symbol.for("protected.fetcherDeadlineMs");
+
+export type DeadlineBoundFetcher = Fetcher & {
+  readonly [PROTECTED_FETCHER_DEADLINE]?: () => number;
+};
+
+// Reads the deadline a fetcher was built with, if it has one. A bare fetcher
+// (tests, or any path that never wrapped) simply has none, and callers fall
+// back to their attempt cap.
+export function fetcherDeadlineMs(fetcher: Fetcher): number | undefined {
+  const accessor = (fetcher as DeadlineBoundFetcher)[PROTECTED_FETCHER_DEADLINE];
+  return accessor === undefined ? undefined : accessor();
+}
+
 export function deadlineFetcher(
   fetcher: Fetcher,
   deadline: () => number,
   maximumRequestMs = PROTECTED_MAX_REQUEST_MS,
   now: () => number = Date.now,
 ): Fetcher {
-  return async (input, init = {}) => {
+  const bound: DeadlineBoundFetcher = Object.assign(async (
+    input: Parameters<Fetcher>[0],
+    init: Parameters<Fetcher>[1] = {},
+  ) => {
     const remainingMs = Math.min(maximumRequestMs, deadline() - now());
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
       throw new Error("API request reached the protected operation deadline.");
@@ -12770,7 +12891,8 @@ export function deadlineFetcher(
       if (timer !== undefined) clearTimeout(timer);
       upstream?.removeEventListener("abort", abortFromUpstream);
     }
-  };
+  }, { [PROTECTED_FETCHER_DEADLINE]: deadline });
+  return bound;
 }
 
 async function bufferApiResponse(
