@@ -44,7 +44,7 @@ const GOOGLE_PROVIDER_MIRROR_COMPONENTS = [
   "linux_amd64",
 ] as const;
 const PLAN_FORMAT_VERSION = "1.2";
-const JOB_TIMEOUT_MINUTES = 41;
+const JOB_TIMEOUT_MINUTES = 42;
 const PLAN_MAIN_STEP_TIMEOUT_MINUTES = 25;
 const APPLY_MAIN_STEP_TIMEOUT_MINUTES = 39;
 const LEASE_MINUTES = 54;
@@ -55,9 +55,14 @@ export const RECOVERY_STABLE_EMPTY_MINUTES = 3;
 const RECOVERY_SCAN_INTERVAL_MINUTES = 1;
 const RECOVERY_SCAN_LATENCY_MARGIN_MINUTES = 1;
 const RECOVERY_LATE_RETRY_MARGIN_MINUTES = 1;
+// Once every affected project has completed the parallel propagation horizon,
+// recovery still has to re-inventory all durable intents, restore four pools in
+// parallel, prove their exact fingerprints, and commit generation-bound
+// markers. This is a real budget, not work smuggled into the horizon margin.
+const RECOVERY_POST_CONTAINMENT_MINUTES = 1;
 export const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
   RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_LATENCY_MARGIN_MINUTES +
-  RECOVERY_LATE_RETRY_MARGIN_MINUTES;
+  RECOVERY_LATE_RETRY_MARGIN_MINUTES + RECOVERY_POST_CONTAINMENT_MINUTES;
 const RECOVERY_SOURCE_PROOF_MINUTES = 1;
 const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;
 const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +
@@ -67,7 +72,11 @@ const SAME_JOB_TRANSITION_MARGIN_MINUTES = 1;
 const PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +
   RECOVERY_STEP_TIMEOUT_MINUTES + SAME_JOB_TRANSITION_MARGIN_MINUTES;
 const APPLY_MAIN_JOB_TAIL_MINUTES = 2;
-const FRESH_RECOVERY_SETUP_STEP_COUNT = 3;
+// Route validation, exact-source fetch, and checksum-pinned Bun installation
+// share one fail-closed setup step. The two independent network transfers run
+// concurrently, so the fresh runner spends one bounded minute rather than
+// serially consuming three minutes of the same one-hour owner token.
+const FRESH_RECOVERY_SETUP_STEP_COUNT = 1;
 const FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES = 1;
 const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +
   RECOVERY_STEP_TIMEOUT_MINUTES + FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES;
@@ -291,7 +300,6 @@ const BRIDGE_PHASES = [
   "controller.federation-preflight",
   "controller.federation-restore",
   "controller.final-audit",
-  "controller.owner-completion",
   "controller.quarantine",
   "controller.complete",
   "controller.failed",
@@ -315,7 +323,6 @@ const BRIDGE_PHASES = [
   "recovery.inventory",
   "recovery.complete",
   "recovery.federation",
-  "recovery.finalize",
   "recovery.failed",
 ] as const;
 const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
@@ -377,14 +384,15 @@ if (
 if (
   PLAN_MAIN_STEP_TIMEOUT_MINUTES !==
       JOB_TIMEOUT_MINUTES - PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES ||
-  APPLY_MAIN_STEP_TIMEOUT_MINUTES !== JOB_TIMEOUT_MINUTES - APPLY_MAIN_JOB_TAIL_MINUTES
+  APPLY_MAIN_STEP_TIMEOUT_MINUTES + APPLY_MAIN_JOB_TAIL_MINUTES > JOB_TIMEOUT_MINUTES
 ) {
   throw new Error("The crash-recovery deadline escaped the main job's reserved tail.");
 }
 if (
   RECOVERY_OPERATION_MINUTES !==
     RECOVERY_DOCUMENTED_PROPAGATION_MINUTES + RECOVERY_STABLE_EMPTY_MINUTES +
-      RECOVERY_SCAN_LATENCY_MARGIN_MINUTES + RECOVERY_LATE_RETRY_MARGIN_MINUTES ||
+      RECOVERY_SCAN_LATENCY_MARGIN_MINUTES + RECOVERY_LATE_RETRY_MARGIN_MINUTES +
+      RECOVERY_POST_CONTAINMENT_MINUTES ||
   RECOVERY_SCAN_LATENCY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
   RECOVERY_LATE_RETRY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
   RECOVERY_STEP_TIMEOUT_MINUTES !==
@@ -555,6 +563,13 @@ export const REPOSITORIES: Readonly<Record<RepositoryName, RepositoryContract>> 
     },
   },
 };
+
+if (
+  new Set(REPOSITORY_NAMES.map((repository) => REPOSITORIES[repository].projectId)).size !==
+    REPOSITORY_NAMES.length
+) {
+  throw new Error("Every protected repository must own one distinct Google Cloud project.");
+}
 
 const BOOTSTRAP_RESOURCE_TYPES = new Set([
   "google_iam_workload_identity_pool",
@@ -1043,26 +1058,12 @@ export type FinalProtectedProof =
 // not know?"), needs seven minutes of propagation plus three stable, and cannot
 // fit between operationDeadlineMs and cleanupDeadlineMs. Wiring it inline would
 // have failed every apply at its last step.
-// An exact reference to one published object, not merely its digest. Completion
-// names the bucket, key, generation, size and content hash it countersigns, so
-// a verifier can re-read exactly that object and nothing else.
-export interface FinalReceiptReference {
-  readonly bucket: string;
-  readonly deElevationExecutorEmail: string;
-  readonly deElevationExecutorUniqueId: string;
-  readonly digest: string;
-  readonly generation: string;
-  readonly object: string;
-  readonly publishedAt: string;
-  readonly size: number;
-}
-
 export interface ExecutorReleaseProof {
   readonly artifactsDeleted: true;
   // How absence was established. The inline path has exact, direct evidence
-  // about one named account; a detached finalizer has the full propagation
-  // horizon instead. Both are proofs; they are not the same proof, and a
-  // verifier is entitled to know which it is reading.
+  // about one named account; crash recovery has the full propagation horizon
+  // instead. Both are proofs; they are not the same proof, and a verifier is
+  // entitled to know which it is reading.
   readonly provenBy: "exact-release" | "propagation-horizon";
   readonly executorEmail: string;
   readonly executorUniqueId: string;
@@ -1177,17 +1178,9 @@ export interface BridgeDependencies {
     invocation: Invocation,
     review: ReviewManifestResult,
     proof: FinalProtectedProof,
-    nowMs: number,
-  ) => Promise<FinalReceiptReference>;
-  // Written by the OWNER, after the executor is provably gone. Until this
-  // exists the final receipt is a claim, not a countable success: the receipt
-  // is published by a de-elevated identity that still exists, and deleting that
-  // identity can still fail afterwards.
-  readonly publishOwnerCompletion: (
-    invocation: Invocation,
-    pending: FinalReceiptReference,
     releaseProof: ExecutorReleaseProof,
-    cleanupDeadlineMs: number,
+    nowMs: number,
+    publicationDeadlineMs: number,
   ) => Promise<void>;
   readonly readPlanJson: (
     invocation: Invocation,
@@ -1229,6 +1222,7 @@ export interface BridgeDependencies {
   // quarantine that fails halfway is still a quarantine this run must undo.
   readonly armFederationQuarantine: (
     invocation: Invocation,
+    session: ExecutorSession,
     operationDeadlineMs: number,
   ) => Promise<{ readonly generation: string; readonly record: FederationQuarantineRecord }>;
   // Disables all four, proving each converged to disabled with an otherwise
@@ -1275,20 +1269,13 @@ export interface RecoveryDependencies {
   // target can be followed by a run for a different one.
   readonly recoverFederation: (
     invocation: RecoveryInvocation,
-    horizon: ProjectContainmentHorizon,
+    horizon: FleetContainmentHorizon,
     recoveryDeadlineMs: number,
   ) => Promise<FederationRecoverySummary>;
-  // Closes the one gap the design leaves: a run that published its pending
-  // apply receipt and died before countersigning it.
-  readonly finalizePendingReceipts: (
-    invocation: RecoveryInvocation,
-    horizon: ProjectContainmentHorizon,
-    recoveryDeadlineMs: number,
-  ) => Promise<PendingFinalizationSummary>;
   readonly recoverArtifacts: (
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
-  ) => Promise<ProjectContainmentHorizon>;
+  ) => Promise<FleetContainmentHorizon>;
   readonly verifySource: (invocation: RecoveryInvocation) => Promise<void>;
 }
 
@@ -3471,12 +3458,24 @@ function normalizedFreezeProof(
 }
 
 export const FEDERATION_POOL_ID = "github-actions";
+export const FEDERATION_PROVIDER_ID = "github";
 const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
 const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
 const MAX_FEDERATION_INTENT_PAGES = 32;
 const FEDERATION_MARKER_SKEW_MS = 5 * 60_000;
 
 export interface FederationPoolState {
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly displayName: string;
+  readonly mode: "FEDERATION_ONLY";
+  readonly name: string;
+  readonly state: string;
+}
+
+export interface FederationProviderState {
+  readonly attributeCondition: string;
+  readonly attributeMapping: Readonly<Record<string, string>>;
   readonly description: string;
   readonly disabled: boolean;
   readonly displayName: string;
@@ -3490,19 +3489,105 @@ export interface FederationPoolState {
 export function federationPoolFingerprint(pool: FederationPoolState): string {
   return canonicalJson(
     json(
-      { description: pool.description, displayName: pool.displayName, name: pool.name, state: pool.state },
+      {
+        description: pool.description,
+        displayName: pool.displayName,
+        mode: pool.mode,
+        name: pool.name,
+        state: pool.state,
+      },
       "federation pool fingerprint",
     ),
   );
 }
 
+function federationPoolResourceName(projectId: string): string {
+  const repository = REPOSITORY_NAMES.find(
+    (candidate) => REPOSITORIES[candidate].projectId === projectId,
+  );
+  if (repository === undefined) {
+    throw new Error("The workload identity pool project escaped the repository contract.");
+  }
+  return `projects/${REPOSITORIES[repository].exposure.projectNumber}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+}
+
+function validatedFederationPoolFingerprint(
+  value: unknown,
+  repository: RepositoryName,
+): string {
+  const text = requiredString(value, "federation quarantine fingerprint");
+  if (Buffer.byteLength(text) > 4096) {
+    throw new Error("Federation quarantine fingerprint is oversized.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("Federation quarantine fingerprint is not JSON.");
+  }
+  const fingerprint = record(parsed, "federation quarantine fingerprint");
+  exactKeys(
+    fingerprint,
+    new Set(["description", "displayName", "mode", "name", "state"]),
+    "federation quarantine fingerprint",
+  );
+  requiredStringOrEmpty(fingerprint.description, "federation quarantine description");
+  requiredStringOrEmpty(fingerprint.displayName, "federation quarantine display name");
+  exact(fingerprint.mode, "FEDERATION_ONLY", "federation quarantine fingerprint mode");
+  exact(
+    fingerprint.name,
+    federationPoolResourceName(REPOSITORIES[repository].projectId),
+    "federation quarantine fingerprint name",
+  );
+  exact(fingerprint.state, "ACTIVE", "federation quarantine fingerprint state");
+  exact(
+    text,
+    canonicalJson(json(fingerprint, "federation quarantine fingerprint")),
+    "federation quarantine fingerprint bytes",
+  );
+  return text;
+}
+
+// The provider contains the actual GitHub claim mapping and CEL admission
+// condition. The pool-level disabled flag is the containment mechanism, but a
+// restore must never re-enable a pool whose provider broadened while it was
+// closed. Store a compact SHA-256 commitment to the complete normalized
+// provider rather than copying four potentially large CEL mappings into every
+// durable intent.
+export function federationProviderFingerprint(provider: FederationProviderState): string {
+  return sha256Hex(canonicalJson(json({
+    attributeCondition: provider.attributeCondition,
+    attributeMapping: provider.attributeMapping,
+    description: provider.description,
+    disabled: provider.disabled,
+    displayName: provider.displayName,
+    name: provider.name,
+    state: provider.state,
+  }, "federation provider fingerprint")));
+}
+
+function validatedFederationProviderFingerprint(value: unknown): string {
+  const text = requiredString(value, "federation quarantine provider fingerprint");
+  if (!/^[0-9a-f]{64}$/.test(text)) {
+    throw new Error("Federation quarantine provider fingerprint is not a SHA-256 digest.");
+  }
+  return text;
+}
+
 export interface FederationQuarantineRecord {
+  readonly approvedManifestSha256: string;
+  readonly approvedPlanRunId: string;
   readonly capturedAt: string;
+  readonly consumerSha: string;
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
   readonly platformSha: string;
   readonly pools: readonly {
     readonly disabled: boolean;
     readonly fingerprint: string;
     readonly name: string;
+    readonly providerFingerprint: string;
+    readonly providerName: string;
     readonly repository: RepositoryName;
   }[];
   readonly repository: RepositoryName;
@@ -3630,6 +3715,11 @@ async function listStorageObjects(
     exactKeys(body, new Set(["items", "nextPageToken"]), "federation intent listing");
     for (const raw of array(body.items ?? [], "federation intent listing items")) {
       const item = record(raw, "federation intent listing item");
+      exactKeys(
+        item,
+        new Set(["generation", "metageneration", "name", "size"]),
+        "federation intent listing item",
+      );
       const name = requiredString(item.name, "federation intent object name");
       if (!name.startsWith(prefix)) {
         throw new Error("Federation intent listing returned an object outside its prefix.");
@@ -3648,9 +3738,16 @@ async function listStorageObjects(
       if (!/^[1-9][0-9]*$/.test(generation)) {
         throw new Error("Federation intent generation is malformed.");
       }
+      const metageneration = requiredString(
+        item.metageneration,
+        "federation intent metageneration",
+      );
+      if (!/^[1-9][0-9]*$/.test(metageneration)) {
+        throw new Error("Federation intent metageneration is malformed.");
+      }
       items.push({
         generation,
-        metageneration: requiredString(item.metageneration, "federation intent metageneration"),
+        metageneration,
         name,
         size,
       });
@@ -3759,22 +3856,24 @@ async function federationInventory(
   ownerAccessToken: string,
   fetcher: Fetcher,
 ): Promise<readonly (StorageObjectListing & { readonly bucket: string })[]> {
-  const inventory: (StorageObjectListing & { readonly bucket: string })[] = [];
-  for (const location of federationIntentLocations()) {
+  // Each bucket is independent authority. Reading them concurrently shortens
+  // elapsed recovery time without weakening pagination or completeness inside
+  // any bucket; every individual listing still has its own strict page walk.
+  const batches = await Promise.all(federationIntentLocations().map(async (location) => {
     const objects = await listStorageObjects(
       location.bucket,
       location.prefix,
       ownerAccessToken,
       fetcher,
     );
-    for (const entry of objects) {
+    const entries = objects.map((entry) => {
       const tail = entry.name.slice(location.prefix.length);
       // Nothing unknown may sit in a prefix whose contents authorize a restore.
       if (!/^[1-9][0-9]*\.json(\.restored)?$/.test(tail)) {
         throw new Error(`Federation intent prefix holds an unrecognised object: ${entry.name}.`);
       }
-      inventory.push({ ...entry, bucket: location.bucket });
-    }
+      return { ...entry, bucket: location.bucket };
+    });
     // A completion marker with no intent behind it is not a harmless leftover:
     // either the intent it completed was deleted, or somebody planted a marker
     // to suppress a restore that has not happened. Neither is safe to walk past.
@@ -3788,8 +3887,9 @@ async function federationInventory(
         );
       }
     }
-  }
-  return inventory.toSorted((left, right) =>
+    return entries;
+  }));
+  return batches.flat().toSorted((left, right) =>
     `${left.bucket}/${left.name}` < `${right.bucket}/${right.name}` ? -1 : 1
   );
 }
@@ -3820,6 +3920,154 @@ async function stableFederationInventory(
   return first;
 }
 
+interface ValidatedFederationInventory {
+  readonly incomplete: readonly DiscoveredIntent[];
+  readonly inventory: readonly (StorageObjectListing & { readonly bucket: string })[];
+  readonly scanned: number;
+  readonly skippedComplete: readonly string[];
+}
+
+export interface FederationContainmentIdentity {
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly platformSha: string;
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+const MAX_FEDERATION_CONTAINMENT_IDENTITIES = 32;
+
+// Read the complete durable recovery authority, not a projection of it.
+//
+// The listing is already double-inventoried. This layer binds every listed
+// generation and byte count to canonical whole-document bytes at the exact
+// contracted bucket/key, and validates a restore marker before treating an
+// intent as complete. The same reader is used both before containment and
+// immediately before mutation, so discovery cannot be weaker than restore.
+async function validatedFederationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  now: () => number,
+): Promise<ValidatedFederationInventory> {
+  const inventory = await stableFederationInventory(ownerAccessToken, fetcher);
+  const byKey = new Map(inventory.map((entry) => [`${entry.bucket}/${entry.name}`, entry]));
+  const incomplete: DiscoveredIntent[] = [];
+  const skippedComplete: string[] = [];
+  let scanned = 0;
+  for (const entry of inventory) {
+    if (entry.name.endsWith(".restored")) continue;
+    scanned += 1;
+    exact(entry.metageneration, "1", "federation intent metageneration");
+    const body = await readObjectGeneration(
+      entry.bucket,
+      entry.name,
+      entry.generation,
+      ownerAccessToken,
+      fetcher,
+    );
+    if (Buffer.byteLength(body) !== entry.size) {
+      throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body) as unknown;
+    } catch {
+      throw new Error(`Federation intent ${entry.name} is not JSON.`);
+    }
+    const intent = federationQuarantineRecordFromJson(parsed);
+    exact(
+      body,
+      canonicalJson(json(intent, "federation quarantine record")),
+      "federation quarantine record bytes",
+    );
+    const state = REPOSITORIES[intent.repository].state[intent.root];
+    exact(entry.bucket, state.bucket, "federation intent bucket");
+    exact(entry.name, federationIntentObjectFor(state, intent.runId), "federation intent object name");
+    const digest = sha256Hex(body);
+    const capturedAtMs = Date.parse(intent.capturedAt);
+    if (capturedAtMs > now() + FEDERATION_MARKER_SKEW_MS) {
+      throw new Error(`Federation intent ${entry.name} is dated into the future.`);
+    }
+    const markerEntry = byKey.get(`${entry.bucket}/${entry.name}.restored`);
+    if (markerEntry !== undefined) {
+      exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
+      const markerBody = await readObjectGeneration(
+        entry.bucket,
+        markerEntry.name,
+        markerEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (Buffer.byteLength(markerBody) !== markerEntry.size) {
+        throw new Error(
+          `Federation restore marker ${markerEntry.name} did not match its listed size.`,
+        );
+      }
+      let markerParsed: unknown;
+      try {
+        markerParsed = JSON.parse(markerBody) as unknown;
+      } catch {
+        throw new Error(`Federation restore marker ${markerEntry.name} is not JSON.`);
+      }
+      const marker = federationRestoreMarkerFromJson(markerParsed, now(), capturedAtMs);
+      exact(markerBody, federationRestoreMarkerBody(marker), "federation restore marker bytes");
+      exact(marker.intentDigest, digest, "federation restore marker intent digest");
+      exact(
+        marker.intentGeneration,
+        entry.generation,
+        "federation restore marker intent generation",
+      );
+      exact(marker.repository, intent.repository, "federation restore marker repository");
+      exact(marker.root, intent.root, "federation restore marker root");
+      exact(marker.runId, intent.runId, "federation restore marker run ID");
+      skippedComplete.push(entry.name);
+      continue;
+    }
+    incomplete.push({
+      bucket: entry.bucket,
+      capturedAtMs,
+      digest,
+      generation: entry.generation,
+      intent,
+      name: entry.name,
+    });
+  }
+  return { incomplete, inventory, scanned, skippedComplete };
+}
+
+export async function discoverFederationContainmentIdentities(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  now: () => number = () => Date.now(),
+): Promise<readonly FederationContainmentIdentity[]> {
+  const snapshot = await validatedFederationInventory(ownerAccessToken, fetcher, now);
+  if (snapshot.incomplete.length > MAX_FEDERATION_CONTAINMENT_IDENTITIES) {
+    throw new Error("Federation recovery found more incomplete identities than its reviewed bound.");
+  }
+  const seen = new Set<string>();
+  const identities = snapshot.incomplete.map(({ intent }) => {
+    const key = `${intent.repository}/${intent.runId}`;
+    if (seen.has(key)) {
+      throw new Error(`Federation recovery found two incomplete intents for ${key}.`);
+    }
+    seen.add(key);
+    return {
+      executorEmail: intent.executorEmail,
+      executorUniqueId: intent.executorUniqueId,
+      platformSha: intent.platformSha,
+      repository: intent.repository,
+      root: intent.root,
+      runId: intent.runId,
+    };
+  });
+  return identities.toSorted((left, right) => {
+    const leftKey = `${left.repository}/${left.runId}`;
+    const rightKey = `${right.repository}/${right.runId}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+}
+
 // The production recovery path, shared verbatim by --recover-only and by the
 // preflight every protected run performs.
 //
@@ -3836,8 +4084,11 @@ export async function recoverFederationQuarantines(
   deadlineMs: number,
   containIntent: (
     identity: {
+      readonly executorEmail: string;
+      readonly executorUniqueId: string;
       readonly platformSha: string;
       readonly repository: RepositoryName;
+      readonly root: TerraformRoot;
       readonly runId: string;
     },
   ) => Promise<ExecutorReleaseProof | undefined>,
@@ -3845,76 +4096,8 @@ export async function recoverFederationQuarantines(
   now: () => number = () => Date.now(),
 ): Promise<FederationRecoverySummary> {
   assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery scan");
-  const inventory = await stableFederationInventory(ownerAccessToken, fetcher);
-  const byKey = new Map(inventory.map((entry) => [`${entry.bucket}/${entry.name}`, entry]));
-  const skippedComplete: string[] = [];
-  const incomplete: DiscoveredIntent[] = [];
-  let scanned = 0;
-
-  // ---- phase one: validate and contain everything -------------------------
-  for (const entry of inventory) {
-    if (entry.name.endsWith(".restored")) continue;
-    scanned += 1;
-    assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery");
-    const body = await readObjectGeneration(
-      entry.bucket,
-      entry.name,
-      entry.generation,
-      ownerAccessToken,
-      fetcher,
-    );
-    if (Buffer.byteLength(body) !== entry.size) {
-      throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
-    }
-    const digest = sha256Hex(body);
-    const intent = federationQuarantineRecordFromJson(JSON.parse(body) as unknown);
-    const state = REPOSITORIES[intent.repository].state[intent.root];
-    exact(entry.name, federationIntentObjectFor(state, intent.runId), "federation intent object name");
-    exact(entry.bucket, state.bucket, "federation intent bucket");
-    exact(entry.metageneration, "1", "federation intent metageneration");
-    const capturedAtMs = Date.parse(intent.capturedAt);
-
-    const markerEntry = byKey.get(`${entry.bucket}/${entry.name}.restored`);
-    if (markerEntry !== undefined) {
-      exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
-      const markerBody = await readObjectGeneration(
-        entry.bucket,
-        markerEntry.name,
-        markerEntry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      if (Buffer.byteLength(markerBody) !== markerEntry.size) {
-        throw new Error(
-          `Federation restore marker ${markerEntry.name} did not match its listed size.`,
-        );
-      }
-      const marker = federationRestoreMarkerFromJson(
-        JSON.parse(markerBody) as unknown,
-        now(),
-        capturedAtMs,
-      );
-      // Canonical bytes, not merely equivalent JSON: a marker that parses to the
-      // right values but was serialised differently was not written by this
-      // system, and the whole point of the marker is provenance.
-      exact(markerBody, federationRestoreMarkerBody(marker), "federation restore marker bytes");
-      exact(marker.intentDigest, digest, "federation restore marker intent digest");
-      exact(marker.intentGeneration, entry.generation, "federation restore marker intent generation");
-      exact(marker.repository, intent.repository, "federation restore marker repository");
-      exact(marker.root, intent.root, "federation restore marker root");
-      exact(marker.runId, intent.runId, "federation restore marker run ID");
-      skippedComplete.push(entry.name);
-      continue;
-    }
-    incomplete.push({
-      bucket: entry.bucket,
-      capturedAtMs,
-      digest,
-      generation: entry.generation,
-      intent,
-      name: entry.name,
-    });
-  }
+  const snapshot = await validatedFederationInventory(ownerAccessToken, fetcher, now);
+  const { incomplete, inventory, scanned, skippedComplete } = snapshot;
 
   if (incomplete.length === 0) {
     return { restored: [], scanned, skippedComplete, skippedUncontained: [] };
@@ -3937,8 +4120,11 @@ export async function recoverFederationQuarantines(
   for (const entry of incomplete) {
     assertBeforeDeadline(now(), deadlineMs, "federation quarantine containment");
     const contained = await containIntent({
+      executorEmail: entry.intent.executorEmail,
+      executorUniqueId: entry.intent.executorUniqueId,
       platformSha: entry.intent.platformSha,
       repository: entry.intent.repository,
+      root: entry.intent.root,
       runId: entry.intent.runId,
     });
     if (contained === undefined) uncontained.push(entry.name);
@@ -3954,6 +4140,11 @@ export async function recoverFederationQuarantines(
   // in that window -- and phase one's conclusions would then be about a world
   // that no longer exists. Re-prove the inventory is byte-identical to the one
   // those conclusions were drawn from, immediately before the first pool moves.
+  // The first snapshot already validated the canonical bytes at an immutable
+  // generation. Re-reading every body here adds no mutation detection: if the
+  // double-listed generation, metageneration, size, key, and count are
+  // byte-for-byte identical, those already-validated immutable bytes are the
+  // same authority. Re-prove exactly that metadata immediately before PATCH.
   const confirmed = await stableFederationInventory(ownerAccessToken, fetcher);
   if (confirmed.length !== inventory.length) {
     throw new Error(
@@ -3974,35 +4165,38 @@ export async function recoverFederationQuarantines(
   });
 
   // ---- phase two: restore, deterministically -------------------------------
-  const restored: string[] = [];
-  for (const entry of incomplete) {
-    assertBeforeDeadline(now(), deadlineMs, "federation quarantine restore");
-    await restoreQuarantinedFederation(
-      entry.intent,
-      ownerAccessToken,
-      fetcher,
-      deadlineMs,
-      sleep,
-      now,
-    );
-    await writeFederationRestoreMarker(
-      entry.bucket,
-      entry.name,
-      {
-        intentDigest: entry.digest,
-        intentGeneration: entry.generation,
-        repository: entry.intent.repository,
-        restoredAt: new Date(now()).toISOString(),
-        root: entry.intent.root,
-        runId: entry.intent.runId,
-      },
-      ownerAccessToken,
-      fetcher,
-      now,
-      entry.capturedAtMs,
-    );
-    restored.push(entry.name);
-  }
+  assertBeforeDeadline(now(), deadlineMs, "federation quarantine restore");
+  // Shape equality above proves every incomplete intent captured the same four
+  // pools. Restore and read back that shared world once; repeating the same
+  // four PATCH/convergence cycles for each historical intent only extends the
+  // privileged outage and consumes the owner-token deadline without adding a
+  // distinct proof.
+  await restoreQuarantinedFederation(
+    incomplete[0]!.intent,
+    ownerAccessToken,
+    fetcher,
+    deadlineMs,
+    sleep,
+    now,
+  );
+  const restoredAt = new Date(now()).toISOString();
+  await Promise.all(incomplete.map((entry) => writeFederationRestoreMarker(
+    entry.bucket,
+    entry.name,
+    {
+      intentDigest: entry.digest,
+      intentGeneration: entry.generation,
+      repository: entry.intent.repository,
+      restoredAt,
+      root: entry.intent.root,
+      runId: entry.intent.runId,
+    },
+    ownerAccessToken,
+    fetcher,
+    now,
+    entry.capturedAtMs,
+  )));
+  const restored = incomplete.map((entry) => entry.name);
   return { restored, scanned, skippedComplete, skippedUncontained: [] };
 }
 
@@ -4076,297 +4270,7 @@ export async function writeFederationRestoreMarker(
   );
 }
 
-export interface PendingFinalizationSummary {
-  readonly alreadyComplete: readonly string[];
-  readonly finalized: readonly string[];
-  readonly scanned: number;
-  readonly skippedUncontained: readonly string[];
-}
-
 const MAX_RECEIPT_BODY_BYTES = 32 * 1024;
-
-function receiptPrefix(state: { readonly prefix: string }, kind: "completion" | "final"): string {
-  return `${state.prefix}/.protected-bootstrap/${kind}/`;
-}
-
-// The detached owner finalizer.
-//
-// A protected apply publishes its pending receipt after cleanup, then
-// countersigns it. A crash between those two writes is the ONLY gap the design
-// leaves, and this is what closes it -- from a fresh runner, with a fresh owner
-// token, and with the full propagation-horizon plus stable-empty containment
-// proof that the inline path cannot afford inside its five-minute reserve.
-//
-// It never invents evidence. A pending receipt is finalized only when the whole
-// document validates, the durable quarantine intent it names still exists at the
-// exact generation and digest it claims, that intent carries a validated restore
-// marker, and the executor for that run is driven to provable absence. A
-// rehearsal is not eligible: its record lives under a different prefix and is
-// terminal on its own.
-export async function finalizePendingApplyReceipts(
-  ownerAccessToken: string,
-  fetcher: Fetcher,
-  deadlineMs: number,
-  horizon: ProjectContainmentHorizon,
-  containRun: (
-    identity: {
-      readonly platformSha: string;
-      readonly repository: RepositoryName;
-      readonly runId: string;
-    },
-  ) => Promise<ExecutorReleaseProof | undefined>,
-  now: () => number = () => Date.now(),
-): Promise<PendingFinalizationSummary> {
-  const alreadyComplete: string[] = [];
-  const finalized: string[] = [];
-  const skippedUncontained: string[] = [];
-  let scanned = 0;
-
-  for (const location of federationIntentLocations()) {
-    assertBeforeDeadline(now(), deadlineMs, "pending receipt finalization scan");
-    const state = REPOSITORIES[location.repository].state[location.root];
-    const pendingObjects = await listStorageObjects(
-      location.bucket,
-      receiptPrefix(state, "final"),
-      ownerAccessToken,
-      fetcher,
-    );
-    const completionObjects = await listStorageObjects(
-      location.bucket,
-      receiptPrefix(state, "completion"),
-      ownerAccessToken,
-      fetcher,
-    );
-    const pendingRuns = new Map<string, StorageObjectListing>();
-    for (const entry of pendingObjects) {
-      const tail = entry.name.slice(receiptPrefix(state, "final").length);
-      if (!/^[1-9][0-9]*\.json$/.test(tail)) {
-        throw new Error(`The pending receipt prefix holds an unrecognised object: ${entry.name}.`);
-      }
-      const runId = tail.slice(0, -".json".length);
-      // Two objects claiming the same run cannot both be that run's receipt.
-      if (pendingRuns.has(runId)) {
-        throw new Error(`Two pending receipts claim run ${runId}.`);
-      }
-      pendingRuns.set(runId, entry);
-    }
-    const completions = new Map<string, StorageObjectListing>();
-    for (const entry of completionObjects) {
-      const tail = entry.name.slice(receiptPrefix(state, "completion").length);
-      if (!/^[1-9][0-9]*\.json$/.test(tail)) {
-        throw new Error(`The completion prefix holds an unrecognised object: ${entry.name}.`);
-      }
-      const runId = tail.slice(0, -".json".length);
-      if (completions.has(runId)) {
-        throw new Error(`Two completions claim run ${runId}.`);
-      }
-      // A completion with no pending receipt has nothing to countersign; it is
-      // either a deletion nobody reviewed or an object nobody should have
-      // written, and either way this stops rather than reasoning past it.
-      if (!pendingRuns.has(runId)) {
-        throw new Error(`Completion ${entry.name} has no pending receipt to countersign.`);
-      }
-      completions.set(runId, entry);
-    }
-
-    for (const [runId, entry] of [...pendingRuns].toSorted(([left], [right]) =>
-      left < right ? -1 : 1
-    )) {
-      scanned += 1;
-      assertBeforeDeadline(now(), deadlineMs, "pending receipt finalization");
-      if (entry.size > MAX_RECEIPT_BODY_BYTES) {
-        throw new Error(`Pending receipt ${entry.name} exceeds its reviewed size bound.`);
-      }
-      const body = await readObjectGeneration(
-        location.bucket,
-        entry.name,
-        entry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      if (Buffer.byteLength(body) !== entry.size) {
-        throw new Error(`Pending receipt ${entry.name} did not match its listed size.`);
-      }
-      // Repository, root and run come from where the object lives and what it
-      // is called; the platform and consumer commits come from the receipt and
-      // are cross-checked against the durable intent below.
-      const receipt = pendingApplyReceiptFromBody(body, {
-        repository: location.repository,
-        root: location.root,
-        runId,
-      });
-
-      // The durable quarantine intent this receipt names must still exist, at
-      // exactly the generation and digest it claims, and must agree about which
-      // platform commit was running.
-      const intentEntry = await readObjectMetadata(
-        location.bucket,
-        federationIntentObjectFor(state, runId),
-        ownerAccessToken,
-        fetcher,
-      );
-      exact(intentEntry.generation, receipt.intentGeneration, "pending receipt intent generation");
-      const intentBody = await readObjectGeneration(
-        location.bucket,
-        federationIntentObjectFor(state, runId),
-        intentEntry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      exact(sha256Hex(intentBody), receipt.intentDigest, "pending receipt intent digest");
-      const intent = federationQuarantineRecordFromJson(JSON.parse(intentBody) as unknown);
-      exact(intent.repository, location.repository, "pending receipt intent repository");
-      exact(intent.root, location.root, "pending receipt intent root");
-      exact(intent.runId, runId, "pending receipt intent run ID");
-      exact(intent.platformSha, receipt.platformSha, "pending receipt intent platform SHA");
-      // The pools the receipt says it observed must be the pools the intent
-      // captured -- same order, same canonical fingerprints. A receipt is not
-      // allowed to invent what the world looked like.
-      exact(
-        canonicalJson(json(
-          receipt.observedPoolFingerprints.map((fingerprint) => fingerprint),
-          "pending receipt observed fingerprints",
-        )),
-        canonicalJson(json(
-          intent.pools.map((pool) => pool.fingerprint),
-          "pending receipt intent fingerprints",
-        )),
-        "pending receipt observed pool fingerprints",
-      );
-
-      // And that intent must carry a validated completion marker: federation
-      // was handed back before this run could ever have published a receipt.
-      const markerObject = `${federationIntentObjectFor(state, runId)}.restored`;
-      const markerEntry = await readObjectMetadata(
-        location.bucket,
-        markerObject,
-        ownerAccessToken,
-        fetcher,
-      );
-      const markerBody = await readObjectGeneration(
-        location.bucket,
-        markerObject,
-        markerEntry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      const marker = federationRestoreMarkerFromJson(
-        JSON.parse(markerBody) as unknown,
-        now(),
-        Date.parse(intent.capturedAt),
-      );
-      exact(markerBody, federationRestoreMarkerBody(marker), "pending receipt restore marker bytes");
-      exact(marker.intentDigest, receipt.intentDigest, "pending receipt restore marker digest");
-      exact(
-        marker.intentGeneration,
-        receipt.intentGeneration,
-        "pending receipt restore marker intent generation",
-      );
-
-      // The manifest digest is checked against the approved plan receipt this
-      // run consumed, which is a separate immutable object written by a
-      // separate run. Without that link the digest would only ever be
-      // self-consistent -- a receipt asserting its own provenance.
-      const planObject = receiptObjectName(state, "plans", receipt.approvedPlanRunId);
-      const planEntry = await readObjectMetadata(
-        location.bucket,
-        planObject,
-        ownerAccessToken,
-        fetcher,
-      );
-      if (planEntry.size > MAX_RECEIPT_BODY_BYTES) {
-        throw new Error(`Approved plan receipt ${planObject} exceeds its reviewed size bound.`);
-      }
-      const planBody = await readObjectGeneration(
-        location.bucket,
-        planObject,
-        planEntry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      exact(
-        requiredString(
-          record(JSON.parse(planBody) as unknown, "approved plan receipt").manifestSha256,
-          "approved plan receipt manifest digest",
-        ),
-        receipt.manifestSha256,
-        "pending receipt manifest digest",
-      );
-
-      const existing = completions.get(runId);
-      if (existing !== undefined) {
-        const completionBody = await readObjectGeneration(
-          location.bucket,
-          existing.name,
-          existing.generation,
-          ownerAccessToken,
-          fetcher,
-        );
-        ownerCompletionFromBody(completionBody, {
-          consumerSha: receipt.consumerSha,
-          finalReceiptDigest: sha256Hex(body),
-          finalReceiptGeneration: entry.generation,
-          finalReceiptObject: entry.name,
-          platformSha: receipt.platformSha,
-          repository: location.repository,
-          root: location.root,
-          runId,
-        });
-        alreadyComplete.push(entry.name);
-        continue;
-      }
-
-      // A receipt outside the project this run established a horizon for is
-      // not contained by it, and is reported rather than assumed.
-      const releaseProof = await containRun({
-        platformSha: receipt.platformSha,
-        repository: location.repository,
-        runId,
-      });
-      if (releaseProof === undefined) {
-        skippedUncontained.push(entry.name);
-        continue;
-      }
-      exact(releaseProof.provenBy, "propagation-horizon", "finalizer release provenance");
-      exact(
-        releaseProof.executorEmail,
-        receipt.deElevationExecutorEmail,
-        "finalizer executor identity",
-      );
-
-      await publishOwnerCompletionProof(
-        {
-          consumerSha: receipt.consumerSha,
-          githubRunId: runId,
-          mode: "apply",
-          platformSha: receipt.platformSha,
-          repository: location.repository,
-          terraformRoot: location.root,
-        } as Invocation,
-        ownerAccessToken,
-        {
-          bucket: location.bucket,
-          deElevationExecutorEmail: receipt.deElevationExecutorEmail,
-          deElevationExecutorUniqueId: receipt.deElevationExecutorUniqueId,
-          digest: sha256Hex(body),
-          generation: entry.generation,
-          object: entry.name,
-          publishedAt: receipt.publishedAt,
-          size: entry.size,
-        },
-        // The proof the containment path produced, not one assembled here from
-        // the receipt's own claims. Only the unique ID is taken from the
-        // receipt, because the horizon establishes absence by email.
-        { ...releaseProof, executorUniqueId: receipt.deElevationExecutorUniqueId },
-        now(),
-        fetcher,
-      );
-      finalized.push(entry.name);
-      void horizon;
-    }
-  }
-  return { alreadyComplete, finalized, scanned, skippedUncontained };
-}
 
 export function federationIntentLocations(): readonly {
   readonly bucket: string;
@@ -4450,6 +4354,23 @@ export function buildFinalProtectedProof(
   exact(intent.root, invocation.terraformRoot, "final receipt intent root");
   exact(intent.runId, invocation.githubRunId, "final receipt intent run ID");
   exact(intent.platformSha, invocation.platformSha, "final receipt intent platform SHA");
+  exact(intent.consumerSha, invocation.consumerSha, "final receipt intent consumer SHA");
+  exact(
+    intent.approvedPlanRunId,
+    invocation.approvedPlanRunId,
+    "final receipt intent approved plan run ID",
+  );
+  exact(
+    intent.approvedManifestSha256,
+    invocation.approvedManifestSha256,
+    "final receipt intent approved manifest digest",
+  );
+  exact(intent.executorEmail, deElevation.executorEmail, "final receipt intent executor email");
+  exact(
+    intent.executorUniqueId,
+    deElevation.executorUniqueId,
+    "final receipt intent executor unique ID",
+  );
   if (observedPools.length !== REPOSITORY_NAMES.length) {
     throw new Error("Final receipt did not observe every consumer pool after restoration.");
   }
@@ -4490,21 +4411,40 @@ export function federationQuarantineRecordFromJson(value: unknown): FederationQu
   const source = record(value, "federation quarantine record");
   exactKeys(
     source,
-    new Set(["capturedAt", "platformSha", "pools", "repository", "root", "runId"]),
+    new Set([
+      "approvedManifestSha256",
+      "approvedPlanRunId",
+      "capturedAt",
+      "consumerSha",
+      "executorEmail",
+      "executorUniqueId",
+      "platformSha",
+      "pools",
+      "repository",
+      "root",
+      "runId",
+    ]),
     "federation quarantine record",
   );
   const pools = array(source.pools, "federation quarantine pools").map((raw, index) => {
     const entry = record(raw, `federation quarantine pool ${index}`);
     exactKeys(
       entry,
-      new Set(["disabled", "fingerprint", "name", "repository"]),
+      new Set([
+        "disabled",
+        "fingerprint",
+        "name",
+        "providerFingerprint",
+        "providerName",
+        "repository",
+      ]),
       `federation quarantine pool ${index}`,
     );
     const repository = repositoryName(
       requiredString(entry.repository, "federation quarantine repository"),
     );
-    const expected =
-      `projects/${REPOSITORIES[repository].projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+    const expected = federationPoolResourceName(REPOSITORIES[repository].projectId);
+    const expectedProvider = `${expected}/providers/${FEDERATION_PROVIDER_ID}`;
     // Only the exact contracted pools are ever touched by a restore.
     exact(entry.name, expected, "federation quarantine pool name");
     if (typeof entry.disabled !== "boolean") {
@@ -4512,8 +4452,13 @@ export function federationQuarantineRecordFromJson(value: unknown): FederationQu
     }
     return {
       disabled: entry.disabled,
-      fingerprint: hexOrCanonical(entry.fingerprint, "federation quarantine fingerprint"),
+      fingerprint: validatedFederationPoolFingerprint(entry.fingerprint, repository),
       name: expected,
+      providerFingerprint: validatedFederationProviderFingerprint(entry.providerFingerprint),
+      providerName: (() => {
+        exact(entry.providerName, expectedProvider, "federation quarantine provider name");
+        return expectedProvider;
+      })(),
       repository,
     };
   });
@@ -4531,18 +4476,72 @@ export function federationQuarantineRecordFromJson(value: unknown): FederationQu
   if (!Number.isFinite(capturedAtMs) || new Date(capturedAtMs).toISOString() !== capturedAt) {
     throw new Error("Federation quarantine capture time is malformed.");
   }
+  const repository = repositoryName(
+    requiredString(source.repository, "federation quarantine repository"),
+  );
+  const root = rootName(requiredString(source.root, "federation quarantine root"));
+  const runId = numeric(
+    requiredString(source.runId, "federation quarantine run ID"),
+    "federation quarantine run ID",
+  );
+  const platformSha = fortyHex(
+    requiredString(source.platformSha, "federation quarantine platform SHA"),
+    "federation quarantine platform SHA",
+  );
+  const consumerSha = fortyHex(
+    requiredString(source.consumerSha, "federation quarantine consumer SHA"),
+    "federation quarantine consumer SHA",
+  );
+  const approvedPlanRunId = requiredStringOrEmpty(
+    source.approvedPlanRunId,
+    "federation quarantine approved plan run ID",
+  );
+  const approvedManifestSha256 = requiredStringOrEmpty(
+    source.approvedManifestSha256,
+    "federation quarantine approved manifest digest",
+  );
+  if ((approvedPlanRunId === "") !== (approvedManifestSha256 === "")) {
+    throw new Error("Federation quarantine approval identity is only partially populated.");
+  }
+  if (approvedPlanRunId !== "") {
+    numeric(approvedPlanRunId, "federation quarantine approved plan run ID");
+    hash(approvedManifestSha256, "federation quarantine approved manifest digest");
+  }
+  const executorEmail = requiredString(
+    source.executorEmail,
+    "federation quarantine executor email",
+  );
+  exact(
+    executorEmail,
+    deterministicExecutorEmail({
+      githubRunId: runId,
+      ownerAccessToken: "",
+      platformRoot: "/",
+      platformSha,
+      repository,
+      runnerTemp: "/",
+    }),
+    "federation quarantine executor email",
+  );
+  const executorUniqueId = requiredString(
+    source.executorUniqueId,
+    "federation quarantine executor unique ID",
+  );
+  if (!/^[1-9][0-9]{5,30}$/.test(executorUniqueId)) {
+    throw new Error("Federation quarantine executor unique ID is malformed.");
+  }
   return {
+    approvedManifestSha256,
+    approvedPlanRunId,
     capturedAt,
-    platformSha: fortyHex(
-      requiredString(source.platformSha, "federation quarantine platform SHA"),
-      "federation quarantine platform SHA",
-    ),
+    consumerSha,
+    executorEmail,
+    executorUniqueId,
+    platformSha,
     pools,
-    repository: repositoryName(
-      requiredString(source.repository, "federation quarantine repository"),
-    ),
-    root: rootName(requiredString(source.root, "federation quarantine root")),
-    runId: numeric(requiredString(source.runId, "federation quarantine run ID"), "federation quarantine run ID"),
+    repository,
+    root,
+    runId,
   };
 }
 
@@ -4565,15 +4564,21 @@ export async function restoreQuarantinedFederation(
   sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
   now: () => number = () => Date.now(),
 ): Promise<readonly ObservedFederationPool[]> {
-  // What the world actually looks like afterwards, read back from the API. A
-  // receipt that copied the pre-mutation intent forward would be asserting the
-  // very thing it was supposed to be proving.
-  const observedFinal: ObservedFederationPool[] = [];
-  for (const pool of record.pools) {
+  // Validate every pool before moving any of them. A sequential
+  // validate-and-write loop could re-enable the first consumer and only then
+  // discover drift in the fourth. Once all four fingerprints are proven, the
+  // independent PATCHes can converge concurrently inside one shared deadline.
+  const initial = await Promise.all(record.pools.map(async (pool) => {
     const projectId = REPOSITORIES[pool.repository].projectId;
-    const observed = await readFederationPool(projectId, token, fetcher);
+    const [observed, provider] = await Promise.all([
+      readFederationPool(projectId, token, fetcher),
+      readFederationProvider(projectId, token, fetcher),
+    ]);
     if (observed === undefined) {
       throw new Error(`The ${pool.repository} workload identity pool vanished during the protected run.`);
+    }
+    if (provider === undefined) {
+      throw new Error(`The ${pool.repository} GitHub provider vanished during the protected run.`);
     }
     exact(observed.name, pool.name, "restored workload identity pool identity");
     // Drift in anything other than the flag this run is allowed to move means
@@ -4591,22 +4596,38 @@ export async function restoreQuarantinedFederation(
           `The ${pool.repository} workload identity pool was disabled before this run and is now enabled.`,
         );
       }
-      observedFinal.push(observedPool(pool.repository, observed));
-      continue;
     }
-    if (!observed.disabled) {
-      observedFinal.push(observedPool(pool.repository, observed));
-      continue;
-    }
-    const restored = await setFederationPoolDisabled(
-      projectId,
-      pool.disabled,
-      token,
-      fetcher,
-      deadlineMs,
-      sleep,
-      now,
+    exact(provider.name, pool.providerName, "restored workload identity provider identity");
+    exact(
+      federationProviderFingerprint(provider),
+      pool.providerFingerprint,
+      `restored ${pool.repository} workload identity provider`,
     );
+    return { observed, pool, projectId };
+  }));
+
+  await Promise.all(initial.map(async ({ observed, pool, projectId }) => {
+    if (observed.disabled === pool.disabled) return;
+    await setFederationPoolDisabled(
+      projectId, pool.disabled, token, fetcher, deadlineMs, sleep, now,
+    );
+  }));
+
+  // What the world actually looks like afterwards, read back from the API. A
+  // receipt that copied the pre-mutation intent forward would be asserting the
+  // very thing it was supposed to be proving.
+  const observedFinal = await Promise.all(record.pools.map(async (pool) => {
+    const projectId = REPOSITORIES[pool.repository].projectId;
+    const [restored, provider] = await Promise.all([
+      readFederationPool(projectId, token, fetcher),
+      readFederationProvider(projectId, token, fetcher),
+    ]);
+    if (restored === undefined) {
+      throw new Error(`The ${pool.repository} workload identity pool vanished during restoration.`);
+    }
+    if (provider === undefined) {
+      throw new Error(`The ${pool.repository} GitHub provider vanished during restoration.`);
+    }
     exact(
       federationPoolFingerprint(restored),
       pool.fingerprint,
@@ -4619,8 +4640,20 @@ export async function restoreQuarantinedFederation(
       pool.disabled,
       `restored ${pool.repository} workload identity pool disabled flag`,
     );
-    observedFinal.push(observedPool(pool.repository, restored));
-  }
+    exact(provider.name, pool.providerName, "restored workload identity provider identity");
+    exact(
+      federationProviderFingerprint(provider),
+      pool.providerFingerprint,
+      `restored ${pool.repository} workload identity provider`,
+    );
+    return {
+      disabled: restored.disabled,
+      fingerprint: federationPoolFingerprint(restored),
+      name: restored.name,
+      observedAt: new Date(now()).toISOString(),
+      repository: pool.repository,
+    } satisfies ObservedFederationPool;
+  }));
   if (observedFinal.length !== REPOSITORY_NAMES.length) {
     throw new Error("Federation restoration did not observe every consumer pool.");
   }
@@ -4652,11 +4685,29 @@ export function federationPoolUrl(projectId: string): string {
   return `https://iam.googleapis.com/v1/projects/${projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
 }
 
+export function federationProviderUrl(projectId: string): string {
+  return `${federationPoolUrl(projectId)}/providers/${FEDERATION_PROVIDER_ID}`;
+}
+
 export function federationPoolFromJson(value: unknown, projectId: string): FederationPoolState {
   const pool = record(value, "workload identity pool");
+  exactKeys(
+    pool,
+    new Set([
+      "description",
+      "disabled",
+      "displayName",
+      "expireTime",
+      "inlineCertificateIssuanceConfig",
+      "inlineTrustConfig",
+      "mode",
+      "name",
+      "state",
+    ]),
+    "workload identity pool",
+  );
   const name = requiredString(pool.name, "workload identity pool name");
-  const expected =
-    `projects/${projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+  const expected = federationPoolResourceName(projectId);
   // Identity first, and exactly. A suffix test would accept
   // projects/<anything>/locations/global/workloadIdentityPools/github-actions,
   // which says nothing about the pool actually under contract.
@@ -4672,13 +4723,145 @@ export function federationPoolFromJson(value: unknown, projectId: string): Feder
   if (pool.disabled !== undefined && typeof pool.disabled !== "boolean") {
     throw new Error("The workload identity pool disabled flag is malformed.");
   }
+  if (pool.expireTime !== undefined) {
+    throw new Error("The active workload identity pool unexpectedly has an expiry time.");
+  }
+  if (
+    pool.inlineCertificateIssuanceConfig !== undefined ||
+    pool.inlineTrustConfig !== undefined
+  ) {
+    throw new Error("The GitHub federation pool unexpectedly contains trust-domain configuration.");
+  }
+  const rawMode = pool.mode === undefined
+    ? "MODE_UNSPECIFIED"
+    : requiredString(pool.mode, "workload identity pool mode");
+  if (rawMode !== "MODE_UNSPECIFIED" && rawMode !== "FEDERATION_ONLY") {
+    throw new Error(`The workload identity pool mode is ${rawMode}, not federation-only.`);
+  }
   return {
     description: requiredStringOrEmpty(pool.description, "workload identity pool description"),
     disabled: pool.disabled === true,
     displayName: requiredStringOrEmpty(pool.displayName, "workload identity pool display name"),
+    mode: "FEDERATION_ONLY",
     name,
     state,
   };
+}
+
+export function federationProviderFromJson(
+  value: unknown,
+  projectId: string,
+): FederationProviderState {
+  const provider = record(value, "workload identity pool provider");
+  exactKeys(
+    provider,
+    new Set([
+      "attributeCondition",
+      "attributeMapping",
+      "description",
+      "disabled",
+      "displayName",
+      "expireTime",
+      "name",
+      "oidc",
+      "state",
+    ]),
+    "workload identity pool provider",
+  );
+  const name = requiredString(provider.name, "workload identity pool provider name");
+  const expected = `${federationPoolResourceName(projectId)}/providers/${FEDERATION_PROVIDER_ID}`;
+  exact(name, expected, "workload identity pool provider identity");
+  const state = requiredString(provider.state, "workload identity pool provider state");
+  exact(state, "ACTIVE", "workload identity pool provider state");
+  if (provider.expireTime !== undefined) {
+    throw new Error("The active workload identity pool provider unexpectedly has an expiry time.");
+  }
+  if (provider.disabled !== undefined && typeof provider.disabled !== "boolean") {
+    throw new Error("The workload identity pool provider disabled flag is malformed.");
+  }
+  const attributeCondition = requiredString(
+    provider.attributeCondition,
+    "workload identity pool provider attribute condition",
+  );
+  if (attributeCondition.length > 4_096) {
+    throw new Error("The workload identity pool provider attribute condition is oversized.");
+  }
+  const rawMapping = record(
+    provider.attributeMapping,
+    "workload identity pool provider attribute mapping",
+  );
+  const mappingEntries = Object.entries(rawMapping).map(([rawKey, rawValue]) => {
+    const key = requiredString(rawKey, "workload identity pool provider mapping key");
+    const expression = requiredString(
+      rawValue,
+      `workload identity pool provider mapping ${key}`,
+    );
+    if (key.length > 100 || expression.length > 2_048) {
+      throw new Error("The workload identity pool provider mapping escaped its documented bound.");
+    }
+    return [key, expression] as const;
+  }).toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  if (mappingEntries.length === 0 || mappingEntries.length > 50) {
+    throw new Error("The workload identity pool provider mapping count escaped its reviewed bound.");
+  }
+  const attributeMapping = Object.fromEntries(mappingEntries);
+  if (attributeMapping["google.subject"] === undefined) {
+    throw new Error("The workload identity pool provider does not map google.subject.");
+  }
+  const oidc = record(provider.oidc, "workload identity pool provider OIDC configuration");
+  exactKeys(
+    oidc,
+    new Set(["allowedAudiences", "issuerUri", "jwksJson"]),
+    "workload identity pool provider OIDC configuration",
+  );
+  const issuer = requiredString(oidc.issuerUri, "workload identity pool provider issuer");
+  if (
+    issuer !== "https://token.actions.githubusercontent.com" &&
+    issuer !== "https://token.actions.githubusercontent.com/"
+  ) {
+    throw new Error("The workload identity pool provider issuer is not GitHub Actions.");
+  }
+  const audiences = array(
+    oidc.allowedAudiences ?? [],
+    "workload identity pool provider allowed audiences",
+  );
+  if (audiences.length !== 0) {
+    throw new Error("The contracted GitHub provider unexpectedly overrides its canonical audience.");
+  }
+  if (oidc.jwksJson !== undefined && oidc.jwksJson !== "") {
+    throw new Error("The contracted GitHub provider unexpectedly embeds custom signing keys.");
+  }
+  return {
+    attributeCondition,
+    attributeMapping,
+    description: requiredStringOrEmpty(
+      provider.description,
+      "workload identity pool provider description",
+    ),
+    disabled: provider.disabled === true,
+    displayName: requiredStringOrEmpty(
+      provider.displayName,
+      "workload identity pool provider display name",
+    ),
+    name,
+    state,
+  };
+}
+
+export async function readFederationProvider(
+  projectId: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<FederationProviderState | undefined> {
+  const response = await fetcher(federationProviderUrl(projectId), {
+    headers: executorHeaders(token),
+    redirect: "error",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    throw new Error(`Workload identity pool provider read failed with HTTP ${response.status}.`);
+  }
+  return federationProviderFromJson(await boundedJson(response, 256 * 1024), projectId);
 }
 
 // What actually authorizes the privileged window.
@@ -5042,6 +5225,7 @@ export async function runProtectedBootstrap(
       telemetry.phase("controller.quarantine");
       quarantinedFederation = await dependencies.armFederationQuarantine(
         invocation,
+        session,
         operationDeadlineMs,
       );
       await dependencies.disableFederation(
@@ -5284,6 +5468,7 @@ export async function runProtectedBootstrap(
     // first PATCH, this run still owns the undo.
     quarantinedFederation = await dependencies.armFederationQuarantine(
       invocation,
+      session,
       operationDeadlineMs,
     );
     await dependencies.disableFederation(
@@ -5303,7 +5488,27 @@ export async function runProtectedBootstrap(
       leaseExpiresAt.getTime(),
       session.tokenExpiresAtMs,
     );
-    await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds);
+    const finalPreApplyFreezeProof = await dependencies.proveFreeze(
+      invocation,
+      preparation.tokenDrainSeconds,
+    );
+    exact(
+      canonicalJson(json(
+        finalPreApplyFreezeProof.repositories,
+        "final pre-apply freeze repositories",
+      )),
+      canonicalJson(json(
+        preApplyProof.freezeProof.repositories,
+        "authorized pre-apply freeze repositories",
+      )),
+      "stable pre-apply freeze repository snapshot",
+    );
+    if (
+      Date.parse(finalPreApplyFreezeProof.observedAt) <
+        Date.parse(preApplyProof.freezeProof.observedAt)
+    ) {
+      throw new Error("The final pre-apply freeze snapshot predates its authorization snapshot.");
+    }
     const finalPreApplyExposureProof = await dependencies.proveExposure(
       invocation,
       session,
@@ -5407,10 +5612,9 @@ export async function runProtectedBootstrap(
       terraformDirectory,
       operationDeadlineMs,
     );
-    // Nothing is published here either. The pending receipt is the artifact a
-    // detached finalizer may later count, so it must not exist until the
-    // sandbox is torn down, the executor is provably gone, and every private
-    // path is removed. Only the payload is held.
+    // Nothing is published here either. The terminal receipt must not exist
+    // until the sandbox is torn down, the executor is provably gone, and every
+    // private path is removed. Only the payload is held.
     applyPublication = {
       review,
       proof: buildFinalProtectedProof({
@@ -5509,41 +5713,37 @@ export async function runProtectedBootstrap(
   // succeeded, so by construction the Docker sandbox is torn down, the executor
   // is provably released, every private path is gone, and federation is back.
   // A crash before this point therefore leaves no claim of any kind. The only
-  // recoverable gap left is between the apply pending receipt and its
-  // completion, which is exactly what the detached finalizer exists for.
+  // terminal receipt is therefore a statement about a world already left
+  // clean, not a promise that cleanup will happen later. If the process dies
+  // before this phase, no success artifact exists and the run is safely retried
+  // under a new GitHub run identity.
   //
   // A plan reaches here with neither payload set and publishes nothing.
+  if (rehearsalPublication === undefined && applyPublication === undefined) return;
+  if (completedReleaseProof === undefined) {
+    throw new Error(
+      "The protected run produced no exact executor release proof, so no terminal receipt may be published.",
+    );
+  }
   if (rehearsalPublication !== undefined) {
     telemetry.phase("controller.apply-publish");
     await dependencies.publishFinalReceipt(
       invocation,
       rehearsalPublication.review,
       rehearsalPublication.proof,
+      completedReleaseProof,
       dependencies.now(),
+      publicationDeadlineMs,
     );
     return;
   }
-  if (applyPublication === undefined) return;
-  if (completedReleaseProof === undefined) {
-    // Cleanup succeeded without yielding an exact release proof, so there is
-    // nothing to bind a completion to. Publish nothing rather than leave a
-    // pending object a finalizer would later have to reason about.
-    throw new Error(
-      "The protected run produced no exact executor release proof, so no apply receipt may be published.",
-    );
-  }
   telemetry.phase("controller.apply-publish");
-  const publishedPending = await dependencies.publishFinalReceipt(
+  await dependencies.publishFinalReceipt(
     invocation,
-    applyPublication.review,
-    applyPublication.proof,
-    dependencies.now(),
-  );
-  telemetry.phase("controller.owner-completion");
-  await dependencies.publishOwnerCompletion(
-    invocation,
-    publishedPending,
+    applyPublication!.review,
+    applyPublication!.proof,
     completedReleaseProof,
+    dependencies.now(),
     publicationDeadlineMs,
   );
 }
@@ -5614,9 +5814,11 @@ export async function runProtectedRecovery(
   const recoveryDeadlineMs = sourceProofCompletedAtMs +
     RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
-  // One horizon, established once, for this recovery run's own project. Every
-  // phase below consumes it rather than starting another: the envelope funds
-  // exactly one, which is the whole reason a per-item horizon was unreachable.
+  // One wall-clock horizon, established once and concurrently across every
+  // affected project. It always includes this failed run even if it died before
+  // writing a quarantine intent, plus every exact identity named by durable
+  // intents. Every phase below consumes that one fleet proof rather than
+  // starting another.
   const horizon = await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
   // Executor containment is proven first, above, so federation is handed back
   // only once nothing can still be holding privilege with it.
@@ -5629,20 +5831,6 @@ export async function runProtectedRecovery(
   if (federation.skippedUncontained.length > 0) {
     throw new Error(
       `Federation quarantine recovery left ${federation.skippedUncontained.length} intent(s) closed because their executors are not provably contained.`,
-    );
-  }
-  // Only after federation is provably back does a pending receipt mean what it
-  // says: the run got as far as publishing, and all that is missing is the
-  // countersignature.
-  telemetry.phase("recovery.finalize");
-  const pending = await activeDependencies.finalizePendingReceipts(
-    invocation,
-    horizon,
-    recoveryDeadlineMs,
-  );
-  if (pending.skippedUncontained.length > 0) {
-    throw new Error(
-      `Pending receipt finalization left ${pending.skippedUncontained.length} receipt(s) uncounted because their executors are not provably contained.`,
     );
   }
 }
@@ -5782,6 +5970,7 @@ export async function proveConsumerFreeze(
   }
   if (!Number.isFinite(nowMs)) throw new Error("The consumer freeze time is invalid.");
   const requiredDrainMs = (tokenDrainSeconds + TOKEN_DRAIN_SKEW_SECONDS) * 1_000;
+  const activeStatuses = new Set(["requested", "waiting", "pending", "queued", "in_progress"]);
   const repositories: Array<ConsumerFreezeProof["repositories"][number]> = [];
   for (const repository of REPOSITORY_NAMES) {
     const contract = REPOSITORIES[repository];
@@ -5807,6 +5996,19 @@ export async function proveConsumerFreeze(
     }
     if (activeRuns.length !== 0) {
       throw new Error(`${repository} still has an active GitHub Actions run.`);
+    }
+    // The status-filtered reads are the primary active-run proof, but the
+    // unfiltered history is an independent view of the same state. If it still
+    // names an active run, an incomplete filtered 200 must never be treated as
+    // evidence of absence merely because the run is old enough to pass the
+    // token-drain timestamp check.
+    for (const run of recentRuns) {
+      const recordValue = record(run, `${repository} workflow run`);
+      const status = requiredString(recordValue.status, "workflow run status");
+      if (activeStatuses.has(status)) {
+        throw new Error(`${repository} unfiltered history still contains an active GitHub Actions run.`);
+      }
+      exact(status, "completed", `${repository} terminal workflow run status`);
     }
     const latestPossibleTokenIssuance = recentRuns.reduce<number>((latest, run) => {
       const recordValue = record(run, `${repository} workflow run`);
@@ -5852,6 +6054,7 @@ async function githubAllRuns(
   retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
+  const runIds = new Set<string>();
   let page = 1;
   let expectedTotal: number | undefined;
   do {
@@ -5872,7 +6075,19 @@ async function githubAllRuns(
     }
     const pageRuns = array(value.workflow_runs, "GitHub workflow runs");
     if (pageRuns.length > 100) throw new Error("GitHub returned an oversized workflow-run page.");
-    results.push(...pageRuns.map((run) => json(run, "GitHub workflow run")));
+    const expectedPageLength = Math.min(100, (expectedTotal ?? 0) - results.length);
+    if (pageRuns.length !== expectedPageLength) {
+      throw new Error("GitHub returned a short or overfilled workflow-run page.");
+    }
+    for (const raw of pageRuns) {
+      const run = record(raw, "GitHub workflow run");
+      const runId = numeric(String(run.id), "workflow run ID");
+      if (runIds.has(runId)) {
+        throw new Error("GitHub workflow-run pagination repeated a run ID.");
+      }
+      runIds.add(runId);
+      results.push(json(run, "GitHub workflow run"));
+    }
     page += 1;
   } while ((page - 1) * 100 < (expectedTotal ?? 0));
   if (results.length !== expectedTotal) {
@@ -5888,7 +6103,9 @@ async function githubActiveRuns(
   retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
+  const runIds = new Set<string>();
   for (const status of ["requested", "waiting", "pending", "queued", "in_progress"] as const) {
+    let statusCount = 0;
     let page = 1;
     let expectedTotal: number | undefined;
     do {
@@ -5902,13 +6119,26 @@ async function githubActiveRuns(
       }
       const pageRuns = array(value.workflow_runs, `GitHub ${status} runs`);
       if (pageRuns.length > 100) throw new Error("GitHub returned an oversized run page.");
+      const expectedPageLength = Math.min(100, (expectedTotal ?? 0) - statusCount);
+      if (pageRuns.length !== expectedPageLength) {
+        throw new Error(`GitHub returned a short or overfilled ${status} run page.`);
+      }
       for (const raw of pageRuns) {
         const run = record(raw, `GitHub ${status} run`);
         exact(run.status, status, `GitHub ${status} run status`);
+        const runId = numeric(String(run.id), `GitHub ${status} run ID`);
+        if (runIds.has(runId)) {
+          throw new Error("GitHub active-run pagination repeated a run ID.");
+        }
+        runIds.add(runId);
         results.push(json(run, `GitHub ${status} run`));
+        statusCount += 1;
       }
       page += 1;
     } while ((page - 1) * 100 < (expectedTotal ?? 0));
+    if (statusCount !== expectedTotal) {
+      throw new Error(`GitHub ${status} run pagination was incomplete.`);
+    }
     if (results.length > REPOSITORY_NAMES.length * MAX_GITHUB_RUNS_PER_STATUS) {
       throw new Error("GitHub active-run proof exceeded its global bound.");
     }
@@ -6651,27 +6881,23 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishFinalReceipt: (invocation, review, proof, nowMs) =>
-      publishFinalProtectedReceipt(
+    publishFinalReceipt: async (
+      invocation,
+      review,
+      proof,
+      releaseProof,
+      nowMs,
+      publicationDeadlineMs,
+    ) => {
+      apiDeadlineMs = publicationDeadlineMs;
+      assertBeforeDeadline(nowMs, publicationDeadlineMs, "terminal owner receipt");
+      await publishFinalProtectedReceipt(
         invocation,
         invocation.ownerAccessToken,
         review,
         proof,
-        nowMs,
-        api,
-      ),
-    publishOwnerCompletion: async (invocation, pending, releaseProof, publicationDeadlineMs) => {
-      // This phase runs past the operation deadline the fetcher was pinned to
-      // during prepare, so the API deadline must be advanced to the reviewed
-      // publication window or every late run fails on an expired deadline.
-      apiDeadlineMs = publicationDeadlineMs;
-      assertBeforeDeadline(Date.now(), publicationDeadlineMs, "owner completion proof");
-      await publishOwnerCompletionProof(
-        invocation,
-        invocation.ownerAccessToken,
-        pending,
         releaseProof,
-        Date.now(),
+        nowMs,
         api,
       );
     },
@@ -6719,16 +6945,18 @@ function defaultBridgeDependencies(
         nowMs,
         api,
         githubProofRetryPolicy(() => apiDeadlineMs),
-      ),
-    armFederationQuarantine: async (invocation, _operationDeadlineMs) => {
-      const pools: FederationQuarantineRecord["pools"][number][] = [];
+    ),
+    armFederationQuarantine: async (invocation, session, _operationDeadlineMs) => {
       // Every consumer pool, not just the target's. The freeze proof already
       // spans the whole fleet because consumer principals are not provably
       // confined to their own project, and quarantining a smaller set would
       // need a transitive-reachability proof this bridge cannot make.
-      for (const repository of REPOSITORY_NAMES) {
+      const pools = await Promise.all(REPOSITORY_NAMES.map(async (repository) => {
         const projectId = REPOSITORIES[repository].projectId;
-        const pool = await readFederationPool(projectId, invocation.ownerAccessToken, api);
+        const [pool, provider] = await Promise.all([
+          readFederationPool(projectId, invocation.ownerAccessToken, api),
+          readFederationProvider(projectId, invocation.ownerAccessToken, api),
+        ]);
         if (pool === undefined) {
           // Fail closed. An absent pool on an established consumer is a missing
           // precondition, not isolation.
@@ -6736,15 +6964,27 @@ function defaultBridgeDependencies(
             `The ${repository} workload identity pool is absent; protected elevation cannot prove federation is closed.`,
           );
         }
-        pools.push({
+        if (provider === undefined) {
+          throw new Error(
+            `The ${repository} GitHub workload identity provider is absent; protected elevation cannot prove its trust condition.`,
+          );
+        }
+        return {
           disabled: pool.disabled,
           fingerprint: federationPoolFingerprint(pool),
           name: pool.name,
+          providerFingerprint: federationProviderFingerprint(provider),
+          providerName: provider.name,
           repository,
-        });
-      }
+        } satisfies FederationQuarantineRecord["pools"][number];
+      }));
       const record: FederationQuarantineRecord = {
+        approvedManifestSha256: invocation.approvedManifestSha256,
+        approvedPlanRunId: invocation.approvedPlanRunId,
         capturedAt: new Date(Date.now()).toISOString(),
+        consumerSha: invocation.consumerSha,
+        executorEmail: session.executorEmail,
+        executorUniqueId: session.executorUniqueId,
         platformSha: invocation.platformSha,
         pools,
         repository: invocation.repository,
@@ -6765,7 +7005,7 @@ function defaultBridgeDependencies(
       return { generation, record };
     },
     disableFederation: async (invocation, record, operationDeadlineMs) => {
-      for (const pool of record.pools) {
+      await Promise.all(record.pools.map(async (pool) => {
         const converged = await setFederationPoolDisabled(
           REPOSITORIES[pool.repository].projectId,
           true,
@@ -6774,7 +7014,21 @@ function defaultBridgeDependencies(
           operationDeadlineMs,
         );
         assertQuarantinedPool(converged, pool);
-      }
+        const provider = await readFederationProvider(
+          REPOSITORIES[pool.repository].projectId,
+          invocation.ownerAccessToken,
+          api,
+        );
+        if (provider === undefined) {
+          throw new Error(`The ${pool.repository} GitHub provider vanished during quarantine.`);
+        }
+        exact(provider.name, pool.providerName, "quarantined federation provider identity");
+        exact(
+          federationProviderFingerprint(provider),
+          pool.providerFingerprint,
+          `quarantined ${pool.repository} federation provider`,
+        );
+      }));
     },
     recoverFederationPreflight: async (invocation, operationDeadlineMs) =>
       // Detection, not repair.
@@ -6819,6 +7073,8 @@ function defaultBridgeDependencies(
         },
         invocation.ownerAccessToken,
         api,
+        () => Date.now(),
+        Date.parse(record.capturedAt),
       );
       return observed;
     },
@@ -6891,56 +7147,6 @@ export async function releaseSandboxAndExecutor<T>(
   return (results[0] as PromiseFulfilledResult<T>).value;
 }
 
-// Containment for one run, against the single horizon this recovery already
-// established.
-//
-// The horizon is project-wide, so it already says "no bridge artifact of any
-// run remains in this project, and has not for the stable window". What remains
-// per run is the exact identity check: the deterministic executor account for
-// THIS repository and run must be absent or denied. A run in a different
-// project is not covered and is reported rather than guessed at -- that is the
-// bounded multi-item behaviour, and it is why one recovery pass cannot pretend
-// to clear the whole fleet.
-function containedByHorizon(
-  horizon: ProjectContainmentHorizon,
-  ownerToken: string,
-  fetcher: Fetcher,
-): (
-  identity: {
-    readonly platformSha: string;
-    readonly repository: RepositoryName;
-    readonly runId: string;
-  },
-) => Promise<ExecutorReleaseProof | undefined> {
-  return async (identity) => {
-    if (identity.repository !== horizon.repository) return undefined;
-    const projectId = REPOSITORIES[identity.repository].projectId;
-    exact(projectId, horizon.projectId, "containment horizon project");
-    const recovery: RecoveryInvocation = {
-      githubRunId: identity.runId,
-      ownerAccessToken: ownerToken,
-      platformRoot: "/",
-      platformSha: identity.platformSha,
-      repository: identity.repository,
-      runnerTemp: "/",
-    };
-    const email = deterministicExecutorEmail(recovery);
-    const probe = await bridgeArtifactsRemain(projectId, ownerToken, fetcher, recovery);
-    if (probe.active || !probe.exactAccountAbsentOrDenied) return undefined;
-    // Evidence produced by the containment path itself: the horizon that
-    // established project-wide absence, plus the exact account it is about.
-    return {
-      artifactsDeleted: true,
-      executorEmail: email,
-      executorUniqueId: "",
-      observedAt: horizon.observedAt,
-      permissionsProvenGone: true,
-      projectBindingsCleared: true,
-      provenBy: "propagation-horizon",
-    };
-  };
-}
-
 function defaultRecoveryDependencies(
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): RecoveryDependencies {
@@ -6954,29 +7160,27 @@ function defaultRecoveryDependencies(
         invocation.ownerAccessToken,
         api,
         recoveryDeadlineMs,
-        containedByHorizon(horizon, invocation.ownerAccessToken, api),
+        async (identity) => containmentProofForFederation(horizon, identity),
         (milliseconds) => Bun.sleep(milliseconds),
-        () => Date.now(),
-      );
-    },
-    finalizePendingReceipts: async (invocation, horizon, recoveryDeadlineMs) => {
-      apiDeadlineMs = recoveryDeadlineMs;
-      return await finalizePendingApplyReceipts(
-        invocation.ownerAccessToken,
-        api,
-        recoveryDeadlineMs,
-        horizon,
-        containedByHorizon(horizon, invocation.ownerAccessToken, api),
         () => Date.now(),
       );
     },
     recoverArtifacts: async (invocation, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
-      return await recoverBridgeArtifactsUntilStable(
+      const identities = await discoverFederationContainmentIdentities(
+        invocation.ownerAccessToken,
+        api,
+        () => Date.now(),
+      );
+      return await recoverFederationArtifactsUntilStable(
+        identities,
         invocation,
+        invocation.ownerAccessToken,
         api,
         (milliseconds) => Bun.sleep(milliseconds),
         recoveryDeadlineMs,
+        invocation.platformRoot,
+        invocation.runnerTemp,
         () => Date.now(),
         telemetry,
       );
@@ -9284,12 +9488,22 @@ async function bridgeArtifactsRemain(
 // recovery envelope could never have funded.
 export interface ProjectContainmentHorizon {
   readonly emptySinceAt: string;
+  readonly identities: readonly {
+    readonly platformSha: string;
+    readonly release: ExecutorReleaseProof;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  }[];
   readonly observationStartedAt: string;
   readonly observedAt: string;
   readonly projectId: string;
   readonly propagationMinutes: number;
-  readonly repository: RepositoryName;
   readonly stableEmptyMinutes: number;
+}
+
+export interface FleetContainmentHorizon {
+  readonly projects: readonly ProjectContainmentHorizon[];
 }
 
 export async function recoverBridgeArtifactsUntilStable(
@@ -9373,11 +9587,11 @@ export async function recoverBridgeArtifactsUntilStable(
         // every run in that project, not only this one.
         return {
           emptySinceAt: new Date(emptySinceMs!).toISOString(),
+          identities: [],
           observedAt: new Date(scanCompletedAtMs).toISOString(),
           observationStartedAt: new Date(observationStartedAtMs).toISOString(),
           projectId,
           propagationMinutes: RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
-          repository: invocation.repository,
           stableEmptyMinutes: RECOVERY_STABLE_EMPTY_MINUTES,
         };
       }
@@ -9406,6 +9620,261 @@ export async function recoverBridgeArtifactsUntilStable(
   throw new Error(
     "Protected crash recovery did not observe the required stable-empty artifact inventory before its deadline.",
   );
+}
+
+// Contain this failed run even if it died before writing an intent, and every
+// executor named by durable federation intents, with one project-wide horizon
+// per affected project. Projects run concurrently because propagation is
+// elapsed wall time; identities within a project run in stable order so their
+// IAM CAS recovery cannot race itself.
+//
+// The returned proof contains the exact identity set that was probed on every
+// scan. A caller cannot use a clean project inventory to vouch for a later or
+// substituted run in that project: containmentProofForFederation requires exact
+// membership and returns the release evidence created here.
+export async function recoverFederationArtifactsUntilStable(
+  identities: readonly FederationContainmentIdentity[],
+  currentRecovery: RecoveryInvocation,
+  ownerToken: string,
+  fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+  platformRoot: string,
+  runnerTemp: string,
+  now: () => number = () => Date.now(),
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
+): Promise<FleetContainmentHorizon> {
+  telemetry = bestEffortTelemetry(telemetry);
+  if (identities.length > MAX_FEDERATION_CONTAINMENT_IDENTITIES) {
+    throw new Error("Federation recovery identity count escaped its reviewed bound.");
+  }
+  exact(currentRecovery.ownerAccessToken, ownerToken, "current recovery owner credential");
+  exact(currentRecovery.platformRoot, platformRoot, "current recovery platform root");
+  exact(currentRecovery.runnerTemp, runnerTemp, "current recovery runner temp");
+  fortyHex(currentRecovery.platformSha, "current recovery platform SHA");
+  numeric(currentRecovery.githubRunId, "current recovery run ID");
+
+  interface RecoveryScanTarget {
+    readonly identity?: FederationContainmentIdentity;
+    readonly recovery: RecoveryInvocation;
+  }
+
+  const targets: RecoveryScanTarget[] = [];
+  const repositoriesByProject = new Map<string, RepositoryName>();
+  const keys = new Set<string>();
+  for (const identity of identities) {
+    const projectId = REPOSITORIES[identity.repository].projectId;
+    const key = `${identity.repository}/${identity.root}/${identity.runId}`;
+    if (keys.has(key)) throw new Error(`Federation recovery repeated identity ${key}.`);
+    keys.add(key);
+    fortyHex(identity.platformSha, "federation recovery platform SHA");
+    numeric(identity.runId, "federation recovery run ID");
+    if (!/^[1-9][0-9]{5,30}$/.test(identity.executorUniqueId)) {
+      throw new Error("Federation recovery executor unique ID is malformed.");
+    }
+    exact(
+      identity.executorEmail,
+      deterministicExecutorEmail({
+        githubRunId: identity.runId,
+        ownerAccessToken: ownerToken,
+        platformRoot,
+        platformSha: identity.platformSha,
+        repository: identity.repository,
+        runnerTemp,
+      }),
+      "federation recovery executor email",
+    );
+    targets.push({
+      identity,
+      recovery: {
+        githubRunId: identity.runId,
+        ownerAccessToken: ownerToken,
+        platformRoot,
+        platformSha: identity.platformSha,
+        repository: identity.repository,
+        runnerTemp,
+      },
+    });
+  }
+
+  const currentMatch = targets.find((target) =>
+    target.recovery.repository === currentRecovery.repository &&
+    target.recovery.githubRunId === currentRecovery.githubRunId
+  );
+  if (currentMatch === undefined) {
+    targets.push({ recovery: currentRecovery });
+  } else {
+    exact(
+      currentMatch.recovery.platformSha,
+      currentRecovery.platformSha,
+      "current recovery intent platform SHA",
+    );
+  }
+
+  const groups = new Map<string, RecoveryScanTarget[]>();
+  for (const target of targets) {
+    const projectId = REPOSITORIES[target.recovery.repository].projectId;
+    const existingRepository = repositoriesByProject.get(projectId);
+    if (
+      existingRepository !== undefined &&
+      existingRepository !== target.recovery.repository
+    ) {
+      throw new Error(
+        `Federation recovery project ${projectId} is shared by multiple repository contracts.`,
+      );
+    }
+    repositoriesByProject.set(projectId, target.recovery.repository);
+    const group = groups.get(projectId) ?? [];
+    group.push(target);
+    groups.set(projectId, group);
+  }
+
+  const projects = await Promise.all([...groups.entries()].map(async ([projectId, rawGroup]) => {
+    const group = rawGroup.toSorted((left, right) => {
+      const leftKey = `${left.recovery.repository}/${left.recovery.githubRunId}/${left.recovery.platformSha}`;
+      const rightKey = `${right.recovery.repository}/${right.recovery.githubRunId}/${right.recovery.platformSha}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    const observationStartedAtMs = now();
+    let emptySinceMs: number | undefined;
+    while (now() < cleanupDeadlineMs) {
+      const scanStartedAtMs = now();
+      try {
+        let clean = true;
+        let observedOrContainedArtifact = false;
+        for (const target of group) {
+          const recovery = target.recovery;
+          const inventory = await inventoryBridgeArtifacts(
+            projectId,
+            ownerToken,
+            fetcher,
+            sleep,
+            cleanupDeadlineMs,
+            recovery,
+          );
+          const remaining = await bridgeArtifactsRemain(
+            projectId,
+            ownerToken,
+            fetcher,
+            recovery,
+          );
+          observedOrContainedArtifact ||= inventory.hadActiveArtifacts;
+          clean &&= !remaining.active &&
+            (inventory.exactAccountAbsentOrDenied || remaining.exactAccountAbsentOrDenied);
+        }
+        const scanCompletedAtMs = now();
+        const propagationComplete = scanCompletedAtMs - observationStartedAtMs >=
+          RECOVERY_DOCUMENTED_PROPAGATION_MINUTES * 60_000;
+        let outcome: RecoveryScanOutcome;
+        let proofMs = 0;
+        if (!clean) {
+          emptySinceMs = undefined;
+          outcome = "reset-active-artifact";
+        } else if (!propagationComplete) {
+          emptySinceMs = undefined;
+          outcome = "reset-propagation-horizon";
+        } else if (observedOrContainedArtifact) {
+          emptySinceMs = scanCompletedAtMs;
+          outcome = "reset-observed-artifact";
+        } else if (emptySinceMs === undefined) {
+          emptySinceMs = scanCompletedAtMs;
+          outcome = "proof-start";
+        } else {
+          proofMs = scanCompletedAtMs - emptySinceMs;
+          if (proofMs >= RECOVERY_STABLE_EMPTY_MS) {
+            const observedAt = new Date(scanCompletedAtMs).toISOString();
+            const horizon: ProjectContainmentHorizon = {
+              emptySinceAt: new Date(emptySinceMs).toISOString(),
+              identities: group.flatMap(({ identity }) => identity === undefined ? [] : [{
+                platformSha: identity.platformSha,
+                release: {
+                  artifactsDeleted: true,
+                  executorEmail: identity.executorEmail,
+                  executorUniqueId: identity.executorUniqueId,
+                  observedAt,
+                  permissionsProvenGone: true,
+                  projectBindingsCleared: true,
+                  provenBy: "propagation-horizon",
+                },
+                repository: identity.repository,
+                root: identity.root,
+                runId: identity.runId,
+              }]),
+              observationStartedAt: new Date(observationStartedAtMs).toISOString(),
+              observedAt,
+              projectId,
+              propagationMinutes: RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+              stableEmptyMinutes: RECOVERY_STABLE_EMPTY_MINUTES,
+            };
+            telemetry.recoveryScan({
+              elapsedMs: scanCompletedAtMs - observationStartedAtMs,
+              outcome: "proof-complete",
+              proofMs,
+              scanMs: scanCompletedAtMs - scanStartedAtMs,
+            });
+            return horizon;
+          }
+          outcome = "proof-continue";
+        }
+        telemetry.recoveryScan({
+          elapsedMs: scanCompletedAtMs - observationStartedAtMs,
+          outcome,
+          proofMs,
+          scanMs: scanCompletedAtMs - scanStartedAtMs,
+        });
+      } catch (error) {
+        if (!recursivelyRetryableCleanupError(error)) throw error;
+        emptySinceMs = undefined;
+        const scanFailedAtMs = now();
+        telemetry.recoveryScan({
+          elapsedMs: scanFailedAtMs - observationStartedAtMs,
+          outcome: "reset-retryable-read",
+          proofMs: 0,
+          scanMs: scanFailedAtMs - scanStartedAtMs,
+        });
+        const retryRemainingMs = cleanupDeadlineMs - now();
+        if (retryRemainingMs <= 0) break;
+        await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, retryRemainingMs));
+        continue;
+      }
+      const remainingMs = cleanupDeadlineMs - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(RECOVERY_STABLE_EMPTY_INTERVAL_MS, remainingMs));
+    }
+    throw new Error(
+      `Federation containment horizon for ${projectId} did not complete before its deadline.`,
+    );
+  }));
+  return {
+    projects: projects.toSorted((left, right) =>
+      left.projectId < right.projectId ? -1 : left.projectId > right.projectId ? 1 : 0
+    ),
+  };
+}
+
+export function containmentProofForFederation(
+  horizon: FleetContainmentHorizon,
+  identity: {
+    readonly executorEmail: string;
+    readonly executorUniqueId: string;
+    readonly platformSha: string;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  },
+): ExecutorReleaseProof | undefined {
+  const projectId = REPOSITORIES[identity.repository].projectId;
+  const project = horizon.projects.find((candidate) => candidate.projectId === projectId);
+  if (project === undefined) return undefined;
+  const contained = project.identities.find((candidate) =>
+    candidate.repository === identity.repository &&
+    candidate.root === identity.root &&
+    candidate.runId === identity.runId &&
+    candidate.platformSha === identity.platformSha &&
+    candidate.release.executorEmail === identity.executorEmail &&
+    candidate.release.executorUniqueId === identity.executorUniqueId
+  );
+  return contained === undefined ? undefined : { ...contained.release };
 }
 
 interface OrphanPolicySurface {
@@ -12788,7 +13257,6 @@ function ownerWrittenReceiptProbes(
   return [
     receiptObjectName(state, "results", invocation.githubRunId),
     receiptObjectName(state, "final", invocation.githubRunId),
-    receiptObjectName(state, "completion", invocation.githubRunId),
     ...(invocation.mode === "rehearsal"
       ? [receiptObjectName(state, "rehearsals", invocation.githubRunId)]
       : []),
@@ -14303,21 +14771,21 @@ export async function consumePlanReceipt(
   );
 }
 
-// The pending apply receipt, or a rehearsal's terminal record. Written by the
-// OWNER after every cleanup prerequisite has succeeded, and never countable on
-// its own: an apply becomes countable only when the separate completion object
-// countersigns it, and a rehearsal never becomes countable at all. Every field
-// is a claim that was already true when it was written: mutation authority was
-// gone, all four pools were handed back to the state the durable intent
-// captured, and the restored world audited to zero diff.
+// The one terminal owner receipt, written only after every cleanup prerequisite
+// has succeeded. An apply is immediately countable because the same immutable
+// object carries the exact release proof; a rehearsal remains non-countable.
+// Every field is a claim already true when written: mutation authority was
+// gone, all four pools were restored, and the restored world audited to zero
+// diff.
 export async function publishFinalProtectedReceipt(
   invocation: Invocation,
   ownerToken: string,
   review: ReviewManifestResult,
   proof: FinalProtectedProof,
+  releaseProof: ExecutorReleaseProof,
   nowMs: number,
   fetcher: Fetcher,
-): Promise<FinalReceiptReference> {
+): Promise<void> {
   if (invocation.mode === "plan") {
     throw new Error("Plan mode produces no final protected receipt.");
   }
@@ -14338,6 +14806,26 @@ export async function publishFinalProtectedReceipt(
   exact(proof.runId, invocation.githubRunId, "final receipt run ID");
   exact(proof.platformSha, invocation.platformSha, "final receipt platform SHA");
   exact(proof.consumerSha, invocation.consumerSha, "final receipt consumer SHA");
+  exact(releaseProof.provenBy, "exact-release", "terminal receipt release provenance");
+  exact(
+    releaseProof.executorEmail,
+    proof.deElevation.executorEmail,
+    "terminal receipt executor email",
+  );
+  exact(
+    releaseProof.executorUniqueId,
+    proof.deElevation.executorUniqueId,
+    "terminal receipt executor unique ID",
+  );
+  const deElevationAtMs = Date.parse(
+    canonicalInstant(proof.deElevation.observedAt, "terminal receipt de-elevation time"),
+  );
+  const releaseAtMs = Date.parse(
+    canonicalInstant(releaseProof.observedAt, "terminal receipt release time"),
+  );
+  if (!(deElevationAtMs <= releaseAtMs && releaseAtMs <= nowMs)) {
+    throw new Error("Terminal receipt requires de-elevation, exact release, and publication in order.");
+  }
   if (proof.observedPools.length !== REPOSITORY_NAMES.length) {
     throw new Error("Final receipt does not account for every consumer pool.");
   }
@@ -14345,22 +14833,16 @@ export async function publishFinalProtectedReceipt(
   const state = contract.state[invocation.terraformRoot];
   const receipt: JsonValue = json(
     {
-      // Names the approved plan whose manifest digest this run consumed, so a
-      // detached finalizer has an independent object to check that digest
-      // against rather than taking the receipt's word for it.
+      // Names the independently approved plan whose manifest digest this run
+      // consumed.
       approvedPlanRunId: invocation.approvedPlanRunId,
       consumerSha: proof.consumerSha,
-      // Never countable, whatever the run was.
-      //
-      // An apply's object is `pending`: it is written before the executor's
-      // deletion has been proven, so at that moment it can only be a claim, and
-      // the owner's completion object is what makes it a success.
-      //
-      // A rehearsal's object is `rehearsal-complete`: terminal, and never
-      // eligible for completion at all. It runs no Terraform, so there is
-      // nothing for a completion to attest.
-      countable: false,
-      status: invocation.mode === "rehearsal" ? "rehearsal-complete" : "pending",
+      // This is the one terminal owner object. It is reached only after the
+      // whole finally cleanup succeeded, and it carries the exact release proof
+      // from that cleanup. A crash before here leaves no success claim; a crash
+      // after the immutable write leaves a statement that was already true.
+      countable: proof.countable,
+      status: invocation.mode === "rehearsal" ? "rehearsal-complete" : "complete",
       deElevation: {
         executorEmail: proof.deElevation.executorEmail,
         executorUniqueId: proof.deElevation.executorUniqueId,
@@ -14371,6 +14853,15 @@ export async function publishFinalProtectedReceipt(
       intentGeneration: proof.intentGeneration,
       kind: proof.kind,
       manifestSha256: proof.reviewSha256,
+      executorRelease: {
+        artifactsDeleted: releaseProof.artifactsDeleted,
+        executorEmail: releaseProof.executorEmail,
+        executorUniqueId: releaseProof.executorUniqueId,
+        observedAt: releaseProof.observedAt,
+        permissionsProvenGone: releaseProof.permissionsProvenGone,
+        projectBindingsCleared: releaseProof.projectBindingsCleared,
+        provenBy: releaseProof.provenBy,
+      },
       observedPools: proof.observedPools.map((pool) => ({ ...pool })),
       platformSha: proof.platformSha,
       projectId: contract.projectId,
@@ -14398,583 +14889,22 @@ export async function publishFinalProtectedReceipt(
   // Reconciled like every other immutable write: a terminal rehearsal receipt
   // whose response was lost must not turn a finished rehearsal into a failure.
   // The committed generation comes back from the write itself.
-  const generation = await writeImmutableObjectIdempotent(
+  await writeImmutableObjectIdempotent(
     state.bucket,
     object,
     body,
     ownerToken,
     fetcher,
   );
-  return {
-    bucket: state.bucket,
-    deElevationExecutorEmail: proof.deElevation.executorEmail,
-    deElevationExecutorUniqueId: proof.deElevation.executorUniqueId,
-    digest: sha256Hex(body),
-    generation,
-    object,
-    publishedAt: new Date(nowMs).toISOString(),
-    size: Buffer.byteLength(body),
-  };
 }
 
-// The owner's countersignature. A verifier that requires this is requiring, in
-// one object: that the final receipt exists with exactly these bytes, and that
-// the executor which wrote it no longer exists.
+// Canonical timestamps are part of every immutable terminal receipt contract.
 function canonicalInstant(value: string, label: string): string {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
     throw new Error(`${label} is not a canonical instant.`);
   }
   return value;
-}
-
-export interface PendingApplyReceipt {
-  readonly approvedPlanRunId: string;
-  readonly consumerSha: string;
-  readonly deElevationAt: string;
-  readonly deElevationExecutorEmail: string;
-  readonly deElevationExecutorUniqueId: string;
-  readonly intentDigest: string;
-  readonly intentGeneration: string;
-  readonly manifestSha256: string;
-  readonly observedPoolFingerprints: readonly string[];
-  readonly platformSha: string;
-  readonly publishedAt: string;
-}
-
-// A strict verifier, not a field-spotter.
-//
-// The difference matters: JSON.parse plus a handful of exact() calls accepts
-// unknown keys, noncanonical bytes, a reordered pool list, a missing audit, and
-// a publishedAt that disagrees with the reference it is supposed to describe.
-// Every one of those is a way for a document to satisfy the checks while not
-// being the receipt this run wrote. So this validates the WHOLE document --
-// exact key sets at every level, exact types, exact ordering, and the canonical
-// bytes including the terminal newline -- against the contract identity of the
-// run being completed.
-export function pendingApplyReceiptFromBody(
-  body: string,
-  expected: {
-    // A detached finalizer derives repository, root and run from the object's
-    // own location and name, and has no independent source for the platform and
-    // consumer commits -- those come from the receipt and are cross-checked
-    // against the durable quarantine intent instead. An inline caller knows all
-    // five and supplies them.
-    readonly consumerSha?: string;
-    readonly platformSha?: string;
-    readonly repository: RepositoryName;
-    readonly root: TerraformRoot;
-    readonly runId: string;
-  },
-): PendingApplyReceipt {
-  const parsed = record(JSON.parse(body) as unknown, "pending apply receipt");
-  // Canonical bytes. A receipt that parses to the right values but was
-  // serialised differently was not written by this system.
-  exact(
-    `${canonicalJson(json(parsed, "pending apply receipt"))}\n`,
-    body,
-    "pending apply receipt bytes",
-  );
-  exactKeys(
-    parsed,
-    new Set([
-      "approvedPlanRunId",
-      "consumerSha",
-      "countable",
-      "deElevation",
-      "intentDigest",
-      "intentGeneration",
-      "kind",
-      "manifestSha256",
-      "observedPools",
-      "platformSha",
-      "projectId",
-      "publishedAt",
-      "quarantinedApplyProofDigest",
-      "repository",
-      "repositoryId",
-      "restoredAudit",
-      "runId",
-      "schemaVersion",
-      "status",
-      "terraformRoot",
-    ]),
-    "pending apply receipt",
-  );
-  const contract = REPOSITORIES[expected.repository];
-  const approvedPlanRunId = numeric(
-    requiredString(parsed.approvedPlanRunId, "pending apply receipt approved plan run ID"),
-    "pending apply receipt approved plan run ID",
-  );
-  exact(parsed.schemaVersion, 1, "pending apply receipt schema version");
-  exact(parsed.kind, "apply", "pending apply receipt kind");
-  exact(parsed.status, "pending", "pending apply receipt status");
-  exact(parsed.countable, false, "pending apply receipt countability");
-  exact(parsed.repository, expected.repository, "pending apply receipt repository");
-  exact(parsed.repositoryId, contract.repositoryId, "pending apply receipt repository ID");
-  exact(parsed.projectId, contract.projectId, "pending apply receipt project");
-  exact(parsed.terraformRoot, expected.root, "pending apply receipt root");
-  exact(parsed.runId, expected.runId, "pending apply receipt run ID");
-  const platformSha = sha(
-    requiredString(parsed.platformSha, "pending apply receipt platform SHA"),
-    "pending apply receipt platform SHA",
-  );
-  const consumerSha = sha(
-    requiredString(parsed.consumerSha, "pending apply receipt consumer SHA"),
-    "pending apply receipt consumer SHA",
-  );
-  if (expected.platformSha !== undefined) {
-    exact(platformSha, expected.platformSha, "pending apply receipt platform SHA");
-  }
-  if (expected.consumerSha !== undefined) {
-    exact(consumerSha, expected.consumerSha, "pending apply receipt consumer SHA");
-  }
-  const manifestSha256 = hash(
-    requiredString(parsed.manifestSha256, "pending apply receipt manifest digest"),
-    "pending apply receipt manifest digest",
-  );
-  hash(
-    requiredString(parsed.quarantinedApplyProofDigest, "pending apply receipt apply-proof digest"),
-    "pending apply receipt apply-proof digest",
-  );
-  const intentDigest = hash(
-    requiredString(parsed.intentDigest, "pending apply receipt intent digest"),
-    "pending apply receipt intent digest",
-  );
-  const intentGeneration = requiredString(
-    parsed.intentGeneration,
-    "pending apply receipt intent generation",
-  );
-  if (!/^[1-9][0-9]*$/.test(intentGeneration)) {
-    throw new Error("Pending apply receipt intent generation is malformed.");
-  }
-
-  const audit = record(parsed.restoredAudit, "pending apply receipt restored audit");
-  exactKeys(
-    audit,
-    new Set(["detailedExitCode", "observedAt", "outputSha256"]),
-    "pending apply receipt restored audit",
-  );
-  exact(audit.detailedExitCode, 0, "pending apply receipt restored audit exit code");
-  hash(
-    requiredString(audit.outputSha256, "pending apply receipt restored audit digest"),
-    "pending apply receipt restored audit digest",
-  );
-  canonicalInstant(
-    requiredString(audit.observedAt, "pending apply receipt restored audit time"),
-    "pending apply receipt restored audit time",
-  );
-
-  const deElevation = record(parsed.deElevation, "pending apply receipt de-elevation");
-  exactKeys(
-    deElevation,
-    new Set(["executorEmail", "executorUniqueId", "observedAt", "provenAbsent"]),
-    "pending apply receipt de-elevation",
-  );
-  // Deterministic, not merely well-formed: exactly the permissions the mutation
-  // role carried that the read role does not, in sorted order. An arbitrary list
-  // would let a receipt claim absence of permissions nobody ever granted.
-  const readPermissions = new Set(
-    executorControlPermissions(expected.repository, expected.root, "read"),
-  );
-  const expectedAbsent = executorControlPermissions(expected.repository, expected.root, "mutation")
-    .filter((permission) => !readPermissions.has(permission))
-    .toSorted();
-  const provenAbsent = array(deElevation.provenAbsent, "pending apply receipt proven-absent set")
-    .map((permission, index) =>
-      requiredString(permission, `pending apply receipt proven-absent ${index}`)
-    );
-  exact(
-    canonicalJson(json(provenAbsent, "pending apply receipt proven-absent set")),
-    canonicalJson(json(expectedAbsent, "pending apply receipt proven-absent set")),
-    "pending apply receipt proven-absent set",
-  );
-  const deElevationAt = canonicalInstant(
-    requiredString(deElevation.observedAt, "pending apply receipt de-elevation time"),
-    "pending apply receipt de-elevation time",
-  );
-
-  // Exactly one observation per consumer, in the contracted order.
-  const observedPoolFingerprints: string[] = [];
-  const observed = array(parsed.observedPools, "pending apply receipt observed pools");
-  if (observed.length !== REPOSITORY_NAMES.length) {
-    throw new Error("Pending apply receipt does not observe every consumer pool.");
-  }
-  REPOSITORY_NAMES.forEach((repository, index) => {
-    const pool = record(observed[index], `pending apply receipt observed pool ${index}`);
-    exactKeys(
-      pool,
-      new Set(["disabled", "fingerprint", "name", "observedAt", "repository"]),
-      `pending apply receipt observed pool ${index}`,
-    );
-    exact(pool.repository, repository, "pending apply receipt observed pool order");
-    exact(pool.disabled, false, "pending apply receipt observed pool state");
-    exact(
-      requiredString(pool.name, "pending apply receipt observed pool name"),
-      `projects/${
-        REPOSITORIES[repository].projectId
-      }/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`,
-      "pending apply receipt observed pool name",
-    );
-    observedPoolFingerprints.push(
-      requiredString(pool.fingerprint, "pending apply receipt observed pool fingerprint"),
-    );
-    canonicalInstant(
-      requiredString(pool.observedAt, "pending apply receipt observed pool time"),
-      "pending apply receipt observed pool time",
-    );
-  });
-
-  // The executor is an ephemeral account this platform mints, in this project,
-  // with a fixed name shape and a stable numeric unique ID. An arbitrary
-  // address is not an executor identity at all.
-  const executorEmail = requiredString(
-    deElevation.executorEmail,
-    "pending apply receipt de-elevation email",
-  );
-  if (
-    !new RegExp(
-      `^${EXECUTOR_ACCOUNT_PREFIX}[0-9a-f]{20}@${contract.projectId}\\.iam\\.gserviceaccount\\.com$`,
-    ).test(executorEmail)
-  ) {
-    throw new Error("Pending apply receipt de-elevation email is not an executor identity.");
-  }
-  const executorUniqueId = requiredString(
-    deElevation.executorUniqueId,
-    "pending apply receipt de-elevation unique ID",
-  );
-  numeric(executorUniqueId, "pending apply receipt de-elevation unique ID");
-  return {
-    approvedPlanRunId,
-    consumerSha,
-    deElevationAt,
-    deElevationExecutorEmail: executorEmail,
-    deElevationExecutorUniqueId: executorUniqueId,
-    intentDigest,
-    intentGeneration,
-    manifestSha256,
-    observedPoolFingerprints,
-    platformSha,
-    publishedAt: canonicalInstant(
-      requiredString(parsed.publishedAt, "pending apply receipt publication time"),
-      "pending apply receipt publication time",
-    ),
-  };
-}
-
-export interface OwnerCompletion {
-  readonly completedAt: string;
-  readonly finalReceiptDigest: string;
-  readonly finalReceiptGeneration: string;
-  readonly runId: string;
-}
-
-// Strict, whole-document validation of a completion object.
-//
-// Used both to read an existing completion during replay and to prove a
-// freshly-written one. It deliberately does NOT compare `completedAt`, because
-// a retry legitimately produces a later one: what makes two completions the
-// same completion is the exact pending receipt they countersign, not the moment
-// somebody got around to writing them.
-export function ownerCompletionFromBody(
-  body: string,
-  expected: {
-    readonly consumerSha: string;
-    readonly finalReceiptDigest: string;
-    readonly finalReceiptGeneration: string;
-    readonly finalReceiptObject: string;
-    readonly platformSha: string;
-    readonly repository: RepositoryName;
-    readonly root: TerraformRoot;
-    readonly runId: string;
-  },
-): OwnerCompletion {
-  const parsed = record(JSON.parse(body) as unknown, "owner completion");
-  exact(
-    `${canonicalJson(json(parsed, "owner completion"))}\n`,
-    body,
-    "owner completion bytes",
-  );
-  exactKeys(
-    parsed,
-    new Set([
-      "completedAt",
-      "consumerSha",
-      "countable",
-      "executorRelease",
-      "finalReceipt",
-      "kind",
-      "platformSha",
-      "projectId",
-      "repository",
-      "repositoryId",
-      "runId",
-      "schemaVersion",
-      "terraformRoot",
-    ]),
-    "owner completion",
-  );
-  const contract = REPOSITORIES[expected.repository];
-  exact(parsed.schemaVersion, 1, "owner completion schema version");
-  // Only an apply is ever countable, and a completion only ever describes one.
-  exact(parsed.kind, "apply", "owner completion kind");
-  exact(parsed.countable, true, "owner completion countability");
-  exact(parsed.repository, expected.repository, "owner completion repository");
-  exact(parsed.repositoryId, contract.repositoryId, "owner completion repository ID");
-  exact(parsed.projectId, contract.projectId, "owner completion project");
-  exact(parsed.terraformRoot, expected.root, "owner completion root");
-  exact(parsed.runId, expected.runId, "owner completion run ID");
-  exact(parsed.platformSha, expected.platformSha, "owner completion platform SHA");
-  exact(parsed.consumerSha, expected.consumerSha, "owner completion consumer SHA");
-
-  const reference = record(parsed.finalReceipt, "owner completion final receipt");
-  exactKeys(
-    reference,
-    new Set(["bucket", "digest", "generation", "object", "publishedAt", "size"]),
-    "owner completion final receipt",
-  );
-  exact(reference.bucket, contract.state[expected.root].bucket, "owner completion receipt bucket");
-  exact(reference.object, expected.finalReceiptObject, "owner completion receipt key");
-  exact(reference.digest, expected.finalReceiptDigest, "owner completion receipt digest");
-  exact(
-    reference.generation,
-    expected.finalReceiptGeneration,
-    "owner completion receipt generation",
-  );
-  canonicalInstant(
-    requiredString(reference.publishedAt, "owner completion receipt publication time"),
-    "owner completion receipt publication time",
-  );
-
-  const release = record(parsed.executorRelease, "owner completion executor release");
-  exactKeys(
-    release,
-    new Set([
-      "artifactsDeleted",
-      "executorEmail",
-      "executorUniqueId",
-      "observedAt",
-      "permissionsProvenGone",
-      "projectBindingsCleared",
-      "provenBy",
-    ]),
-    "owner completion executor release",
-  );
-  exact(release.artifactsDeleted, true, "owner completion artifacts deleted");
-  exact(release.permissionsProvenGone, true, "owner completion permissions proven gone");
-  exact(release.projectBindingsCleared, true, "owner completion bindings cleared");
-  const provenBy = requiredString(release.provenBy, "owner completion release provenance");
-  if (provenBy !== "exact-release" && provenBy !== "propagation-horizon") {
-    throw new Error("Owner completion release provenance escaped its closed set.");
-  }
-  requiredString(release.executorEmail, "owner completion executor email");
-  requiredString(release.executorUniqueId, "owner completion executor unique ID");
-  canonicalInstant(
-    requiredString(release.observedAt, "owner completion release time"),
-    "owner completion release time",
-  );
-
-  return {
-    completedAt: canonicalInstant(
-      requiredString(parsed.completedAt, "owner completion time"),
-      "owner completion time",
-    ),
-    finalReceiptDigest: expected.finalReceiptDigest,
-    finalReceiptGeneration: expected.finalReceiptGeneration,
-    runId: expected.runId,
-  };
-}
-
-export async function publishOwnerCompletionProof(
-  invocation: Invocation,
-  ownerToken: string,
-  pending: FinalReceiptReference,
-  releaseProof: ExecutorReleaseProof,
-  nowMs: number,
-  fetcher: Fetcher,
-): Promise<void> {
-  if (!/^[0-9a-f]{64}$/.test(pending.digest)) {
-    throw new Error("Owner completion proof requires a SHA-256 final receipt digest.");
-  }
-  if (!/^[1-9][0-9]*$/.test(pending.generation)) {
-    throw new Error("Owner completion proof requires a positive final receipt generation.");
-  }
-  // The identity that surrendered privilege and the identity that was deleted
-  // must be the same account. Otherwise the completion would be countersigning
-  // one executor's de-elevation with a different executor's removal.
-  exact(
-    releaseProof.executorEmail,
-    pending.deElevationExecutorEmail,
-    "owner completion executor email",
-  );
-  exact(
-    releaseProof.executorUniqueId,
-    pending.deElevationExecutorUniqueId,
-    "owner completion executor unique ID",
-  );
-  const publishedAtMs = Date.parse(
-    canonicalInstant(pending.publishedAt, "owner completion publication time"),
-  );
-  const releasedAtMs = Date.parse(
-    canonicalInstant(releaseProof.observedAt, "owner completion release time"),
-  );
-  // Only an apply can ever be counted. A rehearsal runs no Terraform and a plan
-  // changes nothing, so neither may produce a completion object at all.
-  if (invocation.mode !== "apply") {
-    throw new Error("Only an apply produces an owner completion proof.");
-  }
-  const contract = REPOSITORIES[invocation.repository];
-  const state = contract.state[invocation.terraformRoot];
-  // The reference is a caller's claim until this reads the object it names.
-  // Exact bucket, exact key, exact generation, exact size, exact bytes -- and
-  // then the receipt inside them has to be a pending apply receipt belonging to
-  // this very run. A completion that countersigned an unread reference would be
-  // countersigning whatever the caller said, which is not a proof of anything.
-  exact(pending.bucket, state.bucket, "owner completion final receipt bucket");
-  exact(
-    pending.object,
-    receiptObjectName(state, "final", invocation.githubRunId),
-    "owner completion final receipt key",
-  );
-  const observedMetadata = await readObjectMetadata(
-    pending.bucket,
-    pending.object,
-    ownerToken,
-    fetcher,
-  );
-  exact(observedMetadata.generation, pending.generation, "owner completion final receipt generation");
-  if (observedMetadata.size !== pending.size) {
-    throw new Error("The pending final receipt is not the size the completion names.");
-  }
-  const observedBody = await readObjectGeneration(
-    pending.bucket,
-    pending.object,
-    pending.generation,
-    ownerToken,
-    fetcher,
-  );
-  if (Buffer.byteLength(observedBody) !== pending.size) {
-    throw new Error("The pending final receipt did not match its recorded size.");
-  }
-  exact(sha256Hex(observedBody), pending.digest, "owner completion final receipt digest");
-  // Whole-document validation against this run's contract identity, not a
-  // handful of spot checks on a parsed blob.
-  const pendingReceipt = pendingApplyReceiptFromBody(observedBody, {
-    consumerSha: invocation.consumerSha,
-    platformSha: invocation.platformSha,
-    repository: invocation.repository,
-    root: invocation.terraformRoot,
-    runId: invocation.githubRunId,
-  });
-  exact(
-    pendingReceipt.deElevationExecutorEmail,
-    pending.deElevationExecutorEmail,
-    "pending final receipt de-elevation email",
-  );
-  exact(
-    pendingReceipt.deElevationExecutorUniqueId,
-    pending.deElevationExecutorUniqueId,
-    "pending final receipt de-elevation unique ID",
-  );
-  // The reference must describe the object it points at, down to when it says
-  // it was published.
-  exact(pendingReceipt.publishedAt, pending.publishedAt, "pending final receipt publication time");
-  // Order depends on HOW absence was proven, because the two paths genuinely
-  // happen in different orders and collapsing them would accept both a
-  // backwards inline run and a horizon proof taken before the run it clears.
-  //
-  //   exact-release:        de-elevation <= release <= pending <= completion
-  //   propagation-horizon:  de-elevation <= pending <= horizon <= completion
-  //
-  // The inline path publishes only after cleanup, so its release necessarily
-  // precedes the pending receipt. A detached finalizer publishes the horizon
-  // proof after finding a pending receipt that already existed.
-  const deElevationAtMs = Date.parse(pendingReceipt.deElevationAt);
-  const ordered = releaseProof.provenBy === "exact-release"
-    ? deElevationAtMs <= releasedAtMs && releasedAtMs <= publishedAtMs &&
-      publishedAtMs <= nowMs
-    : deElevationAtMs <= publishedAtMs && publishedAtMs <= releasedAtMs &&
-      releasedAtMs <= nowMs;
-  if (!ordered) {
-    throw new Error(
-      `Owner completion proof requires ${releaseProof.provenBy} timestamps in order.`,
-    );
-  }
-  const body = `${canonicalJson(json({
-    completedAt: new Date(nowMs).toISOString(),
-    // Consumer identity is bound here too: a completion names the exact
-    // repository, root, run, platform commit AND consumer commit it counts.
-    consumerSha: invocation.consumerSha,
-    countable: true,
-    executorRelease: {
-      artifactsDeleted: releaseProof.artifactsDeleted,
-      executorEmail: releaseProof.executorEmail,
-      executorUniqueId: releaseProof.executorUniqueId,
-      observedAt: releaseProof.observedAt,
-      permissionsProvenGone: releaseProof.permissionsProvenGone,
-      projectBindingsCleared: releaseProof.projectBindingsCleared,
-      provenBy: releaseProof.provenBy,
-    },
-    finalReceipt: {
-      bucket: pending.bucket,
-      digest: pending.digest,
-      generation: pending.generation,
-      object: pending.object,
-      publishedAt: pending.publishedAt,
-      size: pending.size,
-    },
-    kind: "apply",
-    platformSha: invocation.platformSha,
-    projectId: contract.projectId,
-    repository: invocation.repository,
-    repositoryId: contract.repositoryId,
-    runId: invocation.githubRunId,
-    schemaVersion: 1,
-    terraformRoot: invocation.terraformRoot,
-  }, "owner completion proof"))}\n`;
-  // Replay is decided by identity, not by bytes.
-  //
-  // A retry legitimately writes a later `completedAt`, so a byte-equality
-  // reconciliation would report a conflict for a run that had already finished
-  // successfully. What actually makes two completions the same completion is
-  // the exact pending receipt they countersign -- bucket, key, generation and
-  // digest -- so that is what is compared, and a valid existing completion for
-  // this receipt is accepted as the work already being done.
-  const completionObject = receiptObjectName(state, "completion", invocation.githubRunId);
-  const expectedCompletion = {
-    consumerSha: invocation.consumerSha,
-    finalReceiptDigest: pending.digest,
-    finalReceiptGeneration: pending.generation,
-    finalReceiptObject: pending.object,
-    platformSha: invocation.platformSha,
-    repository: invocation.repository,
-    root: invocation.terraformRoot,
-    runId: invocation.githubRunId,
-  } as const;
-  try {
-    await writeImmutableObject(state.bucket, completionObject, body, ownerToken, fetcher);
-    return;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const metadata = await readObjectMetadata(state.bucket, completionObject, ownerToken, fetcher)
-      .catch(() => undefined);
-    if (metadata === undefined) throw error;
-    const observed = await readObjectGeneration(
-      state.bucket,
-      completionObject,
-      metadata.generation,
-      ownerToken,
-      fetcher,
-    );
-    // An existing object only settles the retry if it is a VALID completion for
-    // exactly this pending receipt. Anything else is the original failure.
-    try {
-      ownerCompletionFromBody(observed, expectedCompletion);
-    } catch {
-      throw error;
-    }
-    void message;
-  }
 }
 
 function planReceipt(value: unknown): PlanReceipt {
@@ -15289,7 +15219,6 @@ function receiptObjectName(
   state: { readonly prefix: string },
   kind:
     | "adoptions"
-    | "completion"
     | "consumed"
     | "final"
     | "plans"

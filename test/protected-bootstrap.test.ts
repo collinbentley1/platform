@@ -57,11 +57,11 @@ import {
   parseExecutorProvenance,
   publishPlanReceipt,
   type FederationPoolState,
+  type FederationProviderState,
   federationPoolFromJson,
+  federationProviderFromJson,
   type FederationQuarantineRecord,
   publishFinalProtectedReceipt,
-  publishOwnerCompletionProof,
-  finalizePendingApplyReceipts,
   writeImmutableObject,
   writeFederationRestoreMarker,
   RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
@@ -70,6 +70,7 @@ import {
   assertQuarantinedPool,
   buildFinalProtectedProof,
   federationPoolFingerprint,
+  federationProviderFingerprint,
   setFederationPoolDisabled,
   federationQuarantineRecordFromJson,
   restoreQuarantinedFederation,
@@ -145,7 +146,22 @@ const root = join(import.meta.dir, "..");
 const platformSha = "a".repeat(40);
 const consumerSha = "b".repeat(40);
 const consumerTreeSha = "c".repeat(40);
-const executorEmail = "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com";
+const executorEmail = `${randomExecutorAccountId(
+  deterministicArtifactHex("cdbentley", "123456", "service-account"),
+)}@cdbentley.iam.gserviceaccount.com`;
+
+function federationPoolName(projectId: string): string {
+  const repository = REPOSITORY_NAMES.find(
+    (candidate) => REPOSITORIES[candidate].projectId === projectId,
+  );
+  if (repository === undefined) throw new Error(`Unknown test project ${projectId}.`);
+  return `projects/${REPOSITORIES[repository].exposure.projectNumber}/locations/global/workloadIdentityPools/github-actions`;
+}
+
+function federationProviderName(projectId: string): string {
+  return `${federationPoolName(projectId)}/providers/github`;
+}
+
 const capabilityFiles = [
   ".github/workflows/cleanup-preview.yml",
   ".github/workflows/deploy-preview.yml",
@@ -227,20 +243,20 @@ describe("protected owner Terraform bridge", () => {
       workflow.match(
         /if: \$\{\{ always\(\) && \(steps\.protected-bridge\.outcome == 'failure' \|\| steps\.protected-bridge\.outcome == 'cancelled'\) \}\}/g,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(workflow).toContain(
-      "id: recovery-route\n        if: ${{ always() }}",
+      "if: ${{ always() && inputs.mode != 'apply' && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}",
     );
     expect(workflow).toContain(
-      "id: recovery-source\n        if: ${{ always() && steps.recovery-route.outcome == 'success' }}",
+      "id: recovery-runtime\n        if: ${{ always() }}",
     );
     expect(workflow).toContain(
-      "id: recovery-bun\n        if: ${{ always() && steps.recovery-source.outcome == 'success' }}",
+      "if: ${{ always() && steps.recovery-runtime.outcome == 'success' }}",
     );
-    expect(workflow).toContain(
-      "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
-    );
-    expect(workflow).toContain("bridge_reserve_seconds=$((16 * 60))");
+    expect(workflow).not.toContain("id: recovery-route");
+    expect(workflow).not.toContain("id: recovery-source");
+    expect(workflow).not.toContain("id: recovery-bun");
+    expect(workflow).toContain("bridge_reserve_seconds=$((17 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((25 * 60))");
     expect(workflow).toContain("bridge_reserve_seconds=$((2 * 60))");
     // The apply floor is the ceiling less the reviewed setup tolerance; a
@@ -250,15 +266,15 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).not.toContain("bridge_minimum_seconds=$((34 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((39 * 60))");
     expect(workflow).toContain(
-      "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))",
+      "available_bridge_seconds=$((42 * 60 - elapsed_seconds - bridge_reserve_seconds))",
     );
+    expect(workflow).toContain('bridge_budget_seconds="$available_bridge_seconds"');
     expect(workflow).toContain(
       'test "$bridge_budget_seconds" -ge "$bridge_minimum_seconds"',
     );
     expect(workflow).toContain(
       'test "$bridge_budget_seconds" -le "$bridge_maximum_seconds"',
     );
-    expect(workflow.match(/timeout-minutes: 14/g)).toHaveLength(2);
     const recoveryBlocks = [
       workflow.slice(
         workflow.indexOf("- name: Recover exact IAM artifacts after bridge failure"),
@@ -269,18 +285,18 @@ describe("protected owner Terraform bridge", () => {
       ),
     ];
     for (const recoveryBlock of recoveryBlocks) {
-      expect(recoveryBlock).toContain("timeout-minutes: 14");
+      expect(recoveryBlock).toContain("timeout-minutes: 15");
       expect(recoveryBlock).toContain(
-        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \\\n" +
+        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \\\n" +
           "            /usr/bin/env -i \\",
       );
       expect(recoveryBlock).not.toContain("} | \\\n          exec /usr/bin/env -i");
       expect(recoveryBlock).toContain("--no-env-file --no-orphans");
     }
-    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1 + 1) * 60;
-    const recoveryWrapperSeconds = 795;
+    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1 + 1 + 1) * 60;
+    const recoveryWrapperSeconds = 855;
     const recoveryKillAfterSeconds = 15;
-    const recoveryActionsStepSeconds = 14 * 60;
+    const recoveryActionsStepSeconds = 15 * 60;
     expect(recoveryWrapperSeconds).toBeGreaterThan(recoveryInternalDeadlineSeconds);
     expect(recoveryWrapperSeconds + recoveryKillAfterSeconds).toBeLessThan(
       recoveryActionsStepSeconds,
@@ -288,7 +304,7 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
         "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 18",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 17",
     );
     expect(
       workflow.match(
@@ -3671,7 +3687,7 @@ describe("protected owner Terraform bridge", () => {
       return Number(match?.[1]);
     };
     expect(controller).toContain("} finally {");
-    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 41;");
+    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 42;");
     expect(controller).toContain("const LEASE_MINUTES = 54;");
     expect(controller).toContain("const PLAN_INTERNAL_OPERATION_MINUTES = 24;");
     expect(controller).toContain("const APPLY_INTERNAL_OPERATION_MINUTES = 33;");
@@ -3692,9 +3708,9 @@ describe("protected owner Terraform bridge", () => {
       "requiredOwnerTokenRemainingSeconds(invocation)",
     );
     const userAccessTokenMinutes = 60;
-    const mainJobMinutes = 41;
-    const freshRecoveryJobMinutes = 18;
-    const freshRecoveryTokenRequirementMinutes = 14 + 1;
+    const mainJobMinutes = 42;
+    const freshRecoveryJobMinutes = 17;
+    const freshRecoveryTokenRequirementMinutes = 15 + 1;
     const planTokenRequirementMinutes = requiredOwnerTokenRemainingSeconds({
       mode: "plan",
       operationBudgetSeconds: 25 * 60,
@@ -3703,8 +3719,8 @@ describe("protected owner Terraform bridge", () => {
       mode: "apply",
       operationBudgetSeconds: 39 * 60,
     }) / 60;
-    expect(planTokenRequirementMinutes).toBe(42);
-    expect(applyTokenRequirementMinutes).toBe(59);
+    expect(planTokenRequirementMinutes).toBe(43);
+    expect(applyTokenRequirementMinutes).toBe(58);
     expect(applyTokenRequirementMinutes).toBeLessThan(userAccessTokenMinutes);
     expect(mainJobMinutes + freshRecoveryTokenRequirementMinutes).toBeLessThan(
       userAccessTokenMinutes,
@@ -3758,7 +3774,7 @@ describe("protected owner Terraform bridge", () => {
       join(root, ".github/workflows/protected-bootstrap-implementation.yml"),
       "utf8",
     );
-    expect(workflow).toContain("timeout-minutes: 41");
+    expect(workflow).toContain("timeout-minutes: 42");
   });
 
   test("Terraform sandbox create argv keeps only its work bind writable", () => {
@@ -5224,7 +5240,7 @@ describe("protected owner Terraform bridge", () => {
       },
       verifySource: async () => undefined,
     });
-    expect(recoveryDeadlineMs - startedAt).toBe(12 * 60_000);
+    expect(recoveryDeadlineMs - startedAt).toBe(RECOVERY_OPERATION_MINUTES * 60_000);
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
@@ -5329,7 +5345,9 @@ describe("protected owner Terraform bridge", () => {
         virtualNow += 59_000;
       },
     });
-    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 12 * 60_000);
+    expect(recoveryDeadlineMs).toBe(
+      startedAt + 59_000 + RECOVERY_OPERATION_MINUTES * 60_000,
+    );
 
     let recoveryStarted = false;
     virtualNow = startedAt;
@@ -5507,6 +5525,48 @@ describe("protected owner Terraform bridge", () => {
     expect(auditArgv).toBeDefined();
     expect(auditArgv).toContain("-json");
     expect(auditArgv).toContain("-detailed-exitcode");
+  });
+
+  test("the two freeze snapshots bracketing elevation must be stable", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, {
+      ...identity(),
+      terraformRoot: "bootstrap",
+    });
+    const events: string[] = [];
+    let freezeCalls = 0;
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        proveFreeze: async (_invocation, tokenDrainSeconds) => {
+          freezeCalls += 1;
+          const snapshot = freezeSnapshot(1_800_000_000_000 + freezeCalls, tokenDrainSeconds);
+          if (freezeCalls !== 3) return snapshot;
+          return {
+            ...snapshot,
+            repositories: snapshot.repositories.map((entry, index) =>
+              index === 0
+                ? { ...entry, latestPossibleTokenIssuance: "2026-08-22T20:00:00.000Z" }
+                : entry
+            ),
+          };
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("stable pre-apply freeze repository snapshot");
+
+    expect(freezeCalls).toBe(3);
+    expect(events).toContain("elevate");
+    expect(events).not.toContain("terraform:apply");
+    expect(events).toContain("release");
+    expect(events).toContain("federation:restore");
   });
 
   test("Runsetta production revalidates adoption through elevation and reaches apply", async () => {
@@ -5966,7 +6026,8 @@ describe("protected owner Terraform bridge", () => {
           requestedPages.push(page);
           return Response.json({
             total_count: 101,
-            workflow_runs: Array.from({ length: page === 1 ? 100 : 1 }, () => ({
+            workflow_runs: Array.from({ length: page === 1 ? 100 : 1 }, (_, index) => ({
+              id: (page - 1) * 100 + index + 1,
               status: "requested",
             })),
           });
@@ -5987,6 +6048,101 @@ describe("protected owner Terraform bridge", () => {
     ))
       .rejects.toThrow("active GitHub Actions run");
     expect(requestedPages).toEqual([1, 2]);
+  });
+
+  const freezeProofFetcher = (
+    runs: (
+      repository: string,
+      status: string | null,
+      page: number,
+    ) => { readonly total_count: number; readonly workflow_runs: readonly object[] },
+  ) => async (input: string | URL | Request): Promise<Response> => {
+    const url = new URL(String(input));
+    const repository = url.pathname.split("/")[3] ?? "";
+    const ids: Record<string, string> = {
+      cdbentley: "1255553151",
+      "critical-history": "280932482",
+      healthmcp: "1025243085",
+      runsetta: "711292980",
+    };
+    if (url.pathname.endsWith("/actions/permissions")) return Response.json({ enabled: false });
+    if (url.pathname.endsWith("/actions/runs")) {
+      return Response.json(runs(
+        repository,
+        url.searchParams.get("status"),
+        Number(url.searchParams.get("page")),
+      ));
+    }
+    return Response.json({
+      full_name: `collinbentley1/${repository}`,
+      id: Number(ids[repository]),
+      owner: { id: 16823277 },
+    });
+  };
+
+  test("consumer freeze refuses an incomplete active-status page", async () => {
+    const fetcher = freezeProofFetcher((repository, status) =>
+      repository === "cdbentley" && status === "requested"
+        ? { total_count: 1, workflow_runs: [] }
+        : { total_count: 0, workflow_runs: [] }
+    );
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("short or overfilled requested run page");
+  });
+
+  test("consumer freeze refuses duplicate run IDs across unfiltered pages", async () => {
+    const terminalRun = (id: number) => ({
+      created_at: "2026-08-22T20:00:00.000Z",
+      id,
+      status: "completed",
+      updated_at: "2026-08-22T20:00:00.000Z",
+    });
+    const fetcher = freezeProofFetcher((repository, status, page) => {
+      if (repository !== "cdbentley" || status !== null) {
+        return { total_count: 0, workflow_runs: [] };
+      }
+      return {
+        total_count: 101,
+        workflow_runs: page === 1
+          ? Array.from({ length: 100 }, (_, index) => terminalRun(index + 1))
+          : [terminalRun(100)],
+      };
+    });
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("repeated a run ID");
+  });
+
+  test("consumer freeze cross-checks active status in unfiltered history", async () => {
+    const fetcher = freezeProofFetcher((repository, status) =>
+      repository === "cdbentley" && status === null
+        ? {
+          total_count: 1,
+          workflow_runs: [{
+            created_at: "2026-08-22T20:00:00.000Z",
+            id: 1,
+            status: "in_progress",
+            updated_at: "2026-08-22T20:00:00.000Z",
+          }],
+        }
+        : { total_count: 0, workflow_runs: [] }
+    );
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("unfiltered history still contains an active");
   });
 
   // Abrupt loss, exercised through the real recovery entrypoint. Only the HTTP
@@ -6013,17 +6169,27 @@ describe("protected owner Terraform bridge", () => {
             description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
             disabled: false,
             displayName: "GitHub Actions",
-            name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+            name: federationPoolName(project!),
             state: "ACTIVE",
           },
           project!,
         ),
       ),
-      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
       repository: name,
     }));
+    const projectId = REPOSITORIES[repository as keyof typeof REPOSITORIES].projectId;
     return JSON.stringify({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
       capturedAt: "2026-09-01T12:00:00.000Z",
+      consumerSha: "c".repeat(40),
+      executorEmail: `${randomExecutorAccountId(
+        deterministicArtifactHex(repository, runId, "service-account"),
+      )}@${projectId}.iam.gserviceaccount.com`,
+      executorUniqueId: "123456789012345678901",
       platformSha: "b".repeat(40),
       pools,
       repository,
@@ -6048,6 +6214,21 @@ describe("protected owner Terraform bridge", () => {
       const url = new URL(String(input));
       if (url.hostname === "iam.googleapis.com") {
         const project = url.pathname.split("/")[3]!;
+        if (url.pathname.endsWith("/providers/github")) {
+          return Response.json({
+            attributeCondition: "assertion.repository_owner_id == '16823277'",
+            attributeMapping: {
+              "attribute.repository": "assertion.repository_id",
+              "google.subject": "assertion.sub",
+            },
+            description: "GitHub Actions OIDC provider.",
+            disabled: false,
+            displayName: "GitHub",
+            name: federationProviderName(project),
+            oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
+            state: "ACTIVE",
+          });
+        }
         if (init?.method === "PATCH") {
           patched.push(project);
           options.disabled[project] = JSON.parse(String(init.body)).disabled;
@@ -6057,7 +6238,7 @@ describe("protected owner Terraform bridge", () => {
           description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
           disabled: options.disabled[project] ?? false,
           displayName: "GitHub Actions",
-          name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+          name: federationPoolName(project),
           state: "ACTIVE",
         });
       }
@@ -6247,43 +6428,6 @@ describe("protected owner Terraform bridge", () => {
     expect(world.patched).toEqual([]);
   });
 
-  test("a pending receipt outside this run's horizon is reported, not finalized", async () => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    const summary = await finalizePendingApplyReceipts(
-      "owner-token-value",
-      world.fetcher,
-      Date.parse("2026-09-01T13:00:00.000Z"),
-      { ...CDB_HORIZON, projectId: "runsetta", repository: "runsetta" as const },
-      // A horizon for another project covers nothing here.
-      async () => undefined,
-      () => Date.parse("2026-09-01T12:30:00.000Z"),
-    );
-
-    expect(summary.scanned).toBe(1);
-    expect(summary.finalized).toEqual([]);
-    expect(summary.skippedUncontained).toEqual([key]);
-    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
-  });
-
-  test("the finalizer refuses containment evidence for the wrong executor", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-
-    await expect(finalizePendingApplyReceipts(
-      "owner-token-value",
-      world.fetcher,
-      Date.parse("2026-09-01T13:00:00.000Z"),
-      CDB_HORIZON,
-      // Contained, but the proof names a different account than the receipt.
-      async () => ({
-        ...horizonRelease,
-        executorEmail: "gha-pbt-" + "b".repeat(20) + "@cdbentley.iam.gserviceaccount.com",
-      }),
-      () => Date.parse("2026-09-01T12:30:00.000Z"),
-    )).rejects.toThrow("finalizer executor identity");
-  });
-
   test("recovery for one target repairs an intent left by a run for another", async () => {
     // The lost run was healthmcp/prod; this recovery run was pointed at
     // cdbentley. A per-target scan would never have seen it.
@@ -6332,9 +6476,8 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow("cleanup did not complete exactly");
 
     // Publication happens only after the whole cleanup succeeds, so a failed
-    // executor deletion leaves NO artifact at all -- not a pending one either.
+    // executor deletion leaves no terminal artifact at all.
     expect(events).not.toContain("publish:final");
-    expect(events).not.toContain("owner:completion");
   });
 
   test("a rehearsal receipt is explicitly non-countable and claims no Terraform", () => {
@@ -6460,6 +6603,27 @@ describe("protected owner Terraform bridge", () => {
       async () => {},
       () => 1_800_000_000_000,
     )).rejects.toThrow("did not match its listed size");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("a future-dated intent cannot hold recovery authority", async () => {
+    const future = intentBody("cdbentley", "bootstrap", "123456").replace(
+      "2026-09-01T12:00:00.000Z",
+      "2099-09-01T12:00:00.000Z",
+    );
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: future } },
+    });
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("dated into the future");
     expect(world.patched).toEqual([]);
   });
 
@@ -6703,7 +6867,20 @@ describe("protected owner Terraform bridge", () => {
     description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
     disabled,
     displayName: "GitHub Actions",
-    name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+    name: federationPoolName(project),
+    state: "ACTIVE",
+  });
+  const providerBody = (project: string, condition = "assertion.repository_owner_id == '16823277'") => ({
+    attributeCondition: condition,
+    attributeMapping: {
+      "attribute.repository": "assertion.repository_id",
+      "google.subject": "assertion.sub",
+    },
+    description: "GitHub Actions OIDC provider.",
+    disabled: false,
+    displayName: "GitHub",
+    name: federationProviderName(project),
+    oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
     state: "ACTIVE",
   });
 
@@ -6724,6 +6901,47 @@ describe("protected owner Terraform bridge", () => {
       .toThrow("is DELETED, not ACTIVE");
   });
 
+  test("the live legacy pool shape is bound to its numeric resource identity", () => {
+    const live = federationPoolFromJson({
+      description: "GitHub Actions OIDC identities for collinbentley1/cdbentley.",
+      displayName: "GitHub Actions",
+      name: "projects/882468538648/locations/global/workloadIdentityPools/github-actions",
+      state: "ACTIVE",
+    }, "cdbentley");
+    const explicit = federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "FEDERATION_ONLY",
+    }, "cdbentley");
+    const legacyExplicit = federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "MODE_UNSPECIFIED",
+    }, "cdbentley");
+
+    expect(live.disabled).toBe(false);
+    expect(live.mode).toBe("FEDERATION_ONLY");
+    expect(federationPoolFingerprint(live)).toBe(federationPoolFingerprint(explicit));
+    expect(federationPoolFingerprint(live)).toBe(federationPoolFingerprint(legacyExplicit));
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      name: "projects/cdbentley/locations/global/workloadIdentityPools/github-actions",
+    }, "cdbentley")).toThrow("not the contracted GitHub Actions pool");
+  });
+
+  test("trust-domain or expiring pool configuration is refused", () => {
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "TRUST_DOMAIN",
+    }, "cdbentley")).toThrow("not federation-only");
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      inlineTrustConfig: {},
+    }, "cdbentley")).toThrow("trust-domain configuration");
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      expireTime: "2026-09-02T00:00:00Z",
+    }, "cdbentley")).toThrow("expiry time");
+  });
+
   test("the fingerprint excludes only the flag the run is allowed to move", () => {
     const enabled = federationPoolFromJson(poolBody("cdbentley", false), "cdbentley");
     const disabled = federationPoolFromJson(poolBody("cdbentley", true), "cdbentley");
@@ -6734,6 +6952,27 @@ describe("protected owner Terraform bridge", () => {
 
     expect(federationPoolFingerprint(enabled)).toBe(federationPoolFingerprint(disabled));
     expect(federationPoolFingerprint(renamed)).not.toBe(federationPoolFingerprint(enabled));
+  });
+
+  test("the provider fingerprint binds the exact GitHub mapping and condition", () => {
+    const provider = federationProviderFromJson(providerBody("cdbentley"), "cdbentley");
+    const broadened = federationProviderFromJson(
+      providerBody("cdbentley", "assertion.repository_owner_id != ''"),
+      "cdbentley",
+    );
+    expect(federationProviderFingerprint(provider)).not.toBe(
+      federationProviderFingerprint(broadened),
+    );
+    expect(() =>
+      federationProviderFromJson(
+        {
+          ...providerBody("cdbentley"),
+          name:
+            "projects/999999999999/locations/global/workloadIdentityPools/github-actions/providers/github",
+        },
+        "cdbentley",
+      )
+    ).toThrow("provider identity");
   });
 
   test("disabling is proved by reading the pool back, not by the accepted PATCH", async () => {
@@ -6784,7 +7023,14 @@ describe("protected owner Terraform bridge", () => {
   });
 
   const quarantineRecord = (overrides: Record<string, unknown> = {}) => ({
+    approvedManifestSha256: "f".repeat(64),
+    approvedPlanRunId: "123455",
     capturedAt: "2026-09-01T12:00:00.000Z",
+    consumerSha: "b".repeat(40),
+    executorEmail: `${randomExecutorAccountId(
+      deterministicArtifactHex("cdbentley", "123456", "service-account"),
+    )}@cdbentley.iam.gserviceaccount.com`,
+    executorUniqueId: "123456789012345678901",
     pools: [
       ["cdbentley", "cdbentley"],
       ["runsetta", "runsetta"],
@@ -6795,7 +7041,9 @@ describe("protected owner Terraform bridge", () => {
       fingerprint: federationPoolFingerprint(
         federationPoolFromJson(poolBody(project!, false), project!),
       ),
-      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
       repository,
     })),
     platformSha: "a".repeat(40),
@@ -6821,7 +7069,9 @@ describe("protected owner Terraform bridge", () => {
 
   // Abrupt loss. A fresh runner restores from the durable record alone, and the
   // record is written before the first PATCH, so every boundary is covered.
-  const restoreFetcher = (live: Record<string, { disabled: boolean; body?: object }>) => {
+  const restoreFetcher = (
+    live: Record<string, { disabled: boolean; body?: object; providerBody?: object }>,
+  ) => {
     const patched: string[] = [];
     const fetcher = (async (input: string | URL, init?: RequestInit) => {
       const project = new URL(String(input)).pathname.split("/")[3]!;
@@ -6830,6 +7080,9 @@ describe("protected owner Terraform bridge", () => {
         patched.push(project);
         entry.disabled = JSON.parse(String(init.body)).disabled;
         return Response.json({ name: "operations/1" });
+      }
+      if (new URL(String(input)).pathname.endsWith("/providers/github")) {
+        return Response.json(entry.providerBody ?? providerBody(project));
       }
       return Response.json(entry.body ?? poolBody(project, entry.disabled));
     }) as unknown as typeof fetch;
@@ -6894,9 +7147,27 @@ describe("protected owner Terraform bridge", () => {
       Date.now() + 60_000,
       async () => {},
     )).rejects.toThrow("restored runsetta workload identity pool");
-    // cdbentley came first and was restored; runsetta stopped the run rather
-    // than overwriting a change nobody reviewed.
-    expect(patched).toEqual(["cdbentley"]);
+    // Every fingerprint is validated before the first PATCH, so drift leaves
+    // the entire fleet closed rather than partially restoring it.
+    expect(patched).toEqual([]);
+  });
+
+  test("a provider that broadened while the pool was closed keeps every pool closed", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = {
+      disabled: true,
+      providerBody: providerBody("runsetta", "assertion.repository_owner_id != ''"),
+    };
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("restored runsetta workload identity provider");
+    expect(patched).toEqual([]);
   });
 
   test("a pool that was already disabled before the run is never re-enabled", async () => {
@@ -6979,9 +7250,8 @@ describe("protected owner Terraform bridge", () => {
       expect(events.indexOf(path)).toBeGreaterThan(-1);
       expect(events.indexOf(path)).toBeLessThan(events.indexOf("publish:final"));
     }
-    // The countable object is the owner's, written last.
-    expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("owner:completion"));
-    expect(events.at(-1)).toBe("owner:completion");
+    // The single countable owner object is written last.
+    expect(events.at(-1)).toBe("publish:final");
   });
 
   test("a quarantine that fails halfway is still undone by this run", async () => {
@@ -7116,10 +7386,8 @@ describe("protected owner Terraform bridge", () => {
     )).rejects.toThrow();
 
     // Publication is downstream of every cleanup prerequisite, so a failure in
-    // any of them leaves nothing a finalizer could ever count -- and no
-    // terminal record claiming the run finished.
+    // any of them leaves no terminal record claiming the run finished.
     expect(events).not.toContain("publish:final");
-    expect(events).not.toContain("owner:completion");
   });
 
   test("a rehearsal whose cleanup fails leaves no terminal record", async () => {
@@ -7157,454 +7425,7 @@ describe("protected owner Terraform bridge", () => {
 
     expect(events.filter((event) => event === "publish:final")).toHaveLength(1);
     expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
-    // A rehearsal is never countable, so it never countersigns.
-    expect(events).not.toContain("owner:completion");
   });
-
-  // Drives the REAL publish-then-complete pair against a faithful object store,
-  // rather than restating the ordering rule in the test and checking itself.
-  const completionWorld = () => {
-    const objects = new Map<string, { body: string; generation: string }>();
-    let next = 1_700_000_000;
-    const fetcher = (async (input: string | URL, init?: RequestInit) => {
-      const url = new URL(String(input));
-      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
-      if (url.pathname.startsWith("/upload/")) {
-        const name = url.searchParams.get("name")!;
-        if (objects.has(name)) return new Response("", { status: 412 });
-        const body = String(init!.body);
-        next += 1;
-        objects.set(name, { body, generation: String(next) });
-        return Response.json({
-          bucket,
-          generation: String(next),
-          metageneration: "1",
-          name,
-          size: String(Buffer.byteLength(body)),
-        });
-      }
-      const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
-      const stored = objects.get(name);
-      if (stored === undefined) return new Response("", { status: 404 });
-      if (url.searchParams.get("alt") === "media") return new Response(stored.body);
-      return Response.json({
-        bucket,
-        generation: stored.generation,
-        metageneration: "1",
-        name,
-        size: String(Buffer.byteLength(stored.body)),
-      });
-    }) as unknown as typeof fetch;
-    return { fetcher, objects };
-  };
-
-  // Exactly the permissions the mutation role carries that the read role does
-  // not: the receipt's proven-absent set is deterministic, not free-form.
-  const deterministicProvenAbsent = (repository: "cdbentley", root: "bootstrap") => {
-    const read = new Set(executorControlPermissions(repository, root, "read"));
-    return executorControlPermissions(repository, root, "mutation")
-      .filter((permission) => !read.has(permission))
-      .toSorted();
-  };
-
-  const applyInvocationForCompletion = () =>
-    validateInvocation({
-      ...validEnvironment(),
-      APPROVED_MANIFEST_SHA256: "a".repeat(64),
-      APPROVED_PLAN_RUN_ID: "123455",
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
-      EXECUTION_MODE: "apply",
-    }, true);
-
-  const pendingProofAt = (deElevationAt: string) => {
-    const invocation = applyInvocationForCompletion();
-    const intent = quarantineIntent(invocation);
-    return buildFinalProtectedProof({
-      deElevation: {
-        executorEmail,
-        executorUniqueId: "123456789012345678901",
-        observedAt: deElevationAt,
-        provenAbsent: deterministicProvenAbsent("cdbentley", "bootstrap"),
-      },
-      intent,
-      intentDigest: "c".repeat(64),
-      intentGeneration: "1700000001",
-      invocation,
-      kind: "apply",
-      observedPools: intent.pools.map((pool) => ({
-        disabled: false,
-        fingerprint: pool.fingerprint,
-        name: pool.name,
-        observedAt: deElevationAt,
-        repository: pool.repository,
-      })),
-      quarantinedApplyProof: executionProof(),
-      restoredAudit: {
-        detailedExitCode: 0 as const,
-        observedAt: deElevationAt,
-        outputSha256: "d".repeat(64),
-      },
-      review: { canonical: "", sha256: "a".repeat(64) },
-    });
-  };
-
-  const completeWith = async (options: {
-    readonly deElevationAt: string;
-    readonly provenBy: "exact-release" | "propagation-horizon";
-    readonly publishedAt: string;
-    readonly releasedAt: string;
-  }) => {
-    const invocation = applyInvocationForCompletion();
-    const world = completionWorld();
-    const pending = await publishFinalProtectedReceipt(
-      invocation,
-      "owner-token-value",
-      { canonical: "", sha256: "a".repeat(64) },
-      pendingProofAt(options.deElevationAt),
-      Date.parse(options.publishedAt),
-      world.fetcher,
-    );
-    await publishOwnerCompletionProof(
-      invocation,
-      "owner-token-value",
-      pending,
-      {
-        artifactsDeleted: true,
-        executorEmail,
-        executorUniqueId: "123456789012345678901",
-        observedAt: options.releasedAt,
-        permissionsProvenGone: true,
-        projectBindingsCleared: true,
-        provenBy: options.provenBy,
-      },
-      Date.parse("2026-09-01T12:10:00.000Z"),
-      world.fetcher,
-    );
-    return world;
-  };
-
-  test("an exact-release completion accepts de-elevation, release, then pending", async () => {
-    const world = await completeWith({
-      deElevationAt: "2026-09-01T12:00:00.000Z",
-      provenBy: "exact-release",
-      publishedAt: "2026-09-01T12:02:00.000Z",
-      releasedAt: "2026-09-01T12:01:00.000Z",
-    });
-    const completion = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
-    const body = JSON.parse(world.objects.get(completion)!.body) as Record<string, unknown>;
-    expect(body.countable).toBe(true);
-    expect(body.kind).toBe("apply");
-    expect((body.executorRelease as Record<string, unknown>).provenBy).toBe("exact-release");
-  });
-
-  test("an exact-release completion whose release follows the pending receipt is refused", async () => {
-    await expect(completeWith({
-      deElevationAt: "2026-09-01T12:00:00.000Z",
-      provenBy: "exact-release",
-      publishedAt: "2026-09-01T12:02:00.000Z",
-      releasedAt: "2026-09-01T12:03:00.000Z",
-    })).rejects.toThrow("exact-release timestamps in order");
-  });
-
-  test("a horizon completion accepts de-elevation, pending, then the horizon proof", async () => {
-    const world = await completeWith({
-      deElevationAt: "2026-09-01T12:00:00.000Z",
-      provenBy: "propagation-horizon",
-      publishedAt: "2026-09-01T12:01:00.000Z",
-      releasedAt: "2026-09-01T12:02:00.000Z",
-    });
-    const completion = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
-    const body = JSON.parse(world.objects.get(completion)!.body) as Record<string, unknown>;
-    expect((body.executorRelease as Record<string, unknown>).provenBy).toBe("propagation-horizon");
-  });
-
-  test("a horizon completion taken before its pending receipt is refused", async () => {
-    await expect(completeWith({
-      deElevationAt: "2026-09-01T12:00:00.000Z",
-      provenBy: "propagation-horizon",
-      publishedAt: "2026-09-01T12:01:00.000Z",
-      releasedAt: "2026-09-01T12:00:30.000Z",
-    })).rejects.toThrow("propagation-horizon timestamps in order");
-  });
-
-  test("the pending receipt is never countable and the completion always is", async () => {
-    const world = await completeWith({
-      deElevationAt: "2026-09-01T12:00:00.000Z",
-      provenBy: "exact-release",
-      publishedAt: "2026-09-01T12:02:00.000Z",
-      releasedAt: "2026-09-01T12:01:00.000Z",
-    });
-    const pendingKey = [...world.objects.keys()].find((name) => name.includes("/final/"))!;
-    const completionKey = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
-    expect(JSON.parse(world.objects.get(pendingKey)!.body).countable).toBe(false);
-    expect(JSON.parse(world.objects.get(pendingKey)!.body).status).toBe("pending");
-    expect(JSON.parse(world.objects.get(completionKey)!.body).countable).toBe(true);
-  });
-
-  test("completing twice accepts the existing completion rather than conflicting", async () => {
-    // A retry writes a later completedAt, so byte equality would call a
-    // finished run a conflict. Identity is what settles it.
-    const invocation = applyInvocationForCompletion();
-    const world = completionWorld();
-    const pending = await publishFinalProtectedReceipt(
-      invocation,
-      "owner-token-value",
-      { canonical: "", sha256: "a".repeat(64) },
-      pendingProofAt("2026-09-01T12:00:00.000Z"),
-      Date.parse("2026-09-01T12:02:00.000Z"),
-      world.fetcher,
-    );
-    const release = {
-      artifactsDeleted: true as const,
-      executorEmail,
-      executorUniqueId: "123456789012345678901",
-      observedAt: "2026-09-01T12:01:00.000Z",
-      permissionsProvenGone: true as const,
-      projectBindingsCleared: true as const,
-      provenBy: "exact-release" as const,
-    };
-    await publishOwnerCompletionProof(
-      invocation,
-      "owner-token-value",
-      pending,
-      release,
-      Date.parse("2026-09-01T12:05:00.000Z"),
-      world.fetcher,
-    );
-    const key = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
-    const first = world.objects.get(key)!.body;
-
-    // Same run, later clock: accepted, and the committed object is untouched.
-    await publishOwnerCompletionProof(
-      invocation,
-      "owner-token-value",
-      pending,
-      release,
-      Date.parse("2026-09-01T12:09:00.000Z"),
-      world.fetcher,
-    );
-    expect(world.objects.get(key)!.body).toBe(first);
-    expect(JSON.parse(first).completedAt).toBe("2026-09-01T12:05:00.000Z");
-  });
-
-  test("a completion naming a different pending receipt is not accepted as a replay", async () => {
-    const invocation = applyInvocationForCompletion();
-    const world = completionWorld();
-    const pending = await publishFinalProtectedReceipt(
-      invocation,
-      "owner-token-value",
-      { canonical: "", sha256: "a".repeat(64) },
-      pendingProofAt("2026-09-01T12:00:00.000Z"),
-      Date.parse("2026-09-01T12:02:00.000Z"),
-      world.fetcher,
-    );
-    const release = {
-      artifactsDeleted: true as const,
-      executorEmail,
-      executorUniqueId: "123456789012345678901",
-      observedAt: "2026-09-01T12:01:00.000Z",
-      permissionsProvenGone: true as const,
-      projectBindingsCleared: true as const,
-      provenBy: "exact-release" as const,
-    };
-    await publishOwnerCompletionProof(
-      invocation,
-      "owner-token-value",
-      pending,
-      release,
-      Date.parse("2026-09-01T12:05:00.000Z"),
-      world.fetcher,
-    );
-
-    // A completion already exists, but for a receipt at a different generation.
-    await expect(publishOwnerCompletionProof(
-      invocation,
-      "owner-token-value",
-      { ...pending, generation: "1999999999" },
-      release,
-      Date.parse("2026-09-01T12:09:00.000Z"),
-      world.fetcher,
-    )).rejects.toThrow();
-  });
-
-  // ---- detached finalizer, driven through the real recovery entrypoint -----
-  //
-  // The store is faithful: immutable creates, generation-bound reads, prefix
-  // listing with paging. Every object in it is written by the REAL writer, so a
-  // test cannot accidentally prove something about a shape production never
-  // produces.
-  const finalizerWorld = () => {
-    const objects = new Map<string, { body: string; generation: string }>();
-    let next = 1_700_000_000;
-    let pageSize = 1_000;
-    const fetcher = (async (input: string | URL, init?: RequestInit) => {
-      const url = new URL(String(input));
-      if (url.hostname !== "storage.googleapis.com") return new Response("", { status: 404 });
-      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
-      if (url.pathname.startsWith("/upload/")) {
-        const name = url.searchParams.get("name")!;
-        if (objects.has(name)) return new Response("", { status: 412 });
-        const body = String(init!.body);
-        next += 1;
-        objects.set(name, { body, generation: String(next) });
-        return Response.json({
-          bucket,
-          generation: String(next),
-          metageneration: "1",
-          name,
-          size: String(Buffer.byteLength(body)),
-        });
-      }
-      if (url.pathname.endsWith("/o")) {
-        const prefix = url.searchParams.get("prefix") ?? "";
-        const all = [...objects.entries()].filter(([name]) => name.startsWith(prefix)).toSorted();
-        const from = Number(url.searchParams.get("pageToken") ?? "0");
-        const page = all.slice(from, from + pageSize);
-        const items = page.map(([name, stored]) => ({
-          generation: stored.generation,
-          metageneration: "1",
-          name,
-          size: String(Buffer.byteLength(stored.body)),
-        }));
-        return from + pageSize < all.length
-          ? Response.json({ items, nextPageToken: String(from + pageSize) })
-          : Response.json({ items });
-      }
-      const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
-      const stored = objects.get(name);
-      if (stored === undefined) return new Response("", { status: 404 });
-      if (url.searchParams.get("alt") === "media") return new Response(stored.body);
-      return Response.json({
-        bucket,
-        generation: stored.generation,
-        metageneration: "1",
-        name,
-        size: String(Buffer.byteLength(stored.body)),
-      });
-    }) as unknown as typeof fetch;
-    return {
-      fetcher,
-      objects,
-      setPageSize: (size: number) => {
-        pageSize = size;
-      },
-    };
-  };
-
-  const CDB_STATE = REPOSITORIES.cdbentley.state.bootstrap;
-  const seedPendingRun = async (world: ReturnType<typeof finalizerWorld>, runId: string) => {
-    const invocation = validateInvocation({
-      ...validEnvironment(),
-      APPROVED_MANIFEST_SHA256: "a".repeat(64),
-      APPROVED_PLAN_RUN_ID: "123455",
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
-      EXECUTION_MODE: "apply",
-      GITHUB_RUN_ID_EXACT: runId,
-    }, true);
-    // The approved plan receipt this apply consumed. A real run cannot exist
-    // without it, and the finalizer checks the manifest digest against it.
-    const planKey = `${CDB_STATE.prefix}/.protected-bootstrap/plans/123455.json`;
-    if (!world.objects.has(planKey)) {
-      await writeImmutableObject(
-        CDB_STATE.bucket,
-        planKey,
-        `${JSON.stringify({ manifestSha256: "a".repeat(64), mode: "plan" })}\n`,
-        "owner-token-value",
-        world.fetcher,
-      );
-    }
-    const intent = quarantineIntent(invocation);
-    const intentBody = JSON.stringify(intent);
-    const intentKey =
-      `${CDB_STATE.prefix}/.protected-bootstrap/federation-quarantine/${runId}.json`;
-    const intentGeneration = await writeImmutableObject(
-      CDB_STATE.bucket,
-      intentKey,
-      intentBody,
-      "owner-token-value",
-      world.fetcher,
-    );
-    await writeFederationRestoreMarker(
-      CDB_STATE.bucket,
-      intentKey,
-      {
-        intentDigest: new Bun.CryptoHasher("sha256").update(intentBody).digest("hex"),
-        intentGeneration,
-        repository: "cdbentley",
-        restoredAt: "2026-09-01T12:01:30.000Z",
-        root: "bootstrap",
-        runId,
-      },
-      "owner-token-value",
-      world.fetcher,
-      () => Date.parse("2026-09-01T12:05:00.000Z"),
-      Date.parse(intent.capturedAt),
-    );
-    const proof = buildFinalProtectedProof({
-      deElevation: {
-        executorEmail,
-        executorUniqueId: "123456789012345678901",
-        observedAt: "2026-09-01T12:00:00.000Z",
-        provenAbsent: deterministicProvenAbsent("cdbentley", "bootstrap"),
-      },
-      intent,
-      intentDigest: new Bun.CryptoHasher("sha256").update(intentBody).digest("hex"),
-      intentGeneration,
-      invocation,
-      kind: "apply",
-      observedPools: intent.pools.map((pool) => ({
-        disabled: false,
-        fingerprint: pool.fingerprint,
-        name: pool.name,
-        observedAt: "2026-09-01T12:01:00.000Z",
-        repository: pool.repository,
-      })),
-      quarantinedApplyProof: executionProof(),
-      restoredAudit: {
-        detailedExitCode: 0 as const,
-        observedAt: "2026-09-01T12:01:00.000Z",
-        outputSha256: "d".repeat(64),
-      },
-      review: { canonical: "", sha256: "a".repeat(64) },
-    });
-    await publishFinalProtectedReceipt(
-      invocation,
-      "owner-token-value",
-      { canonical: "", sha256: "a".repeat(64) },
-      proof,
-      Date.parse("2026-09-01T12:02:00.000Z"),
-      world.fetcher,
-    );
-    return `${CDB_STATE.prefix}/.protected-bootstrap/final/${runId}.json`;
-  };
-
-  const CDB_HORIZON = {
-    emptySinceAt: "2026-09-01T12:20:00.000Z",
-    observationStartedAt: "2026-09-01T12:10:00.000Z",
-    observedAt: "2026-09-01T12:23:00.000Z",
-    projectId: "cdbentley",
-    propagationMinutes: 7,
-    repository: "cdbentley" as const,
-    stableEmptyMinutes: 3,
-  };
-  const horizonRelease = {
-    artifactsDeleted: true as const,
-    executorEmail,
-    executorUniqueId: "",
-    observedAt: CDB_HORIZON.observedAt,
-    permissionsProvenGone: true as const,
-    projectBindingsCleared: true as const,
-    provenBy: "propagation-horizon" as const,
-  };
-  const runFinalizer = (world: ReturnType<typeof finalizerWorld>, contained = true) =>
-    finalizePendingApplyReceipts(
-      "owner-token-value",
-      world.fetcher,
-      Date.parse("2026-09-01T13:00:00.000Z"),
-      CDB_HORIZON,
-      async () => (contained ? horizonRelease : undefined),
-      () => Date.parse("2026-09-01T12:30:00.000Z"),
-    );
 
   // The envelope, measured rather than assumed.
   //
@@ -7627,262 +7448,11 @@ describe("protected owner Terraform bridge", () => {
     expect(operationMs - horizonMs).toBeLessThan(horizonMs);
   });
 
-  test("the finalizer countersigns a pending receipt left by a crashed run", async () => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    const summary = await runFinalizer(world);
-
-    expect(summary.scanned).toBe(1);
-    expect(summary.finalized).toEqual([key]);
-    const completionKey = `${CDB_STATE.prefix}/.protected-bootstrap/completion/123456.json`;
-    const completion = JSON.parse(world.objects.get(completionKey)!.body) as Record<string, unknown>;
-    expect(completion.countable).toBe(true);
-    expect((completion.executorRelease as Record<string, unknown>).provenBy)
-      .toBe("propagation-horizon");
-  });
-
-  test("a second finalizer pass accepts the completion instead of rewriting it", async () => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    await runFinalizer(world);
-    const completionKey = `${CDB_STATE.prefix}/.protected-bootstrap/completion/123456.json`;
-    const first = world.objects.get(completionKey)!.body;
-
-    const second = await runFinalizer(world);
-    expect(second.finalized).toEqual([]);
-    expect(second.alreadyComplete).toEqual([key]);
-    expect(world.objects.get(completionKey)!.body).toBe(first);
-  });
-
-  test("an uncontained run is reported and left uncounted", async () => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    const summary = await runFinalizer(world, false);
-
-    expect(summary.finalized).toEqual([]);
-    expect(summary.skippedUncontained).toEqual([key]);
-    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
-  });
-
-  test("a rehearsal record is never eligible for finalization", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    // A terminal rehearsal record for a different run, in its own prefix.
-    await writeImmutableObject(
-      CDB_STATE.bucket,
-      `${CDB_STATE.prefix}/.protected-bootstrap/rehearsals/777777.json`,
-      '{"kind":"rehearsal"}\n',
-      "owner-token-value",
-      world.fetcher,
-    );
-    const summary = await runFinalizer(world);
-
-    // Only the apply receipt was scanned; the rehearsal never enters the set.
-    expect(summary.scanned).toBe(1);
-    expect(summary.finalized).toHaveLength(1);
-    expect(summary.finalized.every((name) => !name.includes("/rehearsals/"))).toBe(true);
-  });
-
-  test("the finalizer pages through more than one hundred pending receipts", async () => {
-    const world = finalizerWorld();
-    world.setPageSize(100);
-    for (let index = 0; index < 101; index += 1) {
-      await seedPendingRun(world, String(200000 + index));
-    }
-    const summary = await runFinalizer(world);
-
-    expect(summary.scanned).toBe(101);
-    expect(summary.finalized).toHaveLength(101);
-  });
-
-  test("an orphan completion with no pending receipt stops the finalizer", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    await writeImmutableObject(
-      CDB_STATE.bucket,
-      `${CDB_STATE.prefix}/.protected-bootstrap/completion/999999.json`,
-      '{"orphan":true}\n',
-      "owner-token-value",
-      world.fetcher,
-    );
-
-    await expect(runFinalizer(world)).rejects.toThrow("has no pending receipt to countersign");
-  });
-
-  test("an unrecognised object in the pending prefix stops the finalizer", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    await writeImmutableObject(
-      CDB_STATE.bucket,
-      `${CDB_STATE.prefix}/.protected-bootstrap/final/notes.txt`,
-      "hello\n",
-      "owner-token-value",
-      world.fetcher,
-    );
-
-    await expect(runFinalizer(world)).rejects.toThrow("unrecognised object");
-  });
-
-  test.each([
-    ["an extra field", (r: Record<string, unknown>) => ({ ...r, extra: 1 })],
-    ["a different manifest digest", (r: Record<string, unknown>) => ({
-      ...r,
-      manifestSha256: "b".repeat(64),
-    })],
-    ["an arbitrary proven-absent set", (r: Record<string, unknown>) => ({
-      ...r,
-      deElevation: { ...(r.deElevation as object), provenAbsent: ["storage.objects.get"] },
-    })],
-    ["a countable flag", (r: Record<string, unknown>) => ({ ...r, countable: true })],
-    ["a non-canonical time", (r: Record<string, unknown>) => ({
-      ...r,
-      publishedAt: "2026-09-01T12:02:00Z",
-    })],
-    ["reordered pools", (r: Record<string, unknown>) => ({
-      ...r,
-      observedPools: [...(r.observedPools as unknown[])].reverse(),
-    })],
-    ["a duplicated pool", (r: Record<string, unknown>) => ({
-      ...r,
-      observedPools: [
-        (r.observedPools as unknown[])[0],
-        (r.observedPools as unknown[])[0],
-        (r.observedPools as unknown[])[2],
-        (r.observedPools as unknown[])[3],
-      ],
-    })],
-    ["a forged pool fingerprint", (r: Record<string, unknown>) => ({
-      ...r,
-      observedPools: (r.observedPools as Record<string, unknown>[]).map((pool, index) =>
-        index === 0 ? { ...pool, fingerprint: "forged" } : pool
-      ),
-    })],
-    ["a different executor identity", (r: Record<string, unknown>) => ({
-      ...r,
-      deElevation: {
-        ...(r.deElevation as object),
-        executorEmail: "someone-else@cdbentley.iam.gserviceaccount.com",
-      },
-    })],
-    ["a different intent digest", (r: Record<string, unknown>) => ({
-      ...r,
-      intentDigest: "e".repeat(64),
-    })],
-  ])("a pending receipt with %s is refused", async (_label, mutate) => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    const stored = world.objects.get(key)!;
-    const mutated = mutate(JSON.parse(stored.body) as Record<string, unknown>);
-    world.objects.set(key, { ...stored, body: `${JSON.stringify(mutated)}\n` });
-
-    await expect(runFinalizer(world)).rejects.toThrow();
-    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
-  });
-
-  test("a shifting page that repeats a receipt name is refused", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    await seedPendingRun(world, "123457");
-    world.setPageSize(1);
-    let listings = 0;
-    const shifting = (async (input: string | URL, init?: RequestInit) => {
-      const url = new URL(String(input));
-      if (url.pathname.endsWith("/o") && url.searchParams.get("prefix")!.includes("/final/")) {
-        listings += 1;
-        // The second page repeats the first page's object: the count adds up
-        // and one real receipt never appears.
-        if (listings === 2) {
-          return Response.json({
-            items: [{
-              generation: "1700000005",
-              metageneration: "1",
-              name: `${CDB_STATE.prefix}/.protected-bootstrap/final/123456.json`,
-              size: "10",
-            }],
-          });
-        }
-      }
-      return await world.fetcher(input as string, init);
-    }) as unknown as typeof fetch;
-
-    await expect(finalizePendingApplyReceipts(
-      "owner-token-value",
-      shifting,
-      Date.parse("2026-09-01T13:00:00.000Z"),
-      CDB_HORIZON,
-      async () => horizonRelease,
-      () => Date.parse("2026-09-01T12:30:00.000Z"),
-    )).rejects.toThrow("repeated");
-  });
-
-  test("a pending receipt larger than its reviewed bound is refused before it is read", async () => {
-    const world = finalizerWorld();
-    const key = await seedPendingRun(world, "123456");
-    const stored = world.objects.get(key)!;
-    world.objects.set(key, { ...stored, body: `${" ".repeat(40 * 1024)}\n` });
-
-    await expect(runFinalizer(world)).rejects.toThrow();
-    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
-  });
-
-  test("a finalizer whose completion response is lost accepts the committed object", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    let dropped = false;
-    const lossy = (async (input: string | URL, init?: RequestInit) => {
-      const url = new URL(String(input));
-      const response = await world.fetcher(input as string, init);
-      if (
-        !dropped && url.pathname.startsWith("/upload/") &&
-        (url.searchParams.get("name") ?? "").includes("/completion/")
-      ) {
-        // The bytes committed; the answer never arrived.
-        dropped = true;
-        throw new TypeError("fetch failed after commit");
-      }
-      return response;
-    }) as unknown as typeof fetch;
-
-    // The write committed and the answer was lost. Reconciliation happens in
-    // the same pass: the object is re-read at its own generation, validated as
-    // a completion for exactly this pending receipt, and accepted -- so a lost
-    // response never turns a finished run into a failed one.
-    const first = await finalizePendingApplyReceipts(
-      "owner-token-value",
-      lossy,
-      Date.parse("2026-09-01T13:00:00.000Z"),
-      CDB_HORIZON,
-      async () => horizonRelease,
-      () => Date.parse("2026-09-01T12:30:00.000Z"),
-    );
-    expect(dropped).toBe(true);
-    expect(first.finalized).toHaveLength(1);
-
-    // Exactly one completion object exists, and a later pass counts it as done.
-    expect([...world.objects.keys()].filter((name) => name.includes("/completion/")))
-      .toHaveLength(1);
-    const second = await runFinalizer(world);
-    expect(second.alreadyComplete).toHaveLength(1);
-    expect(second.finalized).toEqual([]);
-  });
-
-  test("a pending receipt whose restore marker is missing is refused", async () => {
-    const world = finalizerWorld();
-    await seedPendingRun(world, "123456");
-    const markerKey =
-      `${CDB_STATE.prefix}/.protected-bootstrap/federation-quarantine/123456.json.restored`;
-    world.objects.delete(markerKey);
-
-    await expect(runFinalizer(world)).rejects.toThrow();
-    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
-  });
-
   test("a plan publishes no owner artifact at all", async () => {
     const events: string[] = [];
     await runProtectedBootstrap(validateInvocation(validEnvironment()), fakeDependencies(events));
 
     expect(events).not.toContain("publish:final");
-    expect(events).not.toContain("owner:completion");
     expect(events).not.toContain("quarantine:arm");
   });
 
@@ -8548,8 +8118,8 @@ describe("protected owner Terraform bridge", () => {
       expect(probed.some((name) => name.includes("/.protected-bootstrap/plans/"))).toBe(false);
       expect(probed.some((name) => name.includes("/.protected-bootstrap/adoptions/"))).toBe(false);
       expect(probed.some((name) => name.includes("/.protected-bootstrap/consumed/"))).toBe(false);
-      // All four owner-written keys are actively probed and grant nothing.
-      for (const kind of ["results", "final", "completion", "rehearsals"]) {
+      // All three owner-written keys are actively probed and grant nothing.
+      for (const kind of ["results", "final", "rehearsals"]) {
         expect(
           probed.some((name) =>
             name.includes(`${prefix}/.protected-bootstrap/${kind}/123456.json`)
@@ -9951,8 +9521,7 @@ describe("protected owner Terraform bridge", () => {
     const consumed = `${state.prefix}/.protected-bootstrap/consumed/33230835879.json`;
     const finalReceipt = `${state.prefix}/.protected-bootstrap/final/123456.json`;
     const results = `${state.prefix}/.protected-bootstrap/results/123456.json`;
-    const completion = `${state.prefix}/.protected-bootstrap/completion/123456.json`;
-    const ownerWritten = [results, finalReceipt, completion];
+    const ownerWritten = [results, finalReceipt];
     const plans = `${state.prefix}/.protected-bootstrap/plans/33230835879.json`;
     const overwritten: string[] = [];
     const observedOwnerWritten: Record<string, readonly string[]> = {};
@@ -11912,14 +11481,21 @@ function fakeDependencies(
   const now = overrides.now ?? (() => fakeNow);
   const session: ExecutorSession = {
     accessToken: "short-lived-executor-access-token-value",
-    executorEmail: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+    executorEmail,
     executorUniqueId: "123456789012345678901",
     tokenExpiresAtMs: defaultNow + 35 * 60_000,
   };
   return {
-    acquireExecutor: overrides.acquireExecutor ?? (async () => {
+    acquireExecutor: overrides.acquireExecutor ?? (async (invocation) => {
       events.push("acquire");
-      return { ...session, tokenExpiresAtMs: now() + 35 * 60_000 };
+      const projectId = REPOSITORIES[invocation.repository].projectId;
+      return {
+        ...session,
+        executorEmail: `${randomExecutorAccountId(
+          deterministicArtifactHex(invocation.repository, invocation.githubRunId, "service-account"),
+        )}@${projectId}.iam.gserviceaccount.com`,
+        tokenExpiresAtMs: now() + 35 * 60_000,
+      };
     }),
     appendSummary: overrides.appendSummary ?? (async () => {
       events.push("summary");
@@ -11954,15 +11530,16 @@ function fakeDependencies(
       events.push("show");
       return overrides.planJson ?? JSON.stringify(plan([]));
     }),
-    releaseExecutor: overrides.releaseExecutor ?? (async () => {
+    releaseExecutor: overrides.releaseExecutor ?? (async (_invocation, receivedSession) => {
       events.push("release");
       return {
         artifactsDeleted: true as const,
-        executorEmail,
-        executorUniqueId: "123456789012345678901",
+        executorEmail: receivedSession?.executorEmail ?? executorEmail,
+        executorUniqueId: receivedSession?.executorUniqueId ?? "123456789012345678901",
         observedAt: new Date(now()).toISOString(),
         permissionsProvenGone: true as const,
         projectBindingsCleared: true as const,
+        provenBy: "exact-release" as const,
       };
     }),
     removePrivatePath: overrides.removePrivatePath ?? (async (path) => {
@@ -11992,25 +11569,24 @@ function fakeDependencies(
         outputSha256: "a".repeat(64),
       };
     }),
-    deElevateExecutor: overrides.deElevateExecutor ?? (async () => {
+    deElevateExecutor: overrides.deElevateExecutor ?? (async (_invocation, receivedSession) => {
       events.push("de-elevate");
       return {
-        executorEmail,
-        executorUniqueId: "123456789012345678901",
+        executorEmail: receivedSession.executorEmail,
+        executorUniqueId: receivedSession.executorUniqueId,
         observedAt: new Date(now()).toISOString(),
         provenAbsent: ["resourcemanager.projects.setIamPolicy"],
       };
     }),
     publishFinalReceipt: overrides.publishFinalReceipt ?? (async () => {
       events.push("publish:final");
-      return "f".repeat(64);
     }),
-    publishOwnerCompletion: overrides.publishOwnerCompletion ?? (async () => {
-      events.push("owner:completion");
-    }),
-    armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation) => {
+    armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation, receivedSession) => {
       events.push("quarantine:arm");
-      return { generation: "1700000001", record: quarantineIntent(invocation) };
+      return {
+        generation: "1700000001",
+        record: quarantineIntent(invocation, receivedSession),
+      };
     }),
     disableFederation: overrides.disableFederation ?? (async () => {
       events.push("quarantine");
@@ -12541,13 +12117,26 @@ function executionProof(overrides: Partial<ExecutionProof> = {}): ExecutionProof
 }
 
 function quarantineIntent(invocation: {
+  approvedManifestSha256?: string;
+  approvedPlanRunId?: string;
+  consumerSha?: string;
   githubRunId: string;
   platformSha: string;
   repository: string;
   terraformRoot: string;
-}): FederationQuarantineRecord {
+}, session?: Pick<ExecutorSession, "executorEmail" | "executorUniqueId">): FederationQuarantineRecord {
+  const repository = invocation.repository as keyof typeof REPOSITORIES;
+  const projectId = REPOSITORIES[repository].projectId;
+  const deterministicEmail = `${randomExecutorAccountId(
+    deterministicArtifactHex(repository, invocation.githubRunId, "service-account"),
+  )}@${projectId}.iam.gserviceaccount.com`;
   return federationQuarantineRecordFromJson({
+    approvedManifestSha256: invocation.approvedManifestSha256 ?? "",
+    approvedPlanRunId: invocation.approvedPlanRunId ?? "",
     capturedAt: "2026-09-01T12:00:00.000Z",
+    consumerSha: invocation.consumerSha ?? consumerSha,
+    executorEmail: session?.executorEmail ?? deterministicEmail,
+    executorUniqueId: session?.executorUniqueId ?? "123456789012345678901",
     platformSha: invocation.platformSha,
     pools: [
       ["cdbentley", "cdbentley"],
@@ -12562,13 +12151,15 @@ function quarantineIntent(invocation: {
             description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
             disabled: false,
             displayName: "GitHub Actions",
-            name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+            name: federationPoolName(project!),
             state: "ACTIVE",
           },
           project!,
         ),
       ),
-      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
       repository,
     })),
     repository: invocation.repository,
@@ -12577,12 +12168,32 @@ function quarantineIntent(invocation: {
   });
 }
 
+function federationProvider(project = "cdbentley"): FederationProviderState {
+  return federationProviderFromJson(
+    {
+      attributeCondition: "assertion.repository_owner_id == '16823277'",
+      attributeMapping: {
+        "attribute.repository": "assertion.repository_id",
+        "google.subject": "assertion.sub",
+      },
+      description: "GitHub Actions OIDC provider.",
+      disabled: false,
+      displayName: "GitHub",
+      name: federationProviderName(project),
+      oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
+      state: "ACTIVE",
+    },
+    project,
+  );
+}
+
 function federationPool(disabled = false): FederationPoolState {
   return {
     description: "GitHub Actions OIDC identities for collinbentley1/cdbentley.",
     disabled,
     displayName: "GitHub Actions",
-    name: "projects/cdbentley/locations/global/workloadIdentityPools/github-actions",
+    mode: "FEDERATION_ONLY",
+    name: federationPoolName("cdbentley"),
     state: "ACTIVE",
   };
 }
