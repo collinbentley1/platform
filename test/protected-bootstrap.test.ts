@@ -60,6 +60,7 @@ import {
   federationPoolFromJson,
   type FederationQuarantineRecord,
   assertQuarantinedPool,
+  buildFinalProtectedProof,
   federationPoolFingerprint,
   setFederationPoolDisabled,
   federationQuarantineRecordFromJson,
@@ -6143,6 +6144,273 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
+  test("a run whose executor deletion fails produces no countable success", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        releaseExecutor: async () => {
+          throw new Error("the executor could not be deleted");
+        },
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("cleanup did not complete exactly");
+
+    // The final receipt was written by a de-elevated identity that still
+    // exists. Without the owner's countersignature it is a claim, not a success.
+    expect(events).toContain("publish:final");
+    expect(events).not.toContain("owner:completion");
+  });
+
+  test("a rehearsal receipt is explicitly non-countable and claims no Terraform", () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXECUTION_MODE: "rehearsal",
+    });
+    const intent = quarantineIntent(invocation);
+    const proof = buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: "2026-09-01T12:00:00.000Z",
+        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+      },
+      intent,
+      intentDigest: "a".repeat(64),
+      intentGeneration: "1700000001",
+      invocation,
+      kind: "rehearsal",
+      observedPools: intent.pools.map((pool) => ({
+        disabled: pool.disabled,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: "2026-09-01T12:01:00.000Z",
+        repository: pool.repository,
+      })),
+      review: { canonical: "", sha256: "b".repeat(64) },
+    });
+
+    expect(proof.countable).toBe(false);
+    expect(proof.kind).toBe("rehearsal");
+    // A rehearsal runs no Terraform, so these fields do not exist on it at all.
+    expect("quarantinedApplyProofDigest" in proof).toBe(false);
+    expect("restoredAudit" in proof).toBe(false);
+  });
+
+  test("the final proof carries post-restore observations, not the intent", () => {
+    const invocation = validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "rehearsal" });
+    const intent = quarantineIntent(invocation);
+    const observed = intent.pools.map((pool) => ({
+      disabled: false,
+      fingerprint: pool.fingerprint,
+      name: pool.name,
+      observedAt: "2026-09-01T12:01:00.000Z",
+      repository: pool.repository,
+    }));
+    const proof = buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: "2026-09-01T12:00:00.000Z",
+        provenAbsent: [],
+      },
+      intent,
+      intentDigest: "a".repeat(64),
+      intentGeneration: "1700000001",
+      invocation,
+      kind: "rehearsal",
+      observedPools: observed,
+      review: { canonical: "", sha256: "b".repeat(64) },
+    });
+
+    // Every entry carries an observation time, which an intent copy never would.
+    expect(proof.observedPools.every((pool) => pool.observedAt === "2026-09-01T12:01:00.000Z"))
+      .toBe(true);
+    expect(proof.observedPools).toHaveLength(4);
+  });
+
+  test("a short pass caused by a shifting page is refused before any restore", async () => {
+    // The pages omit an object rather than repeating one: every within-pass
+    // check passes and the set that comes back is still not the set that exists.
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") },
+      },
+    });
+    let listings = 0;
+    const shifting = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("prefix") !== null && url.hostname === "storage.googleapis.com") {
+        listings += 1;
+        // The second canonical listing drops the object entirely.
+        if (listings > 2) return Response.json({ items: [] });
+      }
+      return await world.fetcher(input as string, init);
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      shifting,
+      1_800_000_060_000,
+      async () => true,
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("inventory changed size between two listings");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an object replaced between listing and read is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") },
+      },
+    });
+    const swapped = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("alt") === "media" && url.searchParams.get("generation") !== null) {
+        // Same key, different bytes: the generation-bound read is what makes
+        // this detectable at all.
+        return new Response(intentBody("cdbentley", "bootstrap", "123456") + " ");
+      }
+      return await world.fetcher(input as string, init);
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      swapped,
+      1_800_000_060_000,
+      async () => true,
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("did not match its listed size");
+    expect(world.patched).toEqual([]);
+  });
+
+  test.each([
+    ["names the wrong intent bytes", { intentDigest: "0".repeat(64) }],
+    ["names the wrong intent generation", { intentGeneration: "999" }],
+    ["names another repository", { repository: "runsetta" }],
+    ["names another run", { runId: "555555" }],
+    ["is dated before the intent it claims to complete", { restoredAt: "2020-01-01T00:00:00.000Z" }],
+  ])("a completion marker that %s does not suppress the restore", async (_label, override) => {
+    const body = intentBody("cdbentley", "bootstrap", "123456");
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          [INTENT_KEY]: body,
+          [`${INTENT_KEY}.restored`]: `${JSON.stringify({
+            intentDigest: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+            intentGeneration: "1",
+            repository: "cdbentley",
+            restoredAt: "2026-09-01T12:30:00.000Z",
+            root: "bootstrap",
+            runId: "123456",
+            ...override,
+          })}\n`,
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow();
+    // Nothing was handed back on the strength of a marker that does not
+    // describe this intent.
+    expect(world.patched).toEqual([]);
+  });
+
+  test("one uncontained intent stops every other intent from being restored", async () => {
+    // Both intents cover all four pools. Restoring the contained one would hand
+    // federation back to the executor of the uncontained one.
+    const contained = intentBody("cdbentley", "bootstrap", "123456");
+    const stuck = intentBody("healthmcp", "prod", "777888");
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: contained },
+        "medlock-tfstate-1025243085": {
+          "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json": stuck,
+        },
+      },
+    });
+
+    const summary = await recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async (intent) => intent.repository === "cdbentley",
+      async () => {},
+      () => 1_800_000_000_000,
+    );
+
+    expect(summary.scanned).toBe(2);
+    expect(summary.restored).toEqual([]);
+    expect(summary.skippedUncontained).toHaveLength(1);
+    // Not one pool moved.
+    expect(world.patched).toEqual([]);
+  });
+
+  test("incomplete intents that disagree about the prior pool state fail closed", async () => {
+    const agreeing = intentBody("cdbentley", "bootstrap", "123456");
+    const disagreeing = JSON.parse(intentBody("healthmcp", "prod", "777888")) as {
+      pools: { disabled: boolean }[];
+    };
+    // This one captured runsetta as already disabled; the other captured it
+    // enabled. Restoring either invents a state nobody reviewed.
+    disagreeing.pools[1]!.disabled = true;
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: agreeing },
+        "medlock-tfstate-1025243085": {
+          "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json":
+            JSON.stringify(disagreeing),
+        },
+      },
+    });
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async () => true,
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("disagree about the pre-quarantine pool state");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an unrecognised object in the protected prefix stops recovery", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456"),
+          "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/notes.txt": "hello",
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow("unrecognised object");
+    expect(world.patched).toEqual([]);
+  });
+
   test("an intent whose executor is not contained is left closed and reported", async () => {
     const world = recoveryWorld({
       disabled: { cdbentley: true },
@@ -6525,6 +6793,10 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("final-audit"));
     expect(events.indexOf("final-audit")).toBeLessThan(events.indexOf("publish:final"));
     expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("release"));
+    // The countable object is the owner's, written last, after the executor is
+    // provably gone.
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("owner:completion"));
+    expect(events.at(-1)).toBe("owner:completion");
   });
 
   test("a quarantine that fails halfway is still undone by this run", async () => {
@@ -10495,6 +10767,10 @@ function fakeDependencies(
     }),
     publishFinalReceipt: overrides.publishFinalReceipt ?? (async () => {
       events.push("publish:final");
+      return "f".repeat(64);
+    }),
+    publishOwnerCompletion: overrides.publishOwnerCompletion ?? (async () => {
+      events.push("owner:completion");
     }),
     armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation) => {
       events.push("quarantine:arm");

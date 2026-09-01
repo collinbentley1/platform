@@ -284,6 +284,7 @@ const BRIDGE_PHASES = [
   "controller.federation-preflight",
   "controller.federation-restore",
   "controller.final-audit",
+  "controller.owner-completion",
   "controller.quarantine",
   "controller.complete",
   "controller.failed",
@@ -1128,6 +1129,15 @@ export interface BridgeDependencies {
     review: ReviewManifestResult,
     proof: FinalProtectedProof,
     nowMs: number,
+  ) => Promise<string>;
+  // Written by the OWNER, after the executor is provably gone. Until this
+  // exists the final receipt is a claim, not a countable success: the receipt
+  // is published by a de-elevated identity that still exists, and deleting that
+  // identity can still fail afterwards.
+  readonly publishOwnerCompletion: (
+    invocation: Invocation,
+    finalReceiptDigest: string,
+    cleanupDeadlineMs: number,
   ) => Promise<void>;
   readonly readPlanJson: (
     invocation: Invocation,
@@ -4560,6 +4570,7 @@ export async function runProtectedBootstrap(
     | { readonly generation: string; readonly record: FederationQuarantineRecord }
     | undefined;
   let federationRestored = false;
+  let finalReceiptDigest: string | undefined;
   try {
     // Nothing starts until the fleet is known to be free of unrepaired
     // quarantines, for any target, not just this one.
@@ -4639,7 +4650,7 @@ export async function runProtectedBootstrap(
         }, "rehearsal review identity"))),
       };
       telemetry.phase("controller.apply-publish");
-      await dependencies.publishFinalReceipt(
+      finalReceiptDigest = await dependencies.publishFinalReceipt(
         invocation,
         session,
         rehearsalReview,
@@ -4972,7 +4983,7 @@ export async function runProtectedBootstrap(
     // One receipt. The legacy post-apply receipt is gone: it was written before
     // privilege was surrendered and before federation was handed back, so it
     // could be counted as success for a run that never finished either.
-    await dependencies.publishFinalReceipt(
+    finalReceiptDigest = await dependencies.publishFinalReceipt(
       invocation,
       session,
       review,
@@ -5060,6 +5071,20 @@ export async function runProtectedBootstrap(
         "The protected operation failed and its cleanup also failed.",
       );
     }
+  }
+  // Only reachable when nothing above threw: the apply succeeded, privilege was
+  // surrendered, federation was handed back, the restored state audited clean,
+  // and cleanup completed. The owner now proves the executor is gone and
+  // countersigns the receipt. Until this object exists the final receipt is a
+  // claim, not a countable success -- which is what stops a run whose executor
+  // deletion failed from being counted as one.
+  if (finalReceiptDigest !== undefined) {
+    telemetry.phase("controller.owner-completion");
+    await dependencies.publishOwnerCompletion(
+      invocation,
+      finalReceiptDigest,
+      cleanupDeadlineMs,
+    );
   }
 }
 
@@ -6154,6 +6179,32 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
+    publishOwnerCompletion: async (invocation, finalReceiptDigest, cleanupDeadlineMs) => {
+      // Exact absence first, through the same stable-empty recovery a lost run
+      // would receive. Only then does the countable object get written.
+      await recoverBridgeArtifactsUntilStable(
+        {
+          githubRunId: invocation.githubRunId,
+          ownerAccessToken: invocation.ownerAccessToken,
+          platformRoot: invocation.platformRoot,
+          platformSha: invocation.platformSha,
+          repository: invocation.repository,
+          runnerTemp: invocation.runnerTemp,
+        },
+        api,
+        (milliseconds) => Bun.sleep(milliseconds),
+        cleanupDeadlineMs,
+        () => Date.now(),
+        telemetry,
+      );
+      await publishOwnerCompletionProof(
+        invocation,
+        invocation.ownerAccessToken,
+        finalReceiptDigest,
+        Date.now(),
+        api,
+      );
+    },
     readPlanJson: async (
       invocation,
       session,
@@ -13652,7 +13703,7 @@ export async function publishFinalProtectedReceipt(
   proof: FinalProtectedProof,
   nowMs: number,
   fetcher: Fetcher,
-): Promise<void> {
+): Promise<string> {
   if (invocation.mode === "plan") {
     throw new Error("Plan mode produces no final protected receipt.");
   }
@@ -13712,11 +13763,49 @@ export async function publishFinalProtectedReceipt(
     },
     "final protected receipt",
   );
+  const body = `${canonicalJson(receipt)}\n`;
   await writeImmutableObject(
     state.bucket,
     receiptObjectName(state, "final", invocation.githubRunId),
-    `${canonicalJson(receipt)}\n`,
+    body,
     executorToken,
+    fetcher,
+  );
+  return sha256Hex(body);
+}
+
+// The owner's countersignature. A verifier that requires this is requiring, in
+// one object: that the final receipt exists with exactly these bytes, and that
+// the executor which wrote it no longer exists.
+export async function publishOwnerCompletionProof(
+  invocation: Invocation,
+  ownerToken: string,
+  finalReceiptDigest: string,
+  nowMs: number,
+  fetcher: Fetcher,
+): Promise<void> {
+  if (!/^[0-9a-f]{64}$/.test(finalReceiptDigest)) {
+    throw new Error("Owner completion proof requires a SHA-256 final receipt digest.");
+  }
+  const contract = REPOSITORIES[invocation.repository];
+  const state = contract.state[invocation.terraformRoot];
+  const body = `${canonicalJson(json({
+    completedAt: new Date(nowMs).toISOString(),
+    executorProvenAbsent: true,
+    finalReceiptDigest,
+    kind: invocation.mode === "rehearsal" ? "rehearsal" : "apply",
+    platformSha: invocation.platformSha,
+    repository: invocation.repository,
+    repositoryId: contract.repositoryId,
+    runId: invocation.githubRunId,
+    schemaVersion: 1,
+    terraformRoot: invocation.terraformRoot,
+  }, "owner completion proof"))}\n`;
+  await writeImmutableObject(
+    state.bucket,
+    receiptObjectName(state, "completion", invocation.githubRunId),
+    body,
+    ownerToken,
     fetcher,
   );
 }
@@ -14023,7 +14112,7 @@ async function readObject(
 
 function receiptObjectName(
   state: { readonly prefix: string },
-  kind: "adoptions" | "consumed" | "final" | "plans" | "results",
+  kind: "adoptions" | "completion" | "consumed" | "final" | "plans" | "results",
   runId: string,
 ): string {
   numeric(runId, "receipt run ID");
