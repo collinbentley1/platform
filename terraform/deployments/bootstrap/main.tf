@@ -36,6 +36,12 @@ variable "active_workflow_sha" {
   }
 }
 
+variable "federation_quarantined" {
+  description = "Set true only by the protected bridge, for the duration of its own apply. Keeps the GitHub Actions workload identity pool disabled as desired state, so the apply cannot re-enable federation the bridge quarantined before elevating."
+  type        = bool
+  default     = false
+}
+
 variable "legacy_compatibility_mode" {
   description = "Owner-selected WIF migration phase. True retains only constrained compatibility bindings; false is the required steady state."
   type        = bool
@@ -212,6 +218,7 @@ module "bootstrap" {
   preview_operations_active_workflow_shas   = local.preview_operations_active_workflow_shas
   preview_operator_transition_workflow_shas = local.preview_operator_transition_workflow_shas
   legacy_compatibility_mode                 = var.legacy_compatibility_mode
+  federation_quarantined                    = var.federation_quarantined
   # These four personal projects have no organization parent. Google permits
   # Organization Policy Administrator only at organization scope and marks the
   # write permissions unsupported in project custom roles. The authoritative

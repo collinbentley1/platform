@@ -350,6 +350,14 @@ resource "google_iam_workload_identity_pool" "github" {
   display_name              = "GitHub Actions"
   description               = "GitHub Actions OIDC identities for ${local.github_repo_full_name}."
 
+  # Desired state during a protected apply, so the apply itself cannot re-enable
+  # federation that the bridge disabled a moment earlier. Google's contract for a
+  # disabled pool is the strong one: it blocks token exchange AND blocks
+  # already-issued tokens from reaching resources. The provider-level flag only
+  # blocks new exchanges and lets live tokens through, which is why the pool is
+  # what gets quarantined.
+  disabled = var.federation_quarantined
+
   depends_on = [google_project_service.required]
 }
 

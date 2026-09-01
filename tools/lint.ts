@@ -2523,11 +2523,29 @@ for (const publisherVariable of [
   );
 }
 
+// The protected apply disables every consumer workload identity pool for the
+// length of its window. Two concurrent runs against different targets would
+// therefore capture and restore each other's pool state, and the first to finish
+// would re-open federation while the second still held privilege. The group must
+// stay fleet-global and must not interpolate the target.
+requireContains(
+  ".github/workflows/protected-bootstrap-implementation.yml",
+  await read(".github/workflows/protected-bootstrap-implementation.yml"),
+  "group: protected-owner-terraform-federation",
+  "Protected runs must serialise across the whole fleet while federation is quarantined.",
+);
+rejectContains(
+  ".github/workflows/protected-bootstrap-implementation.yml",
+  await read(".github/workflows/protected-bootstrap-implementation.yml"),
+  "group: protected-owner-terraform-${{ inputs.target_repository }}",
+  "A per-target concurrency group lets two protected runs restore each other's federation state.",
+);
+
 const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270"
+  "edc7cb168858bd4f7557a6cf770a471bbc4e72e2a2fe7219945aace521c53f62"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",

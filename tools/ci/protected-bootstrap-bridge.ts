@@ -280,6 +280,8 @@ const BRIDGE_PHASES = [
   "controller.apply-drain",
   "controller.apply-publish",
   "controller.cleanup",
+  "controller.federation-restore",
+  "controller.quarantine",
   "controller.complete",
   "controller.failed",
   "executor.inventory",
@@ -411,7 +413,21 @@ export const REPOSITORY_NAMES = [
 
 export type RepositoryName = (typeof REPOSITORY_NAMES)[number];
 export type TerraformRoot = "bootstrap" | "prod" | "exposure";
-export type ExecutionMode = "plan" | "apply";
+export type ExecutionMode = "plan" | "apply" | "rehearsal";
+
+// Stage one of the federation-quarantine rollout. The subsystem that closes the
+// privileged window lands FIRST, with production apply refused outright, and a
+// rehearsal route that exercises the whole federation lifecycle -- arm,
+// disable, prove all four converged, de-elevate to a receipt-only identity,
+// prove every mutation permission absent, restore, prove the restored
+// fingerprints, and publish a final receipt -- while touching no business
+// resource and running no Terraform mutation.
+//
+// The point is that the first live exercise of this code CANNOT grant an
+// unvalidated production apply. A second, separately reviewed change flips this
+// to false once the canary and the abrupt-loss recovery drills have both run
+// against the merged code.
+export const PRODUCTION_APPLY_ENABLED = false;
 
 export interface RepositoryContract {
   readonly exposure: {
@@ -1086,6 +1102,31 @@ export interface BridgeDependencies {
     mutationCompletedAtMs: number,
     operationDeadlineMs: number,
   ) => Promise<void>;
+  // Disables the consumer workload identity pool before any privilege is
+  // granted, and returns the exact state observed beforehand. See the comment
+  // above federationPoolFingerprint for why the pool, and not the provider or a
+  // clock, is what closes the window.
+  // Reads all four pools and writes the durable intent. Deliberately performs
+  // NO mutation: the controller holds the record before the first PATCH, so a
+  // quarantine that fails halfway is still a quarantine this run must undo.
+  readonly armFederationQuarantine: (
+    invocation: Invocation,
+    operationDeadlineMs: number,
+  ) => Promise<FederationQuarantineRecord>;
+  // Disables all four, proving each converged to disabled with an otherwise
+  // unchanged fingerprint.
+  readonly disableFederation: (
+    invocation: Invocation,
+    record: FederationQuarantineRecord,
+    operationDeadlineMs: number,
+  ) => Promise<void>;
+  // Restores exactly the captured state and proves it converged. Runs after the
+  // post-apply audit and after the executor is released.
+  readonly restoreFederation: (
+    invocation: Invocation,
+    record: FederationQuarantineRecord,
+    operationDeadlineMs: number,
+  ) => Promise<void>;
 }
 
 export interface RecoveryDependencies {
@@ -1157,12 +1198,22 @@ function rejectRecoveryCapabilities(source: NodeJS.ProcessEnv): void {
   }
 }
 
-export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Invocation {
+// `productionApplyEnabled` is the rollout gate, not a caller preference. It
+// defaults to the compiled-in PRODUCTION_APPLY_ENABLED, which is false for the
+// whole first stage; main() never passes it, so a deployed build cannot perform
+// a production apply no matter what the environment says. The apply path still
+// has to be exercised by tests, because stage two turns it on unchanged, and
+// those are the only callers that pass it.
+export function validateInvocation(
+  source: NodeJS.ProcessEnv = process.env,
+  productionApplyEnabled: boolean = PRODUCTION_APPLY_ENABLED,
+): Invocation {
   validateProtectedRoute(source);
 
   const repository = repositoryName(required(source, "TARGET_REPOSITORY"));
   const terraformRoot = rootName(required(source, "TERRAFORM_ROOT"));
   const mode = executionMode(required(source, "EXECUTION_MODE"));
+  assertModeIsPermitted(mode, productionApplyEnabled);
   const exposureAdoptionConfirmation = requiredStringOrEmpty(
     source.EXPOSURE_ADOPTION_CONFIRMATION,
     "exposure adoption confirmation",
@@ -1195,11 +1246,14 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     required(source, "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT"),
     "bridge operation budget seconds",
   ));
-  const minimumOperationBudgetSeconds = mode === "plan"
+  // A rehearsal runs the federation lifecycle and no Terraform mutation, so it
+  // budgets like a plan rather than like an apply.
+  const budgetsLikePlan = mode === "plan" || mode === "rehearsal";
+  const minimumOperationBudgetSeconds = budgetsLikePlan
     ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS
     : MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS;
   const maximumOperationBudgetSeconds = (
-    mode === "plan" ? PLAN_MAIN_STEP_TIMEOUT_MINUTES : APPLY_MAIN_STEP_TIMEOUT_MINUTES
+    budgetsLikePlan ? PLAN_MAIN_STEP_TIMEOUT_MINUTES : APPLY_MAIN_STEP_TIMEOUT_MINUTES
   ) * 60;
   if (
     operationBudgetSeconds < minimumOperationBudgetSeconds ||
@@ -2017,6 +2071,25 @@ export function buildRuntimeActAsLeases(
 // Every preview runtime principal in the fleet. The retired deny policy named
 // these four explicitly; the plan gate below derives them so a repository added
 // to REPOSITORIES cannot silently escape the check.
+// Predefined roles that carry iam.workloadIdentityPools.update. A custom role
+// cannot be evaluated from a plan alone, so any project custom role that names
+// the permission is refused by the separate permission gate below.
+const POOL_MUTATION_ROLES: ReadonlySet<string> = new Set([
+  "roles/editor",
+  "roles/iam.workloadIdentityPoolAdmin",
+  "roles/owner",
+]);
+
+export const POOL_MUTATION_PERMISSION = "iam.workloadIdentityPools.update";
+
+// The owner controller and the run's own ephemeral executor. Nothing else may
+// be able to move a pool's disabled flag.
+function isTrustedFederationController(principal: string): boolean {
+  const member = principalWithoutUid(principal);
+  return member === OWNER_MEMBER ||
+    /^serviceAccount:gha-pbt-[0-9a-f]{20}@[a-z0-9-]+\.iam\.gserviceaccount\.com$/.test(member);
+}
+
 function previewRuntimeMembers(): ReadonlySet<string> {
   const members = new Set<string>();
   for (const repository of REPOSITORY_NAMES) {
@@ -2160,6 +2233,20 @@ function rejectPreviewRuntimeGrant(
     }
   }
   const members = previewRuntimeMembers();
+  // The quarantine is only worth anything if the pools it disables cannot be
+  // re-enabled by a principal inside the window. Only the owner controller and
+  // the ephemeral executor may ever hold that capability, so a plan that grants
+  // a pool-mutation role to anyone else is refused before it can be applied.
+  const role = typeof state.role === "string" ? state.role : "";
+  if (POOL_MUTATION_ROLES.has(role)) {
+    for (const principal of principals) {
+      if (!isTrustedFederationController(principal)) {
+        throw new Error(
+          `${label} at ${address} grants ${role} to ${principal}, which could re-enable a quarantined workload identity pool.`,
+        );
+      }
+    }
+  }
   for (const principal of principals) {
     if (members.has(principalWithoutUid(principal))) {
       throw new Error(
@@ -3203,6 +3290,325 @@ function normalizedFreezeProof(
   return { observedAt: proof.observedAt, repositories, tokenDrainSeconds: proof.tokenDrainSeconds };
 }
 
+export const FEDERATION_POOL_ID = "github-actions";
+const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
+const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
+
+export interface FederationPoolState {
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly displayName: string;
+  readonly name: string;
+  readonly state: string;
+}
+
+// Everything about the pool except the flag the bridge is allowed to move.
+// Restore compares this, so a run cannot hand back a pool whose condition,
+// description, or lifecycle state drifted while it held privilege.
+export function federationPoolFingerprint(pool: FederationPoolState): string {
+  return canonicalJson(
+    json(
+      { description: pool.description, displayName: pool.displayName, name: pool.name, state: pool.state },
+      "federation pool fingerprint",
+    ),
+  );
+}
+
+export interface FederationQuarantineRecord {
+  readonly capturedAt: string;
+  readonly platformSha: string;
+  readonly pools: readonly {
+    readonly disabled: boolean;
+    readonly fingerprint: string;
+    readonly name: string;
+    readonly repository: RepositoryName;
+  }[];
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+export async function readFederationPool(
+  projectId: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<FederationPoolState | undefined> {
+  const response = await fetcher(federationPoolUrl(projectId), {
+    headers: executorHeaders(token),
+    redirect: "error",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    throw new Error(`Workload identity pool read failed with HTTP ${response.status}.`);
+  }
+  return federationPoolFromJson(await boundedJson(response, 256 * 1024), projectId);
+}
+
+// PATCH returns a long-running operation, so "the request was accepted" is not
+// the same as "the pool is disabled". Convergence is proved by reading the pool
+// back, because that is the only statement that matters to a token holder.
+export async function setFederationPoolDisabled(
+  projectId: string,
+  disabled: boolean,
+  token: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<FederationPoolState> {
+  const url = new URL(federationPoolUrl(projectId));
+  url.searchParams.set("updateMask", "disabled");
+  const response = await fetcher(url, {
+    body: JSON.stringify({ disabled }),
+    headers: { ...executorHeaders(token), "Content-Type": "application/json; charset=utf-8" },
+    method: "PATCH",
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`Workload identity pool update failed with HTTP ${response.status}.`);
+  }
+  await boundedJson(response, 256 * 1024);
+  for (;;) {
+    assertBeforeDeadline(now(), deadlineMs, "workload identity pool convergence");
+    const observed = await readFederationPool(projectId, token, fetcher);
+    if (observed === undefined) {
+      throw new Error("The workload identity pool vanished while it was being updated.");
+    }
+    if (observed.disabled === disabled) return observed;
+    await sleep(FEDERATION_CONVERGENCE_INTERVAL_MS);
+  }
+}
+
+function fortyHex(value: string, label: string): string {
+  if (!/^[0-9a-f]{40}$/.test(value)) throw new Error(`${label} is not a commit SHA.`);
+  return value;
+}
+
+function federationIntentBucket(invocation: Invocation): string {
+  return REPOSITORIES[invocation.repository].state[invocation.terraformRoot].bucket;
+}
+
+function federationIntentObject(runId: string): string {
+  return `${FEDERATION_QUARANTINE_PREFIX}/${numeric(runId, "federation quarantine run ID")}.json`;
+}
+
+// Disabled is necessary but not sufficient: the pool must also still be the
+// pool that was captured. A PATCH that returned success against a pool whose
+// description or lifecycle state moved is not the pool this run reasoned about.
+export function assertQuarantinedPool(
+  observed: FederationPoolState,
+  captured: FederationQuarantineRecord["pools"][number],
+): void {
+  exact(observed.name, captured.name, "quarantined workload identity pool identity");
+  exact(
+    federationPoolFingerprint(observed),
+    captured.fingerprint,
+    `quarantined ${captured.repository} workload identity pool`,
+  );
+  exact(observed.disabled, true, `quarantined ${captured.repository} workload identity pool state`);
+}
+
+export function federationQuarantineRecordFromJson(value: unknown): FederationQuarantineRecord {
+  const source = record(value, "federation quarantine record");
+  exactKeys(
+    source,
+    new Set(["capturedAt", "platformSha", "pools", "repository", "root", "runId"]),
+    "federation quarantine record",
+  );
+  const pools = array(source.pools, "federation quarantine pools").map((raw, index) => {
+    const entry = record(raw, `federation quarantine pool ${index}`);
+    exactKeys(
+      entry,
+      new Set(["disabled", "fingerprint", "name", "repository"]),
+      `federation quarantine pool ${index}`,
+    );
+    const repository = repositoryName(
+      requiredString(entry.repository, "federation quarantine repository"),
+    );
+    const expected =
+      `projects/${REPOSITORIES[repository].projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+    // Only the exact contracted pools are ever touched by a restore.
+    exact(entry.name, expected, "federation quarantine pool name");
+    if (typeof entry.disabled !== "boolean") {
+      throw new Error("Federation quarantine disabled flag is malformed.");
+    }
+    return {
+      disabled: entry.disabled,
+      fingerprint: hexOrCanonical(entry.fingerprint, "federation quarantine fingerprint"),
+      name: expected,
+      repository,
+    };
+  });
+  // Exactly one entry per consumer, in the contracted order. A record that
+  // repeats a repository or omits one cannot be restored from safely, and a
+  // partial restore is worse than none.
+  if (pools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Federation quarantine record does not cover every consumer pool.");
+  }
+  REPOSITORY_NAMES.forEach((repository, index) => {
+    exact(pools[index]!.repository, repository, "federation quarantine repository order");
+  });
+  const capturedAt = requiredString(source.capturedAt, "federation quarantine capture time");
+  const capturedAtMs = Date.parse(capturedAt);
+  if (!Number.isFinite(capturedAtMs) || new Date(capturedAtMs).toISOString() !== capturedAt) {
+    throw new Error("Federation quarantine capture time is malformed.");
+  }
+  return {
+    capturedAt,
+    platformSha: fortyHex(
+      requiredString(source.platformSha, "federation quarantine platform SHA"),
+      "federation quarantine platform SHA",
+    ),
+    pools,
+    repository: repositoryName(
+      requiredString(source.repository, "federation quarantine repository"),
+    ),
+    root: rootName(requiredString(source.root, "federation quarantine root")),
+    runId: numeric(requiredString(source.runId, "federation quarantine run ID"), "federation quarantine run ID"),
+  };
+}
+
+function hexOrCanonical(value: unknown, label: string): string {
+  const text = requiredString(value, label);
+  if (text.length > 4096) throw new Error(`${label} is oversized.`);
+  return text;
+}
+
+// The one restore path. A pool is re-enabled only when this run is the one that
+// disabled it, the pool is exactly a contracted pool, it is still the pool that
+// was captured, and it was enabled beforehand. A pool that was already disabled
+// when the run started stays disabled: turning it on would be inventing a state
+// nobody reviewed.
+export async function restoreQuarantinedFederation(
+  record: FederationQuarantineRecord,
+  token: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<void> {
+  for (const pool of record.pools) {
+    const projectId = REPOSITORIES[pool.repository].projectId;
+    const observed = await readFederationPool(projectId, token, fetcher);
+    if (observed === undefined) {
+      throw new Error(`The ${pool.repository} workload identity pool vanished during the protected run.`);
+    }
+    exact(observed.name, pool.name, "restored workload identity pool identity");
+    // Drift in anything other than the flag this run is allowed to move means
+    // the pool is no longer the one that was captured, so it is left alone and
+    // the run fails rather than writing over somebody else's change.
+    exact(
+      federationPoolFingerprint(observed),
+      pool.fingerprint,
+      `restored ${pool.repository} workload identity pool`,
+    );
+    if (pool.disabled) {
+      // Never re-enable a pool that was already disabled before this run.
+      if (!observed.disabled) {
+        throw new Error(
+          `The ${pool.repository} workload identity pool was disabled before this run and is now enabled.`,
+        );
+      }
+      continue;
+    }
+    if (!observed.disabled) continue;
+    const restored = await setFederationPoolDisabled(
+      projectId,
+      pool.disabled,
+      token,
+      fetcher,
+      deadlineMs,
+      sleep,
+      now,
+    );
+    exact(
+      federationPoolFingerprint(restored),
+      pool.fingerprint,
+      `restored ${pool.repository} workload identity pool`,
+    );
+    // The flag is not part of the fingerprint, so it is asserted separately:
+    // the pool must end the run in exactly the state it started it in.
+    exact(
+      restored.disabled,
+      pool.disabled,
+      `restored ${pool.repository} workload identity pool disabled flag`,
+    );
+  }
+}
+
+export function federationPoolUrl(projectId: string): string {
+  return `https://iam.googleapis.com/v1/projects/${projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+}
+
+export function federationPoolFromJson(value: unknown, projectId: string): FederationPoolState {
+  const pool = record(value, "workload identity pool");
+  const name = requiredString(pool.name, "workload identity pool name");
+  const expected =
+    `projects/${projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+  // Identity first, and exactly. A suffix test would accept
+  // projects/<anything>/locations/global/workloadIdentityPools/github-actions,
+  // which says nothing about the pool actually under contract.
+  if (name !== expected) {
+    throw new Error("The workload identity pool is not the contracted GitHub Actions pool.");
+  }
+  const state = requiredString(pool.state, "workload identity pool state");
+  if (state !== "ACTIVE") {
+    // DELETED means soft-deleted; it also blocks token use, but restoring it is
+    // not this bridge's job and pretending otherwise would hide a real problem.
+    throw new Error(`The workload identity pool is ${state}, not ACTIVE.`);
+  }
+  if (pool.disabled !== undefined && typeof pool.disabled !== "boolean") {
+    throw new Error("The workload identity pool disabled flag is malformed.");
+  }
+  return {
+    description: requiredStringOrEmpty(pool.description, "workload identity pool description"),
+    disabled: pool.disabled === true,
+    displayName: requiredStringOrEmpty(pool.displayName, "workload identity pool display name"),
+    name,
+    state,
+  };
+}
+
+// What actually authorizes the privileged window.
+//
+// Not the run listings. GitHub's offset pages are not snapshot-bound; the
+// status-filtered and unfiltered listings come from one authority, so a server
+// that hides a run from both satisfies every cross-check; and a summary can be
+// restored by deleting the run that produced it. Every one of those attacks
+// works by editing the record of activity.
+//
+// Nor a clock. Observing Actions disabled at T0 and again at T1 does not mean
+// they were disabled in between: they can be re-enabled at T0+4m50s, a consumer
+// workflow can mint a service-account token, and Actions can be disabled again
+// before the next snapshot. Both observations agree and the token is alive.
+//
+// So the window is closed at the authorization layer instead. Google's contract
+// for a DISABLED workload identity pool is the strong one:
+//
+//   "You cannot use a disabled pool to exchange tokens, or use existing tokens
+//    to access resources."
+//
+// -- which is why the POOL is quarantined and not the provider, whose contract
+// is explicitly weaker ("existing tokens still grant access"). With the pool
+// disabled, a token minted a second before the quarantine is as useless as one
+// that was never minted, and the token-lifetime timing argument disappears
+// rather than being bounded.
+//
+// The reviewed plan carries `federation_quarantined = true`, so the apply's own
+// desired state keeps the pool disabled and cannot re-enable what the bridge
+// disabled a moment earlier. Restoration happens after the post-apply audit and
+// after the executor is released, and only to the exact fingerprint captured
+// before quarantine.
+//
+// An IAM deny policy would be stronger still and is provably unavailable here:
+// `iam.denypolicies.*` is NOT_SUPPORTED in project custom roles,
+// `roles/iam.denyAdmin` is not grantable at project scope, and these four
+// projects have no organization or folder parent to grant it at instead.
+// Bootstrap apply run 33291080180 died on exactly that setIamPolicy with
+// "Role roles/iam.denyAdmin is not supported for this resource".
+//
+// The Actions-disabled checks and the run listings stay, and stay strict, as
+// corroborating defence in depth. They no longer authorize anything.
 function freezeProofFromJson(value: unknown, expectedDrainSeconds: number): ConsumerFreezeProof {
   const proof = record(value, "freeze proof");
   exactKeys(
@@ -3452,6 +3858,7 @@ export async function runProtectedBootstrap(
   );
   let session: ExecutorSession | undefined;
   let primaryFailure: unknown;
+  let quarantinedFederation: FederationQuarantineRecord | undefined;
   try {
     telemetry.phase("controller.prepare");
     const preparation = await dependencies.prepare(invocation, operationDeadlineMs);
@@ -3514,6 +3921,12 @@ export async function runProtectedBootstrap(
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               `-var=active_workflow_sha=${invocation.platformSha}`,
+              // Both the plan and the apply carry this, so the reviewed plan is
+              // the one that keeps federation quarantined and the recomputed
+              // plan still matches its receipt. The bridge restores the pool
+              // after the post-apply audit, which is why every bootstrap plan
+              // legitimately contains this one disable.
+              `-var=federation_quarantined=true`,
               `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
               `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
             ]
@@ -3641,6 +4054,19 @@ export async function runProtectedBootstrap(
       leaseExpiresAt.getTime(),
       session.tokenExpiresAtMs,
     );
+    // Close consumer federation before any privilege exists. A disabled pool
+    // blocks token exchange AND stops already-issued tokens reaching resources,
+    // so this is what makes the privileged window unreachable rather than
+    // merely unobserved. The approved plan carries the same desired state, so
+    // the apply cannot undo it.
+    telemetry.phase("controller.quarantine");
+    // Armed before the first mutation. If disableFederation dies after the
+    // first PATCH, this run still owns the undo.
+    quarantinedFederation = await dependencies.armFederationQuarantine(
+      invocation,
+      operationDeadlineMs,
+    );
+    await dependencies.disableFederation(invocation, quarantinedFederation, operationDeadlineMs);
     await dependencies.elevateExecutor(
       invocation,
       session,
@@ -3692,6 +4118,12 @@ export async function runProtectedBootstrap(
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               `-var=active_workflow_sha=${invocation.platformSha}`,
+              // Both the plan and the apply carry this, so the reviewed plan is
+              // the one that keeps federation quarantined and the recomputed
+              // plan still matches its receipt. The bridge restores the pool
+              // after the post-apply audit, which is why every bootstrap plan
+              // legitimately contains this one disable.
+              `-var=federation_quarantined=true`,
               `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
               `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
             ]
@@ -3743,7 +4175,7 @@ export async function runProtectedBootstrap(
     // private tree must not consume the cleanup window before the executor is
     // disabled, and a synchronous filesystem-cleanup throw must not prevent
     // the IAM attempt from starting.
-    const cleanupResults = await Promise.allSettled([
+    const [releaseResult, ...pathResults] = await Promise.allSettled([
       Promise.resolve().then(() =>
         dependencies.releaseExecutor(invocation, session, cleanupDeadlineMs)
       ),
@@ -3751,9 +4183,38 @@ export async function runProtectedBootstrap(
         Promise.resolve().then(() => dependencies.removePrivatePath(path))
       ),
     ]);
-    const cleanupErrors = cleanupResults.flatMap((result) =>
+    const cleanupErrors: unknown[] = [releaseResult, ...pathResults].flatMap((result) =>
       result.status === "rejected" ? [result.reason] : []
     );
+    // These two failures are not equivalent. A leftover private path is
+    // recoverable at leisure; an executor whose privilege was not provably
+    // revoked is the exact condition the quarantine exists for.
+    const executorContained = releaseResult!.status === "fulfilled";
+    // Federation is restored only after the executor is gone, so no window
+    // exists in which consumer tokens work again while privilege still does.
+    if (quarantinedFederation !== undefined) {
+      if (!executorContained) {
+        // Leave federation closed. Re-opening it while an executor may still
+        // hold privilege would hand back exactly the overlap this design
+        // removes. A human unblocks it with the durable intent.
+        cleanupErrors.push(
+          new Error(
+            "Consumer federation stays quarantined because executor containment was not proven; restore it from the durable quarantine intent after revoking the executor.",
+          ),
+        );
+      } else {
+        telemetry.phase("controller.federation-restore");
+        try {
+          await dependencies.restoreFederation(
+            invocation,
+            quarantinedFederation,
+            cleanupDeadlineMs,
+          );
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+    }
     if (cleanupErrors.length > 0) {
       const cleanupFailure = new AggregateError(
         cleanupErrors,
@@ -4894,6 +5355,78 @@ function defaultBridgeDependencies(
         api,
         githubProofRetryPolicy(() => apiDeadlineMs),
       ),
+    armFederationQuarantine: async (invocation, _operationDeadlineMs) => {
+      const pools: FederationQuarantineRecord["pools"][number][] = [];
+      // Every consumer pool, not just the target's. The freeze proof already
+      // spans the whole fleet because consumer principals are not provably
+      // confined to their own project, and quarantining a smaller set would
+      // need a transitive-reachability proof this bridge cannot make.
+      for (const repository of REPOSITORY_NAMES) {
+        const projectId = REPOSITORIES[repository].projectId;
+        const pool = await readFederationPool(projectId, invocation.ownerAccessToken, api);
+        if (pool === undefined) {
+          // Fail closed. An absent pool on an established consumer is a missing
+          // precondition, not isolation.
+          throw new Error(
+            `The ${repository} workload identity pool is absent; protected elevation cannot prove federation is closed.`,
+          );
+        }
+        pools.push({
+          disabled: pool.disabled,
+          fingerprint: federationPoolFingerprint(pool),
+          name: pool.name,
+          repository,
+        });
+      }
+      const record: FederationQuarantineRecord = {
+        capturedAt: new Date(Date.now()).toISOString(),
+        platformSha: invocation.platformSha,
+        pools,
+        repository: invocation.repository,
+        root: invocation.terraformRoot,
+        runId: invocation.githubRunId,
+      };
+      // Durable, immutable, and written BEFORE any mutation, so a runner that
+      // dies at any later boundary still leaves a fresh runner enough to
+      // restore exactly these pools to exactly this state -- and nothing else.
+      await writeImmutableObject(
+        federationIntentBucket(invocation),
+        federationIntentObject(invocation.githubRunId),
+        canonicalJson(json(record, "federation quarantine record")),
+        invocation.ownerAccessToken,
+        api,
+      );
+      return record;
+    },
+    disableFederation: async (invocation, record, operationDeadlineMs) => {
+      for (const pool of record.pools) {
+        const converged = await setFederationPoolDisabled(
+          REPOSITORIES[pool.repository].projectId,
+          true,
+          invocation.ownerAccessToken,
+          api,
+          operationDeadlineMs,
+        );
+        assertQuarantinedPool(converged, pool);
+      }
+    },
+    restoreFederation: async (invocation, record, operationDeadlineMs) => {
+      await restoreQuarantinedFederation(
+        record,
+        invocation.ownerAccessToken,
+        api,
+        operationDeadlineMs,
+      );
+      // The completion marker is what stops a later recovery scan replaying
+      // this record and undoing an intentional future disable.
+      await writeImmutableObject(
+        federationIntentBucket(invocation),
+        `${federationIntentObject(invocation.githubRunId)}.restored`,
+        canonicalJson(json({ restoredAt: new Date(Date.now()).toISOString(), runId: record.runId }, "federation restore marker")),
+        invocation.ownerAccessToken,
+        api,
+      );
+    },
     waitForPostMutationDrain: async (invocation, mutationCompletedAtMs, operationDeadlineMs) => {
       if (invocation.terraformRoot !== "bootstrap") return;
       const targetMs = mutationCompletedAtMs +
@@ -13818,10 +14351,22 @@ function rootName(value: string): TerraformRoot {
 }
 
 function executionMode(value: string): ExecutionMode {
-  if (value !== "plan" && value !== "apply") {
+  if (value !== "plan" && value !== "apply" && value !== "rehearsal") {
     throw new Error("Execution mode escaped the closed allowlist.");
   }
   return value;
+}
+
+// Only a run that is about to start is gated. Parsing the mode recorded in an
+// already-published receipt must keep working, or stage one would be unable to
+// read the history stage two depends on.
+function assertModeIsPermitted(mode: ExecutionMode, productionApplyEnabled: boolean): void {
+  if (mode === "apply" && !productionApplyEnabled) {
+    // Fail closed by construction, not by configuration.
+    throw new Error(
+      "Production protected apply is disabled in this build: the federation-quarantine rollout enables it only after the rehearsal canary and recovery drills succeed.",
+    );
+  }
 }
 
 function booleanString(value: string, label: string): boolean {

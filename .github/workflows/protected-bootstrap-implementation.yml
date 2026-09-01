@@ -60,7 +60,13 @@ on:
 permissions: {}
 
 concurrency:
-  group: protected-owner-terraform-${{ inputs.target_repository }}
+  # One group for the whole fleet, not one per target. The protected apply now
+  # quarantines every consumer workload identity pool for the duration of its
+  # window, so two runs against different targets would capture and restore each
+  # other's pool state -- the second run would record "already disabled" and the
+  # first would re-enable federation while the second still held privilege.
+  # Serialising every protected run removes that interleaving outright.
+  group: protected-owner-terraform-federation
   cancel-in-progress: false
 
 jobs:

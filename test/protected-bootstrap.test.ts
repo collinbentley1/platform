@@ -57,6 +57,15 @@ import {
   parseExecutorProvenance,
   publishPlanReceipt,
   publishPostApplyReceipt,
+  type FederationPoolState,
+  federationPoolFromJson,
+  type FederationQuarantineRecord,
+  assertQuarantinedPool,
+  federationPoolFingerprint,
+  setFederationPoolDisabled,
+  federationQuarantineRecordFromJson,
+  restoreQuarantinedFederation,
+  PRODUCTION_APPLY_ENABLED,
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
   proveExposure,
@@ -160,7 +169,11 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain('test "$GITHUB_ACTOR_ID_EXACT" = "16823277"');
     expect(workflow).toContain('test "$GITHUB_REPOSITORY_ID_EXACT" = "1255856466"');
     expect(workflow).toContain("environment: protected-bootstrap-owner-token");
-    expect(workflow).toContain("group: protected-owner-terraform-${{ inputs.target_repository }}");
+    // Fleet-global, not per target: a protected apply quarantines every
+    // consumer workload identity pool, so two concurrent runs would capture and
+    // restore each other's federation state.
+    expect(workflow).toContain("group: protected-owner-terraform-federation");
+    expect(workflow).not.toContain("group: protected-owner-terraform-${{ inputs.target_repository }}");
     expect(workflow).toContain("cancel-in-progress: false");
     expect(workflow.match(/^  owner-terraform:$/gm)).toHaveLength(1);
     expect(workflow).toContain("actions: read");
@@ -1635,7 +1648,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_MANIFEST_SHA256: "",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
     ).toThrow("approved manifest digest");
     expect(() =>
       validateInvocation({ ...environment, LEGACY_COMPATIBILITY_MODE: "1" })
@@ -1682,7 +1695,7 @@ describe("protected owner Terraform bridge", () => {
       EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "exposure",
-    })).toThrow("locked to a Runsetta plan run");
+    }, true)).toThrow("locked to a Runsetta plan run");
     expect(validateInvocation({
       ...environment,
       EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
@@ -4153,7 +4166,7 @@ describe("protected owner Terraform bridge", () => {
       GITHUB_RUN_ID_EXACT: "7654321",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "prod",
-    });
+    }, true);
     const expiresAt = new Date("2026-08-26T23:00:00.000Z");
     const accountId = "gha-pbt-33333333333333333333";
     const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
@@ -4280,7 +4293,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     let acquireDeadline = 0;
     let cleanupDeadline = 0;
@@ -4328,7 +4341,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: budget,
         EXECUTION_MODE: "apply",
-      })).toThrow("2320..2340 second apply range");
+      }, true)).toThrow("2320..2340 second apply range");
     }
   });
 
@@ -4412,7 +4425,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(events, {
         planJson: JSON.stringify(atApplyRun),
         // The receipt digest comes from the PLAN run's fixture, never from what
@@ -4461,7 +4474,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(events, {
         appendSummary: async (_invocation, body) => {
           events.push("summary");
@@ -4594,7 +4607,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(atFloor, walk(atFloor)),
     );
     expect(atFloor).toContain("elevate");
@@ -4616,7 +4629,7 @@ describe("protected owner Terraform bridge", () => {
           APPROVED_PLAN_RUN_ID: "123455",
           BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
           EXECUTION_MODE: "apply",
-        }),
+        }, true),
         operationBudgetSeconds: 34 * 60,
       },
       fakeDependencies(retired, walk(retired)),
@@ -5360,7 +5373,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     const terraformArgv: Array<readonly string[]> = [];
     const dependencies = fakeDependencies(events, {
@@ -5415,7 +5428,7 @@ describe("protected owner Terraform bridge", () => {
       EXPOSURE_ADOPTION_RUN_ID: "123454",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "prod",
-    });
+    }, true);
     const events: string[] = [];
     const dependencies = fakeDependencies(events, {
       planJson: JSON.stringify(raw),
@@ -5514,7 +5527,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     const dependencies = fakeDependencies(events, {
       now: () => now,
@@ -5654,7 +5667,7 @@ describe("protected owner Terraform bridge", () => {
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
       GITHUB_RUN_ID_EXACT: "123457",
-    });
+    }, true);
     const approved = await verifyPlanApproval(
       applyInvocation,
       executorToken,
@@ -5983,6 +5996,482 @@ describe("protected owner Terraform bridge", () => {
     expect(requestedPages).toEqual([1, 2]);
   });
 
+  // Stage one of the rollout. The subsystem that closes the privileged window
+  // lands with production apply refused, so the first live exercise of this
+  // code cannot grant an unvalidated production apply.
+  test("a deployed build refuses production apply outright", () => {
+    expect(PRODUCTION_APPLY_ENABLED).toBe(false);
+    expect(() =>
+      validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "apply" })
+    ).toThrow("Production protected apply is disabled in this build");
+  });
+
+  test("plan and rehearsal remain available while apply is refused", () => {
+    expect(validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "plan" }).mode).toBe("plan");
+    expect(validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "rehearsal" }).mode)
+      .toBe("rehearsal");
+  });
+
+  test("an unknown execution mode is still refused by the allowlist", () => {
+    expect(() => validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "canary" }))
+      .toThrow("Execution mode escaped the closed allowlist");
+  });
+
+  test("reading an already-published apply receipt is not gated by the rollout", () => {
+    // Stage two turns the gate off; stage one must still be able to read the
+    // history stage two depends on.
+    expect(() =>
+      executorDescription({
+        mode: "apply",
+        repository: "cdbentley",
+        root: "bootstrap",
+        runId: "123455",
+      })
+    ).not.toThrow("Production protected apply is disabled");
+  });
+
+  // Federation quarantine. A disabled workload identity pool blocks token
+  // exchange AND stops already-issued tokens reaching resources, which is why
+  // the pool -- not the provider, and not a clock -- is what closes the
+  // privileged window.
+  const poolBody = (project: string, disabled: boolean) => ({
+    description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+    disabled,
+    displayName: "GitHub Actions",
+    name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+    state: "ACTIVE",
+  });
+
+  test("a pool from another project is refused, not accepted by suffix", () => {
+    expect(() =>
+      federationPoolFromJson(
+        {
+          ...poolBody("cdbentley", false),
+          name: "projects/attacker/locations/global/workloadIdentityPools/github-actions",
+        },
+        "cdbentley",
+      )
+    ).toThrow("not the contracted GitHub Actions pool");
+  });
+
+  test("a soft-deleted pool is refused rather than treated as isolation", () => {
+    expect(() => federationPoolFromJson({ ...poolBody("cdbentley", true), state: "DELETED" }, "cdbentley"))
+      .toThrow("is DELETED, not ACTIVE");
+  });
+
+  test("the fingerprint excludes only the flag the run is allowed to move", () => {
+    const enabled = federationPoolFromJson(poolBody("cdbentley", false), "cdbentley");
+    const disabled = federationPoolFromJson(poolBody("cdbentley", true), "cdbentley");
+    const renamed = federationPoolFromJson(
+      { ...poolBody("cdbentley", false), displayName: "Something Else" },
+      "cdbentley",
+    );
+
+    expect(federationPoolFingerprint(enabled)).toBe(federationPoolFingerprint(disabled));
+    expect(federationPoolFingerprint(renamed)).not.toBe(federationPoolFingerprint(enabled));
+  });
+
+  test("disabling is proved by reading the pool back, not by the accepted PATCH", async () => {
+    // Google returns a long-running operation, so an accepted request is not a
+    // disabled pool. The first read still reports enabled.
+    let reads = 0;
+    const sleeps: number[] = [];
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") return Response.json({ name: "operations/1" });
+      reads += 1;
+      return Response.json(poolBody("cdbentley", reads > 1));
+    }) as unknown as typeof fetch;
+
+    const converged = await setFederationPoolDisabled(
+      "cdbentley",
+      true,
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+    );
+
+    expect(converged.disabled).toBe(true);
+    expect(reads).toBe(2);
+    expect(sleeps).toEqual([2_000]);
+  });
+
+  test("a pool that never converges is refused at the deadline", async () => {
+    const fetcher = (async (input: string | URL, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? Response.json({ name: "operations/1" })
+        : Response.json(poolBody("cdbentley", false))) as unknown as typeof fetch;
+    let clock = 1_800_000_000_000;
+
+    await expect(setFederationPoolDisabled(
+      "cdbentley",
+      true,
+      "owner-token",
+      fetcher,
+      clock + 5_000,
+      async (ms) => {
+        clock += ms;
+      },
+      () => clock,
+    )).rejects.toThrow("workload identity pool convergence");
+  });
+
+  const quarantineRecord = (overrides: Record<string, unknown> = {}) => ({
+    capturedAt: "2026-09-01T12:00:00.000Z",
+    pools: [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([repository, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(poolBody(project!, false), project!),
+      ),
+      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      repository,
+    })),
+    platformSha: "a".repeat(40),
+    repository: "cdbentley",
+    root: "bootstrap",
+    runId: "123456",
+    ...overrides,
+  });
+
+  test("the durable record must cover every consumer pool", () => {
+    const partial = quarantineRecord();
+    expect(() =>
+      federationQuarantineRecordFromJson({ ...partial, pools: partial.pools.slice(0, 2) })
+    ).toThrow("does not cover every consumer pool");
+  });
+
+  test("the durable record only ever names contracted pools", () => {
+    const forged = quarantineRecord();
+    forged.pools[0]!.name = "projects/attacker/locations/global/workloadIdentityPools/github-actions";
+    expect(() => federationQuarantineRecordFromJson(forged))
+      .toThrow("federation quarantine pool name");
+  });
+
+  // Abrupt loss. A fresh runner restores from the durable record alone, and the
+  // record is written before the first PATCH, so every boundary is covered.
+  const restoreFetcher = (live: Record<string, { disabled: boolean; body?: object }>) => {
+    const patched: string[] = [];
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const project = new URL(String(input)).pathname.split("/")[3]!;
+      const entry = live[project]!;
+      if (init?.method === "PATCH") {
+        patched.push(project);
+        entry.disabled = JSON.parse(String(init.body)).disabled;
+        return Response.json({ name: "operations/1" });
+      }
+      return Response.json(entry.body ?? poolBody(project, entry.disabled));
+    }) as unknown as typeof fetch;
+    return { fetcher, patched };
+  };
+  const allProjects = ["cdbentley", "runsetta", "medlock-1025243085", "critical-history-16823277"];
+
+  test.each([
+    ["after the pre-disable, before any privilege existed", true],
+    ["after the apply audit", true],
+    ["mid-restore, with some pools already back", false],
+  ])("a fresh runner restores cleanly when the run was lost %s", async (_label, allDisabled) => {
+    const live = Object.fromEntries(
+      allProjects.map((project, index) => [
+        project,
+        { disabled: allDisabled ? true : index % 2 === 0 },
+      ]),
+    );
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    // Every pool ends enabled, and only the ones that were still disabled were
+    // touched.
+    expect(allProjects.every((project) => live[project]!.disabled === false)).toBe(true);
+    expect(patched).toHaveLength(allDisabled ? 4 : 2);
+  });
+
+  test("restore is idempotent when the run was lost after it already finished", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: false }]));
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    expect(patched).toEqual([]);
+  });
+
+  test("a pool that drifted while the run held privilege is never written over", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = {
+      disabled: true,
+      body: { ...poolBody("runsetta", true), description: "changed by somebody else" },
+    } as { disabled: boolean; body?: object };
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("restored runsetta workload identity pool");
+    // cdbentley came first and was restored; runsetta stopped the run rather
+    // than overwriting a change nobody reviewed.
+    expect(patched).toEqual(["cdbentley"]);
+  });
+
+  test("a pool that was already disabled before the run is never re-enabled", async () => {
+    const record = quarantineRecord();
+    record.pools[1]!.disabled = true;
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(record),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    // runsetta was disabled beforehand, so it stays disabled: turning it on
+    // would be inventing a state nobody reviewed.
+    expect(live["runsetta"]!.disabled).toBe(true);
+    expect(patched).not.toContain("runsetta");
+    expect(patched).toHaveLength(3);
+  });
+
+  test("a pool that was disabled beforehand but is now enabled fails the run", async () => {
+    const record = quarantineRecord();
+    record.pools[1]!.disabled = true;
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = { disabled: false };
+    const { fetcher } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(record),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("was disabled before this run and is now enabled");
+  });
+
+  test("federation is quarantined before elevation and restored after the executor is gone", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          events.push(
+            args[0] === "plan" && args.includes("-detailed-exitcode")
+              ? "terraform:audit"
+              : `terraform:${args[0]}`,
+          );
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    );
+
+    expect(events.indexOf("quarantine:arm")).toBeLessThan(events.indexOf("quarantine"));
+    expect(events.indexOf("quarantine")).toBeLessThan(events.indexOf("elevate"));
+    expect(events.indexOf("elevate")).toBeLessThan(events.indexOf("terraform:apply"));
+    // No window in which consumer tokens work again while privilege still does.
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("federation:restore"));
+    expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("federation:restore"));
+  });
+
+  test("a quarantine that fails halfway is still undone by this run", async () => {
+    // The intent is armed before the first PATCH precisely so that a partial
+    // disable is still a disable this run owns.
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        disableFederation: async () => {
+          events.push("quarantine:partial");
+          throw new Error("the runsetta workload identity pool did not converge");
+        },
+        planJson: JSON.stringify(raw),
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("did not converge");
+
+    expect(events).toContain("quarantine:arm");
+    expect(events).not.toContain("elevate");
+    // Armed, so the undo still happens even though the disable never completed.
+    expect(events).toContain("federation:restore");
+  });
+
+  test("federation stays closed when executor containment was not proven", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        releaseExecutor: async () => {
+          events.push("release:failed");
+          throw new Error("the executor could not be disabled");
+        },
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("cleanup did not complete exactly");
+
+    // Re-opening federation while an executor may still hold privilege is the
+    // exact overlap this design removes, so the restore must not have run, and
+    // the run must say why federation was left closed.
+    expect(events).toContain("release:failed");
+    expect(events).not.toContain("federation:restore");
+    const failure = await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies([], {
+        planJson: JSON.stringify(raw),
+        releaseExecutor: async () => {
+          throw new Error("the executor could not be disabled");
+        },
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    ).catch((error: unknown) => error);
+    const reasons = (failure as AggregateError).errors.map((entry: unknown) =>
+      entry instanceof Error ? entry.message : String(entry)
+    );
+    expect(reasons.some((reason) => reason.includes("stays quarantined because executor containment was not proven")))
+      .toBe(true);
+  });
+
+  test("a private-path cleanup failure does not hold federation closed", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        removePrivatePath: async () => {
+          throw new Error("a scratch path could not be removed");
+        },
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("cleanup did not complete exactly");
+
+    // A leftover scratch path is recoverable at leisure; the executor was
+    // contained, so federation is handed back.
+    expect(events).toContain("federation:restore");
+  });
+
+  test("a pool that reports success without converging is refused before elevation", () => {
+    const captured = federationQuarantineRecordFromJson(quarantineRecord()).pools[0]!;
+    const stillEnabled = federationPoolFromJson(poolBody("cdbentley", false), "cdbentley");
+    const drifted = federationPoolFromJson(
+      { ...poolBody("cdbentley", true), description: "changed" },
+      "cdbentley",
+    );
+
+    expect(() => assertQuarantinedPool(stillEnabled, captured))
+      .toThrow("quarantined cdbentley workload identity pool state");
+    expect(() => assertQuarantinedPool(drifted, captured))
+      .toThrow("quarantined cdbentley workload identity pool");
+    expect(() =>
+      assertQuarantinedPool(federationPoolFromJson(poolBody("cdbentley", true), "cdbentley"), captured)
+    ).not.toThrow();
+  });
+
+  test.each([
+    ["a repeated repository", { pools: "duplicate" }],
+    ["a reordered pool set", { pools: "reversed" }],
+    ["a malformed platform SHA", { platformSha: "not-a-sha" }],
+    ["a malformed capture time", { capturedAt: "yesterday" }],
+    ["an unknown root", { root: "somewhere" }],
+  ])("a record with %s is refused before any pool is touched", (_label, override) => {
+    const base = quarantineRecord();
+    const forged: Record<string, unknown> = { ...base, ...override };
+    if (override.pools === "duplicate") forged.pools = [base.pools[0], ...base.pools.slice(1, 3), base.pools[0]];
+    if (override.pools === "reversed") forged.pools = [...base.pools].reverse();
+
+    expect(() => federationQuarantineRecordFromJson(forged)).toThrow();
+  });
+
+  test("a run that cannot quarantine federation never elevates", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        armFederationQuarantine: async () => {
+          throw new Error("the cdbentley workload identity pool is absent");
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("workload identity pool is absent");
+
+    expect(events).not.toContain("elevate");
+    expect(events).not.toContain("terraform:apply");
+    // Nothing was quarantined, so nothing is restored.
+    expect(events).not.toContain("federation:restore");
+  });
+
   test("state validation uses exact gRPC/overwrite probes and never reads or writes object bytes", async () => {
     const invocation = validateInvocation(validEnvironment());
     const requests: Array<{ method: string; url: string }> = [];
@@ -6137,7 +6626,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
 
   const applyReceiptLeases = () =>
     buildReceiptLeases(
@@ -6198,7 +6687,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const acquireLeases = [
       ...buildStorageAcquisitionLeases(
         "cdbentley", "bootstrap", "apply", "123456", leaseExpiresAt, executorEmail,
@@ -6287,7 +6776,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     expect(() =>
       elevationPolicyRecord(
         invocation, executorEmail, new Date("2026-08-30T12:00:00.000Z"),
@@ -7075,7 +7564,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     let nowMs = 1_000;
     const state = REPOSITORIES.cdbentley.state.bootstrap;
     const consumed = `${state.prefix}/.protected-bootstrap/consumed/123455.json`;
@@ -7736,7 +8225,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "33230835879",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const state = {
       bucket: "cdbentley-tfstate-882468538648-bootstrap",
       prefix: "cdbentley/bootstrap",
@@ -9745,6 +10234,16 @@ function fakeDependencies(
     verifyApproval: overrides.verifyApproval ?? (async () => {
       throw new Error("Unexpected approval verification in plan mode.");
     }),
+    armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation) => {
+      events.push("quarantine:arm");
+      return quarantineIntent(invocation);
+    }),
+    disableFederation: overrides.disableFederation ?? (async () => {
+      events.push("quarantine");
+    }),
+    restoreFederation: overrides.restoreFederation ?? (async () => {
+      events.push("federation:restore");
+    }),
     waitForPostMutationDrain: overrides.waitForPostMutationDrain ?? (async (
       invocation,
       mutationCompletedAtMs,
@@ -10257,6 +10756,53 @@ function executionProof(overrides: Partial<ExecutionProof> = {}): ExecutionProof
     freezeProof: freezeSnapshot(1_800_000_000_000),
     markerProof: markers(),
     ...overrides,
+  };
+}
+
+function quarantineIntent(invocation: {
+  githubRunId: string;
+  platformSha: string;
+  repository: string;
+  terraformRoot: string;
+}): FederationQuarantineRecord {
+  return federationQuarantineRecordFromJson({
+    capturedAt: "2026-09-01T12:00:00.000Z",
+    platformSha: invocation.platformSha,
+    pools: [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([repository, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(
+          {
+            description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+            disabled: false,
+            displayName: "GitHub Actions",
+            name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+            state: "ACTIVE",
+          },
+          project!,
+        ),
+      ),
+      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      repository,
+    })),
+    repository: invocation.repository,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  });
+}
+
+function federationPool(disabled = false): FederationPoolState {
+  return {
+    description: "GitHub Actions OIDC identities for collinbentley1/cdbentley.",
+    disabled,
+    displayName: "GitHub Actions",
+    name: "projects/cdbentley/locations/global/workloadIdentityPools/github-actions",
+    state: "ACTIVE",
   };
 }
 
