@@ -2034,6 +2034,15 @@ const V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256 = {
   mutation: "6d2e97c830d53859f1040ac1090bd53303fa23d7743e3f2855095972369eca77",
   read: "cd250d221ea684765f6c2c04dbd806e8b6ce094666455ae50dedcc20564f86e4",
 } as const;
+// A protected HealthMCP prod run from before the ownership-control resources
+// landed can have crashed after creating one of these exact roles. The new
+// matrices below are wider only for the newly reviewed control plane, so keep
+// the prior two digests recoverable without accepting any arbitrary subset or
+// superset of either role.
+const PRE_OWNERSHIP_HEALTHMCP_PROD_ROLE_PERMISSION_SHA256 = {
+  mutation: "774f2e503272daf8ffa2f7ec347886b3f728588232aa1ecb6fe5e322bb30c485",
+  read: "45c4fd9ba76793fd5405f7b0cd2132e93c1f6ca4a5dda952f9cd76026e10b9d0",
+} as const;
 
 export function executorControlPermissions(
   repository: RepositoryName,
@@ -2100,6 +2109,10 @@ export function executorControlPermissions(
           "datastore.databases.get",
           "datastore.databases.getMetadata",
           "datastore.databases.list",
+          "datastore.indexes.get",
+          "datastore.indexes.list",
+          "firebaseauth.configs.get",
+          "recaptchaenterprise.keys.get",
         ]
       : []),
   ];
@@ -2153,8 +2166,14 @@ export function executorControlPermissions(
               "datastore.databases.create",
               "datastore.databases.delete",
               "datastore.databases.update",
+              "datastore.indexes.update",
               "datastore.operations.get",
               "datastore.operations.list",
+              "firebaseauth.configs.create",
+              "firebaseauth.configs.update",
+              "recaptchaenterprise.keys.create",
+              "recaptchaenterprise.keys.update",
+              "serviceusage.services.enable",
             ]
           : []),
       ];
@@ -2187,6 +2206,10 @@ export function bridgeRolePermissionsRecognized(
     ...executorControlPermissions(repository, root, phase),
   ].toSorted());
   if (observedJson === controlJson) return true;
+  if (repository === "healthmcp" && root === "prod") {
+    const digest = createHash("sha256").update(observedJson).digest("hex");
+    return digest === PRE_OWNERSHIP_HEALTHMCP_PROD_ROLE_PERMISSION_SHA256[phase];
+  }
   if (root !== "bootstrap") return false;
   // Google retains deleted custom-role tombstones, and abrupt v0.5.12 loss can
   // also leave an active role. The frozen digests recognize only those exact

@@ -2948,6 +2948,82 @@ describe("protected owner Terraform bridge", () => {
     expect(prod).toContain("datastore.databases.update");
   });
 
+  test("HealthMCP prod executor can manage only the reviewed ownership control plane", () => {
+    const read = executorControlPermissions("healthmcp", "prod", "read");
+    const mutation = executorControlPermissions("healthmcp", "prod", "mutation");
+    const ownershipRead = [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "firebaseauth.configs.get",
+      "recaptchaenterprise.keys.get",
+    ];
+    const ownershipMutation = [
+      "datastore.indexes.update",
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.update",
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.update",
+      "serviceusage.services.enable",
+    ];
+    for (const permission of ownershipRead) {
+      expect(read).toContain(permission);
+      expect(mutation).toContain(permission);
+    }
+    for (const permission of ownershipMutation) {
+      expect(read).not.toContain(permission);
+      expect(mutation).toContain(permission);
+    }
+    for (const forbidden of [
+      "datastore.indexes.create",
+      "datastore.indexes.delete",
+      "firebaseauth.configs.getSecret",
+      "recaptchaenterprise.keys.delete",
+      "recaptchaenterprise.keys.list",
+      "recaptchaenterprise.keys.retrievelegacysecretkey",
+      "serviceusage.services.disable",
+    ]) {
+      expect(read).not.toContain(forbidden);
+      expect(mutation).not.toContain(forbidden);
+    }
+
+    // The same authority must not leak into any other consumer's role.
+    for (const repository of ["cdbentley", "runsetta", "critical-history"] as const) {
+      const foreign = executorControlPermissions(repository, "prod", "mutation");
+      for (const permission of [...ownershipRead, ...ownershipMutation]) {
+        expect(foreign).not.toContain(permission);
+      }
+    }
+  });
+
+  test("pre-ownership HealthMCP prod executor roles remain exactly recoverable", () => {
+    const ownershipPermissions = new Set([
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "datastore.indexes.update",
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.get",
+      "firebaseauth.configs.update",
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.update",
+      "serviceusage.services.enable",
+    ]);
+    for (const phase of ["read", "mutation"] as const) {
+      const prior = executorControlPermissions("healthmcp", "prod", phase).filter(
+        (permission) => !ownershipPermissions.has(permission),
+      );
+      expect(bridgeRolePermissionsRecognized(prior, "healthmcp", "prod", phase)).toBeTrue();
+      expect(
+        bridgeRolePermissionsRecognized(
+          [...prior, "datastore.entities.get"],
+          "healthmcp",
+          "prod",
+          phase,
+        ),
+      ).toBeFalse();
+    }
+  });
+
   // Terraform fixes the ordering of none of the plan's lists. The digest must
   // therefore be invariant under permutation of every one of them, not only
   // resource_changes -- which is all the determinism test below shuffles.
