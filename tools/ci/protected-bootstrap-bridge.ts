@@ -280,7 +280,9 @@ const BRIDGE_PHASES = [
   "controller.apply-drain",
   "controller.apply-publish",
   "controller.cleanup",
+  "controller.de-elevate",
   "controller.federation-restore",
+  "controller.final-audit",
   "controller.quarantine",
   "controller.complete",
   "controller.failed",
@@ -984,6 +986,37 @@ export interface ExecutionProof extends PreparationResult {
   readonly markerProof: readonly MarkerStateProof[];
 }
 
+export interface FinalProtectedProof {
+  readonly consumerSha: string;
+  readonly deElevation: ExecutorDeElevationProof;
+  readonly finalTerraformAuditedAt: string;
+  readonly finalTerraformQuarantined: false;
+  // sha256 over the canonical durable intent, so the receipt names the exact
+  // quarantine this run armed and nothing else.
+  readonly intentDigest: string;
+  readonly platformSha: string;
+  readonly quarantinedApplyProofDigest: string;
+  readonly repository: RepositoryName;
+  readonly restoredPools: readonly {
+    readonly disabled: boolean;
+    readonly fingerprint: string;
+    readonly name: string;
+    readonly repository: RepositoryName;
+  }[];
+  readonly reviewSha256: string;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+export interface ExecutorDeElevationProof {
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly observedAt: string;
+  // Exactly the permissions the mutation role carried that the read role does
+  // not, proven absent against the live control plane after revocation.
+  readonly provenAbsent: readonly string[];
+}
+
 export interface ConsumerFreezeProof {
   readonly observedAt: string;
   readonly repositories: readonly {
@@ -1031,6 +1064,14 @@ export interface BridgeDependencies {
     proof: ExecutionProof,
     nowMs: number,
   ) => Promise<void>;
+  // Revokes mutation authority and proves, against the live control plane, that
+  // every mutation permission is gone while the receipt-scoped read authority
+  // remains. The identity that publishes the final receipt is a reader.
+  readonly deElevateExecutor: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    operationDeadlineMs: number,
+  ) => Promise<ExecutorDeElevationProof>;
   readonly elevateExecutor: (
     invocation: Invocation,
     session: ExecutorSession,
@@ -1062,6 +1103,15 @@ export interface BridgeDependencies {
     session: ExecutorSession,
     review: ReviewManifestResult,
     proof: ExecutionProof,
+    nowMs: number,
+  ) => Promise<void>;
+  // The single countable success. Written only after de-elevation, federation
+  // restoration, and the restored-state audit have all succeeded.
+  readonly publishFinalReceipt: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    review: ReviewManifestResult,
+    proof: FinalProtectedProof,
     nowMs: number,
   ) => Promise<void>;
   readonly publishPostApplyReceipt: (
@@ -1554,6 +1604,9 @@ export function buildLegacyCombinedReceiptCreateLease(
   const resources = [
     `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "consumed", approvedPlanRunId)}`,
     `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "results", runId)}`,
+    // The final receipt is written after mutation authority is revoked, so its
+    // exact object has to be inside the create-only scope granted at acquire.
+    `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "final", runId)}`,
   ];
   return {
     condition: {
@@ -1670,11 +1723,17 @@ export function buildReceiptLeases(
   const resultResource = mode === "apply"
     ? `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "results", runId)}`
     : undefined;
+  // The one countable success, written after mutation authority is revoked.
+  // A rehearsal writes it too: it is the only object a rehearsal produces.
+  const finalResource = mode === "plan"
+    ? undefined
+    : `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "final", runId)}`;
   const member = executorMember(contract.projectId, executorServiceAccountEmail);
   const viewerResources = [
     planResource,
     ...(consumedResource === undefined ? [] : [consumedResource]),
     ...(resultResource === undefined ? [] : [resultResource]),
+    ...(finalResource === undefined ? [] : [finalResource]),
     ...(repository === "runsetta" && root === "prod" && exposureAdoptionRunId !== ""
       ? [
           `projects/_/buckets/${contract.state.exposure.bucket}/objects/${receiptObjectName(
@@ -1695,8 +1754,8 @@ export function buildReceiptLeases(
   // the consumed grant while the result grant, which is still needed to publish
   // the post-apply receipt, survives.
   const creatorResources = consumedResource === undefined
-    ? [planResource]
-    : [resultResource!];
+    ? [planResource, ...(finalResource === undefined ? [] : [finalResource])]
+    : [resultResource!, finalResource!];
   return [
     ...(consumedResource === undefined ? [] : [{
       condition: {
@@ -3408,6 +3467,47 @@ export function assertQuarantinedPool(
   exact(observed.disabled, true, `quarantined ${captured.repository} workload identity pool state`);
 }
 
+// Everything the run is claiming, bound together in one value. A verifier that
+// trusts this receipt is trusting exactly: which plan was reviewed, what the
+// apply proved while federation was closed, that mutation authority was gone
+// before any of this was written, which pools were handed back and in what
+// state, that the restored world audits to zero diff, and which durable intent
+// this all belongs to.
+export function buildFinalProtectedProof(input: {
+  readonly deElevation: ExecutorDeElevationProof;
+  readonly finalAuditedAt: string;
+  readonly intent: FederationQuarantineRecord;
+  readonly invocation: Invocation;
+  readonly quarantinedApplyProof: ExecutionProof;
+  readonly review: ReviewManifestResult;
+}): FinalProtectedProof {
+  const { deElevation, finalAuditedAt, intent, invocation, quarantinedApplyProof, review } = input;
+  exact(intent.repository, invocation.repository, "final receipt intent repository");
+  exact(intent.root, invocation.terraformRoot, "final receipt intent root");
+  exact(intent.runId, invocation.githubRunId, "final receipt intent run ID");
+  exact(intent.platformSha, invocation.platformSha, "final receipt intent platform SHA");
+  return {
+    consumerSha: invocation.consumerSha,
+    deElevation,
+    finalTerraformAuditedAt: finalAuditedAt,
+    finalTerraformQuarantined: false,
+    intentDigest: sha256Hex(canonicalJson(json(intent, "final receipt intent"))),
+    platformSha: invocation.platformSha,
+    quarantinedApplyProofDigest: sha256Hex(
+      canonicalJson(json(quarantinedApplyProof, "final receipt apply proof")),
+    ),
+    repository: invocation.repository,
+    restoredPools: intent.pools.map((pool) => ({ ...pool })),
+    reviewSha256: review.sha256,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  };
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 export function federationQuarantineRecordFromJson(value: unknown): FederationQuarantineRecord {
   const source = record(value, "federation quarantine record");
   exactKeys(
@@ -3859,6 +3959,7 @@ export async function runProtectedBootstrap(
   let session: ExecutorSession | undefined;
   let primaryFailure: unknown;
   let quarantinedFederation: FederationQuarantineRecord | undefined;
+  let federationRestored = false;
   try {
     telemetry.phase("controller.prepare");
     const preparation = await dependencies.prepare(invocation, operationDeadlineMs);
@@ -4151,12 +4252,77 @@ export async function runProtectedBootstrap(
     ) {
       throw new Error("The post-WIF freeze snapshot predates the required token-expiry barrier.");
     }
+    // Nothing below this line may still be able to change anything. The
+    // executor hands back mutation authority first and proves, against the live
+    // control plane, that every mutation permission is gone -- so the identity
+    // that publishes the result is a reader.
+    telemetry.phase("controller.de-elevate");
+    const deElevationProof = await dependencies.deElevateExecutor(
+      invocation,
+      session,
+      operationDeadlineMs,
+    );
+    // Federation comes back only once privilege is gone, and on the success
+    // path it happens here rather than in cleanup, so the final audit and the
+    // receipt describe the world as it will actually be left.
+    telemetry.phase("controller.federation-restore");
+    await dependencies.restoreFederation(
+      invocation,
+      quarantinedFederation!,
+      operationDeadlineMs,
+    );
+    federationRestored = true;
+    // The post-apply audit ran with the pool quarantined, so it attests a state
+    // that restoration immediately ends. This one attests the state the run
+    // actually leaves behind: desired state with federation enabled, zero diff.
+    telemetry.phase("controller.final-audit");
+    await dependencies.runTerraform(
+      invocation,
+      session,
+      terraformDirectory,
+      [
+        "plan",
+        "-json",
+        "-detailed-exitcode",
+        "-input=false",
+        "-lock=false",
+        "-no-color",
+        `-var=repository_id=${contract.repositoryId}`,
+        ...(invocation.terraformRoot === "bootstrap"
+          ? [
+              `-var=active_workflow_sha=${invocation.platformSha}`,
+              `-var=federation_quarantined=false`,
+              `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
+              `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
+            ]
+          : []),
+      ],
+      operationDeadlineMs,
+    );
+    const finalAuditedAt = new Date(dependencies.now()).toISOString();
     telemetry.phase("controller.apply-publish");
     await dependencies.publishPostApplyReceipt(
       invocation,
       session,
       review,
       postApplyProof,
+      dependencies.now(),
+    );
+    // One immutable final receipt. It is the only countable success, and it can
+    // only exist after de-elevation, restoration, and the restored-state audit
+    // have all already happened.
+    await dependencies.publishFinalReceipt(
+      invocation,
+      session,
+      review,
+      buildFinalProtectedProof({
+        deElevation: deElevationProof,
+        finalAuditedAt,
+        intent: quarantinedFederation!,
+        invocation,
+        quarantinedApplyProof: postApplyProof,
+        review,
+      }),
       dependencies.now(),
     );
     await dependencies.appendSummary(
@@ -4192,7 +4358,7 @@ export async function runProtectedBootstrap(
     const executorContained = releaseResult!.status === "fulfilled";
     // Federation is restored only after the executor is gone, so no window
     // exists in which consumer tokens work again while privilege still does.
-    if (quarantinedFederation !== undefined) {
+    if (quarantinedFederation !== undefined && !federationRestored) {
       if (!executorContained) {
         // Leave federation closed. Re-opening it while an executor may still
         // hold privilege would hand back exactly the overlap this design
@@ -5195,6 +5361,8 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
+    deElevateExecutor: (invocation, session, operationDeadlineMs) =>
+      manager.deElevate(invocation, session, operationDeadlineMs),
     elevateExecutor: (invocation, session, leaseExpiresAt, operationDeadlineMs) =>
       manager.elevate(invocation, session, leaseExpiresAt, operationDeadlineMs),
     inspectPlan: inspectPlanFile,
@@ -5293,6 +5461,15 @@ function defaultBridgeDependencies(
       ),
     publishPlanReceipt: (invocation, session, review, proof, nowMs) =>
       publishPlanReceipt(
+        invocation,
+        session.accessToken,
+        review,
+        proof,
+        nowMs,
+        api,
+      ),
+    publishFinalReceipt: (invocation, session, review, proof, nowMs) =>
+      publishFinalProtectedReceipt(
         invocation,
         session.accessToken,
         review,
@@ -6031,6 +6208,7 @@ export class ExecutorLeaseManager {
   // policy and must be able to tell its own read leases apart from authority
   // nobody granted.
   #projectMutation: PolicyMutationRecord | undefined;
+  readonly #elevationMutations: PolicyMutationRecord[] = [];
   #policyCleanupComplete = false;
   #roleIntents = new Map<string, EphemeralRoleIntent>();
   #roles: ProjectCustomRole[] = [];
@@ -6489,14 +6667,14 @@ export class ExecutorLeaseManager {
       mutationRole.name,
       this.#projectMutation?.leases ?? [],
     );
-    await this.#recordAndAdd(
+    this.#elevationMutations.push(await this.#recordAndAdd(
       `mutation project ${contract.projectId}`,
       elevation,
       () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
       (policy) => setPolicy(contract.projectId, invocation.ownerAccessToken, policy, this.#fetcher),
       this.#account.email,
       this.#projectMutation?.leases ?? [],
-    );
+    ));
     if (invocation.terraformRoot === "prod") {
       for (const [email, lease] of Object.entries(buildRuntimeActAsLeases(
         invocation.repository,
@@ -6504,18 +6682,61 @@ export class ExecutorLeaseManager {
         leaseExpiresAt,
         this.#account.email,
       ))) {
-        await this.#recordAndAdd(
+        this.#elevationMutations.push(await this.#recordAndAdd(
           `runtime service account ${email}`,
           { leases: [lease] },
           () => getServiceAccountPolicy(email, invocation.ownerAccessToken, this.#fetcher),
           (policy) =>
             setServiceAccountPolicy(email, invocation.ownerAccessToken, policy, this.#fetcher),
           this.#account.email,
-        );
+        ));
       }
     }
     await this.#waitForPermissionProjection(invocation, session.accessToken, "mutation");
     this.#elevated = true;
+  }
+
+  // Hand back mutation authority while keeping exactly the receipt-scoped read
+  // authority the final receipt needs to be written with. This is what makes it
+  // possible for no countable success to exist until privilege is already gone:
+  // the identity that publishes the result can no longer change anything.
+  async deElevate(
+    invocation: Invocation,
+    session: ExecutorSession,
+    operationDeadlineMs: number,
+  ): Promise<ExecutorDeElevationProof> {
+    if (
+      this.#invocation !== invocation || this.#session !== session ||
+      this.#account === undefined
+    ) {
+      throw new Error("Executor de-elevation did not match the acquired single-run identity.");
+    }
+    this.#apiDeadlineMs = operationDeadlineMs;
+    // A rehearsal never elevates, so there is nothing to revoke; the proof
+    // below still runs, and states the absence positively rather than assuming
+    // it from the fact that no grant was made.
+    while (this.#elevationMutations.length > 0) {
+      await this.#removeRecordedMutation(this.#elevationMutations.pop()!, operationDeadlineMs);
+    }
+    this.#elevated = false;
+    // Positive proof against the live control plane: the mutation permission
+    // set must now be absent and only the acquire-time read authority may
+    // remain. This is the same probe elevation itself is validated with.
+    await this.#waitForPermissionProjection(invocation, session.accessToken, "read");
+    const mutation = executorControlPermissions(
+      invocation.repository,
+      invocation.terraformRoot,
+      "mutation",
+    );
+    const read = new Set(
+      executorControlPermissions(invocation.repository, invocation.terraformRoot, "read"),
+    );
+    return {
+      executorEmail: this.#account.email,
+      executorUniqueId: this.#account.uniqueId,
+      observedAt: new Date(Date.now()).toISOString(),
+      provenAbsent: mutation.filter((permission) => !read.has(permission)).toSorted(),
+    };
   }
 
   async release(invocation: Invocation, cleanupDeadlineMs: number): Promise<void> {
@@ -12729,6 +12950,72 @@ export async function publishPostApplyReceipt(
   );
 }
 
+// The only countable success a protected run produces. Every field it carries
+// is a claim that was already true when it was written: mutation authority was
+// gone, all four pools were handed back to the state the durable intent
+// captured, and the restored world audited to zero diff.
+export async function publishFinalProtectedReceipt(
+  invocation: Invocation,
+  executorToken: string,
+  review: ReviewManifestResult,
+  proof: FinalProtectedProof,
+  nowMs: number,
+  fetcher: Fetcher,
+): Promise<void> {
+  if (invocation.mode === "plan") {
+    throw new Error("Plan mode produces no final protected receipt.");
+  }
+  if (invocation.terraformRoot === "exposure") {
+    throw new Error("Exposure adoption has no final protected receipt.");
+  }
+  exact(proof.reviewSha256, review.sha256, "final receipt manifest digest");
+  exact(proof.repository, invocation.repository, "final receipt repository");
+  exact(proof.root, invocation.terraformRoot, "final receipt root");
+  exact(proof.runId, invocation.githubRunId, "final receipt run ID");
+  exact(proof.platformSha, invocation.platformSha, "final receipt platform SHA");
+  exact(proof.consumerSha, invocation.consumerSha, "final receipt consumer SHA");
+  exact(proof.finalTerraformQuarantined, false, "final receipt audited federation state");
+  if (proof.restoredPools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Final receipt does not account for every consumer pool.");
+  }
+  const contract = REPOSITORIES[invocation.repository];
+  const state = contract.state[invocation.terraformRoot];
+  const receipt: JsonValue = json(
+    {
+      consumerSha: proof.consumerSha,
+      deElevation: {
+        executorEmail: proof.deElevation.executorEmail,
+        executorUniqueId: proof.deElevation.executorUniqueId,
+        observedAt: proof.deElevation.observedAt,
+        provenAbsent: [...proof.deElevation.provenAbsent],
+      },
+      finalTerraformAuditedAt: proof.finalTerraformAuditedAt,
+      finalTerraformQuarantined: false,
+      intentDigest: proof.intentDigest,
+      manifestSha256: proof.reviewSha256,
+      mode: "final",
+      platformSha: proof.platformSha,
+      projectId: contract.projectId,
+      publishedAt: new Date(nowMs).toISOString(),
+      quarantinedApplyProofDigest: proof.quarantinedApplyProofDigest,
+      repository: proof.repository,
+      repositoryId: contract.repositoryId,
+      restoredPools: proof.restoredPools.map((pool) => ({ ...pool })),
+      runId: proof.runId,
+      schemaVersion: 1,
+      terraformRoot: proof.root,
+    },
+    "final protected receipt",
+  );
+  await writeImmutableObject(
+    state.bucket,
+    receiptObjectName(state, "final", invocation.githubRunId),
+    `${canonicalJson(receipt)}\n`,
+    executorToken,
+    fetcher,
+  );
+}
+
 function planReceipt(value: unknown): PlanReceipt {
   const receipt = record(value, "plan receipt");
   exactKeys(
@@ -12947,7 +13234,7 @@ async function readObject(
 
 function receiptObjectName(
   state: { readonly prefix: string },
-  kind: "adoptions" | "consumed" | "plans" | "results",
+  kind: "adoptions" | "consumed" | "final" | "plans" | "results",
   runId: string,
 ): string {
   numeric(runId, "receipt run ID");

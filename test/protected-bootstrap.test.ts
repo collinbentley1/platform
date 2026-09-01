@@ -6299,9 +6299,15 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("quarantine:arm")).toBeLessThan(events.indexOf("quarantine"));
     expect(events.indexOf("quarantine")).toBeLessThan(events.indexOf("elevate"));
     expect(events.indexOf("elevate")).toBeLessThan(events.indexOf("terraform:apply"));
-    // No window in which consumer tokens work again while privilege still does.
-    expect(events.indexOf("release")).toBeLessThan(events.indexOf("federation:restore"));
-    expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("federation:restore"));
+    // No window in which consumer tokens work again while privilege still does:
+    // mutation authority is revoked and proven gone before a single pool is
+    // handed back.
+    expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("de-elevate"));
+    expect(events.indexOf("de-elevate")).toBeLessThan(events.indexOf("federation:restore"));
+    // And no countable success exists until after both.
+    expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("publish:post"));
+    expect(events.indexOf("publish:post")).toBeLessThan(events.indexOf("publish:final"));
+    expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("release"));
   });
 
   test("a quarantine that fails halfway is still undone by this run", async () => {
@@ -6334,11 +6340,16 @@ describe("protected owner Terraform bridge", () => {
     expect(events).toContain("federation:restore");
   });
 
-  test("federation stays closed when executor containment was not proven", async () => {
+  test("federation stays closed when a failed run cannot prove executor containment", async () => {
+    // The success path proves containment positively, by revoking mutation
+    // authority and probing the live control plane for its absence, before a
+    // single pool is handed back. This is the other path: the run died before
+    // de-elevation, so the only containment evidence available is whether
+    // releaseExecutor succeeded -- and it did not.
     const raw = plan([]);
     const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
     const events: string[] = [];
-    await expect(runProtectedBootstrap(
+    const failure = await runProtectedBootstrap(
       validateInvocation({
         ...validEnvironment(),
         APPROVED_MANIFEST_SHA256: review.sha256,
@@ -6352,17 +6363,30 @@ describe("protected owner Terraform bridge", () => {
           events.push("release:failed");
           throw new Error("the executor could not be disabled");
         },
-        runTerraform: async () => {},
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          if (args[0] === "apply") throw new Error("terraform apply failed");
+        },
         verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       }),
-    )).rejects.toThrow("cleanup did not complete exactly");
+    ).catch((error: unknown) => error);
 
-    // Re-opening federation while an executor may still hold privilege is the
-    // exact overlap this design removes, so the restore must not have run, and
-    // the run must say why federation was left closed.
-    expect(events).toContain("release:failed");
+    expect(events).not.toContain("de-elevate");
     expect(events).not.toContain("federation:restore");
-    const failure = await runProtectedBootstrap(
+    expect(events).not.toContain("publish:final");
+    const reasons = (failure as AggregateError).errors.flatMap((entry: unknown) =>
+      entry instanceof AggregateError
+        ? entry.errors.map((inner: unknown) => inner instanceof Error ? inner.message : String(inner))
+        : [entry instanceof Error ? entry.message : String(entry)]
+    );
+    expect(reasons.some((reason) => reason.includes("stays quarantined because executor containment was not proven")))
+      .toBe(true);
+  });
+
+  test("a run that dies before de-elevation still hands federation back once contained", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
       validateInvocation({
         ...validEnvironment(),
         APPROVED_MANIFEST_SHA256: review.sha256,
@@ -6370,20 +6394,20 @@ describe("protected owner Terraform bridge", () => {
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
         EXECUTION_MODE: "apply",
       }, true),
-      fakeDependencies([], {
+      fakeDependencies(events, {
         planJson: JSON.stringify(raw),
-        releaseExecutor: async () => {
-          throw new Error("the executor could not be disabled");
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          if (args[0] === "apply") throw new Error("terraform apply failed");
         },
-        runTerraform: async () => {},
         verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       }),
-    ).catch((error: unknown) => error);
-    const reasons = (failure as AggregateError).errors.map((entry: unknown) =>
-      entry instanceof Error ? entry.message : String(entry)
-    );
-    expect(reasons.some((reason) => reason.includes("stays quarantined because executor containment was not proven")))
-      .toBe(true);
+    )).rejects.toThrow("terraform apply failed");
+
+    // Containment succeeded, so the quarantine is undone even though the run
+    // failed -- and no countable success was written.
+    expect(events).toContain("release");
+    expect(events).toContain("federation:restore");
+    expect(events).not.toContain("publish:final");
   });
 
   test("a private-path cleanup failure does not hold federation closed", async () => {
@@ -10233,6 +10257,18 @@ function fakeDependencies(
     }),
     verifyApproval: overrides.verifyApproval ?? (async () => {
       throw new Error("Unexpected approval verification in plan mode.");
+    }),
+    deElevateExecutor: overrides.deElevateExecutor ?? (async () => {
+      events.push("de-elevate");
+      return {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: new Date(now()).toISOString(),
+        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+      };
+    }),
+    publishFinalReceipt: overrides.publishFinalReceipt ?? (async () => {
+      events.push("publish:final");
     }),
     armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation) => {
       events.push("quarantine:arm");
