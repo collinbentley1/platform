@@ -160,6 +160,9 @@ locals {
         # hand: the API being on is what makes the ownership flow reachable at
         # all, so it is part of the declared control plane.
         "identitytoolkit.googleapis.com",
+        # The public score key and server-side assessment API are provisioned
+        # and authorized by the same reviewed bootstrap boundary.
+        "recaptchaenterprise.googleapis.com",
         "run.googleapis.com",
         "secretmanager.googleapis.com",
         "serviceusage.googleapis.com",

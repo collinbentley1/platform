@@ -29,7 +29,7 @@ type ReviewedTerraformContract = {
   // comments, so this pins what the resources DO and leaves the application
   // free to explain them in prose.
   readonly additionalProductionResources?: string;
-  readonly containerEnv?: readonly (readonly [string, string])[];
+  readonly containerEnv?: readonly (readonly [string, string | TerraformExpression])[];
   readonly firestoreDatabase?: readonly (readonly [string, string])[];
   readonly githubRepo?: string;
   readonly name?: string;
@@ -43,6 +43,13 @@ type ReviewedTerraformContract = {
   readonly runtimeSecretVersionAdderIds: readonly string[];
   readonly serviceName?: string;
   readonly stateBucketName?: string;
+};
+
+type TerraformExpression = {
+  // Reviewed HCL, not application input. This exists for public values that are
+  // created in the same plan (for example a reCAPTCHA site key) and therefore
+  // must be wired by resource identity rather than copied as a string.
+  readonly expression: string;
 };
 
 type WorkflowShaPartitions = {
@@ -127,6 +134,29 @@ resource "google_identity_platform_config" "default" {
   ]
 
   depends_on = [google_project_service.identity_toolkit]
+}
+
+resource "google_project_service" "recaptcha_enterprise" {
+  project = var.project_id
+  service = "recaptchaenterprise.googleapis.com"
+
+  disable_on_destroy = false
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  project      = var.project_id
+  display_name = "Medlock waitlist ownership"
+
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+
+  depends_on = [google_project_service.recaptcha_enterprise]
 }`,
     artifactRegistryDescription: "Container images for Medlock.",
     artifactRegistryRepositoryId: "site",
@@ -148,6 +178,8 @@ resource "google_identity_platform_config" "default" {
       ["WAITLIST_BACKEND", "firestore"],
       ["IDENTITY_PLATFORM_AUDIENCE", "medlock-1025243085"],
       ["IDENTITY_PLATFORM_CONTINUE_URL", "https://medlock.ai/api/waitlist/confirm"],
+      ["RECAPTCHA_PROJECT_ID", "medlock-1025243085"],
+      ["RECAPTCHA_SITE_KEY", { expression: "google_recaptcha_enterprise_key.waitlist.name" }],
     ],
     firestoreDatabase: [
       ["name", "(default)"],
@@ -167,6 +199,7 @@ resource "google_identity_platform_config" "default" {
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
       "identitytoolkit.googleapis.com",
+      "recaptchaenterprise.googleapis.com",
       "run.googleapis.com",
       "secretmanager.googleapis.com",
       "serviceusage.googleapis.com",
@@ -1212,13 +1245,24 @@ function renderBootstrapModule(
 
 function renderStringMap(
   name: string,
-  entries: readonly (readonly [string, string])[],
+  entries: readonly (readonly [string, string | TerraformExpression])[],
 ): string[] {
   return [
     `${name} = {`,
-    ...entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+    ...entries.map(([key, value]) => `${key} = ${renderTerraformValue(value)}`),
     "}",
   ];
+}
+
+function renderTerraformValue(value: string | TerraformExpression): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  // Resource-attribute references only. Refuse calls, interpolation, indexing,
+  // conditionals, or operators even in this reviewed table so extending the
+  // contract cannot quietly turn it into an arbitrary HCL injection surface.
+  if (!/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){2}$/.test(value.expression)) {
+    throw new Error("reviewed Terraform expression must be one resource attribute reference");
+  }
+  return value.expression;
 }
 
 function renderProductionVariables(

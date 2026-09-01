@@ -533,6 +533,35 @@ describe("platform scaffold and doctor", () => {
     }
   });
 
+  test("doctor binds the Medlock reCAPTCHA site key to the reviewed resource", async () => {
+    const env = { TRUSTED_GITHUB_REPOSITORY_ID: "1025243085" };
+    for (const replacement of [
+      '"copied-public-site-key"',
+      "google_recaptcha_enterprise_key.attacker.name",
+    ]) {
+      const app = await scaffold("medlock");
+      await configureReviewedMedlock(app);
+      const path = join(app, "infra/terraform/prod/main.tf");
+      await writeFile(
+        path,
+        (await readFile(path, "utf8")).replace(
+          "RECAPTCHA_SITE_KEY             = google_recaptcha_enterprise_key.waitlist.name",
+          `RECAPTCHA_SITE_KEY             = ${replacement}`,
+        ),
+      );
+
+      for (const result of [
+        await run(["doctor", app], env),
+        await runContract(app, "1025243085"),
+      ]) {
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          "infra/terraform/prod/main.tf module site must exactly match the reviewed repository-specific platform contract",
+        );
+      }
+    }
+  });
+
   test("doctor rejects stale preview-operator grant claims even beside canonical decoys", async () => {
     const app = await scaffold("operator-description-drift");
     const path = join(app, "infra/terraform/bootstrap/outputs.tf");
@@ -2836,7 +2865,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "6296610960293239eefe378271edccb01e81fcf73058209653c6b51dda426f85",
+      "622b96533c846ed215f419aba7e73c7bd9469f37965fe43a253fa621c7fa96e3",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -3766,6 +3795,29 @@ resource "google_identity_platform_config" "default" {
   ]
 
   depends_on = [google_project_service.identity_toolkit]
+}
+
+resource "google_project_service" "recaptcha_enterprise" {
+  project = var.project_id
+  service = "recaptchaenterprise.googleapis.com"
+
+  disable_on_destroy = false
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  project      = var.project_id
+  display_name = "Medlock waitlist ownership"
+
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+
+  depends_on = [google_project_service.recaptcha_enterprise]
 }`;
 
 async function configureReviewedMedlock(app: string): Promise<void> {
@@ -3793,6 +3845,8 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    WAITLIST_BACKEND               = "firestore"',
         '    IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"',
         '    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"',
+        '    RECAPTCHA_PROJECT_ID           = "medlock-1025243085"',
+        "    RECAPTCHA_SITE_KEY             = google_recaptcha_enterprise_key.waitlist.name",
         "  }",
       ].join("\n"),
     )
@@ -3853,6 +3907,7 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    "iam.googleapis.com",',
         '    "iamcredentials.googleapis.com",',
         '    "identitytoolkit.googleapis.com",',
+        '    "recaptchaenterprise.googleapis.com",',
         '    "run.googleapis.com",',
         '    "secretmanager.googleapis.com",',
         '    "serviceusage.googleapis.com",',

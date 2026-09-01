@@ -603,6 +603,16 @@ resource "google_project_iam_custom_role" "terraform_convergence_reader" {
       "datastore.databases.getMetadata",
       "datastore.databases.list",
     ] : [],
+    var.manage_firestore_field_ttl ? [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+    ] : [],
+    contains(var.required_services, "identitytoolkit.googleapis.com") ? [
+      "firebaseauth.configs.get",
+    ] : [],
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.keys.get",
+    ] : [],
     contains(var.required_services, "secretmanager.googleapis.com") ? [
       "secretmanager.locations.get",
       "secretmanager.locations.list",
@@ -693,6 +703,14 @@ resource "google_project_iam_custom_role" "protected_terraform_apply" {
       "firebaseauth.configs.get",
       "firebaseauth.configs.update",
     ] : [],
+    # A protected apply creates and updates the one reviewed public score key.
+    # Delete is deliberately absent and the resource uses deletion_policy =
+    # PREVENT. retrievelegacysecretkey is also absent: this design has no secret.
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.update",
+    ] : [],
     contains(var.required_services, "secretmanager.googleapis.com") ? [
       "secretmanager.locations.get",
       "secretmanager.locations.list",
@@ -752,14 +770,17 @@ resource "google_project_iam_member" "preview_iam_auditors" {
   member  = each.value
 }
 
-# The one permission the waitlist ownership challenge needs, and nothing else.
+# The three permissions the waitlist ownership flow needs, and nothing else.
 #
 # The runtime sends an email-link sign-in challenge by calling
 # projects.accounts:sendOobCode with its own identity. roles/firebaseauth.admin
 # would also work and is refused: it carries users.create, users.delete,
 # users.update, users.get, and configs.getSecret, so a compromised runtime could
 # enumerate the account directory, take over accounts, or read provider secrets.
-# Sending mail needs none of that.
+# Sending mail needs none of that. The same role can create a scored reCAPTCHA
+# assessment, but cannot list, alter, or retrieve a key. serviceusage.services.use
+# is present solely because the documented keyless OOB check names this project
+# as its quota project with X-Goog-User-Project.
 #
 # Scoped to applications that actually declare Identity Platform, so no other
 # project's runtime gains a Firebase Auth permission it never uses.
@@ -768,11 +789,17 @@ resource "google_project_iam_custom_role" "waitlist_challenge_sender" {
 
   project     = var.project_id
   role_id     = "waitlistChallengeSender"
-  title       = "Waitlist Challenge Sender"
-  description = "Sends the email-link ownership challenge. No account read, create, update, delete, or provider-secret access."
-  permissions = [
-    "firebaseauth.users.sendEmail",
-  ]
+  title       = "Waitlist Ownership Runtime"
+  description = "Sends ownership mail, checks reCAPTCHA, and consumes project quota without account or key administration."
+  permissions = concat(
+    [
+      "firebaseauth.users.sendEmail",
+      "serviceusage.services.use",
+    ],
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.assessments.create",
+    ] : [],
+  )
 
   depends_on = [google_project_service.required]
 }

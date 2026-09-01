@@ -43,13 +43,17 @@ function block(source: string, header: string): string {
 }
 
 describe("waitlist ownership grants are exactly least privilege", () => {
-  test("the runtime challenge sender holds one permission and only one", async () => {
+  test("the runtime holds only mail, assessment, and quota-consumer permissions", async () => {
     const source = await readFile(bootstrapModule, "utf8");
     const role = block(
       source,
       'resource "google_project_iam_custom_role" "waitlist_challenge_sender"',
     );
-    expect(grantedPermissions(role)).toEqual(["firebaseauth.users.sendEmail"]);
+    expect(grantedPermissions(role)).toEqual([
+      "firebaseauth.users.sendEmail",
+      "serviceusage.services.use",
+      "recaptchaenterprise.assessments.create",
+    ]);
   });
 
   // Each of these would turn "may send a verification email" into something
@@ -71,6 +75,13 @@ describe("waitlist ownership grants are exactly least privilege", () => {
       "firebaseauth.configs.getSecret",
       "firebaseauth.configs.get",
       "firebaseauth.configs.update",
+      "recaptchaenterprise.assessments.annotate",
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.delete",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.list",
+      "recaptchaenterprise.keys.retrievelegacysecretkey",
+      "recaptchaenterprise.keys.update",
     ]) {
       expect(granted).not.toContain(forbidden);
     }
@@ -154,16 +165,54 @@ describe("the protected apply identity gains only what TTL and config need", () 
     expect(granted).not.toContain("firebaseauth.configs.getSecret");
     expect(granted.filter((value) => value.startsWith("firebaseauth.users."))).toEqual([]);
   });
+
+  test("reCAPTCHA key management can create and update but never delete or retrieve a secret", async () => {
+    const source = await readFile(bootstrapModule, "utf8");
+    const role = block(
+      source,
+      'resource "google_project_iam_custom_role" "protected_terraform_apply"',
+    );
+    const granted = grantedPermissions(role);
+    for (const permission of [
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.update",
+    ]) {
+      expect(granted).toContain(permission);
+    }
+    for (const forbidden of [
+      "recaptchaenterprise.keys.delete",
+      "recaptchaenterprise.keys.list",
+      "recaptchaenterprise.keys.retrievelegacysecretkey",
+    ]) {
+      expect(granted).not.toContain(forbidden);
+    }
+  });
+
+  test("the convergence reader can read the score key but cannot mutate it", async () => {
+    const source = await readFile(bootstrapModule, "utf8");
+    const role = block(
+      source,
+      'resource "google_project_iam_custom_role" "terraform_convergence_reader"',
+    );
+    const granted = grantedPermissions(role);
+    expect(granted).toContain("recaptchaenterprise.keys.get");
+    expect(granted.filter((value) => value.startsWith("recaptchaenterprise.keys."))).toEqual([
+      "recaptchaenterprise.keys.get",
+    ]);
+  });
 });
 
 describe("only the application that needs them declares them", () => {
-  test("Identity Platform and TTL are scoped to the Medlock deployment", async () => {
+  test("Identity Platform, reCAPTCHA, and TTL are scoped to the Medlock deployment", async () => {
     const source = await readFile(bootstrapDeployment, "utf8");
     expect(source.match(/identitytoolkit\.googleapis\.com/g)?.length).toBe(1);
+    expect(source.match(/recaptchaenterprise\.googleapis\.com/g)?.length).toBe(1);
     expect(source.match(/manage_firestore_field_ttl\s*=\s*true/g)?.length).toBe(1);
     // And it is the Medlock entry that carries them.
     const medlock = source.slice(source.indexOf('"1025243085" = {'));
     expect(medlock.indexOf("identitytoolkit.googleapis.com")).toBeGreaterThan(-1);
+    expect(medlock.indexOf("recaptchaenterprise.googleapis.com")).toBeGreaterThan(-1);
     expect(medlock.indexOf("manage_firestore_field_ttl = true")).toBeGreaterThan(-1);
   });
 
@@ -186,6 +235,7 @@ describe("only the application that needs them declares them", () => {
       medlock.indexOf("manage_firestore_field_ttl"),
     );
     expect(services).toContain("identitytoolkit.googleapis.com");
+    expect(services).toContain("recaptchaenterprise.googleapis.com");
   });
 });
 
