@@ -1035,6 +1035,20 @@ export type FinalProtectedProof =
 // not know?"), needs seven minutes of propagation plus three stable, and cannot
 // fit between operationDeadlineMs and cleanupDeadlineMs. Wiring it inline would
 // have failed every apply at its last step.
+// An exact reference to one published object, not merely its digest. Completion
+// names the bucket, key, generation, size and content hash it countersigns, so
+// a verifier can re-read exactly that object and nothing else.
+export interface FinalReceiptReference {
+  readonly bucket: string;
+  readonly deElevationExecutorEmail: string;
+  readonly deElevationExecutorUniqueId: string;
+  readonly digest: string;
+  readonly generation: string;
+  readonly object: string;
+  readonly publishedAt: string;
+  readonly size: number;
+}
+
 export interface ExecutorReleaseProof {
   readonly artifactsDeleted: true;
   readonly executorEmail: string;
@@ -1143,20 +1157,22 @@ export interface BridgeDependencies {
   ) => Promise<void>;
   // The single countable success. Written only after de-elevation, federation
   // restoration, and the restored-state audit have all succeeded.
+  // Written by the OWNER, not the executor. The executor holds no capability on
+  // this object at any point in its life, so the ordering claim is enforced by
+  // which credential can write it rather than by the order of two statements.
   readonly publishFinalReceipt: (
     invocation: Invocation,
-    session: ExecutorSession,
     review: ReviewManifestResult,
     proof: FinalProtectedProof,
     nowMs: number,
-  ) => Promise<string>;
+  ) => Promise<FinalReceiptReference>;
   // Written by the OWNER, after the executor is provably gone. Until this
   // exists the final receipt is a claim, not a countable success: the receipt
   // is published by a de-elevated identity that still exists, and deleting that
   // identity can still fail afterwards.
   readonly publishOwnerCompletion: (
     invocation: Invocation,
-    finalReceiptDigest: string,
+    pending: FinalReceiptReference,
     releaseProof: ExecutorReleaseProof,
     cleanupDeadlineMs: number,
   ) => Promise<void>;
@@ -1656,6 +1672,12 @@ export function buildStorageLease(
 // completed their cleanup in process, so no such orphan is believed to exist --
 // but "believed" is not the standard for a path whose failure mode is a manual
 // outage.
+// Historical orphan recognizer ONLY, and therefore FROZEN. This is the exact
+// v0.5.28 shape -- consumed/* plus results/* in one combined creator binding --
+// and it must never track current grants. If it drifts, recovery stops
+// recognising the orphans it exists to clean up, and the protected path refuses
+// every run until somebody clears them by hand. No current run is granted it:
+// results/* no longer exists and final/* is the owner's.
 export function buildLegacyCombinedReceiptCreateLease(
   repository: RepositoryName,
   root: TerraformRoot,
@@ -1671,9 +1693,6 @@ export function buildLegacyCombinedReceiptCreateLease(
   const resources = [
     `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "consumed", approvedPlanRunId)}`,
     `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "results", runId)}`,
-    // The final receipt is written after mutation authority is revoked, so its
-    // exact object has to be inside the create-only scope granted at acquire.
-    `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "final", runId)}`,
   ];
   return {
     condition: {
@@ -1787,20 +1806,15 @@ export function buildReceiptLeases(
   const consumedResource = mode === "apply"
     ? `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "consumed", approvedPlanRunId)}`
     : undefined;
-  const resultResource = mode === "apply"
-    ? `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "results", runId)}`
-    : undefined;
-  // The one countable success, written after mutation authority is revoked.
-  // A rehearsal writes it too: it is the only object a rehearsal produces.
-  const finalResource = mode === "plan"
-    ? undefined
-    : `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "final", runId)}`;
+  // Deliberately absent: the executor is granted NO capability on the final
+  // receipt, at acquire or at any later point. An acquire-time grant would let
+  // IAM permit that object to be published while mutation authority was still
+  // live, which would leave the publish-after-de-elevation ordering enforced by
+  // cooperative code rather than by credentials. The owner writes it instead.
   const member = executorMember(contract.projectId, executorServiceAccountEmail);
   const viewerResources = [
     planResource,
     ...(consumedResource === undefined ? [] : [consumedResource]),
-    ...(resultResource === undefined ? [] : [resultResource]),
-    ...(finalResource === undefined ? [] : [finalResource]),
     ...(repository === "runsetta" && root === "prod" && exposureAdoptionRunId !== ""
       ? [
           `projects/_/buckets/${contract.state.exposure.bucket}/objects/${receiptObjectName(
@@ -1811,22 +1825,18 @@ export function buildReceiptLeases(
         ]
       : []),
   ];
-  // Apply splits the creator scope in two. The executor must be able to write
-  // the consumed receipt during consumeApproval, and must NOT still be able to
-  // when elevate probes the mutation projection immediately afterwards -- that
-  // projection forbids create on it, and nothing revoked the grant, so the two
-  // contradicted each other permanently and no apply could ever elevate.
+  // The consumed receipt keeps its own short-lived creator lease, revoked at
+  // elevation: the executor must be able to write it during consumeApproval and
+  // must NOT still be able to when elevate probes the mutation projection.
   // Observed on run 33300997122: `consumed/33300628538.json (unexpectedly holds
-  // storage.objects.create)`. Separating the scopes lets elevate remove exactly
-  // the consumed grant while the result grant, which is still needed to publish
-  // the post-apply receipt, survives.
-  // A rehearsal publishes exactly one object and reviews no plan, so it gets
-  // create on the final receipt and nothing else.
-  const creatorResources = mode === "rehearsal"
-    ? [finalResource!]
-    : consumedResource === undefined
-    ? [planResource]
-    : [resultResource!, finalResource!];
+  // storage.objects.create)`.
+  //
+  // Beyond that, an apply or rehearsal executor now creates nothing at all. The
+  // results receipt is gone and the final receipt is the owner's, so there is
+  // no second creator lease to grant -- which is what makes "published only
+  // after mutation authority was surrendered" a statement about credentials
+  // rather than about the order of two lines of code.
+  const creatorResources = mode === "plan" ? [planResource] : [];
   return [
     ...(consumedResource === undefined ? [] : [{
       condition: {
@@ -1843,7 +1853,7 @@ export function buildReceiptLeases(
       members: [member],
       role: "roles/storage.objectCreator",
     } satisfies IamBinding]),
-    {
+    ...(creatorResources.length === 0 ? [] : [{
       condition: {
         ...expiringCondition(
           `codex-receipt-create-${runId}`,
@@ -1857,7 +1867,7 @@ export function buildReceiptLeases(
       },
       members: [member],
       role: "roles/storage.objectCreator",
-    },
+    } satisfies IamBinding]),
     {
       condition: {
         ...expiringCondition(
@@ -3595,7 +3605,7 @@ async function listStorageObjects(
         throw new Error("Federation intent object size escaped its bound.");
       }
       const generation = requiredString(item.generation, "federation intent generation");
-      if (!/^[0-9]+$/.test(generation)) {
+      if (!/^[1-9][0-9]*$/.test(generation)) {
         throw new Error("Federation intent generation is malformed.");
       }
       items.push({
@@ -3654,7 +3664,7 @@ export function federationRestoreMarkerFromJson(
     source.intentGeneration,
     "federation restore marker intent generation",
   );
-  if (!/^[0-9]+$/.test(intentGeneration)) {
+  if (!/^[1-9][0-9]*$/.test(intentGeneration)) {
     throw new Error("Federation restore marker intent generation is malformed.");
   }
   const restoredAt = requiredString(source.restoredAt, "federation restore marker time");
@@ -3765,6 +3775,19 @@ async function federationInventory(
       }
       inventory.push({ ...entry, bucket: location.bucket });
     }
+    // A completion marker with no intent behind it is not a harmless leftover:
+    // either the intent it completed was deleted, or somebody planted a marker
+    // to suppress a restore that has not happened. Neither is safe to walk past.
+    const present = new Set(objects.map((entry) => entry.name));
+    for (const entry of objects) {
+      if (!entry.name.endsWith(".restored")) continue;
+      const intentName = entry.name.slice(0, -".restored".length);
+      if (!present.has(intentName)) {
+        throw new Error(
+          `Federation restore marker ${entry.name} has no matching intent object.`,
+        );
+      }
+    }
   }
   return inventory.toSorted((left, right) =>
     `${left.bucket}/${left.name}` < `${right.bucket}/${right.name}` ? -1 : 1
@@ -3848,19 +3871,27 @@ export async function recoverFederationQuarantines(
     const markerEntry = byKey.get(`${entry.bucket}/${entry.name}.restored`);
     if (markerEntry !== undefined) {
       exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
+      const markerBody = await readObjectGeneration(
+        entry.bucket,
+        markerEntry.name,
+        markerEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (Buffer.byteLength(markerBody) !== markerEntry.size) {
+        throw new Error(
+          `Federation restore marker ${markerEntry.name} did not match its listed size.`,
+        );
+      }
       const marker = federationRestoreMarkerFromJson(
-        JSON.parse(
-          await readObjectGeneration(
-            entry.bucket,
-            markerEntry.name,
-            markerEntry.generation,
-            ownerAccessToken,
-            fetcher,
-          ),
-        ) as unknown,
+        JSON.parse(markerBody) as unknown,
         now(),
         capturedAtMs,
       );
+      // Canonical bytes, not merely equivalent JSON: a marker that parses to the
+      // right values but was serialised differently was not written by this
+      // system, and the whole point of the marker is provenance.
+      exact(markerBody, federationRestoreMarkerBody(marker), "federation restore marker bytes");
       exact(marker.intentDigest, digest, "federation restore marker intent digest");
       exact(marker.intentGeneration, entry.generation, "federation restore marker intent generation");
       exact(marker.repository, intent.repository, "federation restore marker repository");
@@ -3908,6 +3939,29 @@ export async function recoverFederationQuarantines(
     return { restored: [], scanned, skippedComplete, skippedUncontained: uncontained };
   }
 
+  // Containment takes minutes. A new intent can be armed, or a marker written,
+  // in that window -- and phase one's conclusions would then be about a world
+  // that no longer exists. Re-prove the inventory is byte-identical to the one
+  // those conclusions were drawn from, immediately before the first pool moves.
+  const confirmed = await stableFederationInventory(ownerAccessToken, fetcher);
+  if (confirmed.length !== inventory.length) {
+    throw new Error(
+      "The federation intent inventory changed while incomplete intents were being contained; restore none and rescan.",
+    );
+  }
+  inventory.forEach((entry, index) => {
+    const later = confirmed[index]!;
+    if (
+      entry.bucket !== later.bucket || entry.name !== later.name ||
+      entry.generation !== later.generation || entry.metageneration !== later.metageneration ||
+      entry.size !== later.size
+    ) {
+      throw new Error(
+        `The federation intent inventory changed at ${entry.bucket}/${entry.name} while incomplete intents were being contained; restore none and rescan.`,
+      );
+    }
+  });
+
   // ---- phase two: restore, deterministically -------------------------------
   const restored: string[] = [];
   for (const entry of incomplete) {
@@ -3944,6 +3998,51 @@ export async function recoverFederationQuarantines(
 // Idempotent under a lost write response: if the marker is already there, it
 // must be the marker this run would have written, byte for byte. Anything else
 // is a conflict, not a retry.
+// One write, reconciled honestly.
+//
+// A write can fail three ways: it never happened, it happened and the response
+// was lost, or the key was already taken. Only the first is a real failure, and
+// the caller cannot tell them apart from the error alone. So on ANY failure --
+// a precondition conflict, a transport error after the bytes were committed, a
+// truncated response -- this asks the one question that settles it: is there an
+// object at this key, written once, of exactly this size, whose bytes at its
+// own generation are exactly the bytes we meant to write?
+//
+// If yes, the write committed and this is a retry. If anything about that is
+// not exactly so, the ORIGINAL failure is rethrown -- never a message about the
+// reconciliation, which would hide what actually went wrong.
+async function writeImmutableObjectIdempotent(
+  bucket: string,
+  object: string,
+  body: string,
+  token: string,
+  fetcher: Fetcher,
+  validate: (parsed: unknown) => void = () => {},
+): Promise<void> {
+  let original: unknown;
+  try {
+    await writeImmutableObject(bucket, object, body, token, fetcher);
+    return;
+  } catch (error) {
+    original = error;
+  }
+  try {
+    const metadata = await readObjectMetadata(bucket, object, token, fetcher);
+    if (metadata.size !== Buffer.byteLength(body)) throw original;
+    const observed = await readObjectGeneration(
+      bucket,
+      object,
+      metadata.generation,
+      token,
+      fetcher,
+    );
+    if (observed !== body) throw original;
+    validate(JSON.parse(observed) as unknown);
+  } catch {
+    throw original;
+  }
+}
+
 export async function writeFederationRestoreMarker(
   bucket: string,
   intentObject: string,
@@ -3953,36 +4052,14 @@ export async function writeFederationRestoreMarker(
   now: () => number = () => Date.now(),
   capturedAtMs: number = Date.parse(marker.restoredAt),
 ): Promise<void> {
-  const body = federationRestoreMarkerBody(marker);
-  const object = `${intentObject}.restored`;
-  try {
-    await writeImmutableObject(bucket, object, body, token, fetcher);
-    return;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // Only a precondition conflict is a candidate for reconciliation. Anything
-    // else is a real failure and must not be interpreted as "already done".
-    if (!message.includes("already published or consumed")) throw error;
-  }
-  // Reconcile through exact metadata, then a generation-bound media read. A
-  // read by name alone would validate whatever sits at the key now, which is
-  // precisely what an attacker who can create objects would arrange.
-  const metadata = await readObjectMetadata(bucket, object, token, fetcher);
-  exact(metadata.metageneration, "1", "existing federation restore marker metageneration");
-  if (metadata.size !== Buffer.byteLength(body)) {
-    throw new Error("A different federation restore marker already exists for this intent.");
-  }
-  const observed = await readObjectGeneration(
+  await writeImmutableObjectIdempotent(
     bucket,
-    object,
-    metadata.generation,
+    `${intentObject}.restored`,
+    federationRestoreMarkerBody(marker),
     token,
     fetcher,
+    (parsed) => federationRestoreMarkerFromJson(parsed, now(), capturedAtMs),
   );
-  federationRestoreMarkerFromJson(JSON.parse(observed) as unknown, now(), capturedAtMs);
-  if (observed !== body) {
-    throw new Error("A different federation restore marker already exists for this intent.");
-  }
 }
 
 export function federationIntentLocations(): readonly {
@@ -4591,7 +4668,7 @@ export async function runProtectedBootstrap(
     | { readonly generation: string; readonly record: FederationQuarantineRecord }
     | undefined;
   let federationRestored = false;
-  let finalReceiptDigest: string | undefined;
+  let pendingReceipt: FinalReceiptReference | undefined;
   let completedReleaseProof: ExecutorReleaseProof | undefined;
   try {
     // Nothing starts until the fleet is known to be free of unrepaired
@@ -4672,9 +4749,8 @@ export async function runProtectedBootstrap(
         }, "rehearsal review identity"))),
       };
       telemetry.phase("controller.apply-publish");
-      finalReceiptDigest = await dependencies.publishFinalReceipt(
+      pendingReceipt = await dependencies.publishFinalReceipt(
         invocation,
-        session,
         rehearsalReview,
         buildFinalProtectedProof({
           deElevation: rehearsalDeElevation,
@@ -5005,9 +5081,8 @@ export async function runProtectedBootstrap(
     // One receipt. The legacy post-apply receipt is gone: it was written before
     // privilege was surrendered and before federation was handed back, so it
     // could be counted as success for a run that never finished either.
-    finalReceiptDigest = await dependencies.publishFinalReceipt(
+    pendingReceipt = await dependencies.publishFinalReceipt(
       invocation,
-      session,
       review,
       buildFinalProtectedProof({
         deElevation: deElevationProof,
@@ -5105,7 +5180,7 @@ export async function runProtectedBootstrap(
   // countersigns the receipt. Until this object exists the final receipt is a
   // claim, not a countable success -- which is what stops a run whose executor
   // deletion failed from being counted as one.
-  if (finalReceiptDigest !== undefined) {
+  if (pendingReceipt !== undefined) {
     if (completedReleaseProof === undefined) {
       // The receipt the executor wrote stays pending. Nothing counts it, and a
       // later fresh recovery run -- which has the full propagation budget --
@@ -5117,7 +5192,7 @@ export async function runProtectedBootstrap(
     telemetry.phase("controller.owner-completion");
     await dependencies.publishOwnerCompletion(
       invocation,
-      finalReceiptDigest,
+      pendingReceipt,
       completedReleaseProof,
       cleanupDeadlineMs,
     );
@@ -6206,26 +6281,21 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishFinalReceipt: (invocation, session, review, proof, nowMs) =>
+    publishFinalReceipt: (invocation, review, proof, nowMs) =>
       publishFinalProtectedReceipt(
         invocation,
-        session.accessToken,
+        invocation.ownerAccessToken,
         review,
         proof,
         nowMs,
         api,
       ),
-    publishOwnerCompletion: async (
-      invocation,
-      finalReceiptDigest,
-      releaseProof,
-      cleanupDeadlineMs,
-    ) => {
+    publishOwnerCompletion: async (invocation, pending, releaseProof, cleanupDeadlineMs) => {
       assertBeforeDeadline(Date.now(), cleanupDeadlineMs, "owner completion proof");
       await publishOwnerCompletionProof(
         invocation,
         invocation.ownerAccessToken,
-        finalReceiptDigest,
+        pending,
         releaseProof,
         Date.now(),
         api,
@@ -12014,14 +12084,9 @@ export async function waitForStatePermissions(
             : expected === "mutation"
             ? readOnly
             : createRead,
-        }, {
-          bucket: state.bucket,
-          // Still absent at elevation, so create remains both provable and
-          // necessary: this run publishes it.
-          name: receiptObjectName(state, "results", invocation.githubRunId),
-          required: expected === "none" ? noAccess : createRead,
-        }]
+        }, ...ownerWrittenReceiptProbes(state, invocation)]
       : []),
+    ...(invocation.mode === "rehearsal" ? ownerWrittenReceiptProbes(state, invocation) : []),
     ...(invocation.terraformRoot === "exposure"
       ? (() => {
           const contract = REPOSITORIES[invocation.repository];
@@ -12224,6 +12289,36 @@ export async function waitForStatePermissions(
       unconverged.length === 0
         ? ""
         : `Unconverged after the final scan: ${unconverged.join(", ")}.`);
+}
+
+// Owner-written artifacts, probed in EVERY phase and required to return zero
+// executor permissions.
+//
+// Removing the lease is not the same statement as proving the absence. A
+// bucket-level binding, an inherited grant, or anything issued out of band
+// would be invisible if these keys simply stopped being probed -- so they are
+// probed precisely because nothing grants them. The negative result is the
+// evidence; the missing lease is only the intent.
+//
+// `results/*` is included even though no current run writes it: a stale grant
+// from a build that predates its removal is exactly the thing worth catching.
+function ownerWrittenReceiptProbes(
+  state: { readonly bucket: string; readonly prefix: string },
+  invocation: Invocation,
+): readonly {
+  readonly bucket: string;
+  readonly name: string;
+  readonly required: ReadonlySet<string>;
+}[] {
+  const noAccess: ReadonlySet<string> = new Set<string>();
+  return [
+    receiptObjectName(state, "results", invocation.githubRunId),
+    receiptObjectName(state, "final", invocation.githubRunId),
+    receiptObjectName(state, "completion", invocation.githubRunId),
+    ...(invocation.mode === "rehearsal"
+      ? [receiptObjectName(state, "rehearsals", invocation.githubRunId)]
+      : []),
+  ].map((name) => ({ bucket: state.bucket, name, required: noAccess }));
 }
 
 export async function waitForControlPermissions(
@@ -13745,7 +13840,7 @@ export async function publishFinalProtectedReceipt(
   proof: FinalProtectedProof,
   nowMs: number,
   fetcher: Fetcher,
-): Promise<string> {
+): Promise<FinalReceiptReference> {
   if (invocation.mode === "plan") {
     throw new Error("Plan mode produces no final protected receipt.");
   }
@@ -13809,14 +13904,24 @@ export async function publishFinalProtectedReceipt(
     "final protected receipt",
   );
   const body = `${canonicalJson(receipt)}\n`;
-  await writeImmutableObject(
+  const object = receiptObjectName(state, "final", invocation.githubRunId);
+  const generation = await writeImmutableObject(
     state.bucket,
-    receiptObjectName(state, "final", invocation.githubRunId),
+    object,
     body,
     executorToken,
     fetcher,
   );
-  return sha256Hex(body);
+  return {
+    bucket: state.bucket,
+    deElevationExecutorEmail: proof.deElevation.executorEmail,
+    deElevationExecutorUniqueId: proof.deElevation.executorUniqueId,
+    digest: sha256Hex(body),
+    generation,
+    object,
+    publishedAt: new Date(nowMs).toISOString(),
+    size: Buffer.byteLength(body),
+  };
 }
 
 // The owner's countersignature. A verifier that requires this is requiring, in
@@ -13825,13 +13930,39 @@ export async function publishFinalProtectedReceipt(
 export async function publishOwnerCompletionProof(
   invocation: Invocation,
   ownerToken: string,
-  finalReceiptDigest: string,
+  pending: FinalReceiptReference,
   releaseProof: ExecutorReleaseProof,
   nowMs: number,
   fetcher: Fetcher,
 ): Promise<void> {
-  if (!/^[0-9a-f]{64}$/.test(finalReceiptDigest)) {
+  if (!/^[0-9a-f]{64}$/.test(pending.digest)) {
     throw new Error("Owner completion proof requires a SHA-256 final receipt digest.");
+  }
+  if (!/^[1-9][0-9]*$/.test(pending.generation)) {
+    throw new Error("Owner completion proof requires a positive final receipt generation.");
+  }
+  // The identity that surrendered privilege and the identity that was deleted
+  // must be the same account. Otherwise the completion would be countersigning
+  // one executor's de-elevation with a different executor's removal.
+  exact(
+    releaseProof.executorEmail,
+    pending.deElevationExecutorEmail,
+    "owner completion executor email",
+  );
+  exact(
+    releaseProof.executorUniqueId,
+    pending.deElevationExecutorUniqueId,
+    "owner completion executor unique ID",
+  );
+  const publishedAtMs = Date.parse(pending.publishedAt);
+  const releasedAtMs = Date.parse(releaseProof.observedAt);
+  if (
+    !Number.isFinite(publishedAtMs) || !Number.isFinite(releasedAtMs) ||
+    new Date(publishedAtMs).toISOString() !== pending.publishedAt ||
+    new Date(releasedAtMs).toISOString() !== releaseProof.observedAt ||
+    releasedAtMs < publishedAtMs || nowMs < releasedAtMs
+  ) {
+    throw new Error("Owner completion proof requires canonical, ordered timestamps.");
   }
   // Only an apply can ever be counted. A rehearsal runs no Terraform and a plan
   // changes nothing, so neither may produce a completion object at all.
@@ -13851,7 +13982,14 @@ export async function publishOwnerCompletionProof(
       permissionsProvenGone: releaseProof.permissionsProvenGone,
       projectBindingsCleared: releaseProof.projectBindingsCleared,
     },
-    finalReceiptDigest,
+    finalReceipt: {
+      bucket: pending.bucket,
+      digest: pending.digest,
+      generation: pending.generation,
+      object: pending.object,
+      publishedAt: pending.publishedAt,
+      size: pending.size,
+    },
     kind: "apply",
     platformSha: invocation.platformSha,
     repository: invocation.repository,
@@ -13860,7 +13998,10 @@ export async function publishOwnerCompletionProof(
     schemaVersion: 1,
     terraformRoot: invocation.terraformRoot,
   }, "owner completion proof"))}\n`;
-  await writeImmutableObject(
+  // Same reconciliation as the marker: a lost response after a committed write
+  // must not turn a finished run into a failed one, and must not be mistaken
+  // for one either.
+  await writeImmutableObjectIdempotent(
     state.bucket,
     receiptObjectName(state, "completion", invocation.githubRunId),
     body,
@@ -14089,15 +14230,15 @@ function assertStorageObjectMetadata(
 ): { readonly generation: string; readonly metageneration: string } {
   const metadata = record(value, label);
   exact(requiredString(metadata.name, `${label} name`), object, `${label} name`);
-  if (metadata.bucket !== undefined) {
-    exact(requiredString(metadata.bucket, `${label} bucket`), bucket, `${label} bucket`);
-  }
+  // Required, not optional: a response that declines to say which bucket it
+  // wrote to cannot establish that it wrote to this one.
+  exact(requiredString(metadata.bucket, `${label} bucket`), bucket, `${label} bucket`);
   const size = Number(requiredString(metadata.size, `${label} size`));
   if (!Number.isSafeInteger(size) || size !== expectedSize) {
     throw new Error(`${label} size did not match the bytes written.`);
   }
   const generation = requiredString(metadata.generation, `${label} generation`);
-  if (!/^[0-9]+$/.test(generation)) throw new Error(`${label} generation is malformed.`);
+  if (!/^[1-9][0-9]*$/.test(generation)) throw new Error(`${label} generation is malformed.`);
   const metageneration = requiredString(metadata.metageneration, `${label} metageneration`);
   exact(metageneration, "1", `${label} metageneration`);
   return { generation, metageneration };
@@ -14110,6 +14251,9 @@ async function readObjectMetadata(
   token: string,
   fetcher: Fetcher,
 ): Promise<{ readonly generation: string; readonly metageneration: string; readonly size: number }> {
+  // Exact key, exact bucket, a positive generation, an unrewritten
+  // metageneration, and a size inside the reviewed bound. Anything looser and
+  // the reconciliation below is validating an object nobody named.
   const url = new URL(
     `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(object)}`,
   );
@@ -14120,13 +14264,18 @@ async function readObjectMetadata(
   }
   const metadata = record(await boundedJson(response, 256 * 1024), "object metadata");
   exact(requiredString(metadata.name, "object metadata name"), object, "object metadata name");
+  exact(requiredString(metadata.bucket, "object metadata bucket"), bucket, "object metadata bucket");
   const generation = requiredString(metadata.generation, "object metadata generation");
-  if (!/^[0-9]+$/.test(generation)) throw new Error("Object metadata generation is malformed.");
-  return {
-    generation,
-    metageneration: requiredString(metadata.metageneration, "object metadata metageneration"),
-    size: Number(requiredString(metadata.size, "object metadata size")),
-  };
+  if (!/^[1-9][0-9]*$/.test(generation)) {
+    throw new Error("Object metadata generation is malformed.");
+  }
+  const metageneration = requiredString(metadata.metageneration, "object metadata metageneration");
+  exact(metageneration, "1", "object metadata metageneration");
+  const size = Number(requiredString(metadata.size, "object metadata size"));
+  if (!Number.isSafeInteger(size) || size < 1 || size > 32 * 1024) {
+    throw new Error("Object metadata size escaped its bound.");
+  }
+  return { generation, metageneration, size };
 }
 
 // Reads exactly the bytes a listing named. Without the generation an object can
@@ -14171,7 +14320,14 @@ async function readObject(
 
 function receiptObjectName(
   state: { readonly prefix: string },
-  kind: "adoptions" | "completion" | "consumed" | "final" | "plans" | "results",
+  kind:
+    | "adoptions"
+    | "completion"
+    | "consumed"
+    | "final"
+    | "plans"
+    | "rehearsals"
+    | "results",
   runId: string,
 ): string {
   numeric(runId, "receipt run ID");

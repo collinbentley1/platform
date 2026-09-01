@@ -7190,8 +7190,32 @@ describe("protected owner Terraform bridge", () => {
       expected,
       async (input) => {
         nowMs += 100;
+        const url = new URL(String(input));
+        const requested = url.searchParams.getAll("permissions");
+        // Faithful to the leases under test: a permission is granted only when
+        // some lease expression actually names that object with that role.
+        // Echoing every request back would hand the executor capabilities IAM
+        // never issued, which is precisely what this projection exists to catch.
+        const object = decodeURIComponent(url.pathname.split("/o/")[1] ?? "");
+        const bucket = decodeURIComponent(url.pathname.split("/b/")[1]?.split("/")[0] ?? "");
+        const resource = `projects/_/buckets/${bucket}/objects/${object}`;
+        void resource;
+        // Receipt objects are named exactly by their leases; state objects are
+        // covered by prefix conditions, so match on the object path either way.
+        const namedBy = (role: string) =>
+          leases.some((lease) =>
+            lease.role === role && (lease.condition?.expression ?? "").includes(object)
+          );
+        const isReceipt = object.includes("/.protected-bootstrap/");
+        const creator = namedBy("roles/storage.objectCreator");
+        const viewer = namedBy("roles/storage.objectViewer");
         return Response.json({
-          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+          permissions: requested.filter((permission) => {
+            if (!isReceipt) return true;
+            if (permission === "storage.objects.create") return creator;
+            if (permission === "storage.objects.get") return viewer;
+            return creator || viewer;
+          }),
         });
       },
       async (milliseconds) => {
@@ -7274,9 +7298,12 @@ describe("protected owner Terraform bridge", () => {
         written.bindings.some((b) => b.condition?.title === lease.condition?.title),
       ).toBeTrue();
     }
+    // No creator lease survives elevation, because an apply executor is granted
+    // none beyond the consumed-receipt scope this write removes. The only
+    // receipt a post-elevation run produces is the owner's.
     expect(
       written.bindings.some((b) => b.condition?.title === "codex-receipt-create-123456"),
-    ).toBeTrue();
+    ).toBeFalse();
 
     // And mutation authority arrived in the same write.
     for (const lease of elevation.leases) {
@@ -7355,37 +7382,43 @@ describe("protected owner Terraform bridge", () => {
       /consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/,
     );
 
-    // v0.5.29 shape: elevate removes exactly that binding and the projection
-    // converges. The result receipt keeps its create grant, which it needs to
-    // publish the post-apply receipt.
+    // Elevate removes exactly that binding and the projection converges. No
+    // creator grant survives it: the only receipt a post-elevation run produces
+    // is written by the owner.
     const elevated = receipts.filter((lease) => lease.condition?.title !== consumeTitle);
     await runProjection("mutation", [...elevated, ...elevatedStateLeases()]);
   });
 
-  test("apply receipt leases split the creator scope and leave the reader whole", () => {
+  test("an apply executor can create the consumed receipt and nothing else", () => {
     const leases = applyReceiptLeases();
     const creators = leases.filter((lease) => lease.role === "roles/storage.objectCreator");
-    expect(creators).toHaveLength(2);
-    const consume = creators.find(
-      (lease) => lease.condition?.title === receiptConsumeLeaseTitle("123456"),
-    )!;
-    const create = creators.find(
-      (lease) => lease.condition?.title !== receiptConsumeLeaseTitle("123456"),
-    )!;
-    // Disjoint: neither creator scope names the other's object.
+    // Exactly one creator lease now. The results receipt is gone and the final
+    // receipt is the owner's, so IAM itself -- not statement order -- is what
+    // stops the executor publishing a result while it still holds mutation
+    // authority.
+    expect(creators).toHaveLength(1);
+    const consume = creators[0]!;
+    expect(consume.condition!.title).toBe(receiptConsumeLeaseTitle("123456"));
     expect(consume.condition!.expression).toContain("/consumed/123455.json");
     expect(consume.condition!.expression).not.toContain("/results/");
-    expect(create.condition!.expression).toContain("/results/123456.json");
-    expect(create.condition!.expression).not.toContain("/consumed/");
-    // The plan receipt is never creatable during apply.
-    for (const creator of creators) {
-      expect(creator.condition!.expression).not.toContain("/plans/");
-    }
-    // Read scope is unchanged: all three receipts remain readable.
+    expect(consume.condition!.expression).not.toContain("/final/");
+    expect(consume.condition!.expression).not.toContain("/plans/");
+
+    // Read scope covers only what an apply still reads.
     const viewer = leases.find((lease) => lease.role === "roles/storage.objectViewer")!;
-    for (const fragment of ["/plans/123455.json", "/consumed/123455.json", "/results/123456.json"]) {
+    for (const fragment of ["/plans/123455.json", "/consumed/123455.json"]) {
       expect(viewer.condition!.expression).toContain(fragment);
     }
+    expect(viewer.condition!.expression).not.toContain("/results/");
+    expect(viewer.condition!.expression).not.toContain("/final/");
+  });
+
+  test("elevation leaves an apply executor with no receipt creator lease at all", () => {
+    const leases = applyReceiptLeases();
+    const remaining = leases.filter(
+      (lease) => lease.condition?.title !== receiptConsumeLeaseTitle("123456"),
+    );
+    expect(remaining.some((lease) => lease.role === "roles/storage.objectCreator")).toBe(false);
   });
 
   test("recovery still recognises an orphan left by the pre-revocation shape", () => {
@@ -7397,15 +7430,25 @@ describe("protected owner Terraform bridge", () => {
       "cdbentley", "bootstrap", "123456", new Date("2026-08-30T12:00:00.000Z"),
       "123455", executorEmail,
     );
+    // Pinned verbatim. This recognizer is frozen history, so an exact-expression
+    // assertion is the point: if it ever tracks current grants again, recovery
+    // stops recognising the orphans it exists to clean up.
     expect(legacy.condition.title).toBe("codex-receipt-create-123456");
-    expect(legacy.condition.expression).toContain("/consumed/123455.json");
-    expect(legacy.condition.expression).toContain("/results/123456.json");
-    // It is distinguishable from the current pair: same title as the current
-    // result-only creator, different expression.
-    const current = applyReceiptLeases().find(
-      (lease) => lease.condition?.title === "codex-receipt-create-123456",
-    )!;
-    expect(current.condition!.expression).not.toBe(legacy.condition.expression);
+    expect(legacy.condition.expression).toBe(
+      "request.time < timestamp('2026-08-30T12:00:00.000Z') && " +
+        "(resource.name == 'projects/_/buckets/cdbentley-tfstate-882468538648-bootstrap/objects/" +
+        "cdbentley/bootstrap/.protected-bootstrap/consumed/123455.json' || " +
+        "resource.name == 'projects/_/buckets/cdbentley-tfstate-882468538648-bootstrap/objects/" +
+        "cdbentley/bootstrap/.protected-bootstrap/results/123456.json')",
+    );
+    expect(legacy.condition.expression).not.toContain("/final/");
+    // A current apply issues no lease under this title at all, so the orphan is
+    // unambiguous: anything wearing it is historical by definition.
+    expect(
+      applyReceiptLeases().some((lease) =>
+        lease.condition?.title === "codex-receipt-create-123456"
+      ),
+    ).toBe(false);
   });
 
   // Apply run 33305344368 died at controller.proof on a single transient
@@ -8760,9 +8803,13 @@ describe("protected owner Terraform bridge", () => {
       prefix: "cdbentley/bootstrap",
     };
     const consumed = `${state.prefix}/.protected-bootstrap/consumed/33230835879.json`;
+    const finalReceipt = `${state.prefix}/.protected-bootstrap/final/123456.json`;
     const results = `${state.prefix}/.protected-bootstrap/results/123456.json`;
+    const completion = `${state.prefix}/.protected-bootstrap/completion/123456.json`;
+    const ownerWritten = [results, finalReceipt, completion];
     const plans = `${state.prefix}/.protected-bootstrap/plans/33230835879.json`;
     const overwritten: string[] = [];
+    const observedOwnerWritten: Record<string, readonly string[]> = {};
     let clock = 0;
 
     await waitForStatePermissions(
@@ -8786,16 +8833,29 @@ describe("protected owner Terraform bridge", () => {
         // exist yet, so create is both provable and required there.
         testObjectOverwrite: async ({ objectName }) => {
           overwritten.push(objectName);
-          return !(objectName === consumed || objectName === plans);
+          // The executor can overwrite neither the receipts it already wrote
+          // nor any owner-written object, which are not its objects at all.
+          return !(objectName === consumed || objectName === plans ||
+            ownerWritten.includes(objectName));
         },
         // `storage.objects.create` is never reported here -- it is excluded from
         // STORAGE_OBJECT_RPC_PERMISSIONS and arrives only via the probe above.
-        testObjectPermissions: async ({ permissions, resource }) => ({
-          denied: false,
-          permissions: resource.includes("/.protected-bootstrap/")
-            ? permissions.filter((permission) => permission === "storage.objects.get")
-            : permissions.filter((permission) => permission !== "storage.objects.create"),
-        }),
+        testObjectPermissions: async ({ permissions, resource }) => {
+          // Owner-written objects: the executor holds nothing on them, in this
+          // phase or any other, and the projection must observe that actively
+          // rather than infer it from a missing lease.
+          const owner = ownerWritten.find((name) => resource.endsWith(name));
+          if (owner !== undefined) {
+            observedOwnerWritten[owner] = [];
+            return { denied: false, permissions: [] };
+          }
+          return {
+            denied: false,
+            permissions: resource.includes("/.protected-bootstrap/")
+              ? permissions.filter((permission) => permission === "storage.objects.get")
+              : permissions.filter((permission) => permission !== "storage.objects.create"),
+          };
+        },
       },
       300_000,
       () => clock,
@@ -8803,7 +8863,13 @@ describe("protected owner Terraform bridge", () => {
 
     // It probed the object that matters, and did not need it to be overwritable.
     expect(overwritten).toContain(consumed);
-    expect(overwritten).toContain(results);
+    // No executor lease AND a live negative proof. Every owner-written key is
+    // probed in this phase and observed to grant nothing -- which is what would
+    // catch a bucket-level or out-of-band binding that no lease explains.
+    for (const name of ownerWritten) {
+      expect(overwritten).toContain(name);
+      expect(observedOwnerWritten[name]).toEqual([]);
+    }
 
     // The "read" projection runs inside `acquire`, before `consumeApproval`.
     // The receipt is still absent and the lease already grants objectCreator, so
@@ -8830,13 +8896,13 @@ describe("protected owner Terraform bridge", () => {
         // Only the two receipts this run will write are absent and leased to the
         // executor as creator. The plan receipt already exists, and the read
         // projection holds no write lease on the state objects at all.
-        testObjectOverwrite: async ({ objectName }) =>
-          objectName === consumed || objectName === results,
+        testObjectOverwrite: async ({ objectName }) => objectName === consumed,
         // The lock object is reachable only by the mutation projection, so the
         // read projection must observe nothing at all on it.
         testObjectPermissions: async ({ permissions, resource }) => ({
           denied: false,
-          permissions: resource.endsWith("default.tflock")
+          permissions: resource.endsWith("default.tflock") ||
+              ownerWritten.some((name) => resource.endsWith(name))
             ? []
             : permissions.filter((permission) => permission === "storage.objects.get"),
         }),
