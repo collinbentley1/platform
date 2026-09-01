@@ -4049,11 +4049,13 @@ async function writeImmutableObjectIdempotent(
   token: string,
   fetcher: Fetcher,
   validate: (parsed: unknown) => void = () => {},
-): Promise<void> {
+): Promise<string> {
   let original: unknown;
   try {
-    await writeImmutableObject(bucket, object, body, token, fetcher);
-    return;
+    // The generation the write committed at. Returning it means a successful
+    // publish never has to follow itself with an unbound metadata read, which
+    // would be a second way for a finished write to report failure.
+    return await writeImmutableObject(bucket, object, body, token, fetcher);
   } catch (error) {
     original = error;
   }
@@ -4069,6 +4071,7 @@ async function writeImmutableObjectIdempotent(
     );
     if (observed !== body) throw original;
     validate(JSON.parse(observed) as unknown);
+    return metadata.generation;
   } catch {
     throw original;
   }
@@ -14007,9 +14010,14 @@ export async function publishFinalProtectedReceipt(
   );
   // Reconciled like every other immutable write: a terminal rehearsal receipt
   // whose response was lost must not turn a finished rehearsal into a failure.
-  await writeImmutableObjectIdempotent(state.bucket, object, body, ownerToken, fetcher);
-  const written = await readObjectMetadata(state.bucket, object, ownerToken, fetcher);
-  const generation = written.generation;
+  // The committed generation comes back from the write itself.
+  const generation = await writeImmutableObjectIdempotent(
+    state.bucket,
+    object,
+    body,
+    ownerToken,
+    fetcher,
+  );
   return {
     bucket: state.bucket,
     deElevationExecutorEmail: proof.deElevation.executorEmail,
@@ -14208,6 +14216,129 @@ export function pendingApplyReceiptFromBody(
   };
 }
 
+export interface OwnerCompletion {
+  readonly completedAt: string;
+  readonly finalReceiptDigest: string;
+  readonly finalReceiptGeneration: string;
+  readonly runId: string;
+}
+
+// Strict, whole-document validation of a completion object.
+//
+// Used both to read an existing completion during replay and to prove a
+// freshly-written one. It deliberately does NOT compare `completedAt`, because
+// a retry legitimately produces a later one: what makes two completions the
+// same completion is the exact pending receipt they countersign, not the moment
+// somebody got around to writing them.
+export function ownerCompletionFromBody(
+  body: string,
+  expected: {
+    readonly consumerSha: string;
+    readonly finalReceiptDigest: string;
+    readonly finalReceiptGeneration: string;
+    readonly finalReceiptObject: string;
+    readonly platformSha: string;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  },
+): OwnerCompletion {
+  const parsed = record(JSON.parse(body) as unknown, "owner completion");
+  exact(
+    `${canonicalJson(json(parsed, "owner completion"))}\n`,
+    body,
+    "owner completion bytes",
+  );
+  exactKeys(
+    parsed,
+    new Set([
+      "completedAt",
+      "consumerSha",
+      "countable",
+      "executorRelease",
+      "finalReceipt",
+      "kind",
+      "platformSha",
+      "projectId",
+      "repository",
+      "repositoryId",
+      "runId",
+      "schemaVersion",
+      "terraformRoot",
+    ]),
+    "owner completion",
+  );
+  const contract = REPOSITORIES[expected.repository];
+  exact(parsed.schemaVersion, 1, "owner completion schema version");
+  // Only an apply is ever countable, and a completion only ever describes one.
+  exact(parsed.kind, "apply", "owner completion kind");
+  exact(parsed.countable, true, "owner completion countability");
+  exact(parsed.repository, expected.repository, "owner completion repository");
+  exact(parsed.repositoryId, contract.repositoryId, "owner completion repository ID");
+  exact(parsed.projectId, contract.projectId, "owner completion project");
+  exact(parsed.terraformRoot, expected.root, "owner completion root");
+  exact(parsed.runId, expected.runId, "owner completion run ID");
+  exact(parsed.platformSha, expected.platformSha, "owner completion platform SHA");
+  exact(parsed.consumerSha, expected.consumerSha, "owner completion consumer SHA");
+
+  const reference = record(parsed.finalReceipt, "owner completion final receipt");
+  exactKeys(
+    reference,
+    new Set(["bucket", "digest", "generation", "object", "publishedAt", "size"]),
+    "owner completion final receipt",
+  );
+  exact(reference.bucket, contract.state[expected.root].bucket, "owner completion receipt bucket");
+  exact(reference.object, expected.finalReceiptObject, "owner completion receipt key");
+  exact(reference.digest, expected.finalReceiptDigest, "owner completion receipt digest");
+  exact(
+    reference.generation,
+    expected.finalReceiptGeneration,
+    "owner completion receipt generation",
+  );
+  canonicalInstant(
+    requiredString(reference.publishedAt, "owner completion receipt publication time"),
+    "owner completion receipt publication time",
+  );
+
+  const release = record(parsed.executorRelease, "owner completion executor release");
+  exactKeys(
+    release,
+    new Set([
+      "artifactsDeleted",
+      "executorEmail",
+      "executorUniqueId",
+      "observedAt",
+      "permissionsProvenGone",
+      "projectBindingsCleared",
+      "provenBy",
+    ]),
+    "owner completion executor release",
+  );
+  exact(release.artifactsDeleted, true, "owner completion artifacts deleted");
+  exact(release.permissionsProvenGone, true, "owner completion permissions proven gone");
+  exact(release.projectBindingsCleared, true, "owner completion bindings cleared");
+  const provenBy = requiredString(release.provenBy, "owner completion release provenance");
+  if (provenBy !== "exact-release" && provenBy !== "propagation-horizon") {
+    throw new Error("Owner completion release provenance escaped its closed set.");
+  }
+  requiredString(release.executorEmail, "owner completion executor email");
+  requiredString(release.executorUniqueId, "owner completion executor unique ID");
+  canonicalInstant(
+    requiredString(release.observedAt, "owner completion release time"),
+    "owner completion release time",
+  );
+
+  return {
+    completedAt: canonicalInstant(
+      requiredString(parsed.completedAt, "owner completion time"),
+      "owner completion time",
+    ),
+    finalReceiptDigest: expected.finalReceiptDigest,
+    finalReceiptGeneration: expected.finalReceiptGeneration,
+    runId: expected.runId,
+  };
+}
+
 export async function publishOwnerCompletionProof(
   invocation: Invocation,
   ownerToken: string,
@@ -14325,6 +14456,9 @@ export async function publishOwnerCompletionProof(
   }
   const body = `${canonicalJson(json({
     completedAt: new Date(nowMs).toISOString(),
+    // Consumer identity is bound here too: a completion names the exact
+    // repository, root, run, platform commit AND consumer commit it counts.
+    consumerSha: invocation.consumerSha,
     countable: true,
     executorRelease: {
       artifactsDeleted: releaseProof.artifactsDeleted,
@@ -14345,22 +14479,56 @@ export async function publishOwnerCompletionProof(
     },
     kind: "apply",
     platformSha: invocation.platformSha,
+    projectId: contract.projectId,
     repository: invocation.repository,
     repositoryId: contract.repositoryId,
     runId: invocation.githubRunId,
     schemaVersion: 1,
     terraformRoot: invocation.terraformRoot,
   }, "owner completion proof"))}\n`;
-  // Same reconciliation as the marker: a lost response after a committed write
-  // must not turn a finished run into a failed one, and must not be mistaken
-  // for one either.
-  await writeImmutableObjectIdempotent(
-    state.bucket,
-    receiptObjectName(state, "completion", invocation.githubRunId),
-    body,
-    ownerToken,
-    fetcher,
-  );
+  // Replay is decided by identity, not by bytes.
+  //
+  // A retry legitimately writes a later `completedAt`, so a byte-equality
+  // reconciliation would report a conflict for a run that had already finished
+  // successfully. What actually makes two completions the same completion is
+  // the exact pending receipt they countersign -- bucket, key, generation and
+  // digest -- so that is what is compared, and a valid existing completion for
+  // this receipt is accepted as the work already being done.
+  const completionObject = receiptObjectName(state, "completion", invocation.githubRunId);
+  const expectedCompletion = {
+    consumerSha: invocation.consumerSha,
+    finalReceiptDigest: pending.digest,
+    finalReceiptGeneration: pending.generation,
+    finalReceiptObject: pending.object,
+    platformSha: invocation.platformSha,
+    repository: invocation.repository,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  } as const;
+  try {
+    await writeImmutableObject(state.bucket, completionObject, body, ownerToken, fetcher);
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const metadata = await readObjectMetadata(state.bucket, completionObject, ownerToken, fetcher)
+      .catch(() => undefined);
+    if (metadata === undefined) throw error;
+    const observed = await readObjectGeneration(
+      state.bucket,
+      completionObject,
+      metadata.generation,
+      ownerToken,
+      fetcher,
+    );
+    // An existing object only settles the retry if it is a VALID completion for
+    // exactly this pending receipt. Anything else is the original failure.
+    try {
+      ownerCompletionFromBody(observed, expectedCompletion);
+    } catch {
+      throw error;
+    }
+    void message;
+  }
 }
 
 function planReceipt(value: unknown): PlanReceipt {

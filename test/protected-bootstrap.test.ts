@@ -7180,6 +7180,92 @@ describe("protected owner Terraform bridge", () => {
     expect(JSON.parse(world.objects.get(completionKey)!.body).countable).toBe(true);
   });
 
+  test("completing twice accepts the existing completion rather than conflicting", async () => {
+    // A retry writes a later completedAt, so byte equality would call a
+    // finished run a conflict. Identity is what settles it.
+    const invocation = applyInvocationForCompletion();
+    const world = completionWorld();
+    const pending = await publishFinalProtectedReceipt(
+      invocation,
+      "owner-token-value",
+      { canonical: "", sha256: "a".repeat(64) },
+      pendingProofAt("2026-09-01T12:00:00.000Z"),
+      Date.parse("2026-09-01T12:02:00.000Z"),
+      world.fetcher,
+    );
+    const release = {
+      artifactsDeleted: true as const,
+      executorEmail,
+      executorUniqueId: "123456789012345678901",
+      observedAt: "2026-09-01T12:01:00.000Z",
+      permissionsProvenGone: true as const,
+      projectBindingsCleared: true as const,
+      provenBy: "exact-release" as const,
+    };
+    await publishOwnerCompletionProof(
+      invocation,
+      "owner-token-value",
+      pending,
+      release,
+      Date.parse("2026-09-01T12:05:00.000Z"),
+      world.fetcher,
+    );
+    const key = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
+    const first = world.objects.get(key)!.body;
+
+    // Same run, later clock: accepted, and the committed object is untouched.
+    await publishOwnerCompletionProof(
+      invocation,
+      "owner-token-value",
+      pending,
+      release,
+      Date.parse("2026-09-01T12:09:00.000Z"),
+      world.fetcher,
+    );
+    expect(world.objects.get(key)!.body).toBe(first);
+    expect(JSON.parse(first).completedAt).toBe("2026-09-01T12:05:00.000Z");
+  });
+
+  test("a completion naming a different pending receipt is not accepted as a replay", async () => {
+    const invocation = applyInvocationForCompletion();
+    const world = completionWorld();
+    const pending = await publishFinalProtectedReceipt(
+      invocation,
+      "owner-token-value",
+      { canonical: "", sha256: "a".repeat(64) },
+      pendingProofAt("2026-09-01T12:00:00.000Z"),
+      Date.parse("2026-09-01T12:02:00.000Z"),
+      world.fetcher,
+    );
+    const release = {
+      artifactsDeleted: true as const,
+      executorEmail,
+      executorUniqueId: "123456789012345678901",
+      observedAt: "2026-09-01T12:01:00.000Z",
+      permissionsProvenGone: true as const,
+      projectBindingsCleared: true as const,
+      provenBy: "exact-release" as const,
+    };
+    await publishOwnerCompletionProof(
+      invocation,
+      "owner-token-value",
+      pending,
+      release,
+      Date.parse("2026-09-01T12:05:00.000Z"),
+      world.fetcher,
+    );
+
+    // A completion already exists, but for a receipt at a different generation.
+    await expect(publishOwnerCompletionProof(
+      invocation,
+      "owner-token-value",
+      { ...pending, generation: "1999999999" },
+      release,
+      Date.parse("2026-09-01T12:09:00.000Z"),
+      world.fetcher,
+    )).rejects.toThrow();
+  });
+
   test("a plan publishes no owner artifact at all", async () => {
     const events: string[] = [];
     await runProtectedBootstrap(validateInvocation(validEnvironment()), fakeDependencies(events));
