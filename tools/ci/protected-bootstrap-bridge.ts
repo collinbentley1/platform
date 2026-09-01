@@ -13917,7 +13917,10 @@ export async function consumePlanReceipt(
   );
 }
 
-// The only countable success a protected run produces. Every field it carries
+// The pending apply receipt, or a rehearsal's terminal record. Written by the
+// OWNER after every cleanup prerequisite has succeeded, and never countable on
+// its own: an apply becomes countable only when the separate completion object
+// countersigns it, and a rehearsal never becomes countable at all. Every field
 // is a claim that was already true when it was written: mutation authority was
 // gone, all four pools were handed back to the state the durable intent
 // captured, and the restored world audited to zero diff.
@@ -14031,6 +14034,7 @@ function canonicalInstant(value: string, label: string): string {
 }
 
 export interface PendingApplyReceipt {
+  readonly deElevationAt: string;
   readonly deElevationExecutorEmail: string;
   readonly deElevationExecutorUniqueId: string;
   readonly intentDigest: string;
@@ -14152,7 +14156,7 @@ export function pendingApplyReceiptFromBody(
   provenAbsent.forEach((permission, index) => {
     requiredString(permission, `pending apply receipt proven-absent ${index}`);
   });
-  canonicalInstant(
+  const deElevationAt = canonicalInstant(
     requiredString(deElevation.observedAt, "pending apply receipt de-elevation time"),
     "pending apply receipt de-elevation time",
   );
@@ -14186,6 +14190,7 @@ export function pendingApplyReceiptFromBody(
   });
 
   return {
+    deElevationAt,
     deElevationExecutorEmail: requiredString(
       deElevation.executorEmail,
       "pending apply receipt de-elevation email",
@@ -14230,16 +14235,12 @@ export async function publishOwnerCompletionProof(
     pending.deElevationExecutorUniqueId,
     "owner completion executor unique ID",
   );
-  const publishedAtMs = Date.parse(pending.publishedAt);
-  const releasedAtMs = Date.parse(releaseProof.observedAt);
-  if (
-    !Number.isFinite(publishedAtMs) || !Number.isFinite(releasedAtMs) ||
-    new Date(publishedAtMs).toISOString() !== pending.publishedAt ||
-    new Date(releasedAtMs).toISOString() !== releaseProof.observedAt ||
-    releasedAtMs < publishedAtMs || nowMs < releasedAtMs
-  ) {
-    throw new Error("Owner completion proof requires canonical, ordered timestamps.");
-  }
+  const publishedAtMs = Date.parse(
+    canonicalInstant(pending.publishedAt, "owner completion publication time"),
+  );
+  const releasedAtMs = Date.parse(
+    canonicalInstant(releaseProof.observedAt, "owner completion release time"),
+  );
   // Only an apply can ever be counted. A rehearsal runs no Terraform and a plan
   // changes nothing, so neither may produce a completion object at all.
   if (invocation.mode !== "apply") {
@@ -14301,6 +14302,27 @@ export async function publishOwnerCompletionProof(
   // The reference must describe the object it points at, down to when it says
   // it was published.
   exact(pendingReceipt.publishedAt, pending.publishedAt, "pending final receipt publication time");
+  // Order depends on HOW absence was proven, because the two paths genuinely
+  // happen in different orders and collapsing them would accept both a
+  // backwards inline run and a horizon proof taken before the run it clears.
+  //
+  //   exact-release:        de-elevation <= release <= pending <= completion
+  //   propagation-horizon:  de-elevation <= pending <= horizon <= completion
+  //
+  // The inline path publishes only after cleanup, so its release necessarily
+  // precedes the pending receipt. A detached finalizer publishes the horizon
+  // proof after finding a pending receipt that already existed.
+  const deElevationAtMs = Date.parse(pendingReceipt.deElevationAt);
+  const ordered = releaseProof.provenBy === "exact-release"
+    ? deElevationAtMs <= releasedAtMs && releasedAtMs <= publishedAtMs &&
+      publishedAtMs <= nowMs
+    : deElevationAtMs <= publishedAtMs && publishedAtMs <= releasedAtMs &&
+      releasedAtMs <= nowMs;
+  if (!ordered) {
+    throw new Error(
+      `Owner completion proof requires ${releaseProof.provenBy} timestamps in order.`,
+    );
+  }
   const body = `${canonicalJson(json({
     completedAt: new Date(nowMs).toISOString(),
     countable: true,

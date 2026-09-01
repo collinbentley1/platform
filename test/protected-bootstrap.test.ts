@@ -59,6 +59,8 @@ import {
   type FederationPoolState,
   federationPoolFromJson,
   type FederationQuarantineRecord,
+  publishFinalProtectedReceipt,
+  publishOwnerCompletionProof,
   assertQuarantinedPool,
   buildFinalProtectedProof,
   federationPoolFingerprint,
@@ -7005,6 +7007,177 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
     // A rehearsal is never countable, so it never countersigns.
     expect(events).not.toContain("owner:completion");
+  });
+
+  // Drives the REAL publish-then-complete pair against a faithful object store,
+  // rather than restating the ordering rule in the test and checking itself.
+  const completionWorld = () => {
+    const objects = new Map<string, { body: string; generation: string }>();
+    let next = 1_700_000_000;
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
+      if (url.pathname.startsWith("/upload/")) {
+        const name = url.searchParams.get("name")!;
+        if (objects.has(name)) return new Response("", { status: 412 });
+        const body = String(init!.body);
+        next += 1;
+        objects.set(name, { body, generation: String(next) });
+        return Response.json({
+          bucket,
+          generation: String(next),
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(body)),
+        });
+      }
+      const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+      const stored = objects.get(name);
+      if (stored === undefined) return new Response("", { status: 404 });
+      if (url.searchParams.get("alt") === "media") return new Response(stored.body);
+      return Response.json({
+        bucket,
+        generation: stored.generation,
+        metageneration: "1",
+        name,
+        size: String(Buffer.byteLength(stored.body)),
+      });
+    }) as unknown as typeof fetch;
+    return { fetcher, objects };
+  };
+
+  const applyInvocationForCompletion = () =>
+    validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: "a".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+    }, true);
+
+  const pendingProofAt = (deElevationAt: string) => {
+    const invocation = applyInvocationForCompletion();
+    const intent = quarantineIntent(invocation);
+    return buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: deElevationAt,
+        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+      },
+      intent,
+      intentDigest: "c".repeat(64),
+      intentGeneration: "1700000001",
+      invocation,
+      kind: "apply",
+      observedPools: intent.pools.map((pool) => ({
+        disabled: false,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: deElevationAt,
+        repository: pool.repository,
+      })),
+      quarantinedApplyProof: executionProof(),
+      restoredAudit: {
+        detailedExitCode: 0 as const,
+        observedAt: deElevationAt,
+        outputSha256: "d".repeat(64),
+      },
+      review: { canonical: "", sha256: "a".repeat(64) },
+    });
+  };
+
+  const completeWith = async (options: {
+    readonly deElevationAt: string;
+    readonly provenBy: "exact-release" | "propagation-horizon";
+    readonly publishedAt: string;
+    readonly releasedAt: string;
+  }) => {
+    const invocation = applyInvocationForCompletion();
+    const world = completionWorld();
+    const pending = await publishFinalProtectedReceipt(
+      invocation,
+      "owner-token-value",
+      { canonical: "", sha256: "a".repeat(64) },
+      pendingProofAt(options.deElevationAt),
+      Date.parse(options.publishedAt),
+      world.fetcher,
+    );
+    await publishOwnerCompletionProof(
+      invocation,
+      "owner-token-value",
+      pending,
+      {
+        artifactsDeleted: true,
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: options.releasedAt,
+        permissionsProvenGone: true,
+        projectBindingsCleared: true,
+        provenBy: options.provenBy,
+      },
+      Date.parse("2026-09-01T12:10:00.000Z"),
+      world.fetcher,
+    );
+    return world;
+  };
+
+  test("an exact-release completion accepts de-elevation, release, then pending", async () => {
+    const world = await completeWith({
+      deElevationAt: "2026-09-01T12:00:00.000Z",
+      provenBy: "exact-release",
+      publishedAt: "2026-09-01T12:02:00.000Z",
+      releasedAt: "2026-09-01T12:01:00.000Z",
+    });
+    const completion = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
+    const body = JSON.parse(world.objects.get(completion)!.body) as Record<string, unknown>;
+    expect(body.countable).toBe(true);
+    expect(body.kind).toBe("apply");
+    expect((body.executorRelease as Record<string, unknown>).provenBy).toBe("exact-release");
+  });
+
+  test("an exact-release completion whose release follows the pending receipt is refused", async () => {
+    await expect(completeWith({
+      deElevationAt: "2026-09-01T12:00:00.000Z",
+      provenBy: "exact-release",
+      publishedAt: "2026-09-01T12:02:00.000Z",
+      releasedAt: "2026-09-01T12:03:00.000Z",
+    })).rejects.toThrow("exact-release timestamps in order");
+  });
+
+  test("a horizon completion accepts de-elevation, pending, then the horizon proof", async () => {
+    const world = await completeWith({
+      deElevationAt: "2026-09-01T12:00:00.000Z",
+      provenBy: "propagation-horizon",
+      publishedAt: "2026-09-01T12:01:00.000Z",
+      releasedAt: "2026-09-01T12:02:00.000Z",
+    });
+    const completion = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
+    const body = JSON.parse(world.objects.get(completion)!.body) as Record<string, unknown>;
+    expect((body.executorRelease as Record<string, unknown>).provenBy).toBe("propagation-horizon");
+  });
+
+  test("a horizon completion taken before its pending receipt is refused", async () => {
+    await expect(completeWith({
+      deElevationAt: "2026-09-01T12:00:00.000Z",
+      provenBy: "propagation-horizon",
+      publishedAt: "2026-09-01T12:01:00.000Z",
+      releasedAt: "2026-09-01T12:00:30.000Z",
+    })).rejects.toThrow("propagation-horizon timestamps in order");
+  });
+
+  test("the pending receipt is never countable and the completion always is", async () => {
+    const world = await completeWith({
+      deElevationAt: "2026-09-01T12:00:00.000Z",
+      provenBy: "exact-release",
+      publishedAt: "2026-09-01T12:02:00.000Z",
+      releasedAt: "2026-09-01T12:01:00.000Z",
+    });
+    const pendingKey = [...world.objects.keys()].find((name) => name.includes("/final/"))!;
+    const completionKey = [...world.objects.keys()].find((name) => name.includes("/completion/"))!;
+    expect(JSON.parse(world.objects.get(pendingKey)!.body).countable).toBe(false);
+    expect(JSON.parse(world.objects.get(pendingKey)!.body).status).toBe("pending");
+    expect(JSON.parse(world.objects.get(completionKey)!.body).countable).toBe(true);
   });
 
   test("a plan publishes no owner artifact at all", async () => {
