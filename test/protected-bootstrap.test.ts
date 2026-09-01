@@ -4276,6 +4276,14 @@ describe("protected owner Terraform bridge", () => {
       now: () => startedAt,
       releaseExecutor: async (_invocation, _session, deadline) => {
         cleanupDeadline = deadline;
+        return {
+          artifactsDeleted: true as const,
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          observedAt: "2026-09-01T12:00:00.000Z",
+          permissionsProvenGone: true as const,
+          projectBindingsCleared: true as const,
+        };
       },
     }));
     expect(acquireDeadline).toBe(startedAt + 60_000);
@@ -4330,6 +4338,14 @@ describe("protected owner Terraform bridge", () => {
       releaseExecutor: async (_invocation, _session, deadline) => {
         events.push("release");
         cleanupDeadline = deadline;
+        return {
+          artifactsDeleted: true as const,
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          observedAt: "2026-09-01T12:00:00.000Z",
+          permissionsProvenGone: true as const,
+          projectBindingsCleared: true as const,
+        };
       },
       verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
@@ -10728,6 +10744,14 @@ function fakeDependencies(
     }),
     releaseExecutor: overrides.releaseExecutor ?? (async () => {
       events.push("release");
+      return {
+        artifactsDeleted: true as const,
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: new Date(now()).toISOString(),
+        permissionsProvenGone: true as const,
+        projectBindingsCleared: true as const,
+      };
     }),
     removePrivatePath: overrides.removePrivatePath ?? (async (path) => {
       events.push(`remove:${path.endsWith(".tfplan") ? "tfplan" : path.endsWith("/tfdata") ? "tfdata" : "sandbox"}`);

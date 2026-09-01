@@ -1024,6 +1024,26 @@ export type FinalProtectedProof =
     readonly kind: "rehearsal";
   });
 
+// What an exact release actually establishes, captured before the manager
+// forgets the identity. This is direct evidence about one named account --
+// contained by its stable unique ID, every project binding fenced and re-read
+// as absent, permissions positively proven gone, artifacts deleted -- and it is
+// available inside the five-minute cleanup reserve.
+//
+// It is deliberately NOT the propagation-horizon proof. That proof answers a
+// different question ("is anything left anywhere, for a run whose fate we do
+// not know?"), needs seven minutes of propagation plus three stable, and cannot
+// fit between operationDeadlineMs and cleanupDeadlineMs. Wiring it inline would
+// have failed every apply at its last step.
+export interface ExecutorReleaseProof {
+  readonly artifactsDeleted: true;
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly observedAt: string;
+  readonly permissionsProvenGone: true;
+  readonly projectBindingsCleared: true;
+}
+
 export interface ExecutorDeElevationProof {
   readonly executorEmail: string;
   readonly executorUniqueId: string;
@@ -1137,6 +1157,7 @@ export interface BridgeDependencies {
   readonly publishOwnerCompletion: (
     invocation: Invocation,
     finalReceiptDigest: string,
+    releaseProof: ExecutorReleaseProof,
     cleanupDeadlineMs: number,
   ) => Promise<void>;
   readonly readPlanJson: (
@@ -1150,7 +1171,7 @@ export interface BridgeDependencies {
     invocation: Invocation,
     session: ExecutorSession | undefined,
     operationDeadlineMs: number,
-  ) => Promise<void>;
+  ) => Promise<ExecutorReleaseProof | undefined>;
   readonly removePrivatePath: (path: string) => Promise<void>;
   readonly runTerraform: (
     invocation: Invocation,
@@ -4571,6 +4592,7 @@ export async function runProtectedBootstrap(
     | undefined;
   let federationRestored = false;
   let finalReceiptDigest: string | undefined;
+  let completedReleaseProof: ExecutorReleaseProof | undefined;
   try {
     // Nothing starts until the fleet is known to be free of unrepaired
     // quarantines, for any target, not just this one.
@@ -5034,8 +5056,13 @@ export async function runProtectedBootstrap(
     // recoverable at leisure; an executor whose privilege was not provably
     // revoked is the exact condition the quarantine exists for.
     const executorContained = releaseResult!.status === "fulfilled";
+    // The exact release proof, available only when release actually succeeded.
+    const releaseProof = releaseResult!.status === "fulfilled"
+      ? releaseResult!.value
+      : undefined;
     // Federation is restored only after the executor is gone, so no window
     // exists in which consumer tokens work again while privilege still does.
+    completedReleaseProof = releaseProof;
     if (quarantinedFederation !== undefined && !federationRestored) {
       if (!executorContained) {
         // Leave federation closed. Re-opening it while an executor may still
@@ -5079,10 +5106,19 @@ export async function runProtectedBootstrap(
   // claim, not a countable success -- which is what stops a run whose executor
   // deletion failed from being counted as one.
   if (finalReceiptDigest !== undefined) {
+    if (completedReleaseProof === undefined) {
+      // The receipt the executor wrote stays pending. Nothing counts it, and a
+      // later fresh recovery run -- which has the full propagation budget --
+      // finalizes it once absence is proven there.
+      throw new Error(
+        "The protected run produced no exact executor release proof, so its final receipt stays pending until recovery finalizes it.",
+      );
+    }
     telemetry.phase("controller.owner-completion");
     await dependencies.publishOwnerCompletion(
       invocation,
       finalReceiptDigest,
+      completedReleaseProof,
       cleanupDeadlineMs,
     );
   }
@@ -6179,28 +6215,18 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishOwnerCompletion: async (invocation, finalReceiptDigest, cleanupDeadlineMs) => {
-      // Exact absence first, through the same stable-empty recovery a lost run
-      // would receive. Only then does the countable object get written.
-      await recoverBridgeArtifactsUntilStable(
-        {
-          githubRunId: invocation.githubRunId,
-          ownerAccessToken: invocation.ownerAccessToken,
-          platformRoot: invocation.platformRoot,
-          platformSha: invocation.platformSha,
-          repository: invocation.repository,
-          runnerTemp: invocation.runnerTemp,
-        },
-        api,
-        (milliseconds) => Bun.sleep(milliseconds),
-        cleanupDeadlineMs,
-        () => Date.now(),
-        telemetry,
-      );
+    publishOwnerCompletion: async (
+      invocation,
+      finalReceiptDigest,
+      releaseProof,
+      cleanupDeadlineMs,
+    ) => {
+      assertBeforeDeadline(Date.now(), cleanupDeadlineMs, "owner completion proof");
       await publishOwnerCompletionProof(
         invocation,
         invocation.ownerAccessToken,
         finalReceiptDigest,
+        releaseProof,
         Date.now(),
         api,
       );
@@ -6220,12 +6246,11 @@ function defaultBridgeDependencies(
         operationDeadlineMs,
         true,
     ),
-    releaseExecutor: async (invocation, _session, cleanupDeadlineMs) => {
+    releaseExecutor: async (invocation, _session, cleanupDeadlineMs) =>
       await releaseSandboxAndExecutor(
         () => sandbox.cleanupAll(cleanupDeadlineMs),
         () => manager.release(invocation, cleanupDeadlineMs),
-      );
-    },
+      ),
     removePrivatePath: (path) => rm(path, { force: true, recursive: true }),
     runTerraform: async (
       invocation,
@@ -6396,10 +6421,10 @@ function defaultBridgeDependencies(
   };
 }
 
-export async function releaseSandboxAndExecutor(
+export async function releaseSandboxAndExecutor<T>(
   cleanupSandbox: () => Promise<void>,
-  cleanupExecutor: () => Promise<void>,
-): Promise<void> {
+  cleanupExecutor: () => Promise<T>,
+): Promise<T> {
   // Invoke IAM first and isolate both callbacks behind promises so a
   // synchronous Docker-cleanup failure cannot suppress executor containment.
   const results = await Promise.allSettled([
@@ -6412,6 +6437,9 @@ export async function releaseSandboxAndExecutor(
   if (errors.length > 0) {
     throw new AggregateError(errors, "Sandbox and executor cleanup did not both complete.");
   }
+  // The executor result is the exact release proof the countable owner object
+  // is written against; the sandbox has nothing to report.
+  return (results[0] as PromiseFulfilledResult<T>).value;
 }
 
 function defaultRecoveryDependencies(
@@ -7536,15 +7564,29 @@ export class ExecutorLeaseManager {
     };
   }
 
-  async release(invocation: Invocation, cleanupDeadlineMs: number): Promise<void> {
-    if (this.#invocation === undefined) return;
+  async release(
+    invocation: Invocation,
+    cleanupDeadlineMs: number,
+  ): Promise<ExecutorReleaseProof | undefined> {
+    if (this.#invocation === undefined) return undefined;
     if (this.#invocation !== invocation) throw new Error("Executor cleanup invocation drifted.");
     this.#apiDeadlineMs = cleanupDeadlineMs;
+    // Captured before #releaseAll clears them on success.
+    const released = this.#account;
     const errors = await this.#releaseAll(invocation, cleanupDeadlineMs);
     if (errors.length > 0) {
       throw new AggregateError(errors, "Exact executor lease cleanup failed.");
     }
     this.#invocation = undefined;
+    if (released === undefined) return undefined;
+    return {
+      artifactsDeleted: true,
+      executorEmail: released.email,
+      executorUniqueId: released.uniqueId,
+      observedAt: new Date(Date.now()).toISOString(),
+      permissionsProvenGone: true,
+      projectBindingsCleared: true,
+    };
   }
 
   // The grant arrives as one value. Leases and removals travelling together is
@@ -13732,9 +13774,12 @@ export async function publishFinalProtectedReceipt(
   const receipt: JsonValue = json(
     {
       consumerSha: proof.consumerSha,
-      // A rehearsal is explicitly not a success anything may count. It exists
-      // to prove the federation lifecycle works, not that a change landed.
-      countable: proof.countable,
+      // Never countable, whatever the run was. This object is written by an
+      // identity that still exists, before its deletion has been proven, so at
+      // the moment it is written it can only be a claim. The owner's completion
+      // object, written after exact release, is the only countable artifact.
+      countable: false,
+      status: "pending",
       deElevation: {
         executorEmail: proof.deElevation.executorEmail,
         executorUniqueId: proof.deElevation.executorUniqueId,
@@ -13781,19 +13826,33 @@ export async function publishOwnerCompletionProof(
   invocation: Invocation,
   ownerToken: string,
   finalReceiptDigest: string,
+  releaseProof: ExecutorReleaseProof,
   nowMs: number,
   fetcher: Fetcher,
 ): Promise<void> {
   if (!/^[0-9a-f]{64}$/.test(finalReceiptDigest)) {
     throw new Error("Owner completion proof requires a SHA-256 final receipt digest.");
   }
+  // Only an apply can ever be counted. A rehearsal runs no Terraform and a plan
+  // changes nothing, so neither may produce a completion object at all.
+  if (invocation.mode !== "apply") {
+    throw new Error("Only an apply produces an owner completion proof.");
+  }
   const contract = REPOSITORIES[invocation.repository];
   const state = contract.state[invocation.terraformRoot];
   const body = `${canonicalJson(json({
     completedAt: new Date(nowMs).toISOString(),
-    executorProvenAbsent: true,
+    countable: true,
+    executorRelease: {
+      artifactsDeleted: releaseProof.artifactsDeleted,
+      executorEmail: releaseProof.executorEmail,
+      executorUniqueId: releaseProof.executorUniqueId,
+      observedAt: releaseProof.observedAt,
+      permissionsProvenGone: releaseProof.permissionsProvenGone,
+      projectBindingsCleared: releaseProof.projectBindingsCleared,
+    },
     finalReceiptDigest,
-    kind: invocation.mode === "rehearsal" ? "rehearsal" : "apply",
+    kind: "apply",
     platformSha: invocation.platformSha,
     repository: invocation.repository,
     repositoryId: contract.repositoryId,
