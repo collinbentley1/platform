@@ -658,6 +658,20 @@ const PROD_RESOURCE_TYPES = new Set([
   "google_secret_manager_secret_iam_member",
 ]);
 
+// Medlock carries these reviewed project-level resources beside module.site.
+// Keep this as an exact address-to-type map rather than broadening the prod
+// type allowlist: a new root resource, a type swap at a reviewed address, or
+// the same resource in another consumer must require a separate platform
+// review before the protected bridge will admit it.
+const HEALTHMCP_PROD_ROOT_RESOURCES: ReadonlyMap<string, string> = new Map([
+  ["google_firestore_field.waitlist_entry_ttl", "google_firestore_field"],
+  ["google_firestore_field.waitlist_quota_ttl", "google_firestore_field"],
+  ["google_identity_platform_config.default", "google_identity_platform_config"],
+  ["google_project_service.identity_toolkit", "google_project_service"],
+  ["google_project_service.recaptcha_enterprise", "google_project_service"],
+  ["google_recaptcha_enterprise_key.waitlist", "google_recaptcha_enterprise_key"],
+]);
+
 const EXPOSURE_RESOURCE_TYPES = new Set([
   "google_certificate_manager_certificate",
   "google_certificate_manager_certificate_map",
@@ -676,6 +690,7 @@ const EXPOSURE_RESOURCE_TYPES = new Set([
 const TERRAFORM_DIAGNOSTIC_RESOURCE_TYPES = new Set([
   ...BOOTSTRAP_RESOURCE_TYPES,
   ...PROD_RESOURCE_TYPES,
+  ...HEALTHMCP_PROD_ROOT_RESOURCES.values(),
   ...EXPOSURE_RESOURCE_TYPES,
 ]);
 
@@ -15904,7 +15919,12 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
       const forgetOnly = root === "prod" && PROD_FORGET_ONLY_ADDRESSES.some((pattern) =>
         pattern.test(address)
       );
-      const moduleAddress = requiredString(change.module_address, `${label} module address`);
+      const moduleAddress = change.module_address === undefined
+        ? null
+        : requiredString(change.module_address, `${label} module address`);
+      const reviewedProdRootType = root === "prod" && identity.repository === "healthmcp"
+        ? HEALTHMCP_PROD_ROOT_RESOURCES.get(address)
+        : undefined;
       if (root === "exposure") {
         const expected = exposureAddresses.get(address);
         if (
@@ -15918,6 +15938,16 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         }
         if (label === "resource drift") {
           throw new Error("Exposure Terraform reported remote drift; state-only adoption is blocked.");
+        }
+      } else if (reviewedProdRootType !== undefined) {
+        if (
+          moduleAddress !== null ||
+          mode !== "managed" ||
+          type !== reviewedProdRootType
+        ) {
+          throw new Error(
+            `Terraform ${label} ${address} escaped the exact HealthMCP prod root resource map.`,
+          );
         }
       } else if (moduleAddress !== modulePrefix.slice(0, -1)) {
         throw new Error(`Terraform ${label} escaped the exact root module.`);

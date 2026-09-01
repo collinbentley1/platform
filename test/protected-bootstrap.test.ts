@@ -3306,6 +3306,83 @@ describe("protected owner Terraform bridge", () => {
     );
   });
 
+  test("HealthMCP prod admits only its exact reviewed root resources", () => {
+    const healthIdentity: PlanIdentity = {
+      ...identity(),
+      projectId: REPOSITORIES.healthmcp.projectId,
+      repository: "healthmcp",
+      repositoryId: REPOSITORIES.healthmcp.repositoryId,
+    };
+    const rootChange = (address: string, type: string) => {
+      const change = resourceChange(address, type, {}, {});
+      delete (change as { module_address?: string }).module_address;
+      return change;
+    };
+    const exactResources = [
+      ["google_firestore_field.waitlist_entry_ttl", "google_firestore_field"],
+      ["google_firestore_field.waitlist_quota_ttl", "google_firestore_field"],
+      ["google_identity_platform_config.default", "google_identity_platform_config"],
+      ["google_project_service.identity_toolkit", "google_project_service"],
+      ["google_project_service.recaptcha_enterprise", "google_project_service"],
+      ["google_recaptcha_enterprise_key.waitlist", "google_recaptcha_enterprise_key"],
+    ] as const;
+
+    const review = buildReviewManifest(
+      plan(exactResources.map(([address, type]) => rootChange(address, type))),
+      healthIdentity,
+    );
+    for (const [address] of exactResources) expect(review.canonical).toContain(address);
+
+    const extra = rootChange("google_project_service.unreviewed", "google_project_service");
+    expect(() => buildReviewManifest(plan([extra]), healthIdentity)).toThrow(
+      "escaped the exact root module",
+    );
+
+    const swapped = rootChange(
+      "google_recaptcha_enterprise_key.waitlist",
+      "google_project_service",
+    );
+    expect(() => buildReviewManifest(plan([swapped]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const nested = rootChange(
+      "google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key",
+    );
+    nested.module_address = "module.site";
+    expect(() => buildReviewManifest(plan([nested]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const dataSource = rootChange(
+      "google_identity_platform_config.default",
+      "google_identity_platform_config",
+    );
+    dataSource.mode = "data";
+    expect(() => buildReviewManifest(plan([dataSource]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const otherConsumer = rootChange(
+      "google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key",
+    );
+    expect(() => buildReviewManifest(plan([otherConsumer]), identity())).toThrow(
+      "escaped the exact root module",
+    );
+
+    const moduleSmuggling = resourceChange(
+      "module.site.google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key",
+      {},
+      {},
+    );
+    expect(() => buildReviewManifest(plan([moduleSmuggling]), healthIdentity)).toThrow(
+      "escaped the root resource allowlist",
+    );
+  });
+
   test("review manifest is strict hash-only and never copies raw values or state", () => {
     const raw = plan([
       resourceChange(
