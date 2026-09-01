@@ -21,11 +21,12 @@ on:
           - prod
           - exposure
       mode:
-        description: Plan emits a digest; exposure plan is terminal adoption, while apply is bootstrap/prod only.
+        description: Plan emits a digest; rehearsal exercises the federation quarantine only; apply is disabled in this build.
         required: true
         type: choice
         options:
           - plan
+          - rehearsal
           - apply
       consumer_sha:
         description: Full reviewed consumer commit SHA to fetch without a branch or tag.
@@ -175,6 +176,12 @@ jobs:
             *) exit 1 ;;
           esac
           case "$TERRAFORM_ROOT" in bootstrap|prod|exposure) ;; *) exit 1 ;; esac
+          # A rehearsal runs no Terraform and adopts nothing, so it has no
+          # exposure route and no adoption identity of any kind.
+          if [ "$EXECUTION_MODE" = "rehearsal" ]; then
+            test "$TERRAFORM_ROOT" != "exposure"
+            test -z "$EXPOSURE_ADOPTION_RUN_ID"
+          fi
           if [ "$TERRAFORM_ROOT" = "exposure" ]; then
             test "$TARGET_REPOSITORY" = "runsetta"
             test "$EXECUTION_MODE" = "plan"
@@ -182,12 +189,13 @@ jobs:
           else
             test -z "$EXPOSURE_ADOPTION_CONFIRMATION"
           fi
-          if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ]; then
+          if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ] \
+            && [ "$EXECUTION_MODE" != "rehearsal" ]; then
             [[ "$EXPOSURE_ADOPTION_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           else
             test -z "$EXPOSURE_ADOPTION_RUN_ID"
           fi
-          case "$EXECUTION_MODE" in plan|apply) ;; *) exit 1 ;; esac
+          case "$EXECUTION_MODE" in plan|apply|rehearsal) ;; *) exit 1 ;; esac
           [[ "$CONSUMER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_SHA_EXACT" =~ ^[0-9a-f]{40}$ ]]
           case "$LEGACY_COMPATIBILITY_MODE" in true|false) ;; *) exit 1 ;; esac
@@ -202,12 +210,14 @@ jobs:
           elif [ "$LEGACY_COMPATIBILITY_MODE" = "true" ]; then
             test -z "$TRANSITION_WORKFLOW_SHA"
           fi
-          if [ "$EXECUTION_MODE" = "plan" ]; then
-            test -z "$APPROVED_MANIFEST_SHA256"
-            test -z "$APPROVED_PLAN_RUN_ID"
-          else
+          if [ "$EXECUTION_MODE" = "apply" ]; then
             [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
             [[ "$APPROVED_PLAN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          else
+            # Plan AND rehearsal. Treating every non-plan mode as an apply here
+            # would demand approval fields a rehearsal can never have.
+            test -z "$APPROVED_MANIFEST_SHA256"
+            test -z "$APPROVED_PLAN_RUN_ID"
           fi
 
       - name: Fetch the exact public platform, consumer, and transition commits
@@ -439,7 +449,9 @@ jobs:
           # this check and failed twelve minutes later having already acquired
           # and elevated an executor. Setup measures 6 to 9 seconds here.
           case "$EXECUTION_MODE" in
-            plan)
+            # A rehearsal runs the federation lifecycle and no Terraform, so it
+            # takes the plan envelope rather than the apply one.
+            plan|rehearsal)
               bridge_reserve_seconds=$((16 * 60))
               bridge_minimum_seconds=$((7 * 60))
               bridge_maximum_seconds=$((25 * 60))
