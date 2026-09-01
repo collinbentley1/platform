@@ -474,6 +474,25 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
   depends_on = [google_project_service.required]
 }
 
+# The routine Medlock deploy must preserve the Terraform-created public site
+# key, but it must not trust a mutable Cloud Run environment value by itself.
+# This one-permission role lets the deploy re-read that exact key's public
+# policy. It grants no key listing, creation, update, deletion, legacy-secret
+# retrieval, assessment creation, or account access.
+resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader" {
+  count = contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0
+
+  project     = var.project_id
+  role_id     = "waitlistRecaptchaKeyReader"
+  title       = "Waitlist reCAPTCHA Key Reader"
+  description = "Reads only public reCAPTCHA key metadata so a production deploy can preserve and verify the Terraform-created ownership key."
+  permissions = [
+    "recaptchaenterprise.keys.get",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_project_iam_custom_role" "preview_traffic_committer" {
   project     = var.project_id
   role_id     = "previewTrafficCommitter"
@@ -883,6 +902,14 @@ resource "google_service_account_iam_member" "prod_deploy_uses_runtime" {
   service_account_id = google_service_account.runtime.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.prod_deploy.email}"
+}
+
+resource "google_project_iam_member" "prod_deploy_waitlist_recaptcha_key_reader" {
+  count = contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.waitlist_recaptcha_key_reader[0].name
+  member  = "serviceAccount:${google_service_account.prod_deploy.email}"
 }
 
 resource "google_service_account_iam_member" "preview_deploy_uses_preview_runtime" {

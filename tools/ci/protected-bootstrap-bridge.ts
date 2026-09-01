@@ -664,12 +664,10 @@ const PROD_RESOURCE_TYPES = new Set([
 // the same resource in another consumer must require a separate platform
 // review before the protected bridge will admit it.
 const HEALTHMCP_PROD_ROOT_RESOURCES: ReadonlyMap<string, string> = new Map([
-  ["google_firestore_field.waitlist_entry_ttl", "google_firestore_field"],
-  ["google_firestore_field.waitlist_quota_ttl", "google_firestore_field"],
-  ["google_identity_platform_config.default", "google_identity_platform_config"],
-  ["google_project_service.identity_toolkit", "google_project_service"],
-  ["google_project_service.recaptcha_enterprise", "google_project_service"],
-  ["google_recaptcha_enterprise_key.waitlist", "google_recaptcha_enterprise_key"],
+  ["google_firestore_field.waitlist_entry_ttl[0]", "google_firestore_field"],
+  ["google_firestore_field.waitlist_quota_ttl[0]", "google_firestore_field"],
+  ["google_identity_platform_config.default[0]", "google_identity_platform_config"],
+  ["google_recaptcha_enterprise_key.waitlist[0]", "google_recaptcha_enterprise_key"],
 ]);
 
 const EXPOSURE_RESOURCE_TYPES = new Set([
@@ -701,7 +699,9 @@ const TERRAFORM_DIAGNOSTIC_SERVICES = [
   "firestore.googleapis.com",
   "iam.googleapis.com",
   "iamcredentials.googleapis.com",
+  "identitytoolkit.googleapis.com",
   "orgpolicy.googleapis.com",
+  "recaptchaenterprise.googleapis.com",
   "run.googleapis.com",
   "secretmanager.googleapis.com",
   "serviceusage.googleapis.com",
@@ -2173,7 +2173,6 @@ export function executorControlPermissions(
               "firebaseauth.configs.update",
               "recaptchaenterprise.keys.create",
               "recaptchaenterprise.keys.update",
-              "serviceusage.services.enable",
             ]
           : []),
       ];

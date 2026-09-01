@@ -671,6 +671,12 @@ for (const needle of [
   'RUNSETTA_OFFLINE: "1"',
   'WAITLIST_BACKEND: "firestore"',
   'FIRESTORE_PROJECT_ID: "medlock-1025243085"',
+  'gcloud recaptcha keys describe "$recaptcha_site_key"',
+  'IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085"',
+  'IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm"',
+  'RECAPTCHA_PROJECT_ID: "medlock-1025243085"',
+  "RECAPTCHA_SITE_KEY: $recaptcha_site_key",
+  "The served Medlock revision did not preserve the verified ownership configuration.",
 ]) {
   requireContains(
     ".github/workflows/deploy-prod.yml",
@@ -2138,6 +2144,27 @@ for (const needle of [
   );
 }
 for (const needle of [
+  'medlock_ownership_enabled = var.repository_id == "1025243085"',
+  "RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+  'resource "google_firestore_field" "waitlist_entry_ttl"',
+  'resource "google_firestore_field" "waitlist_quota_ttl"',
+  'resource "google_identity_platform_config" "default"',
+  'resource "google_recaptcha_enterprise_key" "waitlist"',
+]) {
+  requireContains(
+    "terraform/deployments/prod/main.tf",
+    productionDeployment,
+    needle,
+    `The trusted production root is missing the Medlock ownership resource: ${needle}`,
+  );
+}
+rejectContains(
+  "terraform/deployments/prod/main.tf",
+  productionDeployment,
+  'resource "google_project_service"',
+  "API enablement must have one Terraform owner in bootstrap state, never a second owner in production state.",
+);
+for (const needle of [
   "runtime_secret_accessor_ids              = []",
   'RUNSETTA_OFFLINE   = "1"',
   'RUNSETTA_TTS_MODEL = "gpt-4o-mini-tts"',
@@ -2545,7 +2572,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "622b96533c846ed215f419aba7e73c7bd9469f37965fe43a253fa621c7fa96e3"
+  "150969da5aa7573dd8beb13e0399e2c8a11923a3fd4913f7074ef91864ebda9e"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2561,6 +2588,7 @@ const bootstrapIamResources = [
 const approvedBootstrapIamResources = [
   "google_project_iam_binding.editor_absent",
   "google_project_iam_member.preview_iam_auditors",
+  "google_project_iam_member.prod_deploy_waitlist_recaptcha_key_reader",
   "google_project_iam_member.runtime_project_roles",
   "google_project_iam_member.runtime_waitlist_challenge_sender",
   "google_project_iam_member.terraform_convergence_reader",

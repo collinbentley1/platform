@@ -2865,7 +2865,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "622b96533c846ed215f419aba7e73c7bd9469f37965fe43a253fa621c7fa96e3",
+      "150969da5aa7573dd8beb13e0399e2c8a11923a3fd4913f7074ef91864ebda9e",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2898,6 +2898,7 @@ describe("platform scaffold and doctor", () => {
       [
         "google_project_iam_binding.editor_absent",
         "google_project_iam_member.preview_iam_auditors",
+        "google_project_iam_member.prod_deploy_waitlist_recaptcha_key_reader",
         "google_project_iam_member.runtime_project_roles",
         "google_project_iam_member.runtime_waitlist_challenge_sender",
         "google_project_iam_member.terraform_convergence_reader",
@@ -3598,6 +3599,16 @@ describe("platform scaffold and doctor", () => {
     expect(preview).toContain('WAITLIST_BACKEND: "memory"');
     expect(production).toContain('WAITLIST_BACKEND: "firestore"');
     expect(production).toContain('FIRESTORE_PROJECT_ID: "medlock-1025243085"');
+    expect(production).toContain('gcloud recaptcha keys describe "$recaptcha_site_key"');
+    expect(production).toContain('IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085"');
+    expect(production).toContain(
+      'IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm"',
+    );
+    expect(production).toContain('RECAPTCHA_PROJECT_ID: "medlock-1025243085"');
+    expect(production).toContain("RECAPTCHA_SITE_KEY: $recaptcha_site_key");
+    expect(production).toContain(
+      "The served Medlock revision did not preserve the verified ownership configuration.",
+    );
     expect(production).toContain('PLATFORM_DEPLOY_ENVIRONMENT: "production"');
     expect(production).toContain("--clear-secrets");
     expect(production).not.toContain("GCP_PROD_ENV_VARS");
@@ -3664,6 +3675,24 @@ describe("platform scaffold and doctor", () => {
     expect(medlockProduction).toContain(
       'runtime_secret_version_adder_ids = [\n        "waitlist-identity-keyset",\n      ]',
     );
+    expect(deployment).toContain(
+      "container_env                                  = merge(local.deployment.container_env, local.medlock_ownership_env)",
+    );
+    expect(deployment).toContain(
+      'medlock_ownership_enabled = var.repository_id == "1025243085"',
+    );
+    expect(deployment).toContain(
+      "RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+    );
+    for (const header of [
+      'resource "google_firestore_field" "waitlist_entry_ttl"',
+      'resource "google_firestore_field" "waitlist_quota_ttl"',
+      'resource "google_identity_platform_config" "default"',
+      'resource "google_recaptcha_enterprise_key" "waitlist"',
+    ]) {
+      expect(deployment).toContain(header);
+    }
+    expect(deployment).not.toContain('resource "google_project_service"');
     const medlockBootstrap = bootstrapDeployment.slice(
       bootstrapDeployment.indexOf('    "1025243085" = {'),
       bootstrapDeployment.indexOf('    "280932482" = {'),
@@ -3682,9 +3711,9 @@ describe("platform scaffold and doctor", () => {
       mirrorContract.indexOf('  "280932482": {'),
       mirrorContract.indexOf("\n};", mirrorContract.indexOf('  "280932482": {')),
     );
-    // A set, and deduplicated on purpose: an API named in required_services may
-    // also be named by a google_project_service resource in the reviewed
-    // additional Terraform, and appearing twice is not a difference.
+    // Required API ownership remains entirely in bootstrap state. The consumer
+    // mirror names the same service set as a contract, but never declares a
+    // second google_project_service owner in production state.
     const serviceSet = (source: string) =>
       [...new Set(
         [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)].map((match) => match[1]!),
@@ -3770,13 +3799,6 @@ resource "google_firestore_field" "waitlist_quota_ttl" {
   depends_on = [module.site]
 }
 
-resource "google_project_service" "identity_toolkit" {
-  project = var.project_id
-  service = "identitytoolkit.googleapis.com"
-
-  disable_on_destroy = false
-}
-
 resource "google_identity_platform_config" "default" {
   project = var.project_id
 
@@ -3793,15 +3815,6 @@ resource "google_identity_platform_config" "default" {
     "medlock.ai",
     "www.medlock.ai",
   ]
-
-  depends_on = [google_project_service.identity_toolkit]
-}
-
-resource "google_project_service" "recaptcha_enterprise" {
-  project = var.project_id
-  service = "recaptchaenterprise.googleapis.com"
-
-  disable_on_destroy = false
 }
 
 resource "google_recaptcha_enterprise_key" "waitlist" {
@@ -3816,8 +3829,6 @@ resource "google_recaptcha_enterprise_key" "waitlist" {
     allow_amp_traffic = false
     allowed_domains   = ["medlock.ai"]
   }
-
-  depends_on = [google_project_service.recaptcha_enterprise]
 }`;
 
 async function configureReviewedMedlock(app: string): Promise<void> {

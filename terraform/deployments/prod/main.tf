@@ -145,6 +145,14 @@ locals {
     }
   }
 
+  medlock_ownership_enabled = var.repository_id == "1025243085"
+  medlock_ownership_env = local.medlock_ownership_enabled ? {
+    IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"
+    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"
+    RECAPTCHA_PROJECT_ID           = "medlock-1025243085"
+    RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)
+  } : {}
+
   deployment = local.deployments[var.repository_id]
 }
 
@@ -189,9 +197,82 @@ module "site" {
   preview_commit_service_account_email           = local.deployment.preview_commit_service_account
   preview_operator_service_account_email         = local.deployment.preview_operator_service_account
   preview_publisher_service_account_email        = local.deployment.preview_publisher_service_account
-  container_env                                  = local.deployment.container_env
+  container_env                                  = merge(local.deployment.container_env, local.medlock_ownership_env)
   runtime_secret_ids                             = local.deployment.runtime_secret_ids
   runtime_secret_accessor_ids                    = local.deployment.runtime_secret_accessor_ids
   runtime_secret_version_adder_ids               = local.deployment.runtime_secret_version_adder_ids
   firestore_database                             = local.deployment.firestore_database
+}
+
+# The protected bridge executes this platform-owned root, not the consumer's
+# mirrored Terraform. Keep these resources here so the reviewed plan is the
+# configuration that actually provisions the waitlist ownership boundary.
+#
+# Identity Toolkit and reCAPTCHA API enablement remain owned exclusively by the
+# bootstrap state (`google_project_service.required`). Duplicating either API
+# resource in this state would create two Terraform owners for one live service.
+resource "google_firestore_field" "waitlist_entry_ttl" {
+  count = local.medlock_ownership_enabled ? 1 : 0
+
+  project    = local.deployment.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  count = local.medlock_ownership_enabled ? 1 : 0
+
+  project    = local.deployment.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_identity_platform_config" "default" {
+  count = local.medlock_ownership_enabled ? 1 : 0
+
+  project = local.deployment.project_id
+
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+
+  authorized_domains = [
+    "medlock.ai",
+    "www.medlock.ai",
+  ]
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  count = local.medlock_ownership_enabled ? 1 : 0
+
+  project      = local.deployment.project_id
+  display_name = "Medlock waitlist ownership"
+
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
 }

@@ -7,6 +7,7 @@ const repoRoot = resolve(import.meta.dir, "..");
 const headSha = "0123456789abcdef0123456789abcdef01234567";
 const platformWorkflowSha = "1234567890abcdef1234567890abcdef12345678";
 const dhiParityId = "1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8";
+const recaptchaSiteKey = "6LmedlockWaitlistOwnershipKey_1234567890";
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
@@ -37,6 +38,13 @@ describe("production Secret Manager deploy boundary", () => {
         `github-run-attempt=1,platform-workflow-sha=${platformWorkflowSha},waitlist-secret-version=7`,
     );
     expect(created.capturedEnvironment).not.toContain("WAITLIST_IDENTITY_KEYSET");
+    expect(JSON.parse(created.capturedEnvironment)).toMatchObject({
+      IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+      IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm",
+      RECAPTCHA_PROJECT_ID: "medlock-1025243085",
+      RECAPTCHA_SITE_KEY: recaptchaSiteKey,
+    });
+    expect(created.calls).toContain(`recaptcha\tkeys\tdescribe\t${recaptchaSiteKey}`);
     expect(created.calls).not.toContain(created.stdinDigest);
     expect(created.deployArguments).not.toContain(created.stdinDigest);
   });
@@ -110,6 +118,58 @@ describe("production Secret Manager deploy boundary", () => {
       expect(rejected.deployArguments).toBe("");
     }
   });
+
+  test("rejects missing, duplicated, or changed ownership runtime settings", async () => {
+    const deployScript = await productionDeployScript();
+    const exact = ownershipEntries();
+    const cases = [
+      exact.filter((entry) => entry.name !== "RECAPTCHA_SITE_KEY"),
+      [...exact, { name: "RECAPTCHA_SITE_KEY", value: recaptchaSiteKey }],
+      exact.map((entry) => entry.name === "IDENTITY_PLATFORM_AUDIENCE"
+        ? { ...entry, value: "foreign-project" }
+        : entry),
+      exact.map((entry) => entry.name === "RECAPTCHA_SITE_KEY"
+        ? { ...entry, value: "not a key" }
+        : entry),
+    ];
+
+    for (const ownership of cases) {
+      const rejected = await runDeployScript(
+        deployScript,
+        serviceWithWaitlistEntries([], ownership),
+        [],
+      );
+      expect(rejected.exitCode).not.toBe(0);
+      expect(rejected.calls).not.toContain("run\tdeploy");
+    }
+  });
+
+  test("rejects a site key whose live public policy drifted", async () => {
+    const deployScript = await productionDeployScript();
+    const exact = exactRecaptchaKey();
+    const cases = [
+      { ...exact, displayName: "Foreign key" },
+      { ...exact, webSettings: { ...exact.webSettings, allowAllDomains: true } },
+      { ...exact, webSettings: { ...exact.webSettings, allowedDomains: ["attacker.example"] } },
+      { ...exact, testingOptions: { testingScore: 1 } },
+      { ...exact, wafSettings: { wafFeature: "CHALLENGE_PAGE", wafService: "CA" } },
+    ];
+
+    for (const key of cases) {
+      const rejected = await runDeployScript(
+        deployScript,
+        serviceWithWaitlistEntries([]),
+        [],
+        "ENABLED",
+        key,
+      );
+      expect(rejected.exitCode).not.toBe(0);
+      expect(rejected.stderr).toContain(
+        "The live Medlock reCAPTCHA key escaped its Terraform-reviewed public policy.",
+      );
+      expect(rejected.calls).not.toContain("run\tdeploy");
+    }
+  });
 });
 
 async function productionDeployScript(): Promise<string> {
@@ -125,7 +185,10 @@ async function productionDeployScript(): Promise<string> {
   return deployScript.replaceAll("${{ steps.parity-policy.outputs.root }}", repoRoot);
 }
 
-function serviceWithWaitlistEntries(entries: unknown[]): object {
+function serviceWithWaitlistEntries(
+  entries: unknown[],
+  ownership: Array<{ name: string; value: string }> = ownershipEntries(),
+): object {
   return {
     apiVersion: "serving.knative.dev/v1",
     kind: "Service",
@@ -140,7 +203,7 @@ function serviceWithWaitlistEntries(entries: unknown[]): object {
       namespace: "229383559510",
     },
     spec: {
-      template: { spec: { containers: [{ env: entries }] } },
+      template: { spec: { containers: [{ env: [...ownership, ...entries] }] } },
       traffic: [{ latestRevision: true, percent: 100 }],
     },
     status: {
@@ -152,6 +215,40 @@ function serviceWithWaitlistEntries(entries: unknown[]): object {
       latestReadyRevisionName: "medlock-00007-abc",
       observedGeneration: 7,
       traffic: [{ latestRevision: true, percent: 100, revisionName: "medlock-00007-abc" }],
+    },
+  };
+}
+
+function ownershipEntries(): Array<{ name: string; value: string }> {
+  return [
+    { name: "IDENTITY_PLATFORM_AUDIENCE", value: "medlock-1025243085" },
+    {
+      name: "IDENTITY_PLATFORM_CONTINUE_URL",
+      value: "https://medlock.ai/api/waitlist/confirm",
+    },
+    { name: "RECAPTCHA_PROJECT_ID", value: "medlock-1025243085" },
+    { name: "RECAPTCHA_SITE_KEY", value: recaptchaSiteKey },
+  ];
+}
+
+function exactRecaptchaKey(): {
+  displayName: string;
+  name: string;
+  webSettings: {
+    allowAllDomains: boolean;
+    allowAmpTraffic: boolean;
+    allowedDomains: string[];
+    integrationType: string;
+  };
+} {
+  return {
+    displayName: "Medlock waitlist ownership",
+    name: `projects/229383559510/keys/${recaptchaSiteKey}`,
+    webSettings: {
+      allowAllDomains: false,
+      allowAmpTraffic: false,
+      allowedDomains: ["medlock.ai"],
+      integrationType: "SCORE",
     },
   };
 }
@@ -180,6 +277,7 @@ function productionRevisionFixture(): object {
         env: [
           { name: "PLATFORM_IMAGE_INDEX_DIGEST", value: `sha256:${"a".repeat(64)}` },
           { name: "PLATFORM_IMAGE_RUNNABLE_DIGEST", value: `sha256:${"b".repeat(64)}` },
+          ...ownershipEntries(),
         ],
         image,
       }],
@@ -209,6 +307,7 @@ async function runDeployScript(
   serviceSnapshot: unknown,
   versionsSnapshot: unknown[],
   versionState: "DISABLED" | "ENABLED" = "ENABLED",
+  keySnapshot: unknown = exactRecaptchaKey(),
 ): Promise<{
   calls: string;
   capturedEnvironment: string;
@@ -227,11 +326,13 @@ async function runDeployScript(
   const stdinDigest = join(root, "stdin-digest.txt");
   const serviceFixture = join(root, "service-fixture.json");
   const revisionFixture = join(root, "revision-fixture.json");
+  const keyFixture = join(root, "key-fixture.json");
   const versionsFixture = join(root, "versions-fixture.json");
   const v2ServiceFixture = join(root, "v2-service-fixture.json");
   const v2RevisionFixture = join(root, "v2-revision-fixture.json");
   await writeFile(serviceFixture, JSON.stringify(serviceSnapshot));
   await writeFile(revisionFixture, JSON.stringify(productionRevisionFixture()));
+  await writeFile(keyFixture, JSON.stringify(keySnapshot));
   await writeFile(versionsFixture, JSON.stringify(versionsSnapshot));
   await writeFile(v2ServiceFixture, JSON.stringify({
     defaultUriDisabled: false,
@@ -255,6 +356,7 @@ async function runDeployScript(
       env: [
         { name: "PLATFORM_IMAGE_INDEX_DIGEST", value: `sha256:${"a".repeat(64)}` },
         { name: "PLATFORM_IMAGE_RUNNABLE_DIGEST", value: `sha256:${"b".repeat(64)}` },
+        ...ownershipEntries(),
       ],
       image: `us-east4-docker.pkg.dev/medlock-1025243085/site/medlock@sha256:${"b".repeat(64)}`,
     }],
@@ -280,6 +382,9 @@ async function runDeployScript(
       "    ;;",
       "  run:revisions:describe)",
       '    cat "$GCLOUD_REVISION_FIXTURE"',
+      "    ;;",
+      "  recaptcha:keys:describe)",
+      '    cat "$GCLOUD_RECAPTCHA_KEY_FIXTURE"',
       "    ;;",
       "  secrets:versions:list)",
       '    cat "$GCLOUD_VERSIONS_FIXTURE"',
@@ -346,6 +451,7 @@ async function runDeployScript(
       GCLOUD_DEPLOY_ARGUMENTS: deployArguments,
       GCLOUD_SERVICE_FIXTURE: serviceFixture,
       GCLOUD_REVISION_FIXTURE: revisionFixture,
+      GCLOUD_RECAPTCHA_KEY_FIXTURE: keyFixture,
       GCLOUD_STDIN_DIGEST: stdinDigest,
       GCLOUD_VERSIONS_FIXTURE: versionsFixture,
       GCLOUD_VERSION_STATE: versionState,

@@ -1285,9 +1285,10 @@ jobs:
           umask 077
           env_file="$RUNNER_TEMP/production-env.json"
           service_snapshot="$RUNNER_TEMP/production-service.json"
+          key_snapshot="$RUNNER_TEMP/waitlist-recaptcha-key.json"
           version_snapshot="$RUNNER_TEMP/waitlist-secret-version.json"
           versions_snapshot="$RUNNER_TEMP/waitlist-secret-versions.json"
-          trap 'rm -f "$env_file" "${env_file}.next" "$service_snapshot" "$version_snapshot" "$versions_snapshot" "${deployed_revision_snapshot:-}" "${parity_outputs:-}" "${rest_token_file:-}" "${rest_header_file:-}" "${v2_service_snapshot:-}" "${v2_revision_snapshot:-}"' EXIT
+          trap 'rm -f "$env_file" "${env_file}.next" "$service_snapshot" "$key_snapshot" "$version_snapshot" "$versions_snapshot" "${deployed_revision_snapshot:-}" "${parity_outputs:-}" "${rest_token_file:-}" "${rest_header_file:-}" "${v2_service_snapshot:-}" "${v2_revision_snapshot:-}"' EXIT
           jq -n --arg index "$IMAGE_DIGEST" --arg runnable "$RUNNABLE_DIGEST" '{
             PLATFORM_IMAGE_INDEX_DIGEST: $index,
             PLATFORM_IMAGE_RUNNABLE_DIGEST: $runnable
@@ -1313,6 +1314,40 @@ jobs:
                 --project="$PROJECT_ID" \
                 --region="$REGION" \
                 --format=json > "$service_snapshot"
+              recaptcha_site_key="$(jq -er '
+                def exact_value($name):
+                  [.spec.template.spec.containers[0].env[]?
+                   | select(.name == $name and (keys | sort) == ["name", "value"])
+                   | .value]
+                  | if length == 1 then .[0] else error("missing or duplicate ownership configuration") end;
+                if exact_value("IDENTITY_PLATFORM_AUDIENCE") != "medlock-1025243085" or
+                   exact_value("IDENTITY_PLATFORM_CONTINUE_URL") != "https://medlock.ai/api/waitlist/confirm" or
+                   exact_value("RECAPTCHA_PROJECT_ID") != "medlock-1025243085"
+                then error("ownership configuration drifted")
+                else exact_value("RECAPTCHA_SITE_KEY")
+                  | select(type == "string" and test("^[A-Za-z0-9_-]{20,100}$"))
+                end
+              ' "$service_snapshot")"
+              gcloud recaptcha keys describe "$recaptcha_site_key" \
+                --project="$PROJECT_ID" \
+                --format=json > "$key_snapshot"
+              jq -e --arg project "$PROJECT_ID" --arg project_number "$PROJECT_NUMBER" --arg key "$recaptcha_site_key" '
+                (.name == ("projects/" + $project + "/keys/" + $key) or
+                 .name == ("projects/" + $project_number + "/keys/" + $key)) and
+                .displayName == "Medlock waitlist ownership" and
+                .webSettings.integrationType == "SCORE" and
+                (.webSettings.allowAllDomains // false) == false and
+                (.webSettings.allowAmpTraffic // false) == false and
+                .webSettings.allowedDomains == ["medlock.ai"] and
+                (.testingOptions // null) == null and
+                (.wafSettings // null) == null and
+                (.androidSettings // null) == null and
+                (.iosSettings // null) == null and
+                (.expressSettings // null) == null
+              ' "$key_snapshot" >/dev/null || {
+                echo "The live Medlock reCAPTCHA key escaped its Terraform-reviewed public policy." >&2
+                exit 1
+              }
               waitlist_entries="$(jq -ce '[
                 .spec.template.spec.containers[0].env[]?
                 | select(.name == "WAITLIST_IDENTITY_KEYSET")
@@ -1371,16 +1406,20 @@ jobs:
               ' "$version_snapshot" >/dev/null
               labels="${labels},waitlist-secret-version=${secret_version}"
               secret_args=(--set-secrets="WAITLIST_IDENTITY_KEYSET=waitlist-identity-keyset:${secret_version}")
-              jq '. + {
+              jq --arg recaptcha_site_key "$recaptcha_site_key" '. + {
                 ALLOWED_HOSTS: "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app",
                 ALLOWED_ORIGINS: "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app",
                 CANONICAL_HOST: "medlock.ai",
                 FIRESTORE_COLLECTION: "waitlist",
                 FIRESTORE_DATABASE_ID: "(default)",
                 FIRESTORE_PROJECT_ID: "medlock-1025243085",
+                IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+                IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm",
                 LEGACY_HOSTS: "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app",
                 MEDLOCK_VERSION: "0.2.0",
                 PLATFORM_DEPLOY_ENVIRONMENT: "production",
+                RECAPTCHA_PROJECT_ID: "medlock-1025243085",
+                RECAPTCHA_SITE_KEY: $recaptcha_site_key,
                 WAITLIST_BACKEND: "firestore"
               }' "$env_file" > "${env_file}.next"
               mv "${env_file}.next" "$env_file"
@@ -1471,6 +1510,22 @@ jobs:
             echo "Production v2 revision did not bind the published OCI index to its Cloud Run runnable child." >&2
             exit 1
           }
+          if [ "$REPOSITORY_ID" = "1025243085" ]; then
+            jq -e --arg site_key "$recaptcha_site_key" '
+              def exact_value($name):
+                [.containers[0].env[]?
+                 | select(.name == $name and (keys | sort) == ["name", "value"])
+                 | .value]
+                | if length == 1 then .[0] else error("missing or duplicate ownership configuration") end;
+              exact_value("IDENTITY_PLATFORM_AUDIENCE") == "medlock-1025243085" and
+              exact_value("IDENTITY_PLATFORM_CONTINUE_URL") == "https://medlock.ai/api/waitlist/confirm" and
+              exact_value("RECAPTCHA_PROJECT_ID") == "medlock-1025243085" and
+              exact_value("RECAPTCHA_SITE_KEY") == $site_key
+            ' "$v2_revision_snapshot" >/dev/null || {
+              echo "The served Medlock revision did not preserve the verified ownership configuration." >&2
+              exit 1
+            }
+          fi
           parity_outputs="$RUNNER_TEMP/deployed-production-parity.outputs"
           GITHUB_OUTPUT="$parity_outputs" \
             PARITY_SERVICE_JSON="$service_snapshot" \

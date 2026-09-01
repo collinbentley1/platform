@@ -80,9 +80,11 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
   },
   "1025243085": {
     // Reviewed verbatim: the Firestore field TTL policies that make `expiresAt`
-    // enforceable, and the Identity Platform configuration behind the waitlist
-    // ownership flow. Both are project resources rather than module inputs, so
-    // they live in the application's prod/main.tf and are pinned here.
+    // enforceable, and the Identity Platform/reCAPTCHA configuration behind the
+    // waitlist ownership flow. The trusted platform production root is their
+    // live owner; this consumer mirror remains an exact, reviewable declaration
+    // of the application contract. API enablement belongs only to bootstrap
+    // state and is intentionally not duplicated here.
     additionalProductionResources: `resource "google_firestore_field" "waitlist_entry_ttl" {
   project    = var.project_id
   database   = "(default)"
@@ -109,13 +111,6 @@ resource "google_firestore_field" "waitlist_quota_ttl" {
   depends_on = [module.site]
 }
 
-resource "google_project_service" "identity_toolkit" {
-  project = var.project_id
-  service = "identitytoolkit.googleapis.com"
-
-  disable_on_destroy = false
-}
-
 resource "google_identity_platform_config" "default" {
   project = var.project_id
 
@@ -132,15 +127,6 @@ resource "google_identity_platform_config" "default" {
     "medlock.ai",
     "www.medlock.ai",
   ]
-
-  depends_on = [google_project_service.identity_toolkit]
-}
-
-resource "google_project_service" "recaptcha_enterprise" {
-  project = var.project_id
-  service = "recaptchaenterprise.googleapis.com"
-
-  disable_on_destroy = false
 }
 
 resource "google_recaptcha_enterprise_key" "waitlist" {
@@ -155,8 +141,6 @@ resource "google_recaptcha_enterprise_key" "waitlist" {
     allow_amp_traffic = false
     allowed_domains   = ["medlock.ai"]
   }
-
-  depends_on = [google_project_service.recaptcha_enterprise]
 }`,
     artifactRegistryDescription: "Container images for Medlock.",
     artifactRegistryRepositoryId: "site",

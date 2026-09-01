@@ -201,6 +201,32 @@ describe("the protected apply identity gains only what TTL and config need", () 
       "recaptchaenterprise.keys.get",
     ]);
   });
+
+  test("the production deployer can only get the Terraform-created key metadata", async () => {
+    const source = await readFile(bootstrapModule, "utf8");
+    const role = block(
+      source,
+      'resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader"',
+    );
+    expect(grantedPermissions(role)).toEqual(["recaptchaenterprise.keys.get"]);
+    expect(role).toContain(
+      'contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0',
+    );
+
+    const binding = block(
+      source,
+      'resource "google_project_iam_member" "prod_deploy_waitlist_recaptcha_key_reader"',
+    );
+    expect(binding).toContain(
+      'contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0',
+    );
+    expect(binding).toContain(
+      "role    = google_project_iam_custom_role.waitlist_recaptcha_key_reader[0].name",
+    );
+    expect(binding).toContain(
+      'member  = "serviceAccount:${google_service_account.prod_deploy.email}"',
+    );
+  });
 });
 
 describe("only the application that needs them declares them", () => {

@@ -2964,7 +2964,6 @@ describe("protected owner Terraform bridge", () => {
       "firebaseauth.configs.update",
       "recaptchaenterprise.keys.create",
       "recaptchaenterprise.keys.update",
-      "serviceusage.services.enable",
     ];
     for (const permission of ownershipRead) {
       expect(read).toContain(permission);
@@ -2981,6 +2980,7 @@ describe("protected owner Terraform bridge", () => {
       "recaptchaenterprise.keys.delete",
       "recaptchaenterprise.keys.list",
       "recaptchaenterprise.keys.retrievelegacysecretkey",
+      "serviceusage.services.enable",
       "serviceusage.services.disable",
     ]) {
       expect(read).not.toContain(forbidden);
@@ -3007,7 +3007,6 @@ describe("protected owner Terraform bridge", () => {
       "recaptchaenterprise.keys.create",
       "recaptchaenterprise.keys.get",
       "recaptchaenterprise.keys.update",
-      "serviceusage.services.enable",
     ]);
     for (const phase of ["read", "mutation"] as const) {
       const prior = executorControlPermissions("healthmcp", "prod", phase).filter(
@@ -3396,12 +3395,10 @@ describe("protected owner Terraform bridge", () => {
       return change;
     };
     const exactResources = [
-      ["google_firestore_field.waitlist_entry_ttl", "google_firestore_field"],
-      ["google_firestore_field.waitlist_quota_ttl", "google_firestore_field"],
-      ["google_identity_platform_config.default", "google_identity_platform_config"],
-      ["google_project_service.identity_toolkit", "google_project_service"],
-      ["google_project_service.recaptcha_enterprise", "google_project_service"],
-      ["google_recaptcha_enterprise_key.waitlist", "google_recaptcha_enterprise_key"],
+      ["google_firestore_field.waitlist_entry_ttl[0]", "google_firestore_field"],
+      ["google_firestore_field.waitlist_quota_ttl[0]", "google_firestore_field"],
+      ["google_identity_platform_config.default[0]", "google_identity_platform_config"],
+      ["google_recaptcha_enterprise_key.waitlist[0]", "google_recaptcha_enterprise_key"],
     ] as const;
 
     const review = buildReviewManifest(
@@ -3416,7 +3413,7 @@ describe("protected owner Terraform bridge", () => {
     );
 
     const swapped = rootChange(
-      "google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key.waitlist[0]",
       "google_project_service",
     );
     expect(() => buildReviewManifest(plan([swapped]), healthIdentity)).toThrow(
@@ -3424,7 +3421,7 @@ describe("protected owner Terraform bridge", () => {
     );
 
     const nested = rootChange(
-      "google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key.waitlist[0]",
       "google_recaptcha_enterprise_key",
     );
     nested.module_address = "module.site";
@@ -3433,7 +3430,7 @@ describe("protected owner Terraform bridge", () => {
     );
 
     const dataSource = rootChange(
-      "google_identity_platform_config.default",
+      "google_identity_platform_config.default[0]",
       "google_identity_platform_config",
     );
     dataSource.mode = "data";
@@ -3442,7 +3439,7 @@ describe("protected owner Terraform bridge", () => {
     );
 
     const otherConsumer = rootChange(
-      "google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key.waitlist[0]",
       "google_recaptcha_enterprise_key",
     );
     expect(() => buildReviewManifest(plan([otherConsumer]), identity())).toThrow(
