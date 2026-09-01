@@ -23,6 +23,7 @@ const canonicalFiles = [
 ];
 const requiredFiles = [
   ...canonicalFiles,
+  ".github/workflows/bun-dependency-update.yml",
   ".gitignore",
   ".platform/config.json",
   "package.json",
@@ -41,6 +42,8 @@ const requiredFiles = [
   "infra/terraform/prod/versions.tf",
 ];
 const requiredDirectories = [
+  ".github",
+  ".github/workflows",
   "infra",
   "infra/terraform",
   "infra/terraform/bootstrap",
@@ -101,6 +104,16 @@ for (const file of canonicalFiles) {
   if (!actual.equals(expected)) {
     throw new Error(`${file} must exactly match the immutable platform template.`);
   }
+}
+
+const [bunUpdateCaller, bunUpdateTemplate] = await Promise.all([
+  readFile(join(appRoot, ".github/workflows/bun-dependency-update.yml"), "utf8"),
+  readFile(join(templateRoot, ".github/workflows/bun-dependency-update.yml"), "utf8"),
+]);
+if (bunUpdateCaller !== bunUpdateTemplate.replaceAll("__PLATFORM_SHA__", expectedPlatformSha)) {
+  throw new Error(
+    ".github/workflows/bun-dependency-update.yml must exactly match the rendered immutable platform template.",
+  );
 }
 
 const packageJson = JSON.parse(await readFile(join(appRoot, "package.json"), "utf8")) as {

@@ -1,0 +1,446 @@
+name: Update Bun dependencies
+
+on:
+  schedule:
+    # The platform runs this directly; consumers call this same immutable
+    # workflow from their platform-managed weekly caller.
+    - cron: "23 13 * * 2"
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: bun-dependency-update-${{ github.event.repository.id }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve a bounded Bun dependency proposal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      digest: ${{ steps.seal.outputs.digest }}
+
+    steps:
+      - name: Reject reruns and alternate privileged event paths
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_EVENT_NAME" = "schedule" || test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+
+      - name: Checkout the exact caller main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve the exact reusable-workflow source
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [ -e "$GITHUB_WORKSPACE/_platform_policy" ] || [ -L "$GITHUB_WORKSPACE/_platform_policy" ]; then
+            echo "The reserved _platform_policy checkout path must not exist in the caller repository." >&2
+            exit 1
+          fi
+
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+            -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
+      - name: Enforce the consumer contract before resolution
+        if: github.event.repository.id != 1255856466
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans ./enforce-app-contract.ts \
+              "$GITHUB_WORKSPACE" \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ github.event.repository.id }}" \
+              "${{ job.workflow_sha }}"
+          )
+
+      - name: Preserve the exact pre-update manifest and lock
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          mkdir -m 0700 "$RUNNER_TEMP/bun-base"
+          install -m 0644 package.json bun.lock "$RUNNER_TEMP/bun-base/"
+
+      - name: Update only direct non-coordinated registry dependencies
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          bun --no-env-file --no-orphans \
+            "$GITHUB_WORKSPACE/_platform_policy/tools/ci/update-bun-dependencies.ts" \
+            "$GITHUB_WORKSPACE"
+
+      - name: Require an atomic manifest and Bun v2 lock proposal
+        id: diff
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          mapfile -t changed < <(git diff --name-only -- | sort)
+          if [ "${#changed[@]}" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${#changed[@]}" -ne 2 ] || [ "${changed[0]}" != "bun.lock" ] || [ "${changed[1]}" != "package.json" ]; then
+            printf 'Refusing a dependency update that touched anything except package.json and bun.lock:\n' >&2
+            printf '  %s\n' "${changed[@]}" >&2
+            exit 1
+          fi
+          git diff --check
+          unexpected="$(git status --short --untracked-files=all | grep -v '^?? _platform_policy/$' || true)"
+          expected="$(printf ' M bun.lock\n M package.json')"
+          if [ "$unexpected" != "$expected" ]; then
+            printf 'Unexpected repository status after dependency update:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Seal the exact two-file proposal
+        if: steps.diff.outputs.changed == 'true'
+        id: seal
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          proposal="$(mktemp -d "$RUNNER_TEMP/bun-proposal.XXXXXX")"
+          install -m 0644 package.json bun.lock "$proposal/"
+          bun --no-env-file --no-orphans \
+            "$GITHUB_WORKSPACE/_platform_policy/tools/ci/update-bun-dependencies.ts" \
+            --validate-proposal "$RUNNER_TEMP/bun-base" "$proposal"
+          digest="$(cd "$proposal" && sha256sum package.json bun.lock | sha256sum | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "path=$proposal" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the immutable dependency proposal
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bun-dependency-proposal-${{ github.run_id }}
+          path: |
+            ${{ steps.seal.outputs.path }}/package.json
+            ${{ steps.seal.outputs.path }}/bun.lock
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  verify:
+    name: Verify the immutable Bun dependency proposal
+    if: needs.resolve.outputs.changed == 'true'
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.artifact.outputs.digest }}
+
+    steps:
+      - name: Reject reruns and alternate privileged event paths
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_EVENT_NAME" = "schedule" || test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+
+      - name: Checkout the exact caller main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+            -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
+      - name: Download the resolved two-file proposal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bun-dependency-proposal-${{ github.run_id }}
+          path: ${{ runner.temp }}/bun-proposal
+
+      - name: Bind the verification runner to the immutable artifact
+        id: artifact
+        env:
+          EXPECTED_DIGEST: ${{ needs.resolve.outputs.digest }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          proposal="$RUNNER_TEMP/bun-proposal"
+          bun --no-env-file --no-orphans \
+            "$GITHUB_WORKSPACE/_platform_policy/tools/ci/update-bun-dependencies.ts" \
+            --validate-proposal "$GITHUB_WORKSPACE" "$proposal"
+          digest="$(cd "$proposal" && sha256sum package.json bun.lock | sha256sum | cut -d' ' -f1)"
+          test "$digest" = "$EXPECTED_DIGEST"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          install -m 0644 "$proposal/package.json" "$proposal/bun.lock" "$GITHUB_WORKSPACE/"
+
+      - name: Enforce the consumer contract before executing updated dependencies
+        if: github.event.repository.id != 1255856466
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/_platform_policy/tools/ci"
+            bun --no-env-file --no-orphans ./enforce-app-contract.ts \
+              "$GITHUB_WORKSPACE" \
+              "$GITHUB_WORKSPACE/_platform_policy/templates/app" \
+              "${{ github.event.repository.id }}" \
+              "${{ job.workflow_sha }}"
+          )
+
+      - name: Prove the updated dependency graph without write authority
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
+          if [ "$REPOSITORY_ID" = "1255856466" ]; then
+            bun --no-env-file run format:check
+            bun --no-env-file run lint
+            bun --no-env-file run typecheck
+            bun --no-env-file run test
+          else
+            bun --no-env-file run verify:ci
+          fi
+
+  propose:
+    name: Open the verified Bun dependency proposal
+    if: needs.resolve.outputs.changed == 'true' && needs.verify.result == 'success'
+    needs: [resolve, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Reject reruns and alternate privileged event paths
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_EVENT_NAME" = "schedule" || test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+
+      - name: Checkout the exact caller main commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout the exact platform policy source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _platform_policy
+          persist-credentials: false
+
+      - name: Verify the checked-out platform policy commit
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_SHA: ${{ job.workflow_sha }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git -C "$GITHUB_WORKSPACE/_platform_policy" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install checksum-pinned Bun 1.4.0
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          "$destination/bun-linux-x64/bun" --no-env-file --no-orphans \
+            -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
+      - name: Download the verified two-file proposal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bun-dependency-proposal-${{ github.run_id }}
+          path: ${{ runner.temp }}/bun-proposal
+
+      - name: Revalidate the artifact in the fresh privileged runner
+        id: proposal
+        env:
+          RESOLVED_DIGEST: ${{ needs.resolve.outputs.digest }}
+          VERIFIED_DIGEST: ${{ needs.verify.outputs.digest }}
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          proposal="$RUNNER_TEMP/bun-proposal"
+          bun --no-env-file --no-orphans \
+            "$GITHUB_WORKSPACE/_platform_policy/tools/ci/update-bun-dependencies.ts" \
+            --validate-proposal "$GITHUB_WORKSPACE" "$proposal" \
+            | tee "$RUNNER_TEMP/bun-update-summary.txt"
+          digest="$(cd "$proposal" && sha256sum package.json bun.lock | sha256sum | cut -d' ' -f1)"
+          test "$digest" = "$RESOLVED_DIGEST"
+          test "$digest" = "$VERIFIED_DIGEST"
+          install -m 0644 "$proposal/package.json" "$proposal/bun.lock" "$GITHUB_WORKSPACE/"
+          mapfile -t changed < <(git diff --name-only -- | sort)
+          test "${#changed[@]}" -eq 2
+          test "${changed[0]}" = "bun.lock"
+          test "${changed[1]}" = "package.json"
+          git diff --check
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Propose the independently verified dependency update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_CONFIG_DIR: ${{ runner.temp }}/gh-config
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: "0"
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          set -euo pipefail
+          mkdir -m 0700 -p "$GH_CONFIG_DIR"
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$current_main" = "$GITHUB_SHA"
+          digest="${{ steps.proposal.outputs.digest }}"
+          branch="chore/bun-dependencies-${digest:0:16}"
+          proposals="$(gh pr list --head "$branch" --state all --json number --jq 'length')"
+          if [ "$proposals" != "0" ]; then
+            echo "already proposed: $branch"
+            exit 0
+          fi
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          {
+            printf 'Automated weekly Bun text-lock v2 dependency refresh.\n\n'
+            printf 'The resolver used checksum-pinned Bun 1.4.0, disabled lifecycle scripts, required the official npm registry and a seven-day minimum release age, and changed only package.json plus bun.lock. Coordinated TypeScript and platform pins were held fixed.\n\n'
+            printf 'The exact two-file artifact digest `%s` was tested without write authority, then revalidated in a fresh proposal runner. Because this pull request is opened with GITHUB_TOKEN, GitHub deliberately does not start another workflow on it. The bound proposing run is:\n\n' "$digest"
+            printf '%s\n\n' "$run_url"
+            printf 'Resolved direct updates:\n\n```text\n'
+            cat "$RUNNER_TEMP/bun-update-summary.txt"
+            printf '```\n\nReview the manifest, lockfile, and bound proposing run before merging. This workflow never auto-merges.\n'
+          } > "$RUNNER_TEMP/pr-body.md"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.hooksPath /dev/null
+          git add -- package.json bun.lock
+          proposal_tree="$(git write-tree)"
+          git_with_token() {
+            git -c credential.helper='!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' "$@"
+          }
+          remote_line="$(git_with_token ls-remote --heads origin "refs/heads/$branch")"
+          if [ -n "$remote_line" ]; then
+            if [[ "$remote_line" == *$'\n'* ]]; then
+              echo "refusing ambiguous remote branch result: $branch" >&2
+              exit 1
+            fi
+            read -r remote_sha remote_ref remote_extra <<< "$remote_line"
+            [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]]
+            test "$remote_ref" = "refs/heads/$branch"
+            test -z "${remote_extra:-}"
+            validation_ref="refs/remotes/platform-bun-updater/$digest"
+            git_with_token fetch --no-tags --no-write-fetch-head origin \
+              "$remote_ref:$validation_ref"
+            test "$(git rev-parse "$validation_ref")" = "$remote_sha"
+            test "$(git rev-list --parents -n 1 "$remote_sha")" = \
+              "$remote_sha $GITHUB_SHA"
+            test "$(git rev-parse "$remote_sha^{tree}")" = "$proposal_tree"
+            echo "reusing the exact digest-bound branch after validating its parent and tree: $branch"
+          else
+            git checkout -b "$branch"
+            git commit -m "chore(deps): refresh Bun dependencies"
+            git_with_token push origin "$branch"
+          fi
+          gh pr create --base main --head "$branch" \
+            --title "chore(deps): refresh Bun dependencies" \
+            --body-file "$RUNNER_TEMP/pr-body.md"

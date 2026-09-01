@@ -1,0 +1,15 @@
+name: Update Bun dependencies
+
+on:
+  schedule:
+    - cron: "23 13 * * 2"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  propose:
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: collinbentley1/platform/.github/workflows/bun-dependency-update.yml@__PLATFORM_SHA__
