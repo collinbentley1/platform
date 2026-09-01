@@ -14042,11 +14042,14 @@ function canonicalInstant(value: string, label: string): string {
 }
 
 export interface PendingApplyReceipt {
+  readonly consumerSha: string;
   readonly deElevationAt: string;
   readonly deElevationExecutorEmail: string;
   readonly deElevationExecutorUniqueId: string;
   readonly intentDigest: string;
   readonly intentGeneration: string;
+  readonly manifestSha256: string;
+  readonly platformSha: string;
   readonly publishedAt: string;
 }
 
@@ -14063,8 +14066,13 @@ export interface PendingApplyReceipt {
 export function pendingApplyReceiptFromBody(
   body: string,
   expected: {
-    readonly consumerSha: string;
-    readonly platformSha: string;
+    // A detached finalizer derives repository, root and run from the object's
+    // own location and name, and has no independent source for the platform and
+    // consumer commits -- those come from the receipt and are cross-checked
+    // against the durable quarantine intent instead. An inline caller knows all
+    // five and supplies them.
+    readonly consumerSha?: string;
+    readonly platformSha?: string;
     readonly repository: RepositoryName;
     readonly root: TerraformRoot;
     readonly runId: string;
@@ -14113,9 +14121,21 @@ export function pendingApplyReceiptFromBody(
   exact(parsed.projectId, contract.projectId, "pending apply receipt project");
   exact(parsed.terraformRoot, expected.root, "pending apply receipt root");
   exact(parsed.runId, expected.runId, "pending apply receipt run ID");
-  exact(parsed.platformSha, expected.platformSha, "pending apply receipt platform SHA");
-  exact(parsed.consumerSha, expected.consumerSha, "pending apply receipt consumer SHA");
-  hash(
+  const platformSha = sha(
+    requiredString(parsed.platformSha, "pending apply receipt platform SHA"),
+    "pending apply receipt platform SHA",
+  );
+  const consumerSha = sha(
+    requiredString(parsed.consumerSha, "pending apply receipt consumer SHA"),
+    "pending apply receipt consumer SHA",
+  );
+  if (expected.platformSha !== undefined) {
+    exact(platformSha, expected.platformSha, "pending apply receipt platform SHA");
+  }
+  if (expected.consumerSha !== undefined) {
+    exact(consumerSha, expected.consumerSha, "pending apply receipt consumer SHA");
+  }
+  const manifestSha256 = hash(
     requiredString(parsed.manifestSha256, "pending apply receipt manifest digest"),
     "pending apply receipt manifest digest",
   );
@@ -14157,13 +14177,24 @@ export function pendingApplyReceiptFromBody(
     new Set(["executorEmail", "executorUniqueId", "observedAt", "provenAbsent"]),
     "pending apply receipt de-elevation",
   );
-  const provenAbsent = array(deElevation.provenAbsent, "pending apply receipt proven-absent set");
-  if (provenAbsent.length < 1 || provenAbsent.length > 256) {
-    throw new Error("Pending apply receipt proven-absent set escaped its bound.");
-  }
-  provenAbsent.forEach((permission, index) => {
-    requiredString(permission, `pending apply receipt proven-absent ${index}`);
-  });
+  // Deterministic, not merely well-formed: exactly the permissions the mutation
+  // role carried that the read role does not, in sorted order. An arbitrary list
+  // would let a receipt claim absence of permissions nobody ever granted.
+  const readPermissions = new Set(
+    executorControlPermissions(expected.repository, expected.root, "read"),
+  );
+  const expectedAbsent = executorControlPermissions(expected.repository, expected.root, "mutation")
+    .filter((permission) => !readPermissions.has(permission))
+    .toSorted();
+  const provenAbsent = array(deElevation.provenAbsent, "pending apply receipt proven-absent set")
+    .map((permission, index) =>
+      requiredString(permission, `pending apply receipt proven-absent ${index}`)
+    );
+  exact(
+    canonicalJson(json(provenAbsent, "pending apply receipt proven-absent set")),
+    canonicalJson(json(expectedAbsent, "pending apply receipt proven-absent set")),
+    "pending apply receipt proven-absent set",
+  );
   const deElevationAt = canonicalInstant(
     requiredString(deElevation.observedAt, "pending apply receipt de-elevation time"),
     "pending apply receipt de-elevation time",
@@ -14198,6 +14229,7 @@ export function pendingApplyReceiptFromBody(
   });
 
   return {
+    consumerSha,
     deElevationAt,
     deElevationExecutorEmail: requiredString(
       deElevation.executorEmail,
@@ -14209,6 +14241,8 @@ export function pendingApplyReceiptFromBody(
     ),
     intentDigest,
     intentGeneration,
+    manifestSha256,
+    platformSha,
     publishedAt: canonicalInstant(
       requiredString(parsed.publishedAt, "pending apply receipt publication time"),
       "pending apply receipt publication time",

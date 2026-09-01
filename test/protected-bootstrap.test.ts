@@ -7046,6 +7046,15 @@ describe("protected owner Terraform bridge", () => {
     return { fetcher, objects };
   };
 
+  // Exactly the permissions the mutation role carries that the read role does
+  // not: the receipt's proven-absent set is deterministic, not free-form.
+  const deterministicProvenAbsent = (repository: "cdbentley", root: "bootstrap") => {
+    const read = new Set(executorControlPermissions(repository, root, "read"));
+    return executorControlPermissions(repository, root, "mutation")
+      .filter((permission) => !read.has(permission))
+      .toSorted();
+  };
+
   const applyInvocationForCompletion = () =>
     validateInvocation({
       ...validEnvironment(),
@@ -7063,7 +7072,7 @@ describe("protected owner Terraform bridge", () => {
         executorEmail,
         executorUniqueId: "123456789012345678901",
         observedAt: deElevationAt,
-        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+        provenAbsent: deterministicProvenAbsent("cdbentley", "bootstrap"),
       },
       intent,
       intentDigest: "c".repeat(64),
