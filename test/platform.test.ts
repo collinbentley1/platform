@@ -62,8 +62,13 @@ describe("platform scaffold and doctor", () => {
     }
 
     expect(runnerJobs.length).toBeGreaterThan(0);
-    expect(protectedOwnerTimeout).toBe(41);
-    expect(protectedRecoveryTimeout).toBe(18);
+    // These mirror JOB_TIMEOUT_MINUTES and the recovery job budget in
+    // tools/ci/protected-bootstrap-bridge.ts, which is the source of truth --
+    // the bridge computes the envelope and the workflow is written from it.
+    // They are asserted here as well so a change to the envelope has to be made
+    // deliberately in both places rather than drifting silently.
+    expect(protectedOwnerTimeout).toBe(42);
+    expect(protectedRecoveryTimeout).toBe(17);
     expect(protectedRecoveryTimeout).toBeLessThanOrEqual(35);
   });
 
@@ -2831,7 +2836,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "edc7cb168858bd4f7557a6cf770a471bbc4e72e2a2fe7219945aace521c53f62",
+      "6296610960293239eefe378271edccb01e81fcf73058209653c6b51dda426f85",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2865,6 +2870,7 @@ describe("platform scaffold and doctor", () => {
         "google_project_iam_binding.editor_absent",
         "google_project_iam_member.preview_iam_auditors",
         "google_project_iam_member.runtime_project_roles",
+        "google_project_iam_member.runtime_waitlist_challenge_sender",
         "google_project_iam_member.terraform_convergence_reader",
         "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
         "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
@@ -3647,10 +3653,13 @@ describe("platform scaffold and doctor", () => {
       mirrorContract.indexOf('  "280932482": {'),
       mirrorContract.indexOf("\n};", mirrorContract.indexOf('  "280932482": {')),
     );
+    // A set, and deduplicated on purpose: an API named in required_services may
+    // also be named by a google_project_service resource in the reviewed
+    // additional Terraform, and appearing twice is not a difference.
     const serviceSet = (source: string) =>
-      [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)]
-        .map((match) => match[1]!)
-        .toSorted();
+      [...new Set(
+        [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)].map((match) => match[1]!),
+      )].toSorted();
     expect(serviceSet(medlockMirror)).toEqual(serviceSet(medlockBootstrap));
     expect(serviceSet(criticalMirror)).toEqual(serviceSet(criticalBootstrap));
     expect(criticalMirror).toContain('"certificatemanager.googleapis.com"');
@@ -3703,6 +3712,62 @@ async function setPlatformIdentity(
   await writeFile(path, JSON.stringify(config, null, 2) + "\n");
 }
 
+// Byte-identical to additionalProductionResources in the reviewed Terraform
+// mirror contract. Comment-free, because the contract compares parsed documents
+// and those strip comments.
+const MEDLOCK_REVIEWED_RESOURCES = `resource "google_firestore_field" "waitlist_entry_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_project_service" "identity_toolkit" {
+  project = var.project_id
+  service = "identitytoolkit.googleapis.com"
+
+  disable_on_destroy = false
+}
+
+resource "google_identity_platform_config" "default" {
+  project = var.project_id
+
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+
+  authorized_domains = [
+    "medlock.ai",
+    "www.medlock.ai",
+  ]
+
+  depends_on = [google_project_service.identity_toolkit]
+}`;
+
 async function configureReviewedMedlock(app: string): Promise<void> {
   await setPlatformIdentity(app, {
     githubRepositoryId: "1025243085",
@@ -3725,7 +3790,9 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    CANONICAL_HOST   = "medlock.ai"',
         '    LEGACY_HOSTS     = "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app"',
         '    MEDLOCK_VERSION  = "0.2.0"',
-        '    WAITLIST_BACKEND = "firestore"',
+        '    WAITLIST_BACKEND               = "firestore"',
+        '    IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"',
+        '    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"',
         "  }",
       ].join("\n"),
     )
@@ -3741,6 +3808,9 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         "  }",
       ].join("\n"),
     );
+  // The reviewed contract now pins additional project resources alongside the
+  // module, so the fixture has to carry them too or `doctor` correctly refuses.
+  productionMain = `${productionMain.trimEnd()}\n\n${MEDLOCK_REVIEWED_RESOURCES}\n`;
   await writeFile(productionMainPath, productionMain);
 
   const productionVariablesPath = join(app, "infra/terraform/prod/variables.tf");
@@ -3782,6 +3852,7 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    "firestore.googleapis.com",',
         '    "iam.googleapis.com",',
         '    "iamcredentials.googleapis.com",',
+        '    "identitytoolkit.googleapis.com",',
         '    "run.googleapis.com",',
         '    "secretmanager.googleapis.com",',
         '    "serviceusage.googleapis.com",',

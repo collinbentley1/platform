@@ -668,6 +668,31 @@ resource "google_project_iam_custom_role" "protected_terraform_apply" {
       "datastore.operations.get",
       "datastore.operations.list",
     ] : [],
+    # Firestore TTL is a field-level policy, patched through
+    # projects.databases.collectionGroups.fields.patch. Without these the apply
+    # fails and `expiresAt` stays inert: written by the application and enforced
+    # by nothing.
+    #
+    # Three permissions, not the five that exist. A field is never created or
+    # deleted -- Terraform's destroy path is also a patch back to defaults -- so
+    # datastore.indexes.create and .delete are not required.
+    #
+    # roles/datastore.indexAdmin is deliberately NOT used: its permission list
+    # is datastore.schemas.*, which does not include datastore.indexes.update,
+    # so it would grant a different surface and still not work.
+    var.manage_firestore_field_ttl ? [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "datastore.indexes.update",
+    ] : [],
+    # Identity Platform configuration only. Nothing here can read, create, or
+    # delete an account, and configs.getSecret is excluded: the apply identity
+    # writes the sign-in configuration, it never reads provider secrets.
+    contains(var.required_services, "identitytoolkit.googleapis.com") ? [
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.get",
+      "firebaseauth.configs.update",
+    ] : [],
     contains(var.required_services, "secretmanager.googleapis.com") ? [
       "secretmanager.locations.get",
       "secretmanager.locations.list",
@@ -725,6 +750,39 @@ resource "google_project_iam_member" "preview_iam_auditors" {
   project = var.project_id
   role    = google_project_iam_custom_role.preview_iam_auditor.name
   member  = each.value
+}
+
+# The one permission the waitlist ownership challenge needs, and nothing else.
+#
+# The runtime sends an email-link sign-in challenge by calling
+# projects.accounts:sendOobCode with its own identity. roles/firebaseauth.admin
+# would also work and is refused: it carries users.create, users.delete,
+# users.update, users.get, and configs.getSecret, so a compromised runtime could
+# enumerate the account directory, take over accounts, or read provider secrets.
+# Sending mail needs none of that.
+#
+# Scoped to applications that actually declare Identity Platform, so no other
+# project's runtime gains a Firebase Auth permission it never uses.
+resource "google_project_iam_custom_role" "waitlist_challenge_sender" {
+  count = contains(var.required_services, "identitytoolkit.googleapis.com") ? 1 : 0
+
+  project     = var.project_id
+  role_id     = "waitlistChallengeSender"
+  title       = "Waitlist Challenge Sender"
+  description = "Sends the email-link ownership challenge. No account read, create, update, delete, or provider-secret access."
+  permissions = [
+    "firebaseauth.users.sendEmail",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "runtime_waitlist_challenge_sender" {
+  count = contains(var.required_services, "identitytoolkit.googleapis.com") ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.waitlist_challenge_sender[0].name
+  member  = "serviceAccount:${google_service_account.runtime.email}"
 }
 
 resource "google_project_iam_member" "runtime_project_roles" {

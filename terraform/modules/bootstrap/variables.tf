@@ -144,6 +144,12 @@ variable "required_services" {
   ]
 }
 
+variable "manage_firestore_field_ttl" {
+  description = "Whether the protected apply identity may patch Firestore field TTL policies. Off by default: only an application that declares google_firestore_field needs it, and it is the difference between reading index metadata and rewriting it."
+  type        = bool
+  default     = false
+}
+
 variable "runtime_project_roles" {
   description = "Intentional project-level data roles granted to the production runtime service account by the protected bootstrap pipeline."
   type        = set(string)

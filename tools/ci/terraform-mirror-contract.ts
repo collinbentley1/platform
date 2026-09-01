@@ -20,6 +20,15 @@ export type TerraformMirrorSources = {
 type ReviewedTerraformContract = {
   readonly artifactRegistryDescription?: string;
   readonly artifactRegistryRepositoryId?: string;
+  // Terraform an application may carry in prod/main.tf ALONGSIDE the platform
+  // module. The whole file is compared against module + these, so an
+  // application cannot add a resource the platform has not reviewed, and the
+  // platform cannot silently drop one the application depends on.
+  //
+  // Held comment-free: the comparison runs on parsed documents, which strip
+  // comments, so this pins what the resources DO and leaves the application
+  // free to explain them in prose.
+  readonly additionalProductionResources?: string;
   readonly containerEnv?: readonly (readonly [string, string])[];
   readonly firestoreDatabase?: readonly (readonly [string, string])[];
   readonly githubRepo?: string;
@@ -63,6 +72,62 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     stateBucketName: "cdbentley-tfstate-882468538648",
   },
   "1025243085": {
+    // Reviewed verbatim: the Firestore field TTL policies that make `expiresAt`
+    // enforceable, and the Identity Platform configuration behind the waitlist
+    // ownership flow. Both are project resources rather than module inputs, so
+    // they live in the application's prod/main.tf and are pinned here.
+    additionalProductionResources: `resource "google_firestore_field" "waitlist_entry_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_project_service" "identity_toolkit" {
+  project = var.project_id
+  service = "identitytoolkit.googleapis.com"
+
+  disable_on_destroy = false
+}
+
+resource "google_identity_platform_config" "default" {
+  project = var.project_id
+
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+
+  authorized_domains = [
+    "medlock.ai",
+    "www.medlock.ai",
+  ]
+
+  depends_on = [google_project_service.identity_toolkit]
+}`,
     artifactRegistryDescription: "Container images for Medlock.",
     artifactRegistryRepositoryId: "site",
     containerEnv: [
@@ -81,6 +146,8 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       ],
       ["MEDLOCK_VERSION", "0.2.0"],
       ["WAITLIST_BACKEND", "firestore"],
+      ["IDENTITY_PLATFORM_AUDIENCE", "medlock-1025243085"],
+      ["IDENTITY_PLATFORM_CONTINUE_URL", "https://medlock.ai/api/waitlist/confirm"],
     ],
     firestoreDatabase: [
       ["name", "(default)"],
@@ -99,6 +166,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       "firestore.googleapis.com",
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
+      "identitytoolkit.googleapis.com",
       "run.googleapis.com",
       "secretmanager.googleapis.com",
       "serviceusage.googleapis.com",
@@ -340,9 +408,12 @@ export function validateTerraformMirrorContract(
           "infra/terraform/prod/main.tf module site must exactly match the reviewed repository-specific platform contract",
         );
       }
-      if (compactHcl(parsed.productionMain) !== compactHcl(expectedProductionModule)) {
+      const expectedProductionFile = contract.additionalProductionResources === undefined
+        ? expectedProductionModule
+        : `${expectedProductionModule}\n${contract.additionalProductionResources}`;
+      if (compactHcl(parsed.productionMain) !== compactHcl(expectedProductionFile)) {
         failures.push(
-          "infra/terraform/prod/main.tf must contain only the exact reviewed repository-specific platform module",
+          "infra/terraform/prod/main.tf must contain only the exact reviewed repository-specific platform module and reviewed additional resources",
         );
       }
     }

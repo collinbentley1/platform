@@ -2545,7 +2545,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "edc7cb168858bd4f7557a6cf770a471bbc4e72e2a2fe7219945aace521c53f62"
+  "6296610960293239eefe378271edccb01e81fcf73058209653c6b51dda426f85"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2562,6 +2562,7 @@ const approvedBootstrapIamResources = [
   "google_project_iam_binding.editor_absent",
   "google_project_iam_member.preview_iam_auditors",
   "google_project_iam_member.runtime_project_roles",
+  "google_project_iam_member.runtime_waitlist_challenge_sender",
   "google_project_iam_member.terraform_convergence_reader",
   "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
   "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",

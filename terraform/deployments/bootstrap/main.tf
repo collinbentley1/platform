@@ -155,12 +155,20 @@ locals {
         "firestore.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
+        # Identity Platform proves that a waitlist address belongs to whoever
+        # claims it. Enabled here, through the reviewed pipeline, rather than by
+        # hand: the API being on is what makes the ownership flow reachable at
+        # all, so it is part of the declared control plane.
+        "identitytoolkit.googleapis.com",
         "run.googleapis.com",
         "secretmanager.googleapis.com",
         "serviceusage.googleapis.com",
         "storage.googleapis.com",
         "sts.googleapis.com",
       ]
+      # Medlock is the only application declaring google_firestore_field, so it
+      # is the only one whose apply identity may patch field TTL policies.
+      manage_firestore_field_ttl = true
       runtime_project_roles = [
         "roles/datastore.user",
       ]
@@ -226,6 +234,7 @@ module "bootstrap" {
   # separately reviewed move into an organization.
   manage_automatic_default_service_account_grants_policy = false
   required_services                                      = local.deployment.required_services
+  manage_firestore_field_ttl                             = try(local.deployment.manage_firestore_field_ttl, false)
   runtime_project_roles                                  = local.deployment.runtime_project_roles
   runtime_description                                    = local.deployment.runtime_description
 }
