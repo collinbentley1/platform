@@ -99,6 +99,20 @@ const MAX_REVIEW_MANIFEST_BYTES = 800 * 1024;
 const MAX_EXPOSURE_STATE_BYTES = 64 * 1024 * 1024;
 const MAX_EXPOSURE_HEALTH_BYTES = 4 * 1024;
 const MAX_GITHUB_RUNS_PER_STATUS = 10_000;
+// A GitHub run listing is only believable when every page is full until the
+// last one. per_page and the page ceiling are therefore part of the contract:
+// MAX_GITHUB_RUNS_PER_STATUS / GITHUB_RUNS_PAGE_SIZE pages is the most a
+// well-formed listing can need, so anything beyond it is a server that is
+// refusing to terminate rather than a large repository.
+const GITHUB_RUNS_PAGE_SIZE = 100;
+const MAX_GITHUB_RUN_PAGES = MAX_GITHUB_RUNS_PER_STATUS / GITHUB_RUNS_PAGE_SIZE;
+const ACTIVE_RUN_STATUSES = [
+  "requested",
+  "waiting",
+  "pending",
+  "queued",
+  "in_progress",
+] as const;
 const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CLEANUP_RETRY_INTERVAL_MS = 2_000;
 const IAM_CONSISTENCY_MAX_WAIT_MS = 5 * 60_000;
@@ -3203,6 +3217,20 @@ function normalizedFreezeProof(
   return { observedAt: proof.observedAt, repositories, tokenDrainSeconds: proof.tokenDrainSeconds };
 }
 
+// Everything a freeze proof asserts about the world, minus the clock. Two
+// snapshots with the same fingerprint observed the same frozen repositories.
+function freezeStabilityFingerprint(proof: ConsumerFreezeProof): string {
+  return canonicalJson(
+    json(
+      {
+        repositories: proof.repositories.map((entry) => ({ ...entry })),
+        tokenDrainSeconds: proof.tokenDrainSeconds,
+      },
+      "freeze stability fingerprint",
+    ),
+  );
+}
+
 function freezeProofFromJson(value: unknown, expectedDrainSeconds: number): ConsumerFreezeProof {
   const proof = record(value, "freeze proof");
   exactKeys(
@@ -3653,7 +3681,19 @@ export async function runProtectedBootstrap(
       leaseExpiresAt.getTime(),
       session.tokenExpiresAtMs,
     );
-    await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds);
+    // Bracket the elevation itself. This snapshot is taken after the executor
+    // gained privilege but before Terraform touches anything, and it has to
+    // describe exactly the same frozen world the authorized pre-apply proof
+    // described. Only the observation clock may have advanced.
+    const postElevationFreezeProof = await dependencies.proveFreeze(
+      invocation,
+      preparation.tokenDrainSeconds,
+    );
+    exact(
+      freezeStabilityFingerprint(postElevationFreezeProof),
+      freezeStabilityFingerprint(preApplyProof.freezeProof),
+      "post-elevation freeze bracket",
+    );
     const finalPreApplyExposureProof = await dependencies.proveExposure(
       invocation,
       session,
@@ -3719,6 +3759,18 @@ export async function runProtectedBootstrap(
     ) {
       throw new Error("The post-WIF freeze snapshot predates the required token-expiry barrier.");
     }
+    // Close the bracket on the far side of the apply, on exactly the terms
+    // that opened it. Actions stay disabled on every consumer for the whole
+    // protected window, so nothing about a repository may differ here — a
+    // token-issuance watermark that moved FORWARD, or appeared where there was
+    // none, means a workflow run changed state while the executor held
+    // privilege, which is the event the freeze exists to preclude. Only the
+    // observation clock is allowed to advance.
+    exact(
+      freezeStabilityFingerprint(postApplyProof.freezeProof),
+      freezeStabilityFingerprint(postElevationFreezeProof),
+      "post-apply freeze bracket",
+    );
     telemetry.phase("controller.apply-publish");
     await dependencies.publishPostApplyReceipt(
       invocation,
@@ -3995,10 +4047,31 @@ export async function proveConsumerFreeze(
     if (permissions.enabled !== false) {
       throw new Error(`${repository} GitHub Actions must remain disabled for the protected run.`);
     }
-    if (activeRuns.length !== 0) {
+    // The status filters and the unfiltered history are two independent views
+    // of the same repository. Reconciling them is what makes "zero active
+    // runs" a proof rather than a hope: a status query that quietly omits a
+    // live run is caught by the unfiltered listing, and an unfiltered listing
+    // that has been truncated is caught by the status queries.
+    for (const run of recentRuns.runs) {
+      const status = requiredString(run.status, `${repository} workflow run status`);
+      const id = numeric(String(run.id), `${repository} workflow run ID`);
+      if (ACTIVE_RUN_STATUSES.some((active) => active === status) && !activeRuns.ids.has(id)) {
+        throw new Error(
+          `${repository} unfiltered history reports run ${id} as ${status} but the status-filtered freeze proof omitted it.`,
+        );
+      }
+    }
+    for (const id of activeRuns.ids) {
+      if (!recentRuns.ids.has(id)) {
+        throw new Error(
+          `${repository} active run ${id} is missing from the unfiltered workflow-run history.`,
+        );
+      }
+    }
+    if (activeRuns.runs.length !== 0) {
       throw new Error(`${repository} still has an active GitHub Actions run.`);
     }
-    const latestPossibleTokenIssuance = recentRuns.reduce<number>((latest, run) => {
+    const latestPossibleTokenIssuance = recentRuns.runs.reduce<number>((latest, run) => {
       const recordValue = record(run, `${repository} workflow run`);
       const createdAt = Date.parse(requiredString(recordValue.created_at, "workflow run creation time"));
       const updatedAt = Date.parse(requiredString(recordValue.updated_at, "workflow run update time"));
@@ -4035,40 +4108,85 @@ export async function proveConsumerFreeze(
   };
 }
 
-async function githubAllRuns(
+interface GithubRunListing {
+  readonly ids: ReadonlySet<string>;
+  readonly runs: readonly Record<string, unknown>[];
+}
+
+// One strict paginator for every workflow-run read the freeze proof makes.
+//
+// The old readers trusted `total_count` to decide when to stop but never
+// checked that the rows actually arrived, so a 200 response carrying a short
+// page — or an empty one — silently shrank the evidence: the loop simply ran
+// out of pages and returned fewer runs than the server said existed. A freeze
+// proof that cannot see a run also cannot refuse it, so "no active runs" was
+// indistinguishable from "the listing was truncated". Both readers also
+// accepted repeated run IDs, which let a page that shifted under pagination
+// pad the count with duplicates while a real run slid out of view.
+//
+// This reader proves completeness instead of assuming it: every page must hold
+// exactly the number of rows `total_count` still owes, `total_count` may not
+// move between pages, and every run ID must be a positive integer that has not
+// already been seen in this listing.
+async function githubRunListing(
   base: string,
+  search: string,
+  label: string,
   token: string,
   fetcher: Fetcher,
   retry?: GithubProofRetryPolicy,
-): Promise<readonly JsonValue[]> {
-  const results: JsonValue[] = [];
-  let page = 1;
+): Promise<GithubRunListing> {
+  const runs: Record<string, unknown>[] = [];
+  const ids = new Set<string>();
   let expectedTotal: number | undefined;
-  do {
-    const value = record(
-      await githubJson(`${base}/actions/runs?per_page=100&page=${page}`, token, fetcher, retry),
-      "GitHub workflow runs",
-    );
-    exactKeys(value, new Set(["total_count", "workflow_runs"]), "GitHub workflow runs");
+  for (let page = 1; page <= MAX_GITHUB_RUN_PAGES; page += 1) {
+    const url =
+      `${base}/actions/runs?${search}per_page=${GITHUB_RUNS_PAGE_SIZE}&page=${page}`;
+    const value = record(await githubJson(url, token, fetcher, retry), label);
+    exactKeys(value, new Set(["total_count", "workflow_runs"]), label);
     const total = boundedInteger(
       value.total_count,
-      "GitHub workflow run count",
+      `${label} count`,
       0,
       MAX_GITHUB_RUNS_PER_STATUS,
     );
     if (expectedTotal === undefined) expectedTotal = total;
     if (total !== expectedTotal) {
-      throw new Error("GitHub workflow-run pagination changed during the token-drain proof.");
+      throw new Error(`${label} pagination changed while the freeze proof read it.`);
     }
-    const pageRuns = array(value.workflow_runs, "GitHub workflow runs");
-    if (pageRuns.length > 100) throw new Error("GitHub returned an oversized workflow-run page.");
-    results.push(...pageRuns.map((run) => json(run, "GitHub workflow run")));
-    page += 1;
-  } while ((page - 1) * 100 < (expectedTotal ?? 0));
-  if (results.length !== expectedTotal) {
-    throw new Error("GitHub workflow-run pagination was incomplete.");
+    const pageRuns = array(value.workflow_runs, label);
+    // Full pages until the remainder. A short page is a missing row, not a
+    // smaller repository, because total_count has already been pinned above.
+    const expectedOnPage = Math.min(GITHUB_RUNS_PAGE_SIZE, expectedTotal - runs.length);
+    if (pageRuns.length !== expectedOnPage) {
+      throw new Error(
+        `${label} returned ${pageRuns.length} rows on page ${page} where total_count requires ${expectedOnPage}.`,
+      );
+    }
+    for (const raw of pageRuns) {
+      const run = record(json(raw, `${label} entry`), `${label} entry`);
+      const id = numeric(String(run.id), `${label} run ID`);
+      if (ids.has(id)) {
+        throw new Error(`${label} repeated run ID ${id} across pages.`);
+      }
+      ids.add(id);
+      runs.push(run);
+    }
+    if (runs.length >= expectedTotal) break;
   }
-  return results;
+  if (expectedTotal === undefined || runs.length !== expectedTotal) {
+    throw new Error(`${label} pagination was incomplete.`);
+  }
+  return { ids, runs };
+}
+
+async function githubAllRuns(
+  base: string,
+  token: string,
+  fetcher: Fetcher,
+  retry?: GithubProofRetryPolicy,
+): Promise<GithubRunListing> {
+  return await githubRunListing(base, "", "GitHub workflow runs", token, fetcher, retry);
 }
 
 async function githubActiveRuns(
@@ -4076,34 +4194,36 @@ async function githubActiveRuns(
   token: string,
   fetcher: Fetcher,
   retry?: GithubProofRetryPolicy,
-): Promise<readonly JsonValue[]> {
-  const results: JsonValue[] = [];
-  for (const status of ["requested", "waiting", "pending", "queued", "in_progress"] as const) {
-    let page = 1;
-    let expectedTotal: number | undefined;
-    do {
-      const url = `${base}/actions/runs?status=${status}&per_page=100&page=${page}`;
-      const value = record(await githubJson(url, token, fetcher, retry), `GitHub ${status} runs`);
-      exactKeys(value, new Set(["total_count", "workflow_runs"]), `GitHub ${status} runs`);
-      const total = boundedInteger(value.total_count, `GitHub ${status} run count`, 0, MAX_GITHUB_RUNS_PER_STATUS);
-      if (expectedTotal === undefined) expectedTotal = total;
-      if (total !== expectedTotal) {
-        throw new Error("GitHub active-run pagination changed during the freeze proof.");
+): Promise<GithubRunListing> {
+  const runs: Record<string, unknown>[] = [];
+  const ids = new Set<string>();
+  for (const status of ACTIVE_RUN_STATUSES) {
+    const listing = await githubRunListing(
+      base,
+      `status=${status}&`,
+      `GitHub ${status} runs`,
+      token,
+      fetcher,
+      retry,
+    );
+    for (const run of listing.runs) {
+      exact(run.status, status, `GitHub ${status} run status`);
+      const id = numeric(String(run.id), `GitHub ${status} run ID`);
+      // A run holds one status at a time. The same ID under two filters means
+      // the statuses disagree with each other, so neither can be trusted.
+      if (ids.has(id)) {
+        throw new Error(`GitHub run ${id} appeared under more than one active status.`);
       }
-      const pageRuns = array(value.workflow_runs, `GitHub ${status} runs`);
-      if (pageRuns.length > 100) throw new Error("GitHub returned an oversized run page.");
-      for (const raw of pageRuns) {
-        const run = record(raw, `GitHub ${status} run`);
-        exact(run.status, status, `GitHub ${status} run status`);
-        results.push(json(run, `GitHub ${status} run`));
-      }
-      page += 1;
-    } while ((page - 1) * 100 < (expectedTotal ?? 0));
-    if (results.length > REPOSITORY_NAMES.length * MAX_GITHUB_RUNS_PER_STATUS) {
+      ids.add(id);
+      runs.push(run);
+    }
+    // Per repository, not scaled by the repository count: this reader only
+    // ever sees one repository's runs.
+    if (runs.length > MAX_GITHUB_RUNS_PER_STATUS) {
       throw new Error("GitHub active-run proof exceeded its global bound.");
     }
   }
-  return results;
+  return { ids, runs };
 }
 
 export async function readConsumerWorkflowPin(consumerRoot: string): Promise<string> {

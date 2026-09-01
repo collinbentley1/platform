@@ -5956,14 +5956,21 @@ describe("protected owner Terraform bridge", () => {
       if (url.pathname.endsWith("/actions/runs")) {
         const status = url.searchParams.get("status");
         const page = Number(url.searchParams.get("page"));
-        if (repository === "cdbentley" && status === "requested") {
-          requestedPages.push(page);
-          return Response.json({
-            total_count: 101,
-            workflow_runs: Array.from({ length: page === 1 ? 100 : 1 }, () => ({
-              status: "requested",
-            })),
-          });
+        // 101 requested runs on cdbentley, spilling onto a second page. Real
+        // GitHub always carries an id and timing on a run, and the unfiltered
+        // listing is a superset of every status-filtered one, so the fixture
+        // says both — otherwise it would be testing a server that does not
+        // exist.
+        const requestedRuns = (which: number) =>
+          Array.from({ length: which === 1 ? 100 : 1 }, (_unused, index) => ({
+            created_at: "2026-08-22T20:00:00Z",
+            id: 900_000 + (which === 1 ? index : 100),
+            status: "requested",
+            updated_at: "2026-08-22T20:00:00Z",
+          }));
+        if (repository === "cdbentley" && (status === "requested" || status === null)) {
+          if (status === "requested") requestedPages.push(page);
+          return Response.json({ total_count: 101, workflow_runs: requestedRuns(page) });
         }
         return Response.json({ total_count: 0, workflow_runs: [] });
       }
@@ -5981,6 +5988,304 @@ describe("protected owner Terraform bridge", () => {
     ))
       .rejects.toThrow("active GitHub Actions run");
     expect(requestedPages).toEqual([1, 2]);
+  });
+
+  // F-04. The freeze proof used to trust `total_count` to say when to stop
+  // paginating but never checked that the rows it was promised actually
+  // arrived, and it never looked at a run's identity at all. A short page, an
+  // empty 200, or a page that shifted and repeated itself all produced a
+  // smaller, quieter proof rather than a refusal — and a proof that cannot see
+  // a run cannot refuse it. These fixtures are the shapes a server would have
+  // to return to hide a live run from the freeze.
+  const FREEZE_NOW = Date.parse("2026-08-22T21:30:00.000Z");
+  const REPOSITORY_IDS: Record<string, string> = {
+    cdbentley: "1255553151",
+    "critical-history": "280932482",
+    healthmcp: "1025243085",
+    runsetta: "711292980",
+  };
+  const freezeRun = (id: unknown, status = "requested") => ({
+    created_at: "2026-08-22T20:00:00Z",
+    id,
+    status,
+    updated_at: "2026-08-22T20:00:00Z",
+  });
+  type RunPage = { total_count: number; workflow_runs: unknown[] };
+  // Every repository is frozen and empty unless `script` says otherwise, so a
+  // test only has to describe the one listing it is attacking.
+  const freezeProofFetcher = (
+    script: (request: {
+      readonly page: number;
+      readonly repository: string;
+      readonly status: string | null;
+    }) => RunPage | undefined,
+  ) =>
+    (async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(String(input));
+      const repository = url.pathname.split("/")[3] ?? "";
+      if (url.pathname.endsWith("/actions/permissions")) {
+        return Response.json({ enabled: false });
+      }
+      if (url.pathname.endsWith("/actions/runs")) {
+        const scripted = script({
+          page: Number(url.searchParams.get("page")),
+          repository,
+          status: url.searchParams.get("status"),
+        });
+        return Response.json(scripted ?? { total_count: 0, workflow_runs: [] });
+      }
+      return Response.json({
+        full_name: `collinbentley1/${repository}`,
+        id: Number(REPOSITORY_IDS[repository]),
+        owner: { id: 16823277 },
+      });
+    }) as unknown as typeof fetch;
+  const proveFreezeWith = (
+    script: Parameters<typeof freezeProofFetcher>[0],
+  ) => proveConsumerFreeze("consumer-actions-token-value", 300, freezeProofFetcher(script), FREEZE_NOW);
+
+  test("a frozen consumer set with no runs anywhere still proves cleanly", async () => {
+    const proof = await proveFreezeWith(() => undefined);
+    expect(proof.repositories).toHaveLength(4);
+    expect(proof.repositories.every((entry) => entry.activeRunCount === 0)).toBe(true);
+    expect(proof.repositories.every((entry) => entry.actionsEnabled === false)).toBe(true);
+    expect(proof.repositories.every((entry) => entry.latestPossibleTokenIssuance === null))
+      .toBe(true);
+    expect(proof.tokenDrainSeconds).toBe(300);
+  });
+
+  test("a short final page is a missing row, not a smaller repository", async () => {
+    await expect(proveFreezeWith(({ page, repository, status }) =>
+      repository === "cdbentley" && status === "requested"
+        ? {
+          total_count: 101,
+          // Page 2 owes exactly one run and delivers none.
+          workflow_runs: page === 1
+            ? Array.from({ length: 100 }, (_u, index) => freezeRun(900_000 + index))
+            : [],
+        }
+        : undefined
+    )).rejects.toThrow("returned 0 rows on page 2 where total_count requires 1");
+  });
+
+  test("an otherwise-valid 200 that carries no rows at all is refused", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "in_progress"
+        ? { total_count: 5, workflow_runs: [] }
+        : undefined
+    )).rejects.toThrow("returned 0 rows on page 1 where total_count requires 5");
+  });
+
+  test("an oversized page is refused rather than truncated", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "queued"
+        ? {
+          total_count: 100,
+          workflow_runs: Array.from({ length: 150 }, (_u, index) => freezeRun(700_000 + index)),
+        }
+        : undefined
+    )).rejects.toThrow("returned 150 rows on page 1 where total_count requires 100");
+  });
+
+  test("a duplicate run ID inside one page cannot pad the count", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "waiting"
+        ? { total_count: 2, workflow_runs: [freezeRun(42, "waiting"), freezeRun(42, "waiting")] }
+        : undefined
+    )).rejects.toThrow("repeated run ID 42 across pages");
+  });
+
+  test("pages that shift and repeat a run cannot hide the one that slid out of view", async () => {
+    await expect(proveFreezeWith(({ page, repository, status }) =>
+      repository === "cdbentley" && status === "requested"
+        ? {
+          total_count: 101,
+          // Page 2 returns a run page 1 already reported: 101 rows counted,
+          // 100 distinct, and one real run never observed.
+          workflow_runs: page === 1
+            ? Array.from({ length: 100 }, (_u, index) => freezeRun(900_000 + index))
+            : [freezeRun(900_000)],
+        }
+        : undefined
+    )).rejects.toThrow("repeated run ID 900000 across pages");
+  });
+
+  test("total_count moving between pages fails the proof closed", async () => {
+    await expect(proveFreezeWith(({ page, repository, status }) =>
+      repository === "cdbentley" && status === "requested"
+        ? {
+          total_count: page === 1 ? 101 : 100,
+          workflow_runs: page === 1
+            ? Array.from({ length: 100 }, (_u, index) => freezeRun(900_000 + index))
+            : [freezeRun(900_100)],
+        }
+        : undefined
+    )).rejects.toThrow("pagination changed while the freeze proof read it");
+  });
+
+  test.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["non-numeric", "not-an-id"],
+    ["fractional", 1.5],
+    ["absent", undefined],
+  ])("a %s run ID is refused", async (_label, id) => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "pending"
+        ? { total_count: 1, workflow_runs: [freezeRun(id, "pending")] }
+        : undefined
+    )).rejects.toThrow("run ID must be a positive integer");
+  });
+
+  test("a run count beyond the reviewed ceiling is refused, not paginated forever", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "requested"
+        ? { total_count: 10_001, workflow_runs: [] }
+        : undefined
+    )).rejects.toThrow("escaped its integer bound");
+  });
+
+  test("one run reported under two active statuses is a disagreement, not two runs", async () => {
+    await expect(proveFreezeWith(({ repository, status }) => {
+      if (repository !== "cdbentley") return undefined;
+      if (status === "queued") return { total_count: 1, workflow_runs: [freezeRun(51, "queued")] };
+      if (status === "in_progress") {
+        // Same ID, and the entry honestly claims the filtered status, so only
+        // cross-status identity catches it.
+        return { total_count: 1, workflow_runs: [freezeRun(51, "in_progress")] };
+      }
+      return undefined;
+    })).rejects.toThrow("appeared under more than one active status");
+  });
+
+  test("a status filter that omits a run the unfiltered history calls live is caught", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      // Every status filter says the repository is quiet; the unfiltered
+      // history says a run is in progress. Before this cross-check the freeze
+      // believed the filters and froze nothing.
+      repository === "cdbentley" && status === null
+        ? { total_count: 1, workflow_runs: [freezeRun(77, "in_progress")] }
+        : undefined
+    )).rejects.toThrow(
+      "unfiltered history reports run 77 as in_progress but the status-filtered freeze proof omitted it",
+    );
+  });
+
+  test("an active run missing from a truncated unfiltered history is caught", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      // The mirror image: the status filter sees the run, the unfiltered
+      // listing has been truncated to nothing.
+      repository === "cdbentley" && status === "in_progress"
+        ? { total_count: 1, workflow_runs: [freezeRun(88, "in_progress")] }
+        : undefined
+    )).rejects.toThrow("active run 88 is missing from the unfiltered workflow-run history");
+  });
+
+  test("a run whose filtered status contradicts its own body is refused", async () => {
+    await expect(proveFreezeWith(({ repository, status }) =>
+      repository === "cdbentley" && status === "queued"
+        ? { total_count: 1, workflow_runs: [freezeRun(99, "completed")] }
+        : undefined
+    )).rejects.toThrow("GitHub queued run status");
+  });
+
+  // The freeze proof was re-taken around the privileged transition but nobody
+  // compared the snapshots, so the elevation and the apply were bracketed by
+  // evidence that was never actually read. A snapshot that drifts across that
+  // window means the frozen world moved while the executor held privilege.
+  const bracketRun = async (
+    freezeFor: (call: number, observedAtMs: number) => ExecutionProof["freezeProof"],
+  ) => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const startedAt = 1_800_000_000_000;
+    let now = startedAt;
+    let calls = 0;
+    const events: string[] = [];
+    return await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }),
+      fakeDependencies(events, {
+        now: () => now,
+        planJson: JSON.stringify(raw),
+        proveFreeze: async () => {
+          calls += 1;
+          events.push("freeze");
+          return freezeFor(calls, now);
+        },
+        runTerraform: async () => {
+          events.push("terraform");
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+        // Push the post-apply observation past the token-expiry barrier so the
+        // bracket, not the barrier, is what these tests exercise.
+        waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
+          now = mutationCompletedAtMs + 7 * 60_000;
+        },
+      }),
+    );
+  };
+  const issuedAt = (snapshot: ExecutionProof["freezeProof"], iso: string | null) => ({
+    ...snapshot,
+    repositories: snapshot.repositories.map((entry) => ({
+      ...entry,
+      latestPossibleTokenIssuance: iso,
+    })),
+  });
+
+  test("a freeze snapshot that drifts across the elevation is refused", async () => {
+    await expect(bracketRun((call, observedAtMs) =>
+      call === 3
+        // The world the authorized pre-apply proof described no longer holds
+        // once the executor is privileged.
+        ? issuedAt(freezeSnapshot(observedAtMs), "2026-08-22T10:00:00.000Z")
+        : freezeSnapshot(observedAtMs)
+    )).rejects.toThrow("post-elevation freeze bracket");
+  });
+
+  test("a stable freeze across the elevation and the apply completes", async () => {
+    const events = await bracketRun((_call, observedAtMs) => freezeSnapshot(observedAtMs));
+    expect(events).toBeUndefined();
+  });
+
+  // Every direction of change is a change. Actions are disabled on every
+  // consumer for the whole protected window, so a watermark that moves at all
+  // across the apply means a run changed state while the executor was
+  // privileged — forward is no safer than backward, and appearing from nothing
+  // is the loudest of the three.
+  test.each([
+    ["rewinds", "2026-08-22T10:00:00.000Z", "2026-08-22T09:00:00.000Z"],
+    ["advances", "2026-08-22T10:00:00.000Z", "2026-08-22T11:00:00.000Z"],
+    ["appears from null", null, "2026-08-22T11:00:00.000Z"],
+  ])(
+    "a post-apply snapshot whose token issuance %s is refused",
+    async (_label, before, after) => {
+      await expect(bracketRun((call, observedAtMs) =>
+        issuedAt(freezeSnapshot(observedAtMs), call === 4 ? after : before)
+      )).rejects.toThrow("post-apply freeze bracket");
+    },
+  );
+
+  test("a post-apply snapshot whose token issuance vanishes to null is refused", async () => {
+    await expect(bracketRun((call, observedAtMs) =>
+      issuedAt(freezeSnapshot(observedAtMs), call === 4 ? null : "2026-08-22T10:00:00.000Z")
+    )).rejects.toThrow("post-apply freeze bracket");
+  });
+
+  test("a post-apply snapshot whose repository inventory reorders is refused", async () => {
+    await expect(bracketRun((call, observedAtMs) => {
+      const snapshot = freezeSnapshot(observedAtMs);
+      if (call !== 4) return snapshot;
+      return {
+        ...snapshot,
+        repositories: [...snapshot.repositories].reverse(),
+      };
+    })).rejects.toThrow("post-apply freeze bracket");
   });
 
   test("state validation uses exact gRPC/overwrite probes and never reads or writes object bytes", async () => {
