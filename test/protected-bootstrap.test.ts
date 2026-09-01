@@ -80,6 +80,7 @@ import {
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
   proveExposure,
+  proveNoUntrustedFederationControllers,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
   retryableGoogleReadStatus,
@@ -7035,6 +7036,286 @@ describe("protected owner Terraform bridge", () => {
     name: federationProviderName(project),
     oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
     state: "ACTIVE",
+  });
+
+  type TestRepository = (typeof REPOSITORY_NAMES)[number];
+  type ControllerMockKind =
+    | "analysis"
+    | "poolPolicy"
+    | "project"
+    | "projectPolicy"
+    | "role";
+  type ControllerMockMutation = (
+    kind: ControllerMockKind,
+    repository: TestRepository | undefined,
+    value: Record<string, unknown>,
+    occurrence: number,
+  ) => unknown | Response;
+  const controllerOwner = "user:CollinBentley1@gmail.com";
+  const controllerPermissions = [
+    "iam.googleapis.com/workloadIdentityPools.setIamPolicy",
+    "iam.googleapis.com/workloadIdentityPools.update",
+    "iam.workloadIdentityPools.createPolicyBinding",
+    "iam.workloadIdentityPools.deletePolicyBinding",
+    "iam.workloadIdentityPools.updatePolicyBinding",
+    "resourcemanager.projects.setIamPolicy",
+  ] as const;
+  const controllerOptions = {
+    analyzeServiceAccountImpersonation: true,
+    expandResources: true,
+    expandRoles: true,
+    outputGroupEdges: true,
+    outputResourceEdges: true,
+  };
+  const repositoryForProjectId = (projectId: string): TestRepository => {
+    const repository = REPOSITORY_NAMES.find(
+      (candidate) => REPOSITORIES[candidate].projectId === projectId,
+    );
+    if (repository === undefined) throw new Error(`Unknown controller test project ${projectId}.`);
+    return repository;
+  };
+  const repositoryForProjectNumber = (projectNumber: string): TestRepository => {
+    const repository = REPOSITORY_NAMES.find(
+      (candidate) => REPOSITORIES[candidate].exposure.projectNumber === projectNumber,
+    );
+    if (repository === undefined) {
+      throw new Error(`Unknown controller test project number ${projectNumber}.`);
+    }
+    return repository;
+  };
+  const controllerAnalysisBody = (repository: TestRepository) => {
+    const projectId = REPOSITORIES[repository].projectId;
+    const projectFullName = `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
+    return {
+      fullyExplored: true,
+      mainAnalysis: {
+        analysisQuery: {
+          accessSelector: { permissions: [...controllerPermissions].toSorted() },
+          options: controllerOptions,
+          scope: `projects/${projectId}`,
+        },
+        analysisResults: [{
+          accessControlLists: [{
+            accesses: controllerPermissions.map((permission) => ({ permission })),
+            resources: [{ fullResourceName: projectFullName }],
+          }],
+          attachedResourceFullName: projectFullName,
+          fullyExplored: true,
+          iamBinding: { members: [controllerOwner], role: "roles/owner" },
+          identityList: { identities: [{ name: controllerOwner }] },
+        }],
+        fullyExplored: true,
+      },
+    };
+  };
+  const controllerProofFetcher = (mutation?: ControllerMockMutation) => {
+    const counts = new Map<string, number>();
+    const requests: Array<{ method: string; url: string }> = [];
+    const respond = (
+      kind: ControllerMockKind,
+      repository: TestRepository | undefined,
+      value: Record<string, unknown>,
+    ): Response => {
+      const key = `${kind}:${repository ?? "shared"}`;
+      const occurrence = (counts.get(key) ?? 0) + 1;
+      counts.set(key, occurrence);
+      const copy = structuredClone(value) as Record<string, unknown>;
+      const changed = mutation?.(kind, repository, copy, occurrence) ?? copy;
+      return changed instanceof Response ? changed : Response.json(changed);
+    };
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      requests.push({ method, url: url.toString() });
+      if (url.hostname === "cloudresourcemanager.googleapis.com") {
+        const policy = /^\/v1\/projects\/([^/:]+):getIamPolicy$/.exec(url.pathname);
+        if (policy !== null && method === "POST") {
+          const repository = repositoryForProjectId(policy[1]!);
+          return respond("projectPolicy", repository, {
+            bindings: [{ members: [controllerOwner], role: "roles/owner" }],
+            etag: `project-policy-${repository}`,
+            version: 1,
+          });
+        }
+        const project = /^\/v1\/projects\/([^/:]+)$/.exec(url.pathname);
+        if (project !== null && method === "GET") {
+          const repository = repositoryForProjectId(project[1]!);
+          const contract = REPOSITORIES[repository];
+          return respond("project", repository, {
+            lifecycleState: "ACTIVE",
+            name: repository,
+            projectId: contract.projectId,
+            projectNumber: contract.exposure.projectNumber,
+          });
+        }
+      }
+      if (url.hostname === "iam.googleapis.com") {
+        const pool = /^\/v1\/projects\/([^/]+)\/locations\/global\/workloadIdentityPools\/github-actions:getIamPolicy$/.exec(
+          url.pathname,
+        );
+        if (pool !== null && method === "POST") {
+          return respond("poolPolicy", repositoryForProjectNumber(pool[1]!), {});
+        }
+        if (url.pathname === "/v1/roles/owner" && method === "GET") {
+          return respond("role", undefined, {
+            description: "Full access to the reviewed project control plane.",
+            etag: "owner-role-etag",
+            includedPermissions: [...controllerPermissions],
+            name: "roles/owner",
+            stage: "GA",
+            title: "Owner",
+          });
+        }
+      }
+      if (url.hostname === "cloudasset.googleapis.com" && method === "GET") {
+        const analysis = /^\/v1\/projects\/([^/:]+):analyzeIamPolicy$/.exec(url.pathname);
+        if (analysis !== null) {
+          const repository = repositoryForProjectId(analysis[1]!);
+          return respond("analysis", repository, controllerAnalysisBody(repository));
+        }
+      }
+      throw new Error(`Unexpected controller proof request ${method} ${url.toString()}`);
+    }) as typeof fetch;
+    return { fetcher, requests };
+  };
+
+  test("the live controller proof brackets exact policies and fully expands every mutator", async () => {
+    const { fetcher, requests } = controllerProofFetcher();
+
+    await proveNoUntrustedFederationControllers(
+      "owner-token-value-long-enough",
+      fetcher,
+    );
+
+    const analyses = requests.filter((request) =>
+      new URL(request.url).hostname === "cloudasset.googleapis.com"
+    );
+    expect(analyses).toHaveLength(4);
+    for (const request of analyses) {
+      const url = new URL(request.url);
+      expect(request.method).toBe("GET");
+      expect(
+        url.searchParams.getAll("analysisQuery.accessSelector.permissions"),
+      ).toEqual([...controllerPermissions]);
+      for (const option of Object.keys(controllerOptions)) {
+        expect(url.searchParams.get(`analysisQuery.options.${option}`)).toBe("true");
+      }
+      expect(url.searchParams.get("executionTimeout")).toBe("120s");
+    }
+    for (const repository of REPOSITORY_NAMES) {
+      const projectId = REPOSITORIES[repository].projectId;
+      expect(requests.filter((request) =>
+        request.url.includes(`/v1/projects/${projectId}:getIamPolicy`)
+      )).toHaveLength(2);
+      expect(requests.filter((request) =>
+        request.url.includes(`/v1/projects/${projectId}`) &&
+        !request.url.includes(":getIamPolicy") &&
+        !request.url.includes(":analyzeIamPolicy")
+      )).toHaveLength(2);
+    }
+  });
+
+  test.each([
+    ["an inherited project", ((kind, repository, value) => {
+      if (kind === "project" && repository === "cdbentley") {
+        value.parent = { id: "1", type: "organization" };
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "acquired an organization or folder parent"],
+    ["a resource-level pool binding", ((kind, repository, value) => {
+      if (kind === "poolPolicy" && repository === "cdbentley") {
+        value.bindings = [{ members: [controllerOwner], role: "roles/owner" }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "resource-level IAM binding"],
+    ["an untrusted live project mutator", ((kind, repository, value) => {
+      if (kind === "projectPolicy" && repository === "cdbentley") {
+        const bindings = value.bindings as Array<{ members: string[] }>;
+        bindings[0]!.members.push("serviceAccount:attacker@evil.invalid");
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "outside the exact owner identity"],
+    ["no direct owner mutator", ((kind, _repository, value) => {
+      if (kind === "role") value.includedPermissions = ["resourcemanager.projects.get"];
+      return value;
+    }) satisfies ControllerMockMutation, "has no exact owner federation-controller binding"],
+    ["a partial top-level analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") value.fullyExplored = false;
+      return value;
+    }) satisfies ControllerMockMutation, "controller analysis completeness drifted"],
+    ["an analysis warning", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        (value.mainAnalysis as Record<string, unknown>).nonCriticalErrors = [{ code: "UNKNOWN" }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "returned non-critical errors"],
+    ["an incomplete binding analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        main.analysisResults[0]!.fullyExplored = false;
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller result completeness drifted"],
+    ["an empty analysis result", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        (value.mainAnalysis as Record<string, unknown>).analysisResults = [];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "returned no or too many bindings"],
+    ["an impersonation path", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        value.serviceAccountImpersonationAnalysis = [{ fullyExplored: true }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "found a service-account impersonation path"],
+    ["an untrusted analyzed identity", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        const result = main.analysisResults[0]!;
+        result.iamBinding = {
+          members: ["group:attackers@evil.invalid"],
+          role: "roles/owner",
+        };
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "outside the unconditional exact owner binding"],
+    ["a group-derived identity", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        const identityList = main.analysisResults[0]!.identityList as Record<string, unknown>;
+        identityList.groupEdges = [{ sourceNode: "group:x", targetNode: controllerOwner }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "found a group-derived identity"],
+    ["a changed analyzer query", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisQuery: Record<string, unknown> };
+        main.analysisQuery.scope = "projects/attacker";
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller analysis scope drifted"],
+    ["a project-policy race", ((kind, repository, value, occurrence) => {
+      if (kind === "projectPolicy" && repository === "cdbentley" && occurrence === 2) {
+        value.etag = "changed-policy-etag";
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "federation controller snapshot drifted"],
+    ["a role-definition race", ((kind, _repository, value, occurrence) => {
+      if (kind === "role" && occurrence === 2) value.etag = "changed-role-etag";
+      return value;
+    }) satisfies ControllerMockMutation, "federation controller snapshot drifted"],
+    ["an analyzer HTTP failure", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        return new Response(JSON.stringify(value), { status: 503 });
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "analysis failed with HTTP 503"],
+  ])("the live controller proof refuses %s", async (_label, mutation, message) => {
+    const { fetcher } = controllerProofFetcher(mutation);
+    await expect(proveNoUntrustedFederationControllers(
+      "owner-token-value-long-enough",
+      fetcher,
+    )).rejects.toThrow(message);
   });
 
   test("a pool from another project is refused, not accepted by suffix", () => {

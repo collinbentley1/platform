@@ -2276,16 +2276,39 @@ export function buildRuntimeActAsLeases(
 // Every preview runtime principal in the fleet. The retired deny policy named
 // these four explicitly; the plan gate below derives them so a repository added
 // to REPOSITORIES cannot silently escape the check.
-// Predefined roles that carry iam.workloadIdentityPools.update. A custom role
-// cannot be evaluated from a plan alone, so any project custom role that names
-// the permission is refused by the separate permission gate below.
+// Predefined roles that can move a workload-identity pool or rewrite the
+// authority that controls one. The plan gate is deliberately conservative:
+// Editor no longer expands to the update permission in the current role
+// inventory, but retaining it here refuses a historical/high-impact primitive
+// grant instead of making the safety of an approved plan depend on a mutable
+// predefined role definition.
 const POOL_MUTATION_ROLES: ReadonlySet<string> = new Set([
   "roles/editor",
+  "roles/iam.admin",
+  "roles/iam.securityAdmin",
   "roles/iam.workloadIdentityPoolAdmin",
   "roles/owner",
 ]);
 
+// The pool PATCH API still documents this legacy permission spelling and the
+// ephemeral executor role must carry it. Cloud Asset and the live IAM role
+// inventory expose the analyzable canonical spelling with the service prefix;
+// the live controller proof below binds both surfaces instead of assuming they
+// are interchangeable.
 export const POOL_MUTATION_PERMISSION = "iam.workloadIdentityPools.update";
+export const POOL_MUTATION_ANALYSIS_PERMISSION =
+  "iam.googleapis.com/workloadIdentityPools.update";
+
+const FEDERATION_CONTROLLER_PERMISSIONS = [
+  "iam.googleapis.com/workloadIdentityPools.setIamPolicy",
+  POOL_MUTATION_ANALYSIS_PERMISSION,
+  "iam.workloadIdentityPools.createPolicyBinding",
+  "iam.workloadIdentityPools.deletePolicyBinding",
+  "iam.workloadIdentityPools.updatePolicyBinding",
+  "resourcemanager.projects.setIamPolicy",
+] as const;
+const FEDERATION_CONTROLLER_PERMISSION_SET: ReadonlySet<string> =
+  new Set(FEDERATION_CONTROLLER_PERMISSIONS);
 
 // The owner controller and the run's own ephemeral executor. Nothing else may
 // be able to move a pool's disabled flag.
@@ -3547,6 +3570,559 @@ function federationPoolResourceName(projectId: string): string {
     throw new Error("The workload identity pool project escaped the repository contract.");
   }
   return `projects/${REPOSITORIES[repository].exposure.projectNumber}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+}
+
+interface FederationControllerRole {
+  readonly canonical: JsonValue;
+  readonly includedPermissions: readonly string[];
+  readonly name: string;
+}
+
+interface FederationControllerBaseSnapshot {
+  readonly poolPolicy: JsonValue;
+  readonly project: JsonValue;
+  readonly projectPolicy: IamPolicy;
+  readonly repository: RepositoryName;
+}
+
+interface FederationControllerSnapshot {
+  readonly canonical: string;
+  readonly mutatorBindings: readonly JsonValue[];
+  readonly repository: RepositoryName;
+}
+
+function normalizedIamBinding(binding: IamBinding): JsonValue {
+  return json({
+    ...(binding.condition === undefined ? {} : { condition: binding.condition }),
+    members: [...binding.members].toSorted(),
+    role: binding.role,
+  }, "normalized IAM binding");
+}
+
+function normalizedIamPolicy(policy: IamPolicy): JsonValue {
+  const bindings = policy.bindings
+    .map((binding) => normalizedIamBinding(binding))
+    .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  const auditConfigs = policy.auditConfigs === undefined
+    ? undefined
+    : [...policy.auditConfigs]
+      .map((entry) => json(entry, "normalized IAM audit config"))
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  return json({
+    ...(auditConfigs === undefined ? {} : { auditConfigs }),
+    bindings,
+    etag: policy.etag,
+    version: policy.version,
+  }, "normalized IAM policy");
+}
+
+async function readFederationControllerProject(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<JsonValue> {
+  const contract = REPOSITORIES[repository];
+  const response = await fetcher(
+    `https://cloudresourcemanager.googleapis.com/v1/projects/${contract.projectId}`,
+    { headers: googleHeaders(ownerToken), redirect: "error" },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `The ${repository} controller project lookup failed with HTTP ${response.status}.`,
+    );
+  }
+  const value = record(
+    await boundedJson(response, 512 * 1024),
+    `${repository} controller project`,
+  );
+  exact(value.projectId, contract.projectId, `${repository} controller project ID`);
+  exact(
+    value.projectNumber,
+    contract.exposure.projectNumber,
+    `${repository} controller project number`,
+  );
+  exact(value.lifecycleState, "ACTIVE", `${repository} controller project lifecycle`);
+  if (value.parent !== undefined && value.parent !== null) {
+    throw new Error(
+      `The ${repository} controller project acquired an organization or folder parent; inherited pool authority is outside this proof.`,
+    );
+  }
+  return json(value, `${repository} controller project`);
+}
+
+async function readFederationPoolPolicy(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<JsonValue> {
+  const projectId = REPOSITORIES[repository].projectId;
+  const value = record(
+    await googleJson(
+      `https://iam.googleapis.com/v1/${federationPoolResourceName(projectId)}:getIamPolicy`,
+      ownerToken,
+      { options: { requestedPolicyVersion: 3 } },
+      fetcher,
+    ),
+    `${repository} workload identity pool policy`,
+  );
+  exactKeys(
+    value,
+    new Set(["auditConfigs", "bindings", "etag", "version"]),
+    `${repository} workload identity pool policy`,
+  );
+  if (array(value.bindings ?? [], `${repository} workload identity pool bindings`).length !== 0) {
+    throw new Error(
+      `The ${repository} workload identity pool has a resource-level IAM binding; only the exact owner project binding is admitted.`,
+    );
+  }
+  if (array(value.auditConfigs ?? [], `${repository} workload identity pool audit configs`).length !== 0) {
+    throw new Error(
+      `The ${repository} workload identity pool has an unreviewed resource-level audit configuration.`,
+    );
+  }
+  if (value.etag !== undefined) requiredString(value.etag, `${repository} pool policy etag`);
+  if (value.version !== undefined) {
+    boundedInteger(value.version, `${repository} pool policy version`, 1, 3);
+  }
+  return json(value, `${repository} workload identity pool policy`);
+}
+
+async function readFederationControllerRole(
+  roleName: string,
+  projectId: string,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<FederationControllerRole> {
+  const predefined = /^roles\/[A-Za-z0-9_.]{3,128}$/.test(roleName);
+  const projectRole = new RegExp(
+    `^projects/${escapeRegExp(projectId)}/roles/[A-Za-z0-9_.]{3,128}$`,
+  ).test(roleName);
+  if (!predefined && !projectRole) {
+    throw new Error(
+      `A ${projectId} project IAM binding names a role outside its project or the predefined-role namespace.`,
+    );
+  }
+  const url = new URL(`https://iam.googleapis.com/v1/${roleName}`);
+  const response = await fetcher(url, {
+    headers: googleHeaders(ownerToken),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`The live IAM role ${roleName} could not be resolved (HTTP ${response.status}).`);
+  }
+  const value = record(await boundedJson(response, 2 * 1024 * 1024), "live IAM role");
+  exactKeys(
+    value,
+    new Set(["deleted", "description", "etag", "includedPermissions", "name", "stage", "title"]),
+    "live IAM role",
+  );
+  exact(value.name, roleName, "live IAM role name");
+  if (value.deleted === true) {
+    throw new Error(`The bound IAM role ${roleName} is soft-deleted and cannot prove authority.`);
+  }
+  if (value.deleted !== undefined && value.deleted !== false) {
+    throw new Error(`The bound IAM role ${roleName} has a malformed deletion state.`);
+  }
+  requiredString(value.description, "live IAM role description");
+  requiredString(value.etag, "live IAM role etag");
+  requiredString(value.stage, "live IAM role stage");
+  requiredString(value.title, "live IAM role title");
+  const includedPermissions = array(
+    value.includedPermissions,
+    "live IAM role permissions",
+  ).map((permission) => requiredString(permission, "live IAM role permission")).toSorted();
+  if (
+    includedPermissions.length > 20_000 ||
+    new Set(includedPermissions).size !== includedPermissions.length
+  ) {
+    throw new Error(`The bound IAM role ${roleName} has a duplicate or oversized permission set.`);
+  }
+  return {
+    canonical: json({
+      deleted: false,
+      description: value.description,
+      etag: value.etag,
+      includedPermissions,
+      name: roleName,
+      stage: value.stage,
+      title: value.title,
+    }, "live IAM role"),
+    includedPermissions,
+    name: roleName,
+  };
+}
+
+async function readFederationControllerBaseSnapshot(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<FederationControllerBaseSnapshot> {
+  const projectId = REPOSITORIES[repository].projectId;
+  const [project, projectPolicy, poolPolicy] = await Promise.all([
+    readFederationControllerProject(repository, ownerToken, fetcher),
+    getPolicy(projectId, ownerToken, fetcher),
+    readFederationPoolPolicy(repository, ownerToken, fetcher),
+  ]);
+  return { poolPolicy, project, projectPolicy, repository };
+}
+
+async function readFederationControllerSnapshots(
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<readonly FederationControllerSnapshot[]> {
+  const bases = await Promise.all(
+    REPOSITORY_NAMES.map((repository) =>
+      readFederationControllerBaseSnapshot(repository, ownerToken, fetcher)
+    ),
+  );
+  const roleReads = new Map<string, Promise<FederationControllerRole>>();
+  const readRole = (roleName: string, projectId: string) => {
+    const existing = roleReads.get(roleName);
+    if (existing !== undefined) return existing;
+    const created = readFederationControllerRole(roleName, projectId, ownerToken, fetcher);
+    roleReads.set(roleName, created);
+    return created;
+  };
+  const snapshots: FederationControllerSnapshot[] = [];
+  for (const base of bases) {
+    const projectId = REPOSITORIES[base.repository].projectId;
+    const roles = await Promise.all(
+      [...new Set(base.projectPolicy.bindings.map((binding) => binding.role))]
+        .toSorted()
+        .map((roleName) => readRole(roleName, projectId)),
+    );
+    const rolesByName = new Map(roles.map((role) => [role.name, role]));
+    const mutatorBindings = base.projectPolicy.bindings
+      .filter((binding) => {
+        const role = rolesByName.get(binding.role);
+        if (role === undefined) throw new Error("A project IAM binding lost its role definition.");
+        return role.includedPermissions.some((permission) =>
+          permission === POOL_MUTATION_PERMISSION ||
+          FEDERATION_CONTROLLER_PERMISSION_SET.has(permission)
+        );
+      })
+      .map((binding) => {
+        if (binding.condition !== undefined) {
+          throw new Error(
+            `The ${base.repository} federation controller binding ${binding.role} is conditional; the quarantine requires stable owner authority.`,
+          );
+        }
+        if (
+          binding.members.length === 0 ||
+          binding.members.some((member) => member !== OWNER_MEMBER)
+        ) {
+          throw new Error(
+            `The ${base.repository} project grants federation-controller authority outside the exact owner identity.`,
+          );
+        }
+        return normalizedIamBinding(binding);
+      })
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    if (mutatorBindings.length === 0) {
+      throw new Error(
+        `The ${base.repository} project has no exact owner federation-controller binding.`,
+      );
+    }
+    const roleDefinitions = roles
+      .map((role) => role.canonical)
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    snapshots.push({
+      canonical: canonicalJson(json({
+        mutatorBindings,
+        poolPolicy: base.poolPolicy,
+        project: base.project,
+        projectPolicy: normalizedIamPolicy(base.projectPolicy),
+        roleDefinitions,
+      }, `${base.repository} federation controller snapshot`)),
+      mutatorBindings,
+      repository: base.repository,
+    });
+  }
+  return snapshots;
+}
+
+function requireEmptyAnalysisState(value: unknown, label: string): void {
+  if (value === undefined) return;
+  if (Object.keys(record(value, label)).length !== 0) {
+    throw new Error(`${label} is not fully resolved.`);
+  }
+}
+
+function validateFederationControllerAnalysis(
+  value: unknown,
+  snapshot: FederationControllerSnapshot,
+): void {
+  const repository = snapshot.repository;
+  const projectId = REPOSITORIES[repository].projectId;
+  const projectFullName = `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
+  const response = record(value, `${repository} federation controller analysis`);
+  exactKeys(
+    response,
+    new Set(["fullyExplored", "mainAnalysis", "serviceAccountImpersonationAnalysis"]),
+    `${repository} federation controller analysis`,
+  );
+  exact(response.fullyExplored, true, `${repository} controller analysis completeness`);
+  const impersonation = array(
+    response.serviceAccountImpersonationAnalysis ?? [],
+    `${repository} controller impersonation analyses`,
+  );
+  if (impersonation.length !== 0) {
+    throw new Error(
+      `The ${repository} controller analysis found a service-account impersonation path.`,
+    );
+  }
+  const main = record(response.mainAnalysis, `${repository} main controller analysis`);
+  exactKeys(
+    main,
+    new Set(["analysisQuery", "analysisResults", "fullyExplored", "nonCriticalErrors"]),
+    `${repository} main controller analysis`,
+  );
+  exact(main.fullyExplored, true, `${repository} main controller analysis completeness`);
+  if (
+    array(main.nonCriticalErrors ?? [], `${repository} controller analysis warnings`).length !== 0
+  ) {
+    throw new Error(`The ${repository} controller analysis returned non-critical errors.`);
+  }
+  const query = record(main.analysisQuery, `${repository} controller analysis query`);
+  exactKeys(
+    query,
+    new Set(["accessSelector", "options", "scope"]),
+    `${repository} controller analysis query`,
+  );
+  exact(query.scope, `projects/${projectId}`, `${repository} controller analysis scope`);
+  const selector = record(query.accessSelector, `${repository} controller access selector`);
+  exactKeys(selector, new Set(["permissions"]), `${repository} controller access selector`);
+  exact(
+    canonicalJson(json(
+      array(selector.permissions, `${repository} controller permissions`).toSorted(),
+      `${repository} controller permissions`,
+    )),
+    canonicalJson(json([...FEDERATION_CONTROLLER_PERMISSIONS].toSorted(), "controller permissions")),
+    `${repository} controller permissions`,
+  );
+  const options = record(query.options, `${repository} controller analysis options`);
+  const expectedOptions = {
+    analyzeServiceAccountImpersonation: true,
+    expandResources: true,
+    expandRoles: true,
+    outputGroupEdges: true,
+    outputResourceEdges: true,
+  };
+  exactKeys(options, new Set(Object.keys(expectedOptions)), `${repository} controller options`);
+  exact(
+    canonicalJson(json(options, `${repository} controller options`)),
+    canonicalJson(json(expectedOptions, "controller options")),
+    `${repository} controller options`,
+  );
+  const results = array(main.analysisResults, `${repository} controller analysis results`);
+  if (results.length === 0 || results.length > 128) {
+    throw new Error(`The ${repository} controller analysis returned no or too many bindings.`);
+  }
+  const observedBindings = results.map((candidate, index) => {
+    const result = record(candidate, `${repository} controller analysis result ${index}`);
+    exactKeys(
+      result,
+      new Set([
+        "accessControlLists",
+        "attachedResourceFullName",
+        "fullyExplored",
+        "iamBinding",
+        "identityList",
+      ]),
+      `${repository} controller analysis result ${index}`,
+    );
+    exact(result.fullyExplored, true, `${repository} controller result completeness`);
+    exact(
+      result.attachedResourceFullName,
+      projectFullName,
+      `${repository} controller policy attachment`,
+    );
+    const binding = iamPolicy({
+      bindings: [result.iamBinding],
+      etag: "analysis-only",
+      version: 3,
+    }).bindings[0]!;
+    if (
+      binding.condition !== undefined ||
+      binding.members.length === 0 ||
+      binding.members.some((member) => member !== OWNER_MEMBER)
+    ) {
+      throw new Error(
+        `The ${repository} controller analysis returned authority outside the unconditional exact owner binding.`,
+      );
+    }
+    const accessLists = array(
+      result.accessControlLists,
+      `${repository} controller access-control lists`,
+    );
+    if (accessLists.length === 0 || accessLists.length > 32) {
+      throw new Error(`The ${repository} controller analysis returned no or too many ACLs.`);
+    }
+    const observedPermissions = new Set<string>();
+    for (const [aclIndex, rawAcl] of accessLists.entries()) {
+      const acl = record(rawAcl, `${repository} controller ACL ${aclIndex}`);
+      exactKeys(
+        acl,
+        new Set(["accesses", "conditionEvaluation", "resourceEdges", "resources"]),
+        `${repository} controller ACL ${aclIndex}`,
+      );
+      if (acl.conditionEvaluation !== undefined) {
+        throw new Error(`The ${repository} controller ACL is conditional.`);
+      }
+      if (array(acl.resourceEdges ?? [], `${repository} controller resource edges`).length !== 0) {
+        throw new Error(`The ${repository} controller ACL escaped the exact project resource.`);
+      }
+      const resources = array(acl.resources, `${repository} controller resources`);
+      if (resources.length === 0) {
+        throw new Error(`The ${repository} controller ACL has no resource.`);
+      }
+      for (const rawResource of resources) {
+        const resource = record(rawResource, `${repository} controller resource`);
+        exactKeys(
+          resource,
+          new Set(["analysisState", "fullResourceName"]),
+          `${repository} controller resource`,
+        );
+        exact(
+          resource.fullResourceName,
+          projectFullName,
+          `${repository} controller ACL resource`,
+        );
+        requireEmptyAnalysisState(
+          resource.analysisState,
+          `${repository} controller resource analysis state`,
+        );
+      }
+      const accesses = array(acl.accesses, `${repository} controller accesses`);
+      if (accesses.length === 0) {
+        throw new Error(`The ${repository} controller ACL has no access.`);
+      }
+      for (const rawAccess of accesses) {
+        const access = record(rawAccess, `${repository} controller access`);
+        exactKeys(
+          access,
+          new Set(["analysisState", "permission", "role"]),
+          `${repository} controller access`,
+        );
+        if (access.role !== undefined) {
+          throw new Error(`The ${repository} controller analysis did not expand a role.`);
+        }
+        const permission = requiredString(
+          access.permission,
+          `${repository} controller permission`,
+        );
+        if (!FEDERATION_CONTROLLER_PERMISSION_SET.has(permission)) {
+          throw new Error(`The ${repository} controller analysis returned an unrequested access.`);
+        }
+        requireEmptyAnalysisState(
+          access.analysisState,
+          `${repository} controller access analysis state`,
+        );
+        observedPermissions.add(permission);
+      }
+    }
+    if (observedPermissions.size === 0) {
+      throw new Error(`The ${repository} controller analysis proved no controller permission.`);
+    }
+    const identities = record(result.identityList, `${repository} controller identity list`);
+    exactKeys(
+      identities,
+      new Set(["groupEdges", "identities"]),
+      `${repository} controller identity list`,
+    );
+    if (array(identities.groupEdges ?? [], `${repository} controller group edges`).length !== 0) {
+      throw new Error(`The ${repository} controller analysis found a group-derived identity.`);
+    }
+    const identityValues = array(
+      identities.identities,
+      `${repository} controller identities`,
+    );
+    if (identityValues.length === 0) {
+      throw new Error(`The ${repository} controller analysis returned no identity.`);
+    }
+    for (const rawIdentity of identityValues) {
+      const identity = record(rawIdentity, `${repository} controller identity`);
+      exactKeys(
+        identity,
+        new Set(["analysisState", "name"]),
+        `${repository} controller identity`,
+      );
+      exact(identity.name, OWNER_MEMBER, `${repository} controller identity`);
+      requireEmptyAnalysisState(
+        identity.analysisState,
+        `${repository} controller identity analysis state`,
+      );
+    }
+    return normalizedIamBinding(binding);
+  }).toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  exact(
+    canonicalJson(json(observedBindings, `${repository} observed controller bindings`)),
+    canonicalJson(json(snapshot.mutatorBindings, `${repository} live controller bindings`)),
+    `${repository} live/analyzed controller bindings`,
+  );
+}
+
+async function analyzeFederationControllers(
+  snapshot: FederationControllerSnapshot,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<void> {
+  const projectId = REPOSITORIES[snapshot.repository].projectId;
+  const url = new URL(
+    `https://cloudasset.googleapis.com/v1/projects/${projectId}:analyzeIamPolicy`,
+  );
+  for (const permission of FEDERATION_CONTROLLER_PERMISSIONS) {
+    url.searchParams.append("analysisQuery.accessSelector.permissions", permission);
+  }
+  url.searchParams.set("analysisQuery.options.expandRoles", "true");
+  url.searchParams.set("analysisQuery.options.expandResources", "true");
+  url.searchParams.set("analysisQuery.options.outputGroupEdges", "true");
+  url.searchParams.set("analysisQuery.options.outputResourceEdges", "true");
+  url.searchParams.set("analysisQuery.options.analyzeServiceAccountImpersonation", "true");
+  url.searchParams.set("executionTimeout", "120s");
+  const response = await fetcher(url, {
+    headers: googleHeaders(ownerToken),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(
+      `The ${snapshot.repository} federation controller analysis failed with HTTP ${response.status}.`,
+    );
+  }
+  validateFederationControllerAnalysis(
+    await boundedJson(response, 4 * 1024 * 1024),
+    snapshot,
+  );
+}
+
+// Proves the live state that a reviewed plan cannot: every effective pool
+// updater and every principal able to grant pool-update authority is the exact
+// owner, the projects have no inheritance boundary, and the pools carry no
+// resource-level policy. Policy and role etags bracket a complete Cloud Asset
+// expansion so an eventually-consistent or concurrently changed answer cannot
+// authorize the first quarantine write.
+export async function proveNoUntrustedFederationControllers(
+  ownerToken: string,
+  policyFetcher: Fetcher,
+  analysisFetcher: Fetcher = policyFetcher,
+): Promise<void> {
+  secretValue(ownerToken, "federation controller owner token");
+  const before = await readFederationControllerSnapshots(ownerToken, policyFetcher);
+  await Promise.all(
+    before.map((snapshot) => analyzeFederationControllers(snapshot, ownerToken, analysisFetcher)),
+  );
+  const after = await readFederationControllerSnapshots(ownerToken, policyFetcher);
+  for (const [index, first] of before.entries()) {
+    const second = after[index];
+    if (second === undefined || second.repository !== first.repository) {
+      throw new Error("The federation controller snapshot lost repository order.");
+    }
+    exact(
+      second.canonical,
+      first.canonical,
+      `${first.repository} federation controller snapshot`,
+    );
+  }
 }
 
 function validatedFederationPoolFingerprint(
@@ -6799,6 +7375,11 @@ function defaultBridgeDependencies(
   const sandbox = new TerraformSandboxExecutor(dockerTerraformSandboxDriver());
   let apiDeadlineMs = Date.now() + 5 * 60_000;
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
+  // Policy Analyzer commonly takes longer than the ordinary 20-second API
+  // envelope. It still shares the protected operation deadline and the global
+  // response bound, but one complete analysis may use the documented 120s
+  // execution window rather than being aborted into a false-negative proof.
+  const controllerAnalysisApi = deadlineFetcher(fetch, () => apiDeadlineMs, 125_000);
   return {
     acquireExecutor: (invocation, leaseExpiresAt, operationDeadlineMs) =>
       manager.acquire(invocation, leaseExpiresAt, operationDeadlineMs),
@@ -6984,7 +7565,22 @@ function defaultBridgeDependencies(
         api,
         githubProofRetryPolicy(() => apiDeadlineMs),
     ),
-    armFederationQuarantine: async (invocation, session, _operationDeadlineMs) => {
+    armFederationQuarantine: async (invocation, session, operationDeadlineMs) => {
+      apiDeadlineMs = operationDeadlineMs;
+      // This is intentionally inside the arm operation and immediately before
+      // the live pool capture. Both rehearsal and apply therefore prove the
+      // current controller set; a clean plan after-state cannot hide an
+      // untrusted grant that remains live until Terraform applies its removal.
+      await proveNoUntrustedFederationControllers(
+        invocation.ownerAccessToken,
+        api,
+        controllerAnalysisApi,
+      );
+      assertBeforeDeadline(
+        Date.now(),
+        operationDeadlineMs,
+        "live federation controller proof",
+      );
       // Every consumer pool, not just the target's. The freeze proof already
       // spans the whole fleet because consumer principals are not provably
       // confined to their own project, and quarantining a smaller set would
