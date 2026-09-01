@@ -56,7 +56,6 @@ import {
   parseRecoverySecretBundle,
   parseExecutorProvenance,
   publishPlanReceipt,
-  publishPostApplyReceipt,
   type FederationPoolState,
   federationPoolFromJson,
   type FederationQuarantineRecord,
@@ -2278,6 +2277,7 @@ describe("protected owner Terraform bridge", () => {
         stored = String(init?.body);
         return Response.json({
           generation: "11",
+          metageneration: "1",
           bucket: "runsetta-tfstate-601124730704-bootstrap",
           generation,
           name: "runsetta/exposure/default.tfstate",
@@ -3906,7 +3906,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events).toContain("publish:adoption");
     expect(events).not.toContain("consume");
     expect(events).not.toContain("elevate");
-    expect(events).not.toContain("publish:post");
+    expect(events).not.toContain("publish:final");
     expect(publishedProof?.seedContract?.confirmation).toBe(
       "ADOPT_RUNSETTA_EXPOSURE_STATE",
     );
@@ -4339,7 +4339,7 @@ describe("protected owner Terraform bridge", () => {
     expect(acquireDeadline).toBe(startedAt + 33 * 60_000);
     expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
     expect(events).toContain("terraform:apply");
-    expect(events).toContain("publish:post");
+    expect(events).toContain("publish:final");
     for (const budget of ["2319", "2341"]) {
       expect(() => validateInvocation({
         ...validEnvironment(),
@@ -5433,7 +5433,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("terraform:audit")).toBeGreaterThan(events.indexOf("terraform:apply"));
     expect(events.indexOf("drain:post")).toBeGreaterThan(events.indexOf("terraform:audit"));
     expect(events.indexOf("markers:post")).toBeGreaterThan(events.indexOf("terraform:audit"));
-    expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("markers:post"));
+    expect(events.indexOf("publish:final")).toBeGreaterThan(events.indexOf("markers:post"));
     expect(events.filter((event) => event === "consume")).toHaveLength(1);
     expect(events).toContain("release");
     const auditArgv = terraformArgv.find((args) =>
@@ -5478,7 +5478,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events.filter((event) => event === "exposure")).toHaveLength(4);
     expect(events.indexOf("elevate")).toBeGreaterThan(events.indexOf("consume"));
     expect(events.indexOf("terraform:apply")).toBeGreaterThan(events.indexOf("elevate"));
-    expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("terraform:apply"));
+    expect(events.indexOf("publish:final")).toBeGreaterThan(events.indexOf("terraform:apply"));
 
     const rejectedEvents: string[] = [];
     await expect(runProtectedBootstrap(
@@ -5634,125 +5634,6 @@ describe("protected owner Terraform bridge", () => {
     await expect(bounded("https://example.invalid/hanging-body")).rejects.toThrow("timed out");
   });
 
-  test("fresh plan receipt is source-bound, byte-verified, and consumed exactly once", async () => {
-    const now = Date.parse("2026-08-22T21:30:00.000Z");
-    const planInvocation = validateInvocation(validEnvironment());
-    const review = buildReviewManifest(plan([]), {
-      ...identity(),
-      terraformRoot: "bootstrap",
-    });
-    const objects = new Map<string, string>();
-    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const url = new URL(String(input));
-      if (url.hostname === "api.github.com" && url.pathname.endsWith("/actions/runs/123456")) {
-        return Response.json({
-          actor: { id: 16823277 },
-          conclusion: "success",
-          created_at: "2026-08-22T21:29:00.000Z",
-          event: "workflow_dispatch",
-          head_branch: "main",
-          head_sha: platformSha,
-          id: 123456,
-          repository: { id: 1255856466 },
-          run_attempt: 1,
-          status: "completed",
-          updated_at: "2026-08-22T21:29:30.000Z",
-          workflow_id: 77,
-        });
-      }
-      if (url.hostname === "api.github.com" && url.pathname.endsWith("/actions/workflows/77")) {
-        return Response.json({ path: ".github/workflows/protected-bootstrap-implementation.yml" });
-      }
-      if (url.hostname === "storage.googleapis.com" && url.pathname.startsWith("/upload/")) {
-        const name = url.searchParams.get("name");
-        if (name === null) return new Response("", { status: 400 });
-        if (objects.has(name)) return new Response("", { status: 412 });
-        objects.set(name, String(init?.body));
-        return Response.json({
-          bucket: "cdbentley-tfstate-882468538648-bootstrap",
-          generation: String(1_700_000_000 + objects.size),
-          name,
-        });
-      }
-      if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
-        const encoded = url.pathname.split("/o/")[1];
-        const name = encoded === undefined ? "" : decodeURIComponent(encoded);
-        const body = objects.get(name);
-        return body === undefined ? new Response("", { status: 404 }) : new Response(body);
-      }
-      return new Response("", { status: 500 });
-    };
-    const executorToken = "short-lived-executor-access-token-value";
-    await publishPlanReceipt(
-      planInvocation,
-      executorToken,
-      review,
-      executionProof(),
-      now,
-      fetcher,
-    );
-    const publishedReceipt = JSON.parse(
-      objects.get("cdbentley/bootstrap/.protected-bootstrap/plans/123456.json") ?? "{}",
-    ) as Record<string, unknown>;
-    expect(publishedReceipt.mode).toBe("plan");
-    expect(publishedReceipt.schemaVersion).toBe(4);
-    expect(publishedReceipt.exposureProof).toBeNull();
-    expect(publishedReceipt.legacyCompatibilityMode).toBeFalse();
-    expect(publishedReceipt.markerProof).toEqual(markers());
-    expect(publishedReceipt.transitionWorkflowSha).toBe("");
-    const applyInvocation = validateInvocation({
-      ...validEnvironment(),
-      APPROVED_MANIFEST_SHA256: review.sha256,
-      APPROVED_PLAN_RUN_ID: "123456",
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
-      EXECUTION_MODE: "apply",
-      GITHUB_RUN_ID_EXACT: "123457",
-    }, true);
-    const approved = await verifyPlanApproval(
-      applyInvocation,
-      executorToken,
-      executionProof(),
-      now,
-      fetcher,
-    );
-    expect(approved.sha256).toBe(review.sha256);
-    const changedMarkers = markers().map((marker, index) =>
-      index === 0 ? { ...marker, generation: "999" } : marker
-    );
-    await expect(verifyPlanApproval(
-      applyInvocation,
-      executorToken,
-      executionProof({ markerProof: changedMarkers }),
-      now,
-      fetcher,
-    )).rejects.toThrow("approved deployment-parity marker proof");
-    await consumePlanReceipt(applyInvocation, executorToken, review, executionProof(), now, fetcher);
-    await expect(
-      consumePlanReceipt(applyInvocation, executorToken, review, executionProof(), now, fetcher),
-    )
-      .rejects.toThrow("already published or consumed");
-    expect([...objects.keys()].filter((name) => name.includes("/consumed/"))).toHaveLength(1);
-    const postProof = executionProof({
-      freezeProof: freezeSnapshot(now + 420_000),
-    });
-    await publishPostApplyReceipt(
-      applyInvocation,
-      executorToken,
-      review,
-      postProof,
-      now + 420_000,
-      fetcher,
-    );
-    const result = JSON.parse(
-      objects.get("cdbentley/bootstrap/.protected-bootstrap/results/123457.json") ?? "{}",
-    ) as Record<string, unknown>;
-    expect(result.mode).toBe("post-apply");
-    expect(result.markerProof).toEqual(markers());
-    expect((result.freezeProof as Record<string, unknown>).observedAt).toBe(
-      new Date(now + 420_000).toISOString(),
-    );
-  });
-
   test("Runsetta adoption publishes one immutable terminal receipt with no apply capability", async () => {
     const now = Date.parse("2026-08-26T16:00:00.000Z");
     const invocation = validateInvocation({
@@ -5779,7 +5660,9 @@ describe("protected owner Terraform bridge", () => {
         return Response.json({
           bucket: REPOSITORIES.runsetta.state.exposure.bucket,
           generation: String(1_700_000_000 + objects.size),
+          metageneration: "1",
           name,
+          size: String(Buffer.byteLength(String(init?.body))),
         });
       }
       if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
@@ -5897,6 +5780,7 @@ describe("protected owner Terraform bridge", () => {
           return Response.json({
             bucket: REPOSITORIES.runsetta.state.exposure.bucket,
             generation: "8",
+            metageneration: "1",
             name,
             size: String(Buffer.byteLength(raw)),
           });
@@ -6120,7 +6004,13 @@ describe("protected owner Terraform bridge", () => {
         store[name] = String(init!.body);
         writes.push(`${bucket}/${name}`);
         generations[name] = String(1_700_000_000 + writes.length);
-        return Response.json({ generation: generations[name], name });
+        return Response.json({
+          bucket,
+          generation: generations[name],
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(store[name]!)),
+        });
       }
       if (url.searchParams.get("alt") === "media") {
         const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
@@ -6632,8 +6522,8 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("de-elevate"));
     expect(events.indexOf("de-elevate")).toBeLessThan(events.indexOf("federation:restore"));
     // And no countable success exists until after both.
-    expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("publish:post"));
-    expect(events.indexOf("publish:post")).toBeLessThan(events.indexOf("publish:final"));
+    expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("final-audit"));
+    expect(events.indexOf("final-audit")).toBeLessThan(events.indexOf("publish:final"));
     expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("release"));
   });
 
@@ -10560,9 +10450,6 @@ function fakeDependencies(
     publishPlanReceipt: overrides.publishPlanReceipt ?? (async () => {
       events.push("publish");
     }),
-    publishPostApplyReceipt: overrides.publishPostApplyReceipt ?? (async () => {
-      events.push("publish:post");
-    }),
     readPlanJson: overrides.readPlanJson ?? (async () => {
       events.push("show");
       return overrides.planJson ?? JSON.stringify(plan([]));
@@ -10589,6 +10476,14 @@ function fakeDependencies(
       events.push("federation:preflight");
       return { restored: [], scanned: 0, skippedComplete: [], skippedUncontained: [] };
     }),
+    auditRestoredState: overrides.auditRestoredState ?? (async () => {
+      events.push("final-audit");
+      return {
+        detailedExitCode: 0 as const,
+        observedAt: new Date(now()).toISOString(),
+        outputSha256: "a".repeat(64),
+      };
+    }),
     deElevateExecutor: overrides.deElevateExecutor ?? (async () => {
       events.push("de-elevate");
       return {
@@ -10603,13 +10498,20 @@ function fakeDependencies(
     }),
     armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation) => {
       events.push("quarantine:arm");
-      return quarantineIntent(invocation);
+      return { generation: "1700000001", record: quarantineIntent(invocation) };
     }),
     disableFederation: overrides.disableFederation ?? (async () => {
       events.push("quarantine");
     }),
-    restoreFederation: overrides.restoreFederation ?? (async () => {
+    restoreFederation: overrides.restoreFederation ?? (async (_invocation, record) => {
       events.push("federation:restore");
+      return record.pools.map((pool) => ({
+        disabled: pool.disabled,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: new Date(now()).toISOString(),
+        repository: pool.repository,
+      }));
     }),
     waitForPostMutationDrain: overrides.waitForPostMutationDrain ?? (async (
       invocation,

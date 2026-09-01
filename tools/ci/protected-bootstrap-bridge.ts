@@ -988,27 +988,40 @@ export interface ExecutionProof extends PreparationResult {
   readonly markerProof: readonly MarkerStateProof[];
 }
 
-export interface FinalProtectedProof {
+export interface FinalProtectedProofBase {
   readonly consumerSha: string;
   readonly deElevation: ExecutorDeElevationProof;
-  readonly finalTerraformAuditedAt: string;
-  readonly finalTerraformQuarantined: false;
-  // sha256 over the canonical durable intent, so the receipt names the exact
-  // quarantine this run armed and nothing else.
+  // The digest and generation of the exact durable intent bytes this run armed.
   readonly intentDigest: string;
+  readonly intentGeneration: string;
+  // Read back from the API AFTER restoration. Never a copy of the intent: the
+  // intent is what the run promised, this is what it left behind.
+  readonly observedPools: readonly ObservedFederationPool[];
   readonly platformSha: string;
-  readonly quarantinedApplyProofDigest: string;
   readonly repository: RepositoryName;
-  readonly restoredPools: readonly {
-    readonly disabled: boolean;
-    readonly fingerprint: string;
-    readonly name: string;
-    readonly repository: RepositoryName;
-  }[];
   readonly reviewSha256: string;
   readonly root: TerraformRoot;
   readonly runId: string;
 }
+
+// A rehearsal runs no Terraform, so it cannot carry an apply proof, a restored
+// zero-diff audit, or a countable verdict -- and the type is what stops it
+// claiming any of them rather than a comment asking nicely.
+export type FinalProtectedProof =
+  | (FinalProtectedProofBase & {
+    readonly countable: true;
+    readonly kind: "apply";
+    readonly quarantinedApplyProofDigest: string;
+    readonly restoredAudit: {
+      readonly detailedExitCode: 0;
+      readonly observedAt: string;
+      readonly outputSha256: string;
+    };
+  })
+  | (FinalProtectedProofBase & {
+    readonly countable: false;
+    readonly kind: "rehearsal";
+  });
 
 export interface ExecutorDeElevationProof {
   readonly executorEmail: string;
@@ -1116,13 +1129,6 @@ export interface BridgeDependencies {
     proof: FinalProtectedProof,
     nowMs: number,
   ) => Promise<void>;
-  readonly publishPostApplyReceipt: (
-    invocation: Invocation,
-    session: ExecutorSession,
-    review: ReviewManifestResult,
-    proof: ExecutionProof,
-    nowMs: number,
-  ) => Promise<void>;
   readonly readPlanJson: (
     invocation: Invocation,
     session: ExecutorSession,
@@ -1164,7 +1170,7 @@ export interface BridgeDependencies {
   readonly armFederationQuarantine: (
     invocation: Invocation,
     operationDeadlineMs: number,
-  ) => Promise<FederationQuarantineRecord>;
+  ) => Promise<{ readonly generation: string; readonly record: FederationQuarantineRecord }>;
   // Disables all four, proving each converged to disabled with an otherwise
   // unchanged fingerprint.
   readonly disableFederation: (
@@ -1185,8 +1191,21 @@ export interface BridgeDependencies {
   readonly restoreFederation: (
     invocation: Invocation,
     record: FederationQuarantineRecord,
+    generation: string,
     operationDeadlineMs: number,
-  ) => Promise<void>;
+  ) => Promise<readonly ObservedFederationPool[]>;
+  // The restored-state audit. Its output digest is the zero-diff evidence the
+  // final receipt binds; a timestamp alone would assert nothing.
+  readonly auditRestoredState: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    terraformDirectory: string,
+    operationDeadlineMs: number,
+  ) => Promise<{
+    readonly detailedExitCode: 0;
+    readonly observedAt: string;
+    readonly outputSha256: string;
+  }>;
 }
 
 export interface RecoveryDependencies {
@@ -3375,7 +3394,6 @@ const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
 const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
 const MAX_FEDERATION_INTENT_PAGES = 32;
 const FEDERATION_MARKER_SKEW_MS = 5 * 60_000;
-const FEDERATION_MARKER_MAX_AGE_MS = 365 * 24 * 60 * 60_000;
 
 export interface FederationPoolState {
   readonly description: string;
@@ -3589,6 +3607,7 @@ export function federationRestoreMarkerBody(marker: FederationRestoreMarker): st
 export function federationRestoreMarkerFromJson(
   value: unknown,
   nowMs: number,
+  capturedAtMs: number,
 ): FederationRestoreMarker {
   const source = record(value, "federation restore marker");
   exactKeys(
@@ -3609,11 +3628,17 @@ export function federationRestoreMarkerFromJson(
   }
   const restoredAt = requiredString(source.restoredAt, "federation restore marker time");
   const restoredAtMs = Date.parse(restoredAt);
+  // A completion record is durable: it stays valid for as long as the intent it
+  // completes exists. An arbitrary maximum age would eventually turn a valid
+  // marker into a permanent preflight failure, or tempt someone to replay the
+  // intent it completed. What IS checked is that it is canonical, that it did
+  // not happen before the intent it claims to complete, and that it is not
+  // dated into the future beyond clock skew.
   if (
     !Number.isFinite(restoredAtMs) ||
     new Date(restoredAtMs).toISOString() !== restoredAt ||
-    restoredAtMs > nowMs + FEDERATION_MARKER_SKEW_MS ||
-    restoredAtMs < nowMs - FEDERATION_MARKER_MAX_AGE_MS
+    restoredAtMs + FEDERATION_MARKER_SKEW_MS < capturedAtMs ||
+    restoredAtMs > nowMs + FEDERATION_MARKER_SKEW_MS
   ) {
     throw new Error("Federation restore marker time is malformed or out of bounds.");
   }
@@ -3679,6 +3704,78 @@ export function federationIntentContainment(options: {
   };
 }
 
+interface DiscoveredIntent {
+  readonly bucket: string;
+  readonly capturedAtMs: number;
+  readonly digest: string;
+  readonly generation: string;
+  readonly intent: FederationQuarantineRecord;
+  readonly name: string;
+}
+
+// One canonical listing of every protected prefix, in a fixed order.
+async function federationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+): Promise<readonly (StorageObjectListing & { readonly bucket: string })[]> {
+  const inventory: (StorageObjectListing & { readonly bucket: string })[] = [];
+  for (const location of federationIntentLocations()) {
+    const objects = await listStorageObjects(
+      location.bucket,
+      location.prefix,
+      ownerAccessToken,
+      fetcher,
+    );
+    for (const entry of objects) {
+      const tail = entry.name.slice(location.prefix.length);
+      // Nothing unknown may sit in a prefix whose contents authorize a restore.
+      if (!/^[1-9][0-9]*\.json(\.restored)?$/.test(tail)) {
+        throw new Error(`Federation intent prefix holds an unrecognised object: ${entry.name}.`);
+      }
+      inventory.push({ ...entry, bucket: location.bucket });
+    }
+  }
+  return inventory.toSorted((left, right) =>
+    `${left.bucket}/${left.name}` < `${right.bucket}/${right.name}` ? -1 : 1
+  );
+}
+
+// A single pass catches repeats but not omissions: a page that shifts can drop
+// an object entirely and every within-pass check still passes. Two independent
+// canonical listings must agree exactly -- name, generation, metageneration,
+// size, and count -- before anything is restored on the strength of them.
+async function stableFederationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+): Promise<readonly (StorageObjectListing & { readonly bucket: string })[]> {
+  const first = await federationInventory(ownerAccessToken, fetcher);
+  const second = await federationInventory(ownerAccessToken, fetcher);
+  if (first.length !== second.length) {
+    throw new Error("The federation intent inventory changed size between two listings.");
+  }
+  first.forEach((entry, index) => {
+    const later = second[index]!;
+    if (
+      entry.bucket !== later.bucket || entry.name !== later.name ||
+      entry.generation !== later.generation || entry.metageneration !== later.metageneration ||
+      entry.size !== later.size
+    ) {
+      throw new Error(`The federation intent inventory drifted at ${entry.bucket}/${entry.name}.`);
+    }
+  });
+  return first;
+}
+
+// The production recovery path, shared verbatim by --recover-only and by the
+// preflight every protected run performs.
+//
+// It is deliberately two-phase and fleet-global. Every intent covers ALL FOUR
+// consumer pools, so restoring one intent re-enables federation everywhere. If
+// a second incomplete intent existed whose executor was still privileged,
+// restoring the first would hand that executor its credentials back. Nothing is
+// therefore restored until every incomplete intent in the whole inventory has
+// been validated and contained -- and if any one of them cannot be, none of
+// them is touched.
 export async function recoverFederationQuarantines(
   ownerAccessToken: string,
   fetcher: Fetcher,
@@ -3687,113 +3784,130 @@ export async function recoverFederationQuarantines(
   sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
   now: () => number = () => Date.now(),
 ): Promise<FederationRecoverySummary> {
-  const restored: string[] = [];
+  assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery scan");
+  const inventory = await stableFederationInventory(ownerAccessToken, fetcher);
+  const byKey = new Map(inventory.map((entry) => [`${entry.bucket}/${entry.name}`, entry]));
   const skippedComplete: string[] = [];
-  const skippedUncontained: string[] = [];
+  const incomplete: DiscoveredIntent[] = [];
   let scanned = 0;
-  for (const location of federationIntentLocations()) {
-    assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery scan");
-    const objects = await listStorageObjects(
-      location.bucket,
-      location.prefix,
+
+  // ---- phase one: validate and contain everything -------------------------
+  for (const entry of inventory) {
+    if (entry.name.endsWith(".restored")) continue;
+    scanned += 1;
+    assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery");
+    const body = await readObjectGeneration(
+      entry.bucket,
+      entry.name,
+      entry.generation,
       ownerAccessToken,
       fetcher,
     );
-    const byName = new Map(objects.map((entry) => [entry.name, entry]));
-    // Nothing unknown may sit in a prefix whose contents authorize a restore.
-    for (const entry of objects) {
-      const tail = entry.name.slice(location.prefix.length);
-      if (!/^[1-9][0-9]*\.json(\.restored)?$/.test(tail)) {
-        throw new Error(
-          `Federation intent prefix holds an unrecognised object: ${entry.name}.`,
-        );
-      }
+    if (Buffer.byteLength(body) !== entry.size) {
+      throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
     }
-    for (const entry of objects) {
-      if (entry.name.endsWith(".restored")) continue;
-      scanned += 1;
-      assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery");
-      // Bound to the generation the listing named, so the object cannot be
-      // swapped between discovery and validation.
-      const body = await readObjectGeneration(
-        location.bucket,
-        entry.name,
-        entry.generation,
-        ownerAccessToken,
-        fetcher,
-      );
-      if (Buffer.byteLength(body) !== entry.size) {
-        throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
-      }
-      const digest = sha256Hex(body);
-      const intent = federationQuarantineRecordFromJson(JSON.parse(body) as unknown);
-      const state = REPOSITORIES[intent.repository].state[intent.root];
-      // The object's own key has to agree with the identity inside it, or the
-      // two describe different runs and neither can be trusted.
-      exact(
-        entry.name,
-        federationIntentObjectFor(state, intent.runId),
-        "federation intent object name",
-      );
-      exact(location.bucket, state.bucket, "federation intent bucket");
-      // Written once, immutably: a metageneration past its first value means
-      // somebody rewrote the record this restore would act on.
-      exact(entry.metageneration, "1", "federation intent metageneration");
+    const digest = sha256Hex(body);
+    const intent = federationQuarantineRecordFromJson(JSON.parse(body) as unknown);
+    const state = REPOSITORIES[intent.repository].state[intent.root];
+    exact(entry.name, federationIntentObjectFor(state, intent.runId), "federation intent object name");
+    exact(entry.bucket, state.bucket, "federation intent bucket");
+    exact(entry.metageneration, "1", "federation intent metageneration");
+    const capturedAtMs = Date.parse(intent.capturedAt);
 
-      const markerEntry = byName.get(`${entry.name}.restored`);
-      if (markerEntry !== undefined) {
-        // A name is not a completion record. Read the marker at its own
-        // generation and require it to name these exact bytes and this exact
-        // object; a marker that does not is a forgery or a stale artifact, and
-        // either way it must not suppress the restore.
-        exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
-        const marker = federationRestoreMarkerFromJson(
-          JSON.parse(
-            await readObjectGeneration(
-              location.bucket,
-              markerEntry.name,
-              markerEntry.generation,
-              ownerAccessToken,
-              fetcher,
-            ),
-          ) as unknown,
-          now(),
-        );
-        exact(marker.intentDigest, digest, "federation restore marker intent digest");
-        exact(marker.intentGeneration, entry.generation, "federation restore marker intent generation");
-        exact(marker.repository, intent.repository, "federation restore marker repository");
-        exact(marker.root, intent.root, "federation restore marker root");
-        exact(marker.runId, intent.runId, "federation restore marker run ID");
-        skippedComplete.push(entry.name);
-        continue;
-      }
-
-      if (!await containIntent(intent, deadlineMs)) {
-        // The run that armed this may still hold privilege. Handing federation
-        // back now is exactly the overlap the quarantine exists to prevent.
-        skippedUncontained.push(entry.name);
-        continue;
-      }
-      await restoreQuarantinedFederation(intent, ownerAccessToken, fetcher, deadlineMs, sleep, now);
-      await writeFederationRestoreMarker(
-        location.bucket,
-        entry.name,
-        {
-          intentDigest: digest,
-          intentGeneration: entry.generation,
-          repository: intent.repository,
-          restoredAt: new Date(now()).toISOString(),
-          root: intent.root,
-          runId: intent.runId,
-        },
-        ownerAccessToken,
-        fetcher,
-        now,
+    const markerEntry = byKey.get(`${entry.bucket}/${entry.name}.restored`);
+    if (markerEntry !== undefined) {
+      exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
+      const marker = federationRestoreMarkerFromJson(
+        JSON.parse(
+          await readObjectGeneration(
+            entry.bucket,
+            markerEntry.name,
+            markerEntry.generation,
+            ownerAccessToken,
+            fetcher,
+          ),
+        ) as unknown,
+        now(),
+        capturedAtMs,
       );
-      restored.push(entry.name);
+      exact(marker.intentDigest, digest, "federation restore marker intent digest");
+      exact(marker.intentGeneration, entry.generation, "federation restore marker intent generation");
+      exact(marker.repository, intent.repository, "federation restore marker repository");
+      exact(marker.root, intent.root, "federation restore marker root");
+      exact(marker.runId, intent.runId, "federation restore marker run ID");
+      skippedComplete.push(entry.name);
+      continue;
     }
+    incomplete.push({
+      bucket: entry.bucket,
+      capturedAtMs,
+      digest,
+      generation: entry.generation,
+      intent,
+      name: entry.name,
+    });
   }
-  return { restored, scanned, skippedComplete, skippedUncontained };
+
+  if (incomplete.length === 0) {
+    return { restored: [], scanned, skippedComplete, skippedUncontained: [] };
+  }
+
+  // Overlapping incomplete intents describe the same four pools. They can only
+  // be restored together if they agree about what those pools looked like
+  // before anything moved; if they disagree, restoring either one invents a
+  // state nobody reviewed, so this stops for a human.
+  const shapes = new Set(
+    incomplete.map((entry) => canonicalJson(json([...entry.intent.pools], "intent pool shape"))),
+  );
+  if (shapes.size > 1) {
+    throw new Error(
+      `Federation recovery found ${incomplete.length} incomplete quarantine intents that disagree about the pre-quarantine pool state; restore none and recover by hand.`,
+    );
+  }
+
+  const uncontained: string[] = [];
+  for (const entry of incomplete) {
+    assertBeforeDeadline(now(), deadlineMs, "federation quarantine containment");
+    if (!await containIntent(entry.intent, deadlineMs)) uncontained.push(entry.name);
+  }
+  if (uncontained.length > 0) {
+    // Restore NOTHING. Every intent covers every pool, so handing back the
+    // pools for a contained intent would also hand them back to the executor of
+    // an uncontained one.
+    return { restored: [], scanned, skippedComplete, skippedUncontained: uncontained };
+  }
+
+  // ---- phase two: restore, deterministically -------------------------------
+  const restored: string[] = [];
+  for (const entry of incomplete) {
+    assertBeforeDeadline(now(), deadlineMs, "federation quarantine restore");
+    await restoreQuarantinedFederation(
+      entry.intent,
+      ownerAccessToken,
+      fetcher,
+      deadlineMs,
+      sleep,
+      now,
+    );
+    await writeFederationRestoreMarker(
+      entry.bucket,
+      entry.name,
+      {
+        intentDigest: entry.digest,
+        intentGeneration: entry.generation,
+        repository: entry.intent.repository,
+        restoredAt: new Date(now()).toISOString(),
+        root: entry.intent.root,
+        runId: entry.intent.runId,
+      },
+      ownerAccessToken,
+      fetcher,
+      now,
+      entry.capturedAtMs,
+    );
+    restored.push(entry.name);
+  }
+  return { restored, scanned, skippedComplete, skippedUncontained: [] };
 }
 
 // Idempotent under a lost write response: if the marker is already there, it
@@ -3806,20 +3920,37 @@ export async function writeFederationRestoreMarker(
   token: string,
   fetcher: Fetcher,
   now: () => number = () => Date.now(),
+  capturedAtMs: number = Date.parse(marker.restoredAt),
 ): Promise<void> {
   const body = federationRestoreMarkerBody(marker);
+  const object = `${intentObject}.restored`;
   try {
-    await writeImmutableObject(bucket, `${intentObject}.restored`, body, token, fetcher);
+    await writeImmutableObject(bucket, object, body, token, fetcher);
+    return;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // Only a precondition conflict is a candidate for reconciliation. Anything
+    // else is a real failure and must not be interpreted as "already done".
     if (!message.includes("already published or consumed")) throw error;
-    const observed = await readObject(bucket, `${intentObject}.restored`, token, fetcher);
-    // Validate it as a marker rather than trusting a string compare alone, so
-    // a malformed object cannot pass by matching some other run's bytes.
-    federationRestoreMarkerFromJson(JSON.parse(observed) as unknown, now());
-    if (observed !== body) {
-      throw new Error("A different federation restore marker already exists for this intent.");
-    }
+  }
+  // Reconcile through exact metadata, then a generation-bound media read. A
+  // read by name alone would validate whatever sits at the key now, which is
+  // precisely what an attacker who can create objects would arrange.
+  const metadata = await readObjectMetadata(bucket, object, token, fetcher);
+  exact(metadata.metageneration, "1", "existing federation restore marker metageneration");
+  if (metadata.size !== Buffer.byteLength(body)) {
+    throw new Error("A different federation restore marker already exists for this intent.");
+  }
+  const observed = await readObjectGeneration(
+    bucket,
+    object,
+    metadata.generation,
+    token,
+    fetcher,
+  );
+  federationRestoreMarkerFromJson(JSON.parse(observed) as unknown, now(), capturedAtMs);
+  if (observed !== body) {
+    throw new Error("A different federation restore marker already exists for this intent.");
   }
 }
 
@@ -3875,34 +4006,65 @@ export function assertQuarantinedPool(
 // before any of this was written, which pools were handed back and in what
 // state, that the restored world audits to zero diff, and which durable intent
 // this all belongs to.
-export function buildFinalProtectedProof(input: {
-  readonly deElevation: ExecutorDeElevationProof;
-  readonly finalAuditedAt: string;
-  readonly intent: FederationQuarantineRecord;
-  readonly invocation: Invocation;
-  readonly quarantinedApplyProof: ExecutionProof;
-  readonly review: ReviewManifestResult;
-}): FinalProtectedProof {
-  const { deElevation, finalAuditedAt, intent, invocation, quarantinedApplyProof, review } = input;
+export function buildFinalProtectedProof(
+  input:
+    & {
+      readonly deElevation: ExecutorDeElevationProof;
+      readonly intentDigest: string;
+      readonly intentGeneration: string;
+      readonly intent: FederationQuarantineRecord;
+      readonly invocation: Invocation;
+      readonly observedPools: readonly ObservedFederationPool[];
+      readonly review: ReviewManifestResult;
+    }
+    & (
+      | {
+        readonly kind: "apply";
+        readonly quarantinedApplyProof: ExecutionProof;
+        readonly restoredAudit: {
+          readonly detailedExitCode: 0;
+          readonly observedAt: string;
+          readonly outputSha256: string;
+        };
+      }
+      | { readonly kind: "rehearsal" }
+    ),
+): FinalProtectedProof {
+  const { deElevation, intent, intentDigest, intentGeneration, invocation, observedPools, review } =
+    input;
   exact(intent.repository, invocation.repository, "final receipt intent repository");
   exact(intent.root, invocation.terraformRoot, "final receipt intent root");
   exact(intent.runId, invocation.githubRunId, "final receipt intent run ID");
   exact(intent.platformSha, invocation.platformSha, "final receipt intent platform SHA");
-  return {
+  if (observedPools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Final receipt did not observe every consumer pool after restoration.");
+  }
+  REPOSITORY_NAMES.forEach((repository, index) => {
+    exact(observedPools[index]!.repository, repository, "final receipt observed pool order");
+  });
+  const base: FinalProtectedProofBase = {
     consumerSha: invocation.consumerSha,
     deElevation,
-    finalTerraformAuditedAt: finalAuditedAt,
-    finalTerraformQuarantined: false,
-    intentDigest: sha256Hex(canonicalJson(json(intent, "final receipt intent"))),
+    intentDigest,
+    intentGeneration,
+    observedPools: observedPools.map((pool) => ({ ...pool })),
     platformSha: invocation.platformSha,
-    quarantinedApplyProofDigest: sha256Hex(
-      canonicalJson(json(quarantinedApplyProof, "final receipt apply proof")),
-    ),
     repository: invocation.repository,
-    restoredPools: intent.pools.map((pool) => ({ ...pool })),
     reviewSha256: review.sha256,
     root: invocation.terraformRoot,
     runId: invocation.githubRunId,
+  };
+  if (input.kind === "rehearsal") {
+    return { ...base, countable: false, kind: "rehearsal" };
+  }
+  return {
+    ...base,
+    countable: true,
+    kind: "apply",
+    quarantinedApplyProofDigest: sha256Hex(
+      canonicalJson(json(input.quarantinedApplyProof, "final receipt apply proof")),
+    ),
+    restoredAudit: { ...input.restoredAudit },
   };
 }
 
@@ -4394,7 +4556,9 @@ export async function runProtectedBootstrap(
   );
   let session: ExecutorSession | undefined;
   let primaryFailure: unknown;
-  let quarantinedFederation: FederationQuarantineRecord | undefined;
+  let quarantinedFederation:
+    | { readonly generation: string; readonly record: FederationQuarantineRecord }
+    | undefined;
   let federationRestored = false;
   try {
     // Nothing starts until the fleet is known to be free of unrepaired
@@ -4444,7 +4608,7 @@ export async function runProtectedBootstrap(
       );
       await dependencies.disableFederation(
         invocation,
-        quarantinedFederation,
+        quarantinedFederation.record,
         operationDeadlineMs,
       );
       telemetry.phase("controller.de-elevate");
@@ -4454,9 +4618,10 @@ export async function runProtectedBootstrap(
         operationDeadlineMs,
       );
       telemetry.phase("controller.federation-restore");
-      await dependencies.restoreFederation(
+      const rehearsalPools = await dependencies.restoreFederation(
         invocation,
-        quarantinedFederation,
+        quarantinedFederation.record,
+        quarantinedFederation.generation,
         operationDeadlineMs,
       );
       federationRestored = true;
@@ -4480,10 +4645,14 @@ export async function runProtectedBootstrap(
         rehearsalReview,
         buildFinalProtectedProof({
           deElevation: rehearsalDeElevation,
-          finalAuditedAt: new Date(dependencies.now()).toISOString(),
-          intent: quarantinedFederation,
+          intent: quarantinedFederation.record,
+          intentDigest: sha256Hex(
+            canonicalJson(json(quarantinedFederation.record, "federation quarantine record")),
+          ),
+          intentGeneration: quarantinedFederation.generation,
           invocation,
-          quarantinedApplyProof: proof,
+          kind: "rehearsal",
+          observedPools: rehearsalPools,
           review: rehearsalReview,
         }),
         dependencies.now(),
@@ -4678,7 +4847,11 @@ export async function runProtectedBootstrap(
       invocation,
       operationDeadlineMs,
     );
-    await dependencies.disableFederation(invocation, quarantinedFederation, operationDeadlineMs);
+    await dependencies.disableFederation(
+      invocation,
+      quarantinedFederation.record,
+      operationDeadlineMs,
+    );
     await dependencies.elevateExecutor(
       invocation,
       session,
@@ -4774,64 +4947,47 @@ export async function runProtectedBootstrap(
       operationDeadlineMs,
     );
     // Federation comes back only once privilege is gone, and on the success
-    // path it happens here rather than in cleanup, so the final audit and the
-    // receipt describe the world as it will actually be left.
+    // path it happens here rather than in cleanup, so the audit and the receipt
+    // describe the world as it will actually be left.
     telemetry.phase("controller.federation-restore");
-    await dependencies.restoreFederation(
+    const observedPools = await dependencies.restoreFederation(
       invocation,
-      quarantinedFederation!,
+      quarantinedFederation!.record,
+      quarantinedFederation!.generation,
       operationDeadlineMs,
     );
     federationRestored = true;
-    // The post-apply audit ran with the pool quarantined, so it attests a state
-    // that restoration immediately ends. This one attests the state the run
-    // actually leaves behind: desired state with federation enabled, zero diff.
+    // The post-apply audit ran with the pools quarantined, so it attests a
+    // state restoration immediately ends. This one attests the state the run
+    // actually leaves behind: desired state with federation enabled, zero diff,
+    // and its output digest is what the receipt binds.
     telemetry.phase("controller.final-audit");
-    await dependencies.runTerraform(
+    const restoredAudit = await dependencies.auditRestoredState(
       invocation,
       session,
       terraformDirectory,
-      [
-        "plan",
-        "-json",
-        "-detailed-exitcode",
-        "-input=false",
-        "-lock=false",
-        "-no-color",
-        `-var=repository_id=${contract.repositoryId}`,
-        ...(invocation.terraformRoot === "bootstrap"
-          ? [
-              `-var=active_workflow_sha=${invocation.platformSha}`,
-              `-var=federation_quarantined=false`,
-              `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
-              `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
-            ]
-          : []),
-      ],
       operationDeadlineMs,
     );
-    const finalAuditedAt = new Date(dependencies.now()).toISOString();
     telemetry.phase("controller.apply-publish");
-    await dependencies.publishPostApplyReceipt(
-      invocation,
-      session,
-      review,
-      postApplyProof,
-      dependencies.now(),
-    );
-    // One immutable final receipt. It is the only countable success, and it can
-    // only exist after de-elevation, restoration, and the restored-state audit
-    // have all already happened.
+    // One receipt. The legacy post-apply receipt is gone: it was written before
+    // privilege was surrendered and before federation was handed back, so it
+    // could be counted as success for a run that never finished either.
     await dependencies.publishFinalReceipt(
       invocation,
       session,
       review,
       buildFinalProtectedProof({
         deElevation: deElevationProof,
-        finalAuditedAt,
-        intent: quarantinedFederation!,
+        intent: quarantinedFederation!.record,
+        intentDigest: sha256Hex(
+          canonicalJson(json(quarantinedFederation!.record, "federation quarantine record")),
+        ),
+        intentGeneration: quarantinedFederation!.generation,
         invocation,
+        kind: "apply",
+        observedPools,
         quarantinedApplyProof: postApplyProof,
+        restoredAudit,
         review,
       }),
       dependencies.now(),
@@ -4884,7 +5040,8 @@ export async function runProtectedBootstrap(
         try {
           await dependencies.restoreFederation(
             invocation,
-            quarantinedFederation,
+            quarantinedFederation.record,
+            quarantinedFederation.generation,
             cleanupDeadlineMs,
           );
         } catch (error) {
@@ -5997,15 +6154,6 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishPostApplyReceipt: (invocation, session, review, proof, nowMs) =>
-      publishPostApplyReceipt(
-        invocation,
-        session.accessToken,
-        review,
-        proof,
-        nowMs,
-        api,
-      ),
     readPlanJson: async (
       invocation,
       session,
@@ -6086,14 +6234,15 @@ function defaultBridgeDependencies(
       // Durable, immutable, and written BEFORE any mutation, so a runner that
       // dies at any later boundary still leaves a fresh runner enough to
       // restore exactly these pools to exactly this state -- and nothing else.
-      await writeImmutableObject(
+      // The generation it lands at is what a completion marker binds to.
+      const generation = await writeImmutableObject(
         federationIntentBucket(invocation),
         federationIntentObject(invocation),
         canonicalJson(json(record, "federation quarantine record")),
         invocation.ownerAccessToken,
         api,
       );
-      return record;
+      return { generation, record };
     },
     disableFederation: async (invocation, record, operationDeadlineMs) => {
       for (const pool of record.pools) {
@@ -6122,29 +6271,65 @@ function defaultBridgeDependencies(
           telemetry,
         }),
       ),
-    restoreFederation: async (invocation, record, operationDeadlineMs) => {
-      await restoreQuarantinedFederation(
+    restoreFederation: async (invocation, record, generation, operationDeadlineMs) => {
+      const observed = await restoreQuarantinedFederation(
         record,
         invocation.ownerAccessToken,
         api,
         operationDeadlineMs,
       );
-      // The completion marker is what stops a later recovery scan replaying
-      // this record and undoing an intentional future disable. Same shape and
-      // same binding the recovery path writes, so one reader understands both.
-      await writeImmutableObject(
+      // Exactly the marker the recovery path writes, through exactly the same
+      // idempotent writer, so one reader validates both and a lost response
+      // does not turn a completed restore into a conflict.
+      await writeFederationRestoreMarker(
         federationIntentBucket(invocation),
-        `${federationIntentObject(invocation)}.restored`,
-        `${canonicalJson(json({
+        federationIntentObject(invocation),
+        {
           intentDigest: sha256Hex(canonicalJson(json(record, "federation quarantine record"))),
+          intentGeneration: generation,
           repository: record.repository,
           restoredAt: new Date(Date.now()).toISOString(),
           root: record.root,
           runId: record.runId,
-        }, "federation restore marker"))}\n`,
+        },
         invocation.ownerAccessToken,
         api,
       );
+      return observed;
+    },
+    auditRestoredState: async (invocation, session, terraformDirectory, operationDeadlineMs) => {
+      const contract = REPOSITORIES[invocation.repository];
+      const output = await sandbox.run(
+        invocation,
+        session,
+        terraformDirectory,
+        [
+          "plan",
+          "-json",
+          "-detailed-exitcode",
+          "-input=false",
+          "-lock=false",
+          "-no-color",
+          `-var=repository_id=${contract.repositoryId}`,
+          ...(invocation.terraformRoot === "bootstrap"
+            ? [
+              `-var=active_workflow_sha=${invocation.platformSha}`,
+              `-var=federation_quarantined=false`,
+              `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
+              `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
+            ]
+            : []),
+        ],
+        operationDeadlineMs,
+        true,
+      );
+      // The sandbox throws on a non-zero detailed exit code, so reaching here
+      // IS the zero-diff result; the digest is what makes it evidence.
+      return {
+        detailedExitCode: 0,
+        observedAt: new Date(Date.now()).toISOString(),
+        outputSha256: sha256Hex(output ?? ""),
+      };
     },
     waitForPostMutationDrain: async (invocation, mutationCompletedAtMs, operationDeadlineMs) => {
       if (invocation.terraformRoot !== "bootstrap") return;
@@ -13456,61 +13641,6 @@ export async function consumePlanReceipt(
   );
 }
 
-export async function publishPostApplyReceipt(
-  invocation: Invocation,
-  executorToken: string,
-  review: ReviewManifestResult,
-  proof: ExecutionProof,
-  nowMs: number,
-  fetcher: Fetcher,
-): Promise<void> {
-  if (invocation.mode !== "apply") {
-    throw new Error("Only apply mode may publish a post-apply receipt.");
-  }
-  if (invocation.terraformRoot === "exposure") {
-    throw new Error("Exposure adoption has no post-apply receipt.");
-  }
-  const contract = REPOSITORIES[invocation.repository];
-  const state = contract.state[invocation.terraformRoot];
-  const receipt: JsonValue = {
-    applyRunId: invocation.githubRunId,
-    consumerSha: invocation.consumerSha,
-    consumerTreeSha: proof.consumerTreeSha,
-    dhiParityId: proof.dhiParityId,
-    exposureProof: json(
-      exposureProofForReceipt(proof.exposureProof, invocation),
-      "post-apply exposure proof",
-    ),
-    freezeProof: json(
-      normalizedFreezeProof(proof.freezeProof, proof.tokenDrainSeconds),
-      "post-apply freeze proof",
-    ),
-    manifestSha256: review.sha256,
-    markerProof: json(
-      markerProofForReceipt(proof.markerProof, invocation),
-      "post-apply marker proof",
-    ),
-    mode: "post-apply",
-    planRunId: invocation.approvedPlanRunId,
-    platformSha: invocation.platformSha,
-    projectId: contract.projectId,
-    publishedAt: new Date(nowMs).toISOString(),
-    repository: invocation.repository,
-    repositoryId: contract.repositoryId,
-    schemaVersion: 4,
-    terraformRoot: invocation.terraformRoot,
-    tokenDrainSeconds: proof.tokenDrainSeconds,
-    transitionWorkflowSha: invocation.transitionWorkflowSha,
-  };
-  await writeImmutableObject(
-    state.bucket,
-    receiptObjectName(state, "results", invocation.githubRunId),
-    `${canonicalJson(receipt)}\n`,
-    executorToken,
-    fetcher,
-  );
-}
-
 // The only countable success a protected run produces. Every field it carries
 // is a claim that was already true when it was written: mutation authority was
 // gone, all four pools were handed back to the state the durable intent
@@ -13529,14 +13659,21 @@ export async function publishFinalProtectedReceipt(
   if (invocation.terraformRoot === "exposure") {
     throw new Error("Exposure adoption has no final protected receipt.");
   }
+  // The kind must match the run. A rehearsal receipt claiming an apply, or an
+  // apply receipt written by a rehearsal, would each be a lie about whether any
+  // Terraform ran.
+  exact(
+    proof.kind,
+    invocation.mode === "rehearsal" ? "rehearsal" : "apply",
+    "final receipt kind",
+  );
   exact(proof.reviewSha256, review.sha256, "final receipt manifest digest");
   exact(proof.repository, invocation.repository, "final receipt repository");
   exact(proof.root, invocation.terraformRoot, "final receipt root");
   exact(proof.runId, invocation.githubRunId, "final receipt run ID");
   exact(proof.platformSha, invocation.platformSha, "final receipt platform SHA");
   exact(proof.consumerSha, invocation.consumerSha, "final receipt consumer SHA");
-  exact(proof.finalTerraformQuarantined, false, "final receipt audited federation state");
-  if (proof.restoredPools.length !== REPOSITORY_NAMES.length) {
+  if (proof.observedPools.length !== REPOSITORY_NAMES.length) {
     throw new Error("Final receipt does not account for every consumer pool.");
   }
   const contract = REPOSITORIES[invocation.repository];
@@ -13544,27 +13681,34 @@ export async function publishFinalProtectedReceipt(
   const receipt: JsonValue = json(
     {
       consumerSha: proof.consumerSha,
+      // A rehearsal is explicitly not a success anything may count. It exists
+      // to prove the federation lifecycle works, not that a change landed.
+      countable: proof.countable,
       deElevation: {
         executorEmail: proof.deElevation.executorEmail,
         executorUniqueId: proof.deElevation.executorUniqueId,
         observedAt: proof.deElevation.observedAt,
         provenAbsent: [...proof.deElevation.provenAbsent],
       },
-      finalTerraformAuditedAt: proof.finalTerraformAuditedAt,
-      finalTerraformQuarantined: false,
       intentDigest: proof.intentDigest,
+      intentGeneration: proof.intentGeneration,
+      kind: proof.kind,
       manifestSha256: proof.reviewSha256,
-      mode: "final",
+      observedPools: proof.observedPools.map((pool) => ({ ...pool })),
       platformSha: proof.platformSha,
       projectId: contract.projectId,
       publishedAt: new Date(nowMs).toISOString(),
-      quarantinedApplyProofDigest: proof.quarantinedApplyProofDigest,
       repository: proof.repository,
       repositoryId: contract.repositoryId,
-      restoredPools: proof.restoredPools.map((pool) => ({ ...pool })),
       runId: proof.runId,
       schemaVersion: 1,
       terraformRoot: proof.root,
+      ...(proof.kind === "apply"
+        ? {
+          quarantinedApplyProofDigest: proof.quarantinedApplyProofDigest,
+          restoredAudit: { ...proof.restoredAudit },
+        }
+        : {}),
     },
     "final protected receipt",
   );
@@ -13770,14 +13914,71 @@ async function writeImmutableObject(
     throw new Error("The immutable protected receipt was already published or consumed.");
   }
   if (!response.ok) throw new Error(`Receipt upload failed with HTTP ${response.status}.`);
-  const created = record(await boundedJson(response, 256 * 1024), "immutable object write");
-  const generation = requiredString(created.generation, "immutable object generation");
-  if (!/^[0-9]+$/.test(generation)) {
-    throw new Error("Immutable object generation is malformed.");
-  }
-  const observed = await readObject(bucket, object, token, fetcher);
+  // The write must identify itself completely, and the readback must be bound
+  // to the generation it reports. A readback by name alone verifies whatever
+  // happens to be at that key now, which is not the same statement.
+  const created = assertStorageObjectMetadata(
+    await boundedJson(response, 256 * 1024),
+    bucket,
+    object,
+    Buffer.byteLength(body),
+    "immutable object write",
+  );
+  const observed = await readObjectGeneration(bucket, object, created.generation, token, fetcher);
   if (observed !== body) throw new Error("Immutable receipt readback was not byte-equivalent.");
-  return generation;
+  return created.generation;
+}
+
+// Exact identity for one storage object: the bucket and key it claims, the size
+// it claims, a well-formed generation, and a metageneration proving nothing has
+// rewritten its metadata since creation.
+function assertStorageObjectMetadata(
+  value: unknown,
+  bucket: string,
+  object: string,
+  expectedSize: number,
+  label: string,
+): { readonly generation: string; readonly metageneration: string } {
+  const metadata = record(value, label);
+  exact(requiredString(metadata.name, `${label} name`), object, `${label} name`);
+  if (metadata.bucket !== undefined) {
+    exact(requiredString(metadata.bucket, `${label} bucket`), bucket, `${label} bucket`);
+  }
+  const size = Number(requiredString(metadata.size, `${label} size`));
+  if (!Number.isSafeInteger(size) || size !== expectedSize) {
+    throw new Error(`${label} size did not match the bytes written.`);
+  }
+  const generation = requiredString(metadata.generation, `${label} generation`);
+  if (!/^[0-9]+$/.test(generation)) throw new Error(`${label} generation is malformed.`);
+  const metageneration = requiredString(metadata.metageneration, `${label} metageneration`);
+  exact(metageneration, "1", `${label} metageneration`);
+  return { generation, metageneration };
+}
+
+// Exact metadata for one object, without reading its bytes.
+async function readObjectMetadata(
+  bucket: string,
+  object: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<{ readonly generation: string; readonly metageneration: string; readonly size: number }> {
+  const url = new URL(
+    `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(object)}`,
+  );
+  url.searchParams.set("fields", "name,bucket,size,generation,metageneration");
+  const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+  if (!response.ok) {
+    throw new Error(`Object metadata read failed with HTTP ${response.status}.`);
+  }
+  const metadata = record(await boundedJson(response, 256 * 1024), "object metadata");
+  exact(requiredString(metadata.name, "object metadata name"), object, "object metadata name");
+  const generation = requiredString(metadata.generation, "object metadata generation");
+  if (!/^[0-9]+$/.test(generation)) throw new Error("Object metadata generation is malformed.");
+  return {
+    generation,
+    metageneration: requiredString(metadata.metageneration, "object metadata metageneration"),
+    size: Number(requiredString(metadata.size, "object metadata size")),
+  };
 }
 
 // Reads exactly the bytes a listing named. Without the generation an object can
