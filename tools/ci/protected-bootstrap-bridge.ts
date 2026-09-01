@@ -1275,18 +1275,20 @@ export interface RecoveryDependencies {
   // target can be followed by a run for a different one.
   readonly recoverFederation: (
     invocation: RecoveryInvocation,
+    horizon: ProjectContainmentHorizon,
     recoveryDeadlineMs: number,
   ) => Promise<FederationRecoverySummary>;
   // Closes the one gap the design leaves: a run that published its pending
   // apply receipt and died before countersigning it.
   readonly finalizePendingReceipts: (
     invocation: RecoveryInvocation,
+    horizon: ProjectContainmentHorizon,
     recoveryDeadlineMs: number,
   ) => Promise<PendingFinalizationSummary>;
   readonly recoverArtifacts: (
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
-  ) => Promise<void>;
+  ) => Promise<ProjectContainmentHorizon>;
   readonly verifySource: (invocation: RecoveryInvocation) => Promise<void>;
 }
 
@@ -3742,46 +3744,6 @@ export function federationRestoreMarkerFromJson(
 // for that record's own repository and run has been driven to provable absence
 // through the same stable-empty recovery a lost run would get. Anything else is
 // left closed and reported.
-// The one containment path, shared verbatim by --recover-only and by the
-// preflight every protected run performs. A single artifact probe is not
-// containment: the executor is driven to provable absence through the same
-// stable-empty, propagation-horizon recovery a lost run would receive, against
-// the intent's OWN repository, run, project, and platform SHA -- never against
-// whichever target this recovery run happens to be pointed at.
-export function federationIntentContainment(options: {
-  readonly fetcher: Fetcher;
-  readonly now: () => number;
-  readonly ownerAccessToken: string;
-  readonly platformRoot: string;
-  readonly runnerTemp: string;
-  readonly sleep: (milliseconds: number) => Promise<void>;
-  readonly telemetry?: BridgeTelemetry;
-}): (intent: FederationQuarantineRecord, deadlineMs: number) => Promise<boolean> {
-  return async (intent, deadlineMs) => {
-    try {
-      await recoverBridgeArtifactsUntilStable(
-        {
-          githubRunId: intent.runId,
-          ownerAccessToken: options.ownerAccessToken,
-          platformRoot: options.platformRoot,
-          platformSha: intent.platformSha,
-          repository: intent.repository,
-          runnerTemp: options.runnerTemp,
-        },
-        options.fetcher,
-        options.sleep,
-        deadlineMs,
-        options.now,
-        options.telemetry,
-      );
-      return true;
-    } catch {
-      // Not contained is a state, not a crash: the caller leaves the pools
-      // closed and reports the intent rather than guessing.
-      return false;
-    }
-  };
-}
 
 interface DiscoveredIntent {
   readonly bucket: string;
@@ -3872,7 +3834,13 @@ export async function recoverFederationQuarantines(
   ownerAccessToken: string,
   fetcher: Fetcher,
   deadlineMs: number,
-  containIntent: (intent: FederationQuarantineRecord, deadlineMs: number) => Promise<boolean>,
+  containIntent: (
+    identity: {
+      readonly platformSha: string;
+      readonly repository: RepositoryName;
+      readonly runId: string;
+    },
+  ) => Promise<ExecutorReleaseProof | undefined>,
   sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
   now: () => number = () => Date.now(),
 ): Promise<FederationRecoverySummary> {
@@ -3968,7 +3936,12 @@ export async function recoverFederationQuarantines(
   const uncontained: string[] = [];
   for (const entry of incomplete) {
     assertBeforeDeadline(now(), deadlineMs, "federation quarantine containment");
-    if (!await containIntent(entry.intent, deadlineMs)) uncontained.push(entry.name);
+    const contained = await containIntent({
+      platformSha: entry.intent.platformSha,
+      repository: entry.intent.repository,
+      runId: entry.intent.runId,
+    });
+    if (contained === undefined) uncontained.push(entry.name);
   }
   if (uncontained.length > 0) {
     // Restore NOTHING. Every intent covers every pool, so handing back the
@@ -4134,15 +4107,14 @@ export async function finalizePendingApplyReceipts(
   ownerAccessToken: string,
   fetcher: Fetcher,
   deadlineMs: number,
+  horizon: ProjectContainmentHorizon,
   containRun: (
     identity: {
       readonly platformSha: string;
       readonly repository: RepositoryName;
       readonly runId: string;
     },
-    deadlineMs: number,
-  ) => Promise<boolean>,
-  sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  ) => Promise<ExecutorReleaseProof | undefined>,
   now: () => number = () => Date.now(),
 ): Promise<PendingFinalizationSummary> {
   const alreadyComplete: string[] = [];
@@ -4344,15 +4316,23 @@ export async function finalizePendingApplyReceipts(
         continue;
       }
 
-      if (
-        !await containRun(
-          { platformSha: receipt.platformSha, repository: location.repository, runId },
-          deadlineMs,
-        )
-      ) {
+      // A receipt outside the project this run established a horizon for is
+      // not contained by it, and is reported rather than assumed.
+      const releaseProof = await containRun({
+        platformSha: receipt.platformSha,
+        repository: location.repository,
+        runId,
+      });
+      if (releaseProof === undefined) {
         skippedUncontained.push(entry.name);
         continue;
       }
+      exact(releaseProof.provenBy, "propagation-horizon", "finalizer release provenance");
+      exact(
+        releaseProof.executorEmail,
+        receipt.deElevationExecutorEmail,
+        "finalizer executor identity",
+      );
 
       await publishOwnerCompletionProof(
         {
@@ -4374,22 +4354,15 @@ export async function finalizePendingApplyReceipts(
           publishedAt: receipt.publishedAt,
           size: entry.size,
         },
-        {
-          artifactsDeleted: true,
-          executorEmail: receipt.deElevationExecutorEmail,
-          executorUniqueId: receipt.deElevationExecutorUniqueId,
-          observedAt: new Date(now()).toISOString(),
-          permissionsProvenGone: true,
-          projectBindingsCleared: true,
-          // A detached finalizer has the horizon proof, not the inline exact
-          // release, and the completion says so.
-          provenBy: "propagation-horizon",
-        },
+        // The proof the containment path produced, not one assembled here from
+        // the receipt's own claims. Only the unique ID is taken from the
+        // receipt, because the horizon establishes absence by email.
+        { ...releaseProof, executorUniqueId: receipt.deElevationExecutorUniqueId },
         now(),
         fetcher,
       );
       finalized.push(entry.name);
-      void sleep;
+      void horizon;
     }
   }
   return { alreadyComplete, finalized, scanned, skippedUncontained };
@@ -5641,11 +5614,18 @@ export async function runProtectedRecovery(
   const recoveryDeadlineMs = sourceProofCompletedAtMs +
     RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
-  await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+  // One horizon, established once, for this recovery run's own project. Every
+  // phase below consumes it rather than starting another: the envelope funds
+  // exactly one, which is the whole reason a per-item horizon was unreachable.
+  const horizon = await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
   // Executor containment is proven first, above, so federation is handed back
   // only once nothing can still be holding privilege with it.
   telemetry.phase("recovery.federation");
-  const federation = await activeDependencies.recoverFederation(invocation, recoveryDeadlineMs);
+  const federation = await activeDependencies.recoverFederation(
+    invocation,
+    horizon,
+    recoveryDeadlineMs,
+  );
   if (federation.skippedUncontained.length > 0) {
     throw new Error(
       `Federation quarantine recovery left ${federation.skippedUncontained.length} intent(s) closed because their executors are not provably contained.`,
@@ -5657,6 +5637,7 @@ export async function runProtectedRecovery(
   telemetry.phase("recovery.finalize");
   const pending = await activeDependencies.finalizePendingReceipts(
     invocation,
+    horizon,
     recoveryDeadlineMs,
   );
   if (pending.skippedUncontained.length > 0) {
@@ -6796,19 +6777,24 @@ function defaultBridgeDependencies(
       }
     },
     recoverFederationPreflight: async (invocation, operationDeadlineMs) =>
+      // Detection, not repair.
+      //
+      // The preflight runs inside the protected run's own operation window, and
+      // a containment horizon is ten minutes -- a third of an apply's entire
+      // budget for a single intent, and unbounded for several. It also has no
+      // need for one: its job is to refuse to START while an unrepaired
+      // quarantine exists, and refusing needs only to see that one exists.
+      // Repair belongs to --recover-only, whose envelope is sized for exactly
+      // one horizon.
       await recoverFederationQuarantines(
         invocation.ownerAccessToken,
         api,
         operationDeadlineMs,
-        federationIntentContainment({
-          fetcher: api,
-          now: () => Date.now(),
-          ownerAccessToken: invocation.ownerAccessToken,
-          platformRoot: invocation.platformRoot,
-          runnerTemp: invocation.runnerTemp,
-          sleep: (milliseconds) => Bun.sleep(milliseconds),
-          telemetry,
-        }),
+        // Never contained here, so nothing is ever restored here: every
+        // incomplete intent is reported and the run refuses to begin.
+        async () => undefined,
+        (milliseconds) => Bun.sleep(milliseconds),
+        () => Date.now(),
       ),
     restoreFederation: async (invocation, record, generation, operationDeadlineMs) => {
       const observed = await restoreQuarantinedFederation(
@@ -6905,6 +6891,56 @@ export async function releaseSandboxAndExecutor<T>(
   return (results[0] as PromiseFulfilledResult<T>).value;
 }
 
+// Containment for one run, against the single horizon this recovery already
+// established.
+//
+// The horizon is project-wide, so it already says "no bridge artifact of any
+// run remains in this project, and has not for the stable window". What remains
+// per run is the exact identity check: the deterministic executor account for
+// THIS repository and run must be absent or denied. A run in a different
+// project is not covered and is reported rather than guessed at -- that is the
+// bounded multi-item behaviour, and it is why one recovery pass cannot pretend
+// to clear the whole fleet.
+function containedByHorizon(
+  horizon: ProjectContainmentHorizon,
+  ownerToken: string,
+  fetcher: Fetcher,
+): (
+  identity: {
+    readonly platformSha: string;
+    readonly repository: RepositoryName;
+    readonly runId: string;
+  },
+) => Promise<ExecutorReleaseProof | undefined> {
+  return async (identity) => {
+    if (identity.repository !== horizon.repository) return undefined;
+    const projectId = REPOSITORIES[identity.repository].projectId;
+    exact(projectId, horizon.projectId, "containment horizon project");
+    const recovery: RecoveryInvocation = {
+      githubRunId: identity.runId,
+      ownerAccessToken: ownerToken,
+      platformRoot: "/",
+      platformSha: identity.platformSha,
+      repository: identity.repository,
+      runnerTemp: "/",
+    };
+    const email = deterministicExecutorEmail(recovery);
+    const probe = await bridgeArtifactsRemain(projectId, ownerToken, fetcher, recovery);
+    if (probe.active || !probe.exactAccountAbsentOrDenied) return undefined;
+    // Evidence produced by the containment path itself: the horizon that
+    // established project-wide absence, plus the exact account it is about.
+    return {
+      artifactsDeleted: true,
+      executorEmail: email,
+      executorUniqueId: "",
+      observedAt: horizon.observedAt,
+      permissionsProvenGone: true,
+      projectBindingsCleared: true,
+      provenBy: "propagation-horizon",
+    };
+  };
+}
+
 function defaultRecoveryDependencies(
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
 ): RecoveryDependencies {
@@ -6912,63 +6948,31 @@ function defaultRecoveryDependencies(
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
   return {
     now: () => Date.now(),
-    recoverFederation: async (invocation, recoveryDeadlineMs) => {
+    recoverFederation: async (invocation, horizon, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
       return await recoverFederationQuarantines(
         invocation.ownerAccessToken,
         api,
         recoveryDeadlineMs,
-        federationIntentContainment({
-          fetcher: api,
-          now: () => Date.now(),
-          ownerAccessToken: invocation.ownerAccessToken,
-          platformRoot: invocation.platformRoot,
-          runnerTemp: invocation.runnerTemp,
-          sleep: (milliseconds) => Bun.sleep(milliseconds),
-          telemetry,
-        }),
+        containedByHorizon(horizon, invocation.ownerAccessToken, api),
         (milliseconds) => Bun.sleep(milliseconds),
         () => Date.now(),
       );
     },
-    finalizePendingReceipts: async (invocation, recoveryDeadlineMs) => {
+    finalizePendingReceipts: async (invocation, horizon, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
       return await finalizePendingApplyReceipts(
         invocation.ownerAccessToken,
         api,
         recoveryDeadlineMs,
-        // The full propagation-horizon and stable-empty proof, against the
-        // receipt's OWN repository, run and platform commit -- the same one a
-        // lost run would receive, not a single artifact probe.
-        async (identity, deadlineMs) => {
-          try {
-            await recoverBridgeArtifactsUntilStable(
-              {
-                githubRunId: identity.runId,
-                ownerAccessToken: invocation.ownerAccessToken,
-                platformRoot: invocation.platformRoot,
-                platformSha: identity.platformSha,
-                repository: identity.repository,
-                runnerTemp: invocation.runnerTemp,
-              },
-              api,
-              (milliseconds) => Bun.sleep(milliseconds),
-              deadlineMs,
-              () => Date.now(),
-              telemetry,
-            );
-            return true;
-          } catch {
-            return false;
-          }
-        },
-        (milliseconds) => Bun.sleep(milliseconds),
+        horizon,
+        containedByHorizon(horizon, invocation.ownerAccessToken, api),
         () => Date.now(),
       );
     },
     recoverArtifacts: async (invocation, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
-      await recoverBridgeArtifactsUntilStable(
+      return await recoverBridgeArtifactsUntilStable(
         invocation,
         api,
         (milliseconds) => Bun.sleep(milliseconds),
@@ -9270,6 +9274,24 @@ async function bridgeArtifactsRemain(
   };
 }
 
+// What one completed containment observation establishes.
+//
+// The inventory it is built from is PROJECT-WIDE: it enumerates every bridge
+// service account and custom role in the project, not just one run's. So a
+// stable-empty result is a statement about every run that project has ever
+// hosted, which is what makes a single horizon sufficient for many receipts
+// instead of one horizon per receipt -- an arrangement the twelve-minute
+// recovery envelope could never have funded.
+export interface ProjectContainmentHorizon {
+  readonly emptySinceAt: string;
+  readonly observationStartedAt: string;
+  readonly observedAt: string;
+  readonly projectId: string;
+  readonly propagationMinutes: number;
+  readonly repository: RepositoryName;
+  readonly stableEmptyMinutes: number;
+}
+
 export async function recoverBridgeArtifactsUntilStable(
   invocation: RecoveryInvocation,
   fetcher: Fetcher,
@@ -9277,7 +9299,7 @@ export async function recoverBridgeArtifactsUntilStable(
   cleanupDeadlineMs: number,
   now: () => number = () => Date.now(),
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
-): Promise<void> {
+): Promise<ProjectContainmentHorizon> {
   telemetry = bestEffortTelemetry(telemetry);
   const projectId = REPOSITORIES[invocation.repository].projectId;
   const observationStartedAtMs = now();
@@ -9344,7 +9366,21 @@ export async function recoverBridgeArtifactsUntilStable(
         proofMs,
         scanMs: scanCompletedAtMs - scanStartedAtMs,
       });
-      if (proofComplete) return;
+      if (proofComplete) {
+        // The evidence this observation actually produced, returned rather than
+        // reconstructed by a caller afterwards. `inventoryBridgeArtifacts`
+        // scans the PROJECT, so an empty, stable inventory is a statement about
+        // every run in that project, not only this one.
+        return {
+          emptySinceAt: new Date(emptySinceMs!).toISOString(),
+          observedAt: new Date(scanCompletedAtMs).toISOString(),
+          observationStartedAt: new Date(observationStartedAtMs).toISOString(),
+          projectId,
+          propagationMinutes: RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+          repository: invocation.repository,
+          stableEmptyMinutes: RECOVERY_STABLE_EMPTY_MINUTES,
+        };
+      }
     } catch (error) {
       if (!recursivelyRetryableCleanupError(error)) throw error;
       // A failed read is not negative proof. Retry the entire inventory while

@@ -6114,23 +6114,45 @@ describe("protected owner Terraform bridge", () => {
   const INTENT_KEY =
     "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/123456.json";
 
+  // The typed horizon proof a real containment path returns. `undefined` means
+  // "not covered by this run's horizon", which is now how a different project,
+  // or a still-live executor, is reported.
+  const horizonProofFor = (repository: string) => ({
+    artifactsDeleted: true as const,
+    executorEmail: `gha-pbt-${"a".repeat(20)}@${repository}.iam.gserviceaccount.com`,
+    executorUniqueId: "",
+    observedAt: "2026-09-01T12:30:00.000Z",
+    permissionsProvenGone: true as const,
+    projectBindingsCleared: true as const,
+    provenBy: "propagation-horizon" as const,
+  });
+
   const driveRecovery = async (world: ReturnType<typeof recoveryWorld>, contained = true) => {
     const summaries: FederationRecoverySummary[] = [];
     await runProtectedRecovery(recoveryInvocation, {
       now: () => 1_800_000_000_000,
-      recoverArtifacts: async () => {},
+      recoverArtifacts: async () => ({
+        emptySinceAt: "2026-09-01T12:20:00.000Z",
+        observationStartedAt: "2026-09-01T12:10:00.000Z",
+        observedAt: "2026-09-01T12:23:00.000Z",
+        projectId: "cdbentley",
+        propagationMinutes: 7,
+        repository: "cdbentley" as const,
+        stableEmptyMinutes: 3,
+      }),
       finalizePendingReceipts: async () => ({
         alreadyComplete: [],
         finalized: [],
         scanned: 0,
         skippedUncontained: [],
       }),
-      recoverFederation: async (invocation, deadlineMs) => {
+      recoverFederation: async (invocation, _horizon, deadlineMs) => {
         const summary = await recoverFederationQuarantines(
           invocation.ownerAccessToken,
           world.fetcher,
           deadlineMs,
-          async () => contained,
+          async (identity: { repository: string }) =>
+            contained ? horizonProofFor(identity.repository) : undefined,
           async () => {},
           () => 1_800_000_000_000,
         );
@@ -6187,6 +6209,79 @@ describe("protected owner Terraform bridge", () => {
     expect(second.restored).toEqual([]);
     expect(second.skippedComplete).toEqual([INTENT_KEY]);
     expect(world.patched).toEqual([]);
+  });
+
+  test("an intent outside this run's horizon is reported, not restored", async () => {
+    // The redesign's honest bound. A containment horizon is project-wide but
+    // only for ONE project, and the twelve-minute recovery envelope funds
+    // exactly one. So an intent belonging to a different project is not covered
+    // by this run's evidence and is reported for a recovery run of its own --
+    // rather than restored on the strength of a horizon that never observed it.
+    const key = "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json";
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        "medlock-tfstate-1025243085": { [key]: intentBody("healthmcp", "prod", "777888") },
+      },
+    });
+
+    const summary = await recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      // Faithful to containedByHorizon: only the horizon's own repository.
+      async (identity: { repository: string }) =>
+        identity.repository === "cdbentley" ? horizonProofFor("cdbentley") : undefined,
+      async () => {},
+      () => 1_800_000_000_000,
+    );
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.restored).toEqual([]);
+    expect(summary.skippedUncontained).toEqual([key]);
+    expect(world.patched).toEqual([]);
+  });
+
+  test("a pending receipt outside this run's horizon is reported, not finalized", async () => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    const summary = await finalizePendingApplyReceipts(
+      "owner-token-value",
+      world.fetcher,
+      Date.parse("2026-09-01T13:00:00.000Z"),
+      { ...CDB_HORIZON, projectId: "runsetta", repository: "runsetta" as const },
+      // A horizon for another project covers nothing here.
+      async () => undefined,
+      () => Date.parse("2026-09-01T12:30:00.000Z"),
+    );
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.finalized).toEqual([]);
+    expect(summary.skippedUncontained).toEqual([key]);
+    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
+  });
+
+  test("the finalizer refuses containment evidence for the wrong executor", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+
+    await expect(finalizePendingApplyReceipts(
+      "owner-token-value",
+      world.fetcher,
+      Date.parse("2026-09-01T13:00:00.000Z"),
+      CDB_HORIZON,
+      // Contained, but the proof names a different account than the receipt.
+      async () => ({
+        ...horizonRelease,
+        executorEmail: "gha-pbt-" + "b".repeat(20) + "@cdbentley.iam.gserviceaccount.com",
+      }),
+      () => Date.parse("2026-09-01T12:30:00.000Z"),
+    )).rejects.toThrow("finalizer executor identity");
   });
 
   test("recovery for one target repairs an intent left by a run for another", async () => {
@@ -6333,7 +6428,7 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       shifting,
       1_800_000_060_000,
-      async () => true,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
       async () => {},
       () => 1_800_000_000_000,
     )).rejects.toThrow("inventory changed size between two listings");
@@ -6361,7 +6456,7 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       swapped,
       1_800_000_060_000,
-      async () => true,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
       async () => {},
       () => 1_800_000_000_000,
     )).rejects.toThrow("did not match its listed size");
@@ -6424,7 +6519,8 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       world.fetcher,
       1_800_000_060_000,
-      async (intent) => intent.repository === "cdbentley",
+      async (identity: { repository: string }) =>
+        identity.repository === "cdbentley" ? horizonProofFor(identity.repository) : undefined,
       async () => {},
       () => 1_800_000_000_000,
     );
@@ -6459,7 +6555,7 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       world.fetcher,
       1_800_000_060_000,
-      async () => true,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
       async () => {},
       () => 1_800_000_000_000,
     )).rejects.toThrow("disagree about the pre-quarantine pool state");
@@ -6489,19 +6585,27 @@ describe("protected owner Terraform bridge", () => {
 
     await expect(runProtectedRecovery(recoveryInvocation, {
       now: () => 1_800_000_000_000,
-      recoverArtifacts: async () => {},
+      recoverArtifacts: async () => ({
+        emptySinceAt: "2026-09-01T12:20:00.000Z",
+        observationStartedAt: "2026-09-01T12:10:00.000Z",
+        observedAt: "2026-09-01T12:23:00.000Z",
+        projectId: "cdbentley",
+        propagationMinutes: 7,
+        repository: "cdbentley" as const,
+        stableEmptyMinutes: 3,
+      }),
       finalizePendingReceipts: async () => ({
         alreadyComplete: [],
         finalized: [],
         scanned: 0,
         skippedUncontained: [],
       }),
-      recoverFederation: async (invocation, deadlineMs) =>
+      recoverFederation: async (invocation, _horizon, deadlineMs) =>
         await recoverFederationQuarantines(
           invocation.ownerAccessToken,
           world.fetcher,
           deadlineMs,
-          async () => false,
+          async () => undefined,
           async () => {},
           () => 1_800_000_000_000,
         ),
@@ -6550,7 +6654,7 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       rewritten,
       1_800_000_060_000,
-      async () => true,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
       async () => {},
       () => 1_800_000_000_000,
     )).rejects.toThrow("federation intent metageneration");
@@ -7474,13 +7578,31 @@ describe("protected owner Terraform bridge", () => {
     return `${CDB_STATE.prefix}/.protected-bootstrap/final/${runId}.json`;
   };
 
+  const CDB_HORIZON = {
+    emptySinceAt: "2026-09-01T12:20:00.000Z",
+    observationStartedAt: "2026-09-01T12:10:00.000Z",
+    observedAt: "2026-09-01T12:23:00.000Z",
+    projectId: "cdbentley",
+    propagationMinutes: 7,
+    repository: "cdbentley" as const,
+    stableEmptyMinutes: 3,
+  };
+  const horizonRelease = {
+    artifactsDeleted: true as const,
+    executorEmail,
+    executorUniqueId: "",
+    observedAt: CDB_HORIZON.observedAt,
+    permissionsProvenGone: true as const,
+    projectBindingsCleared: true as const,
+    provenBy: "propagation-horizon" as const,
+  };
   const runFinalizer = (world: ReturnType<typeof finalizerWorld>, contained = true) =>
     finalizePendingApplyReceipts(
       "owner-token-value",
       world.fetcher,
       Date.parse("2026-09-01T13:00:00.000Z"),
-      async () => contained,
-      async () => {},
+      CDB_HORIZON,
+      async () => (contained ? horizonRelease : undefined),
       () => Date.parse("2026-09-01T12:30:00.000Z"),
     );
 
@@ -7687,8 +7809,8 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       shifting,
       Date.parse("2026-09-01T13:00:00.000Z"),
-      async () => true,
-      async () => {},
+      CDB_HORIZON,
+      async () => horizonRelease,
       () => Date.parse("2026-09-01T12:30:00.000Z"),
     )).rejects.toThrow("repeated");
   });
@@ -7729,8 +7851,8 @@ describe("protected owner Terraform bridge", () => {
       "owner-token-value",
       lossy,
       Date.parse("2026-09-01T13:00:00.000Z"),
-      async () => true,
-      async () => {},
+      CDB_HORIZON,
+      async () => horizonRelease,
       () => Date.parse("2026-09-01T12:30:00.000Z"),
     );
     expect(dropped).toBe(true);
