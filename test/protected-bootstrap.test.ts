@@ -4756,6 +4756,12 @@ describe("protected owner Terraform bridge", () => {
     const events: string[] = [];
     const dependencies: RecoveryDependencies = {
       now: () => 1_800_000_000_000,
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (invocation) => {
         expect(invocation.ownerAccessToken).toBe(ownerToken);
         events.push("recover");
@@ -5147,6 +5153,12 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (invocation, deadlineMs) => {
         recoveryDeadlineMs = deadlineMs;
         await recoverBridgeArtifactsUntilStable(
@@ -5169,6 +5181,12 @@ describe("protected owner Terraform bridge", () => {
     const startedAt = fixture.now();
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: (invocation, deadlineMs) =>
         recoverBridgeArtifactsUntilStable(
           invocation,
@@ -5233,6 +5251,12 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (_invocation, deadlineMs) => {
         recoveryDeadlineMs = deadlineMs;
       },
@@ -5246,6 +5270,12 @@ describe("protected owner Terraform bridge", () => {
     virtualNow = startedAt;
     await expect(runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async () => {
         recoveryStarted = true;
       },
@@ -10257,6 +10287,10 @@ function fakeDependencies(
     }),
     verifyApproval: overrides.verifyApproval ?? (async () => {
       throw new Error("Unexpected approval verification in plan mode.");
+    }),
+    recoverFederationPreflight: overrides.recoverFederationPreflight ?? (async () => {
+      events.push("federation:preflight");
+      return { restored: [], scanned: 0, skippedComplete: [], skippedUncontained: [] };
     }),
     deElevateExecutor: overrides.deElevateExecutor ?? (async () => {
       events.push("de-elevate");

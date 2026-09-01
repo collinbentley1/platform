@@ -281,6 +281,7 @@ const BRIDGE_PHASES = [
   "controller.apply-publish",
   "controller.cleanup",
   "controller.de-elevate",
+  "controller.federation-preflight",
   "controller.federation-restore",
   "controller.final-audit",
   "controller.quarantine",
@@ -305,6 +306,7 @@ const BRIDGE_PHASES = [
   "recovery.source-proof",
   "recovery.inventory",
   "recovery.complete",
+  "recovery.federation",
   "recovery.failed",
 ] as const;
 const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
@@ -1172,6 +1174,14 @@ export interface BridgeDependencies {
   ) => Promise<void>;
   // Restores exactly the captured state and proves it converged. Runs after the
   // post-apply audit and after the executor is released.
+  // Runs before any protected work. A run that started while an earlier run's
+  // quarantine was still unrepaired would arm a second intent over pools that
+  // are already disabled, and the two runs would then restore each other's
+  // captured state.
+  readonly recoverFederationPreflight: (
+    invocation: Invocation,
+    operationDeadlineMs: number,
+  ) => Promise<FederationRecoverySummary>;
   readonly restoreFederation: (
     invocation: Invocation,
     record: FederationQuarantineRecord,
@@ -1181,6 +1191,13 @@ export interface BridgeDependencies {
 
 export interface RecoveryDependencies {
   readonly now: () => number;
+  // Repairs any protected run, for any target, that died holding disabled
+  // consumer pools. Fleet-wide by construction: an abruptly lost run for one
+  // target can be followed by a run for a different one.
+  readonly recoverFederation: (
+    invocation: RecoveryInvocation,
+    recoveryDeadlineMs: number,
+  ) => Promise<FederationRecoverySummary>;
   readonly recoverArtifacts: (
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
@@ -3352,6 +3369,7 @@ function normalizedFreezeProof(
 export const FEDERATION_POOL_ID = "github-actions";
 const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
 const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
+const MAX_FEDERATION_INTENT_PAGES = 32;
 
 export interface FederationPoolState {
   readonly description: string;
@@ -3447,8 +3465,191 @@ function federationIntentBucket(invocation: Invocation): string {
   return REPOSITORIES[invocation.repository].state[invocation.terraformRoot].bucket;
 }
 
-function federationIntentObject(runId: string): string {
-  return `${FEDERATION_QUARANTINE_PREFIX}/${numeric(runId, "federation quarantine run ID")}.json`;
+function federationIntentPrefix(state: { readonly prefix: string }): string {
+  return `${state.prefix}/.protected-bootstrap/${FEDERATION_QUARANTINE_PREFIX}/`;
+}
+
+function federationIntentObjectFor(state: { readonly prefix: string }, runId: string): string {
+  return `${federationIntentPrefix(state)}${numeric(runId, "federation quarantine run ID")}.json`;
+}
+
+function federationIntentObject(invocation: Invocation): string {
+  return federationIntentObjectFor(
+    REPOSITORIES[invocation.repository].state[invocation.terraformRoot],
+    invocation.githubRunId,
+  );
+}
+
+// Every distinct bucket/prefix a quarantine intent can live under. An abruptly
+// lost run for one target can be followed by a run for a different target, so
+// recovery has to look everywhere rather than only where it happens to be
+// pointed.
+export interface FederationRecoverySummary {
+  readonly restored: readonly string[];
+  readonly scanned: number;
+  readonly skippedComplete: readonly string[];
+  readonly skippedUncontained: readonly string[];
+}
+
+interface StorageObjectListing {
+  readonly generation: string;
+  readonly metageneration: string;
+  readonly name: string;
+}
+
+async function listStorageObjects(
+  bucket: string,
+  prefix: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<readonly StorageObjectListing[]> {
+  const items: StorageObjectListing[] = [];
+  let pageToken: string | undefined;
+  for (let page = 0; page < MAX_FEDERATION_INTENT_PAGES; page += 1) {
+    const url = new URL(`https://storage.googleapis.com/storage/v1/b/${bucket}/o`);
+    url.searchParams.set("prefix", prefix);
+    url.searchParams.set("maxResults", "200");
+    url.searchParams.set("fields", "items(name,generation,metageneration),nextPageToken");
+    if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
+    const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+    if (!response.ok) {
+      throw new Error(`Federation intent listing failed with HTTP ${response.status}.`);
+    }
+    const body = record(await boundedJson(response, 4 * 1024 * 1024), "federation intent listing");
+    for (const raw of array(body.items ?? [], "federation intent listing items")) {
+      const item = record(raw, "federation intent listing item");
+      items.push({
+        generation: requiredString(item.generation, "federation intent generation"),
+        metageneration: requiredString(item.metageneration, "federation intent metageneration"),
+        name: requiredString(item.name, "federation intent object name"),
+      });
+    }
+    const next = body.nextPageToken;
+    if (next === undefined || next === null) return items;
+    pageToken = requiredString(next, "federation intent page token");
+  }
+  throw new Error("Federation intent listing did not terminate within its page bound.");
+}
+
+// The production recovery path. It runs from --recover-only and as a preflight
+// before every protected run, and it is the only thing that repairs a run that
+// died holding four disabled pools.
+//
+// A pool is re-enabled only when: the object sits at exactly the contracted
+// prefix, its body digest matches what the record says it is, the record itself
+// validates completely, no completion marker exists, and the executor for that
+// record's own repository and run is provably contained. Anything else is left
+// alone and reported.
+export async function recoverFederationQuarantines(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  proveContained: (record: FederationQuarantineRecord) => Promise<boolean>,
+  sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<FederationRecoverySummary> {
+  const restored: string[] = [];
+  const skippedComplete: string[] = [];
+  const skippedUncontained: string[] = [];
+  let scanned = 0;
+  for (const location of federationIntentLocations()) {
+    assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery scan");
+    const objects = await listStorageObjects(
+      location.bucket,
+      location.prefix,
+      ownerAccessToken,
+      fetcher,
+    );
+    const complete = new Set(
+      objects.filter((entry) => entry.name.endsWith(".restored")).map((entry) => entry.name),
+    );
+    for (const entry of objects) {
+      if (!entry.name.endsWith(".json")) continue;
+      scanned += 1;
+      // An intent whose restoration already completed must never be replayed:
+      // doing so would undo an intentional later disable.
+      if (complete.has(`${entry.name}.restored`)) {
+        skippedComplete.push(entry.name);
+        continue;
+      }
+      assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery");
+      const body = await readObject(location.bucket, entry.name, ownerAccessToken, fetcher);
+      const digest = sha256Hex(body);
+      const parsed: unknown = JSON.parse(body);
+      const intent = federationQuarantineRecordFromJson(parsed);
+      // The object's own name has to agree with the identity inside it, or the
+      // two describe different runs and neither can be trusted.
+      exact(
+        entry.name,
+        federationIntentObjectFor(
+          REPOSITORIES[intent.repository].state[intent.root],
+          intent.runId,
+        ),
+        "federation intent object name",
+      );
+      exact(location.bucket, REPOSITORIES[intent.repository].state[intent.root].bucket,
+        "federation intent bucket");
+      // Written once, immutably: a metageneration past its first value means
+      // somebody rewrote the record this restore would act on.
+      exact(entry.metageneration, "1", "federation intent metageneration");
+      if (!/^[0-9]+$/.test(entry.generation)) {
+        throw new Error("Federation intent generation is malformed.");
+      }
+      if (!await proveContained(intent)) {
+        // The run that armed this may still hold privilege. Handing federation
+        // back now is exactly the overlap the quarantine exists to prevent.
+        skippedUncontained.push(entry.name);
+        continue;
+      }
+      await restoreQuarantinedFederation(intent, ownerAccessToken, fetcher, deadlineMs, sleep, now);
+      await writeImmutableObject(
+        location.bucket,
+        `${entry.name}.restored`,
+        `${canonicalJson(json({
+          intentDigest: digest,
+          intentGeneration: entry.generation,
+          repository: intent.repository,
+          restoredAt: new Date(now()).toISOString(),
+          root: intent.root,
+          runId: intent.runId,
+        }, "federation restore marker"))}\n`,
+        ownerAccessToken,
+        fetcher,
+      );
+      restored.push(entry.name);
+    }
+  }
+  return { restored, scanned, skippedComplete, skippedUncontained };
+}
+
+export function federationIntentLocations(): readonly {
+  readonly bucket: string;
+  readonly prefix: string;
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+}[] {
+  const seen = new Set<string>();
+  const locations: {
+    bucket: string;
+    prefix: string;
+    repository: RepositoryName;
+    root: TerraformRoot;
+  }[] = [];
+  for (const repository of REPOSITORY_NAMES) {
+    for (const root of ["bootstrap", "exposure", "prod"] as const) {
+      const state = REPOSITORIES[repository].state[root];
+      const key = `${state.bucket}|${federationIntentPrefix(state)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      locations.push({
+        bucket: state.bucket,
+        prefix: federationIntentPrefix(state),
+        repository,
+        root,
+      });
+    }
+  }
+  return locations;
 }
 
 // Disabled is necessary but not sufficient: the pool must also still be the
@@ -3961,6 +4162,18 @@ export async function runProtectedBootstrap(
   let quarantinedFederation: FederationQuarantineRecord | undefined;
   let federationRestored = false;
   try {
+    // Nothing starts until the fleet is known to be free of unrepaired
+    // quarantines, for any target, not just this one.
+    telemetry.phase("controller.federation-preflight");
+    const preflight = await dependencies.recoverFederationPreflight(
+      invocation,
+      operationDeadlineMs,
+    );
+    if (preflight.skippedUncontained.length > 0) {
+      throw new Error(
+        `A previous protected run left ${preflight.skippedUncontained.length} consumer federation quarantine(s) closed and its executor is not provably contained; recover before starting another run.`,
+      );
+    }
     telemetry.phase("controller.prepare");
     const preparation = await dependencies.prepare(invocation, operationDeadlineMs);
     const consumerTreeSha = preparation.consumerTreeSha;
@@ -3979,6 +4192,69 @@ export async function runProtectedBootstrap(
       freezeProof: await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds),
       markerProof: await dependencies.proveMarkers(invocation, session, false),
     };
+
+    // The rehearsal route. It exercises every federation boundary against live
+    // infrastructure -- arm the durable intent, disable all four pools and
+    // prove each converged, revoke mutation authority and prove its absence,
+    // hand the pools back and prove the restored fingerprints, then publish the
+    // one countable receipt -- while touching no business resource. No
+    // Terraform runs, no plan is read or consumed, and the executor is never
+    // elevated. This is what makes the first live exercise of the quarantine
+    // incapable of granting a production apply.
+    if (invocation.mode === "rehearsal") {
+      telemetry.phase("controller.quarantine");
+      quarantinedFederation = await dependencies.armFederationQuarantine(
+        invocation,
+        operationDeadlineMs,
+      );
+      await dependencies.disableFederation(
+        invocation,
+        quarantinedFederation,
+        operationDeadlineMs,
+      );
+      telemetry.phase("controller.de-elevate");
+      const rehearsalDeElevation = await dependencies.deElevateExecutor(
+        invocation,
+        session,
+        operationDeadlineMs,
+      );
+      telemetry.phase("controller.federation-restore");
+      await dependencies.restoreFederation(
+        invocation,
+        quarantinedFederation,
+        operationDeadlineMs,
+      );
+      federationRestored = true;
+      // A rehearsal reviews no Terraform plan, so its manifest digest names the
+      // rehearsal identity rather than pretending to name a plan.
+      const rehearsalReview: ReviewManifestResult = {
+        canonical: "",
+        sha256: sha256Hex(canonicalJson(json({
+          consumerSha: invocation.consumerSha,
+          mode: "rehearsal",
+          platformSha: invocation.platformSha,
+          repository: invocation.repository,
+          runId: invocation.githubRunId,
+          terraformRoot: invocation.terraformRoot,
+        }, "rehearsal review identity"))),
+      };
+      telemetry.phase("controller.apply-publish");
+      await dependencies.publishFinalReceipt(
+        invocation,
+        session,
+        rehearsalReview,
+        buildFinalProtectedProof({
+          deElevation: rehearsalDeElevation,
+          finalAuditedAt: new Date(dependencies.now()).toISOString(),
+          intent: quarantinedFederation,
+          invocation,
+          quarantinedApplyProof: proof,
+          review: rehearsalReview,
+        }),
+        dependencies.now(),
+      );
+      return;
+    }
 
     const approved = invocation.mode === "apply"
       ? await dependencies.verifyApproval(invocation, session, proof, dependencies.now())
@@ -4462,6 +4738,15 @@ export async function runProtectedRecovery(
     RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
   await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+  // Executor containment is proven first, above, so federation is handed back
+  // only once nothing can still be holding privilege with it.
+  telemetry.phase("recovery.federation");
+  const federation = await activeDependencies.recoverFederation(invocation, recoveryDeadlineMs);
+  if (federation.skippedUncontained.length > 0) {
+    throw new Error(
+      `Federation quarantine recovery left ${federation.skippedUncontained.length} intent(s) closed because their executors are not provably contained.`,
+    );
+  }
 }
 
 export async function recoveryMain(
@@ -5568,7 +5853,7 @@ function defaultBridgeDependencies(
       // restore exactly these pools to exactly this state -- and nothing else.
       await writeImmutableObject(
         federationIntentBucket(invocation),
-        federationIntentObject(invocation.githubRunId),
+        federationIntentObject(invocation),
         canonicalJson(json(record, "federation quarantine record")),
         invocation.ownerAccessToken,
         api,
@@ -5587,6 +5872,28 @@ function defaultBridgeDependencies(
         assertQuarantinedPool(converged, pool);
       }
     },
+    recoverFederationPreflight: async (invocation, operationDeadlineMs) =>
+      await recoverFederationQuarantines(
+        invocation.ownerAccessToken,
+        api,
+        operationDeadlineMs,
+        async (intent) => {
+          const probe = await bridgeArtifactsRemain(
+            REPOSITORIES[intent.repository].projectId,
+            invocation.ownerAccessToken,
+            api,
+            {
+              githubRunId: intent.runId,
+              ownerAccessToken: invocation.ownerAccessToken,
+              platformRoot: invocation.platformRoot,
+              platformSha: invocation.platformSha,
+              repository: intent.repository,
+              runnerTemp: invocation.runnerTemp,
+            },
+          );
+          return !probe.active && probe.exactAccountAbsentOrDenied;
+        },
+      ),
     restoreFederation: async (invocation, record, operationDeadlineMs) => {
       await restoreQuarantinedFederation(
         record,
@@ -5595,11 +5902,18 @@ function defaultBridgeDependencies(
         operationDeadlineMs,
       );
       // The completion marker is what stops a later recovery scan replaying
-      // this record and undoing an intentional future disable.
+      // this record and undoing an intentional future disable. Same shape and
+      // same binding the recovery path writes, so one reader understands both.
       await writeImmutableObject(
         federationIntentBucket(invocation),
-        `${federationIntentObject(invocation.githubRunId)}.restored`,
-        canonicalJson(json({ restoredAt: new Date(Date.now()).toISOString(), runId: record.runId }, "federation restore marker")),
+        `${federationIntentObject(invocation)}.restored`,
+        `${canonicalJson(json({
+          intentDigest: sha256Hex(canonicalJson(json(record, "federation quarantine record"))),
+          repository: record.repository,
+          restoredAt: new Date(Date.now()).toISOString(),
+          root: record.root,
+          runId: record.runId,
+        }, "federation restore marker"))}\n`,
         invocation.ownerAccessToken,
         api,
       );
@@ -5643,6 +5957,32 @@ function defaultRecoveryDependencies(
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
   return {
     now: () => Date.now(),
+    recoverFederation: async (invocation, recoveryDeadlineMs) => {
+      apiDeadlineMs = recoveryDeadlineMs;
+      return await recoverFederationQuarantines(
+        invocation.ownerAccessToken,
+        api,
+        recoveryDeadlineMs,
+        // Containment is proven per record, against that record's own project
+        // and run -- not against the repository this recovery run was pointed
+        // at, which may be a different one entirely.
+        async (intent) => {
+          const probe = await bridgeArtifactsRemain(
+            REPOSITORIES[intent.repository].projectId,
+            invocation.ownerAccessToken,
+            api,
+            {
+              ...invocation,
+              githubRunId: intent.runId,
+              repository: intent.repository,
+            },
+          );
+          return !probe.active && probe.exactAccountAbsentOrDenied;
+        },
+        (milliseconds) => Bun.sleep(milliseconds),
+        () => Date.now(),
+      );
+    },
     recoverArtifacts: async (invocation, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
       await recoverBridgeArtifactsUntilStable(
