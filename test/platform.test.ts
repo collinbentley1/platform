@@ -3599,6 +3599,10 @@ describe("platform scaffold and doctor", () => {
     expect(preview).toContain('WAITLIST_BACKEND: "memory"');
     expect(production).toContain('WAITLIST_BACKEND: "firestore"');
     expect(production).toContain('FIRESTORE_PROJECT_ID: "medlock-1025243085"');
+    expect(production).toContain('MEDLOCK_OWNERSHIP_REQUIRED: "false"');
+    expect(production).toContain(
+      "The staged Medlock deploy may not clear an existing ownership boundary.",
+    );
     expect(production).toContain('gcloud recaptcha keys describe "$recaptcha_site_key"');
     expect(production).toContain('IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085"');
     expect(production).toContain(
@@ -3682,7 +3686,10 @@ describe("platform scaffold and doctor", () => {
       'medlock_ownership_enabled = var.repository_id == "1025243085"',
     );
     expect(deployment).toContain(
-      "RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+      "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+    );
+    expect(deployment).not.toContain(
+      "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].id)",
     );
     for (const header of [
       'resource "google_firestore_field" "waitlist_entry_ttl"',

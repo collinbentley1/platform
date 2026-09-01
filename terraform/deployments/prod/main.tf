@@ -150,7 +150,9 @@ locals {
     IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"
     IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"
     RECAPTCHA_PROJECT_ID           = "medlock-1025243085"
-    RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)
+    # Provider 7.45 exports `name` as the browser site key itself. Its `id` is
+    # the full projects/{project}/keys/{name} resource identifier.
+    RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].name)
   } : {}
 
   deployment = local.deployments[var.repository_id]

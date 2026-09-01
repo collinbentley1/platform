@@ -17,6 +17,45 @@ afterEach(async () => {
 });
 
 describe("production Secret Manager deploy boundary", () => {
+  test("stage one deploys only the still-unprovisioned Medlock shape", async () => {
+    const deployScript = await productionDeployScript();
+    const staged = await runDeployScript(
+      deployScript,
+      serviceWithWaitlistEntries([], []),
+      [],
+      "ENABLED",
+      exactRecaptchaKey(),
+      [exactRecaptchaKey()],
+      "false",
+    );
+
+    expect({ exitCode: staged.exitCode, stderr: staged.stderr }).toEqual({
+      exitCode: 0,
+      stderr: "",
+    });
+    expect(staged.calls).not.toContain("recaptcha\tkeys\tlist");
+    expect(staged.calls).not.toContain("recaptcha\tkeys\tdescribe");
+    expect(JSON.parse(staged.capturedEnvironment)).not.toHaveProperty(
+      "IDENTITY_PLATFORM_AUDIENCE",
+    );
+    expect(JSON.parse(staged.capturedEnvironment)).not.toHaveProperty("RECAPTCHA_SITE_KEY");
+
+    const downgrade = await runDeployScript(
+      deployScript,
+      serviceWithWaitlistEntries([]),
+      [],
+      "ENABLED",
+      exactRecaptchaKey(),
+      [exactRecaptchaKey()],
+      "false",
+    );
+    expect(downgrade.exitCode).not.toBe(0);
+    expect(downgrade.stderr).toContain(
+      "The staged Medlock deploy may not clear an existing ownership boundary.",
+    );
+    expect(downgrade.calls).not.toContain("run\tdeploy");
+  });
+
   test("generates a key only for an empty binding/inventory and never exposes its payload", async () => {
     const deployScript = await productionDeployScript();
     const created = await runDeployScript(deployScript, serviceWithWaitlistEntries([], []), []);
@@ -341,6 +380,7 @@ async function runDeployScript(
   versionState: "DISABLED" | "ENABLED" = "ENABLED",
   keySnapshot: unknown = exactRecaptchaKey(),
   keyInventorySnapshot: unknown[] = [exactRecaptchaKey()],
+  medlockOwnershipRequired: "false" | "true" = "true",
 ): Promise<{
   calls: string;
   capturedEnvironment: string;
@@ -505,6 +545,7 @@ async function runDeployScript(
       RUNNABLE_DIGEST: "sha256:" + "b".repeat(64),
       IMAGE_NAME: "us-east4-docker.pkg.dev/medlock-1025243085/site/medlock",
       MAPBOX_PUBLIC_TOKEN: "",
+      MEDLOCK_OWNERSHIP_REQUIRED: medlockOwnershipRequired,
       PATH: bin + ":" + (process.env.PATH ?? "/usr/bin:/bin"),
       PLATFORM_WORKFLOW_SHA: platformWorkflowSha,
       PROJECT_ID: "medlock-1025243085",

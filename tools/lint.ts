@@ -2145,7 +2145,7 @@ for (const needle of [
 }
 for (const needle of [
   'medlock_ownership_enabled = var.repository_id == "1025243085"',
-  "RECAPTCHA_SITE_KEY             = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+  "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].name)",
   'resource "google_firestore_field" "waitlist_entry_ttl"',
   'resource "google_firestore_field" "waitlist_quota_ttl"',
   'resource "google_identity_platform_config" "default"',
