@@ -64,6 +64,9 @@ import {
   finalizePendingApplyReceipts,
   writeImmutableObject,
   writeFederationRestoreMarker,
+  RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+  RECOVERY_STABLE_EMPTY_MINUTES,
+  RECOVERY_OPERATION_MINUTES,
   assertQuarantinedPool,
   buildFinalProtectedProof,
   federationPoolFingerprint,
@@ -7480,6 +7483,27 @@ describe("protected owner Terraform bridge", () => {
       async () => {},
       () => Date.parse("2026-09-01T12:30:00.000Z"),
     );
+
+  // The envelope, measured rather than assumed.
+  //
+  // runProtectedRecovery grants ONE RECOVERY_OPERATION_MINUTES deadline for
+  // everything. recoverArtifacts alone must burn the 7-minute propagation
+  // horizon plus the 3-minute stable-empty window before it can conclude
+  // anything, so whatever follows it inherits a nearly exhausted budget. Any
+  // phase that needs a horizon of its own therefore cannot run at all -- and a
+  // containment stub that returns true hides exactly that.
+  test("the recovery envelope cannot fund a second containment horizon", () => {
+    const horizonMs = (RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
+      RECOVERY_STABLE_EMPTY_MINUTES) * 60_000;
+    const operationMs = RECOVERY_OPERATION_MINUTES * 60_000;
+
+    // One horizon fits, with only the scan-latency and late-retry margins spare.
+    expect(operationMs).toBeGreaterThanOrEqual(horizonMs);
+    // Two do not. This is the arithmetic that makes a per-item horizon
+    // unreachable, whatever the item is.
+    expect(operationMs).toBeLessThan(horizonMs * 2);
+    expect(operationMs - horizonMs).toBeLessThan(horizonMs);
+  });
 
   test("the finalizer countersigns a pending receipt left by a crashed run", async () => {
     const world = finalizerWorld();
