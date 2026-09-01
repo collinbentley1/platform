@@ -61,6 +61,9 @@ import {
   type FederationQuarantineRecord,
   publishFinalProtectedReceipt,
   publishOwnerCompletionProof,
+  finalizePendingApplyReceipts,
+  writeImmutableObject,
+  writeFederationRestoreMarker,
   assertQuarantinedPool,
   buildFinalProtectedProof,
   federationPoolFingerprint,
@@ -7315,6 +7318,330 @@ describe("protected owner Terraform bridge", () => {
       Date.parse("2026-09-01T12:09:00.000Z"),
       world.fetcher,
     )).rejects.toThrow();
+  });
+
+  // ---- detached finalizer, driven through the real recovery entrypoint -----
+  //
+  // The store is faithful: immutable creates, generation-bound reads, prefix
+  // listing with paging. Every object in it is written by the REAL writer, so a
+  // test cannot accidentally prove something about a shape production never
+  // produces.
+  const finalizerWorld = () => {
+    const objects = new Map<string, { body: string; generation: string }>();
+    let next = 1_700_000_000;
+    let pageSize = 1_000;
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname !== "storage.googleapis.com") return new Response("", { status: 404 });
+      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
+      if (url.pathname.startsWith("/upload/")) {
+        const name = url.searchParams.get("name")!;
+        if (objects.has(name)) return new Response("", { status: 412 });
+        const body = String(init!.body);
+        next += 1;
+        objects.set(name, { body, generation: String(next) });
+        return Response.json({
+          bucket,
+          generation: String(next),
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(body)),
+        });
+      }
+      if (url.pathname.endsWith("/o")) {
+        const prefix = url.searchParams.get("prefix") ?? "";
+        const all = [...objects.entries()].filter(([name]) => name.startsWith(prefix)).toSorted();
+        const from = Number(url.searchParams.get("pageToken") ?? "0");
+        const page = all.slice(from, from + pageSize);
+        const items = page.map(([name, stored]) => ({
+          generation: stored.generation,
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(stored.body)),
+        }));
+        return from + pageSize < all.length
+          ? Response.json({ items, nextPageToken: String(from + pageSize) })
+          : Response.json({ items });
+      }
+      const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+      const stored = objects.get(name);
+      if (stored === undefined) return new Response("", { status: 404 });
+      if (url.searchParams.get("alt") === "media") return new Response(stored.body);
+      return Response.json({
+        bucket,
+        generation: stored.generation,
+        metageneration: "1",
+        name,
+        size: String(Buffer.byteLength(stored.body)),
+      });
+    }) as unknown as typeof fetch;
+    return {
+      fetcher,
+      objects,
+      setPageSize: (size: number) => {
+        pageSize = size;
+      },
+    };
+  };
+
+  const CDB_STATE = REPOSITORIES.cdbentley.state.bootstrap;
+  const seedPendingRun = async (world: ReturnType<typeof finalizerWorld>, runId: string) => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      APPROVED_MANIFEST_SHA256: "a".repeat(64),
+      APPROVED_PLAN_RUN_ID: "123455",
+      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+      EXECUTION_MODE: "apply",
+      GITHUB_RUN_ID_EXACT: runId,
+    }, true);
+    // The approved plan receipt this apply consumed. A real run cannot exist
+    // without it, and the finalizer checks the manifest digest against it.
+    const planKey = `${CDB_STATE.prefix}/.protected-bootstrap/plans/123455.json`;
+    if (!world.objects.has(planKey)) {
+      await writeImmutableObject(
+        CDB_STATE.bucket,
+        planKey,
+        `${JSON.stringify({ manifestSha256: "a".repeat(64), mode: "plan" })}\n`,
+        "owner-token-value",
+        world.fetcher,
+      );
+    }
+    const intent = quarantineIntent(invocation);
+    const intentBody = JSON.stringify(intent);
+    const intentKey =
+      `${CDB_STATE.prefix}/.protected-bootstrap/federation-quarantine/${runId}.json`;
+    const intentGeneration = await writeImmutableObject(
+      CDB_STATE.bucket,
+      intentKey,
+      intentBody,
+      "owner-token-value",
+      world.fetcher,
+    );
+    await writeFederationRestoreMarker(
+      CDB_STATE.bucket,
+      intentKey,
+      {
+        intentDigest: new Bun.CryptoHasher("sha256").update(intentBody).digest("hex"),
+        intentGeneration,
+        repository: "cdbentley",
+        restoredAt: "2026-09-01T12:01:30.000Z",
+        root: "bootstrap",
+        runId,
+      },
+      "owner-token-value",
+      world.fetcher,
+      () => Date.parse("2026-09-01T12:05:00.000Z"),
+      Date.parse(intent.capturedAt),
+    );
+    const proof = buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: "2026-09-01T12:00:00.000Z",
+        provenAbsent: deterministicProvenAbsent("cdbentley", "bootstrap"),
+      },
+      intent,
+      intentDigest: new Bun.CryptoHasher("sha256").update(intentBody).digest("hex"),
+      intentGeneration,
+      invocation,
+      kind: "apply",
+      observedPools: intent.pools.map((pool) => ({
+        disabled: false,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: "2026-09-01T12:01:00.000Z",
+        repository: pool.repository,
+      })),
+      quarantinedApplyProof: executionProof(),
+      restoredAudit: {
+        detailedExitCode: 0 as const,
+        observedAt: "2026-09-01T12:01:00.000Z",
+        outputSha256: "d".repeat(64),
+      },
+      review: { canonical: "", sha256: "a".repeat(64) },
+    });
+    await publishFinalProtectedReceipt(
+      invocation,
+      "owner-token-value",
+      { canonical: "", sha256: "a".repeat(64) },
+      proof,
+      Date.parse("2026-09-01T12:02:00.000Z"),
+      world.fetcher,
+    );
+    return `${CDB_STATE.prefix}/.protected-bootstrap/final/${runId}.json`;
+  };
+
+  const runFinalizer = (world: ReturnType<typeof finalizerWorld>, contained = true) =>
+    finalizePendingApplyReceipts(
+      "owner-token-value",
+      world.fetcher,
+      Date.parse("2026-09-01T13:00:00.000Z"),
+      async () => contained,
+      async () => {},
+      () => Date.parse("2026-09-01T12:30:00.000Z"),
+    );
+
+  test("the finalizer countersigns a pending receipt left by a crashed run", async () => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    const summary = await runFinalizer(world);
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.finalized).toEqual([key]);
+    const completionKey = `${CDB_STATE.prefix}/.protected-bootstrap/completion/123456.json`;
+    const completion = JSON.parse(world.objects.get(completionKey)!.body) as Record<string, unknown>;
+    expect(completion.countable).toBe(true);
+    expect((completion.executorRelease as Record<string, unknown>).provenBy)
+      .toBe("propagation-horizon");
+  });
+
+  test("a second finalizer pass accepts the completion instead of rewriting it", async () => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    await runFinalizer(world);
+    const completionKey = `${CDB_STATE.prefix}/.protected-bootstrap/completion/123456.json`;
+    const first = world.objects.get(completionKey)!.body;
+
+    const second = await runFinalizer(world);
+    expect(second.finalized).toEqual([]);
+    expect(second.alreadyComplete).toEqual([key]);
+    expect(world.objects.get(completionKey)!.body).toBe(first);
+  });
+
+  test("an uncontained run is reported and left uncounted", async () => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    const summary = await runFinalizer(world, false);
+
+    expect(summary.finalized).toEqual([]);
+    expect(summary.skippedUncontained).toEqual([key]);
+    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
+  });
+
+  test("a rehearsal record is never eligible for finalization", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    // A terminal rehearsal record for a different run, in its own prefix.
+    await writeImmutableObject(
+      CDB_STATE.bucket,
+      `${CDB_STATE.prefix}/.protected-bootstrap/rehearsals/777777.json`,
+      '{"kind":"rehearsal"}\n',
+      "owner-token-value",
+      world.fetcher,
+    );
+    const summary = await runFinalizer(world);
+
+    // Only the apply receipt was scanned; the rehearsal never enters the set.
+    expect(summary.scanned).toBe(1);
+    expect(summary.finalized).toHaveLength(1);
+    expect(summary.finalized.every((name) => !name.includes("/rehearsals/"))).toBe(true);
+  });
+
+  test("the finalizer pages through more than one hundred pending receipts", async () => {
+    const world = finalizerWorld();
+    world.setPageSize(100);
+    for (let index = 0; index < 101; index += 1) {
+      await seedPendingRun(world, String(200000 + index));
+    }
+    const summary = await runFinalizer(world);
+
+    expect(summary.scanned).toBe(101);
+    expect(summary.finalized).toHaveLength(101);
+  });
+
+  test("an orphan completion with no pending receipt stops the finalizer", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    await writeImmutableObject(
+      CDB_STATE.bucket,
+      `${CDB_STATE.prefix}/.protected-bootstrap/completion/999999.json`,
+      '{"orphan":true}\n',
+      "owner-token-value",
+      world.fetcher,
+    );
+
+    await expect(runFinalizer(world)).rejects.toThrow("has no pending receipt to countersign");
+  });
+
+  test("an unrecognised object in the pending prefix stops the finalizer", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    await writeImmutableObject(
+      CDB_STATE.bucket,
+      `${CDB_STATE.prefix}/.protected-bootstrap/final/notes.txt`,
+      "hello\n",
+      "owner-token-value",
+      world.fetcher,
+    );
+
+    await expect(runFinalizer(world)).rejects.toThrow("unrecognised object");
+  });
+
+  test.each([
+    ["an extra field", (r: Record<string, unknown>) => ({ ...r, extra: 1 })],
+    ["a different manifest digest", (r: Record<string, unknown>) => ({
+      ...r,
+      manifestSha256: "b".repeat(64),
+    })],
+    ["an arbitrary proven-absent set", (r: Record<string, unknown>) => ({
+      ...r,
+      deElevation: { ...(r.deElevation as object), provenAbsent: ["storage.objects.get"] },
+    })],
+    ["a countable flag", (r: Record<string, unknown>) => ({ ...r, countable: true })],
+    ["a non-canonical time", (r: Record<string, unknown>) => ({
+      ...r,
+      publishedAt: "2026-09-01T12:02:00Z",
+    })],
+    ["reordered pools", (r: Record<string, unknown>) => ({
+      ...r,
+      observedPools: [...(r.observedPools as unknown[])].reverse(),
+    })],
+    ["a duplicated pool", (r: Record<string, unknown>) => ({
+      ...r,
+      observedPools: [
+        (r.observedPools as unknown[])[0],
+        (r.observedPools as unknown[])[0],
+        (r.observedPools as unknown[])[2],
+        (r.observedPools as unknown[])[3],
+      ],
+    })],
+    ["a forged pool fingerprint", (r: Record<string, unknown>) => ({
+      ...r,
+      observedPools: (r.observedPools as Record<string, unknown>[]).map((pool, index) =>
+        index === 0 ? { ...pool, fingerprint: "forged" } : pool
+      ),
+    })],
+    ["a different executor identity", (r: Record<string, unknown>) => ({
+      ...r,
+      deElevation: {
+        ...(r.deElevation as object),
+        executorEmail: "someone-else@cdbentley.iam.gserviceaccount.com",
+      },
+    })],
+    ["a different intent digest", (r: Record<string, unknown>) => ({
+      ...r,
+      intentDigest: "e".repeat(64),
+    })],
+  ])("a pending receipt with %s is refused", async (_label, mutate) => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    const stored = world.objects.get(key)!;
+    const mutated = mutate(JSON.parse(stored.body) as Record<string, unknown>);
+    world.objects.set(key, { ...stored, body: `${JSON.stringify(mutated)}\n` });
+
+    await expect(runFinalizer(world)).rejects.toThrow();
+    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
+  });
+
+  test("a pending receipt whose restore marker is missing is refused", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    const markerKey =
+      `${CDB_STATE.prefix}/.protected-bootstrap/federation-quarantine/123456.json.restored`;
+    world.objects.delete(markerKey);
+
+    await expect(runFinalizer(world)).rejects.toThrow();
+    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
   });
 
   test("a plan publishes no owner artifact at all", async () => {

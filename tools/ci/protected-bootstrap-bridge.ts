@@ -4247,6 +4247,20 @@ export async function finalizePendingApplyReceipts(
       exact(intent.root, location.root, "pending receipt intent root");
       exact(intent.runId, runId, "pending receipt intent run ID");
       exact(intent.platformSha, receipt.platformSha, "pending receipt intent platform SHA");
+      // The pools the receipt says it observed must be the pools the intent
+      // captured -- same order, same canonical fingerprints. A receipt is not
+      // allowed to invent what the world looked like.
+      exact(
+        canonicalJson(json(
+          receipt.observedPoolFingerprints.map((fingerprint) => fingerprint),
+          "pending receipt observed fingerprints",
+        )),
+        canonicalJson(json(
+          intent.pools.map((pool) => pool.fingerprint),
+          "pending receipt intent fingerprints",
+        )),
+        "pending receipt observed pool fingerprints",
+      );
 
       // And that intent must carry a validated completion marker: federation
       // was handed back before this run could ever have published a receipt.
@@ -4275,6 +4289,36 @@ export async function finalizePendingApplyReceipts(
         marker.intentGeneration,
         receipt.intentGeneration,
         "pending receipt restore marker intent generation",
+      );
+
+      // The manifest digest is checked against the approved plan receipt this
+      // run consumed, which is a separate immutable object written by a
+      // separate run. Without that link the digest would only ever be
+      // self-consistent -- a receipt asserting its own provenance.
+      const planObject = receiptObjectName(state, "plans", receipt.approvedPlanRunId);
+      const planEntry = await readObjectMetadata(
+        location.bucket,
+        planObject,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (planEntry.size > MAX_RECEIPT_BODY_BYTES) {
+        throw new Error(`Approved plan receipt ${planObject} exceeds its reviewed size bound.`);
+      }
+      const planBody = await readObjectGeneration(
+        location.bucket,
+        planObject,
+        planEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      exact(
+        requiredString(
+          record(JSON.parse(planBody) as unknown, "approved plan receipt").manifestSha256,
+          "approved plan receipt manifest digest",
+        ),
+        receipt.manifestSha256,
+        "pending receipt manifest digest",
       );
 
       const existing = completions.get(runId);
@@ -14265,6 +14309,10 @@ export async function publishFinalProtectedReceipt(
   const state = contract.state[invocation.terraformRoot];
   const receipt: JsonValue = json(
     {
+      // Names the approved plan whose manifest digest this run consumed, so a
+      // detached finalizer has an independent object to check that digest
+      // against rather than taking the receipt's word for it.
+      approvedPlanRunId: invocation.approvedPlanRunId,
       consumerSha: proof.consumerSha,
       // Never countable, whatever the run was.
       //
@@ -14345,6 +14393,7 @@ function canonicalInstant(value: string, label: string): string {
 }
 
 export interface PendingApplyReceipt {
+  readonly approvedPlanRunId: string;
   readonly consumerSha: string;
   readonly deElevationAt: string;
   readonly deElevationExecutorEmail: string;
@@ -14352,6 +14401,7 @@ export interface PendingApplyReceipt {
   readonly intentDigest: string;
   readonly intentGeneration: string;
   readonly manifestSha256: string;
+  readonly observedPoolFingerprints: readonly string[];
   readonly platformSha: string;
   readonly publishedAt: string;
 }
@@ -14392,6 +14442,7 @@ export function pendingApplyReceiptFromBody(
   exactKeys(
     parsed,
     new Set([
+      "approvedPlanRunId",
       "consumerSha",
       "countable",
       "deElevation",
@@ -14415,6 +14466,10 @@ export function pendingApplyReceiptFromBody(
     "pending apply receipt",
   );
   const contract = REPOSITORIES[expected.repository];
+  const approvedPlanRunId = numeric(
+    requiredString(parsed.approvedPlanRunId, "pending apply receipt approved plan run ID"),
+    "pending apply receipt approved plan run ID",
+  );
   exact(parsed.schemaVersion, 1, "pending apply receipt schema version");
   exact(parsed.kind, "apply", "pending apply receipt kind");
   exact(parsed.status, "pending", "pending apply receipt status");
@@ -14504,6 +14559,7 @@ export function pendingApplyReceiptFromBody(
   );
 
   // Exactly one observation per consumer, in the contracted order.
+  const observedPoolFingerprints: string[] = [];
   const observed = array(parsed.observedPools, "pending apply receipt observed pools");
   if (observed.length !== REPOSITORY_NAMES.length) {
     throw new Error("Pending apply receipt does not observe every consumer pool.");
@@ -14524,27 +14580,44 @@ export function pendingApplyReceiptFromBody(
       }/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`,
       "pending apply receipt observed pool name",
     );
-    requiredString(pool.fingerprint, "pending apply receipt observed pool fingerprint");
+    observedPoolFingerprints.push(
+      requiredString(pool.fingerprint, "pending apply receipt observed pool fingerprint"),
+    );
     canonicalInstant(
       requiredString(pool.observedAt, "pending apply receipt observed pool time"),
       "pending apply receipt observed pool time",
     );
   });
 
+  // The executor is an ephemeral account this platform mints, in this project,
+  // with a fixed name shape and a stable numeric unique ID. An arbitrary
+  // address is not an executor identity at all.
+  const executorEmail = requiredString(
+    deElevation.executorEmail,
+    "pending apply receipt de-elevation email",
+  );
+  if (
+    !new RegExp(
+      `^${EXECUTOR_ACCOUNT_PREFIX}[0-9a-f]{20}@${contract.projectId}\\.iam\\.gserviceaccount\\.com$`,
+    ).test(executorEmail)
+  ) {
+    throw new Error("Pending apply receipt de-elevation email is not an executor identity.");
+  }
+  const executorUniqueId = requiredString(
+    deElevation.executorUniqueId,
+    "pending apply receipt de-elevation unique ID",
+  );
+  numeric(executorUniqueId, "pending apply receipt de-elevation unique ID");
   return {
+    approvedPlanRunId,
     consumerSha,
     deElevationAt,
-    deElevationExecutorEmail: requiredString(
-      deElevation.executorEmail,
-      "pending apply receipt de-elevation email",
-    ),
-    deElevationExecutorUniqueId: requiredString(
-      deElevation.executorUniqueId,
-      "pending apply receipt de-elevation unique ID",
-    ),
+    deElevationExecutorEmail: executorEmail,
+    deElevationExecutorUniqueId: executorUniqueId,
     intentDigest,
     intentGeneration,
     manifestSha256,
+    observedPoolFingerprints,
     platformSha,
     publishedAt: canonicalInstant(
       requiredString(parsed.publishedAt, "pending apply receipt publication time"),
@@ -15036,7 +15109,7 @@ async function verifyPlanRun(
   }
 }
 
-async function writeImmutableObject(
+export async function writeImmutableObject(
   bucket: string,
   object: string,
   body: string,
