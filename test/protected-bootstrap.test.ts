@@ -7633,6 +7633,93 @@ describe("protected owner Terraform bridge", () => {
     expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
   });
 
+  test("a shifting page that repeats a receipt name is refused", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    await seedPendingRun(world, "123457");
+    world.setPageSize(1);
+    let listings = 0;
+    const shifting = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/o") && url.searchParams.get("prefix")!.includes("/final/")) {
+        listings += 1;
+        // The second page repeats the first page's object: the count adds up
+        // and one real receipt never appears.
+        if (listings === 2) {
+          return Response.json({
+            items: [{
+              generation: "1700000005",
+              metageneration: "1",
+              name: `${CDB_STATE.prefix}/.protected-bootstrap/final/123456.json`,
+              size: "10",
+            }],
+          });
+        }
+      }
+      return await world.fetcher(input as string, init);
+    }) as unknown as typeof fetch;
+
+    await expect(finalizePendingApplyReceipts(
+      "owner-token-value",
+      shifting,
+      Date.parse("2026-09-01T13:00:00.000Z"),
+      async () => true,
+      async () => {},
+      () => Date.parse("2026-09-01T12:30:00.000Z"),
+    )).rejects.toThrow("repeated");
+  });
+
+  test("a pending receipt larger than its reviewed bound is refused before it is read", async () => {
+    const world = finalizerWorld();
+    const key = await seedPendingRun(world, "123456");
+    const stored = world.objects.get(key)!;
+    world.objects.set(key, { ...stored, body: `${" ".repeat(40 * 1024)}\n` });
+
+    await expect(runFinalizer(world)).rejects.toThrow();
+    expect([...world.objects.keys()].some((name) => name.includes("/completion/"))).toBe(false);
+  });
+
+  test("a finalizer whose completion response is lost accepts the committed object", async () => {
+    const world = finalizerWorld();
+    await seedPendingRun(world, "123456");
+    let dropped = false;
+    const lossy = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const response = await world.fetcher(input as string, init);
+      if (
+        !dropped && url.pathname.startsWith("/upload/") &&
+        (url.searchParams.get("name") ?? "").includes("/completion/")
+      ) {
+        // The bytes committed; the answer never arrived.
+        dropped = true;
+        throw new TypeError("fetch failed after commit");
+      }
+      return response;
+    }) as unknown as typeof fetch;
+
+    // The write committed and the answer was lost. Reconciliation happens in
+    // the same pass: the object is re-read at its own generation, validated as
+    // a completion for exactly this pending receipt, and accepted -- so a lost
+    // response never turns a finished run into a failed one.
+    const first = await finalizePendingApplyReceipts(
+      "owner-token-value",
+      lossy,
+      Date.parse("2026-09-01T13:00:00.000Z"),
+      async () => true,
+      async () => {},
+      () => Date.parse("2026-09-01T12:30:00.000Z"),
+    );
+    expect(dropped).toBe(true);
+    expect(first.finalized).toHaveLength(1);
+
+    // Exactly one completion object exists, and a later pass counts it as done.
+    expect([...world.objects.keys()].filter((name) => name.includes("/completion/")))
+      .toHaveLength(1);
+    const second = await runFinalizer(world);
+    expect(second.alreadyComplete).toHaveLength(1);
+    expect(second.finalized).toEqual([]);
+  });
+
   test("a pending receipt whose restore marker is missing is refused", async () => {
     const world = finalizerWorld();
     await seedPendingRun(world, "123456");
