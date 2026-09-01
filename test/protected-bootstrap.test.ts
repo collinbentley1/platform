@@ -614,6 +614,39 @@ describe("protected owner Terraform bridge", () => {
         planIdentity,
       )
     ).not.toThrow();
+
+    // Executor authority is created out of band by the bridge for the exact
+    // current run. Terraform may never grant a pool-mutation role to an
+    // executor-shaped account: its name alone does not bind it to this session,
+    // and a plan could otherwise create a peer controller during quarantine.
+    const poolControllerGrant = (member: string) =>
+      plan([
+        resourceChange(
+          "module.bootstrap.google_project_iam_member.pool_controller",
+          "google_project_iam_member",
+          null,
+          {
+            member,
+            project: "cdbentley",
+            role: "roles/iam.workloadIdentityPoolAdmin",
+          },
+        ),
+      ]);
+    expect(() =>
+      buildReviewManifest(
+        poolControllerGrant(
+          "serviceAccount:gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+        ),
+        planIdentity,
+      )
+    ).toThrow("could re-enable a quarantined workload identity pool");
+    // The stable owner controller remains the sole Terraform-managed exception.
+    expect(() =>
+      buildReviewManifest(
+        poolControllerGrant("user:CollinBentley1@gmail.com"),
+        planIdentity,
+      )
+    ).not.toThrow();
   });
 
   test("a Firestore recovery window that slides cannot break plan/apply agreement", () => {

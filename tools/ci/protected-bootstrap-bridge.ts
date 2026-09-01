@@ -2309,12 +2309,14 @@ const FEDERATION_CONTROLLER_PERMISSIONS = [
 const FEDERATION_CONTROLLER_PERMISSION_SET: ReadonlySet<string> =
   new Set(FEDERATION_CONTROLLER_PERMISSIONS);
 
-// The owner controller and the run's own ephemeral executor. Nothing else may
-// be able to move a pool's disabled flag.
+// Terraform may preserve only the owner controller. The run's ephemeral
+// executor receives its exact, single-run mutation lease out of band from this
+// bridge after the reviewed plan is accepted; it must never be granted pool
+// authority by Terraform. Accepting an account merely because its name looked
+// like an executor would let a plan create a different gha-pbt-* principal and
+// use it to re-enable a quarantined pool.
 function isTrustedFederationController(principal: string): boolean {
-  const member = principalWithoutUid(principal);
-  return member === OWNER_MEMBER ||
-    /^serviceAccount:gha-pbt-[0-9a-f]{20}@[a-z0-9-]+\.iam\.gserviceaccount\.com$/.test(member);
+  return principalWithoutUid(principal) === OWNER_MEMBER;
 }
 
 function previewRuntimeMembers(): ReadonlySet<string> {
@@ -2461,9 +2463,10 @@ function rejectPreviewRuntimeGrant(
   }
   const members = previewRuntimeMembers();
   // The quarantine is only worth anything if the pools it disables cannot be
-  // re-enabled by a principal inside the window. Only the owner controller and
-  // the ephemeral executor may ever hold that capability, so a plan that grants
-  // a pool-mutation role to anyone else is refused before it can be applied.
+  // re-enabled by a principal inside the window. Terraform may preserve only
+  // the owner controller; the bridge separately grants the exact current
+  // executor its bounded lease. Any Terraform-managed executor-like grant is
+  // therefore refused before it can be applied.
   const role = typeof state.role === "string" ? state.role : "";
   if (POOL_MUTATION_ROLES.has(role)) {
     for (const principal of principals) {
