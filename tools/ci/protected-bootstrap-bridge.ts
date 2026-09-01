@@ -14010,6 +14010,187 @@ export async function publishFinalProtectedReceipt(
 // The owner's countersignature. A verifier that requires this is requiring, in
 // one object: that the final receipt exists with exactly these bytes, and that
 // the executor which wrote it no longer exists.
+function canonicalInstant(value: string, label: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    throw new Error(`${label} is not a canonical instant.`);
+  }
+  return value;
+}
+
+export interface PendingApplyReceipt {
+  readonly deElevationExecutorEmail: string;
+  readonly deElevationExecutorUniqueId: string;
+  readonly intentDigest: string;
+  readonly intentGeneration: string;
+  readonly publishedAt: string;
+}
+
+// A strict verifier, not a field-spotter.
+//
+// The difference matters: JSON.parse plus a handful of exact() calls accepts
+// unknown keys, noncanonical bytes, a reordered pool list, a missing audit, and
+// a publishedAt that disagrees with the reference it is supposed to describe.
+// Every one of those is a way for a document to satisfy the checks while not
+// being the receipt this run wrote. So this validates the WHOLE document --
+// exact key sets at every level, exact types, exact ordering, and the canonical
+// bytes including the terminal newline -- against the contract identity of the
+// run being completed.
+export function pendingApplyReceiptFromBody(
+  body: string,
+  expected: {
+    readonly consumerSha: string;
+    readonly platformSha: string;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  },
+): PendingApplyReceipt {
+  const parsed = record(JSON.parse(body) as unknown, "pending apply receipt");
+  // Canonical bytes. A receipt that parses to the right values but was
+  // serialised differently was not written by this system.
+  exact(
+    `${canonicalJson(json(parsed, "pending apply receipt"))}\n`,
+    body,
+    "pending apply receipt bytes",
+  );
+  exactKeys(
+    parsed,
+    new Set([
+      "consumerSha",
+      "countable",
+      "deElevation",
+      "intentDigest",
+      "intentGeneration",
+      "kind",
+      "manifestSha256",
+      "observedPools",
+      "platformSha",
+      "projectId",
+      "publishedAt",
+      "quarantinedApplyProofDigest",
+      "repository",
+      "repositoryId",
+      "restoredAudit",
+      "runId",
+      "schemaVersion",
+      "status",
+      "terraformRoot",
+    ]),
+    "pending apply receipt",
+  );
+  const contract = REPOSITORIES[expected.repository];
+  exact(parsed.schemaVersion, 1, "pending apply receipt schema version");
+  exact(parsed.kind, "apply", "pending apply receipt kind");
+  exact(parsed.status, "pending", "pending apply receipt status");
+  exact(parsed.countable, false, "pending apply receipt countability");
+  exact(parsed.repository, expected.repository, "pending apply receipt repository");
+  exact(parsed.repositoryId, contract.repositoryId, "pending apply receipt repository ID");
+  exact(parsed.projectId, contract.projectId, "pending apply receipt project");
+  exact(parsed.terraformRoot, expected.root, "pending apply receipt root");
+  exact(parsed.runId, expected.runId, "pending apply receipt run ID");
+  exact(parsed.platformSha, expected.platformSha, "pending apply receipt platform SHA");
+  exact(parsed.consumerSha, expected.consumerSha, "pending apply receipt consumer SHA");
+  hash(
+    requiredString(parsed.manifestSha256, "pending apply receipt manifest digest"),
+    "pending apply receipt manifest digest",
+  );
+  hash(
+    requiredString(parsed.quarantinedApplyProofDigest, "pending apply receipt apply-proof digest"),
+    "pending apply receipt apply-proof digest",
+  );
+  const intentDigest = hash(
+    requiredString(parsed.intentDigest, "pending apply receipt intent digest"),
+    "pending apply receipt intent digest",
+  );
+  const intentGeneration = requiredString(
+    parsed.intentGeneration,
+    "pending apply receipt intent generation",
+  );
+  if (!/^[1-9][0-9]*$/.test(intentGeneration)) {
+    throw new Error("Pending apply receipt intent generation is malformed.");
+  }
+
+  const audit = record(parsed.restoredAudit, "pending apply receipt restored audit");
+  exactKeys(
+    audit,
+    new Set(["detailedExitCode", "observedAt", "outputSha256"]),
+    "pending apply receipt restored audit",
+  );
+  exact(audit.detailedExitCode, 0, "pending apply receipt restored audit exit code");
+  hash(
+    requiredString(audit.outputSha256, "pending apply receipt restored audit digest"),
+    "pending apply receipt restored audit digest",
+  );
+  canonicalInstant(
+    requiredString(audit.observedAt, "pending apply receipt restored audit time"),
+    "pending apply receipt restored audit time",
+  );
+
+  const deElevation = record(parsed.deElevation, "pending apply receipt de-elevation");
+  exactKeys(
+    deElevation,
+    new Set(["executorEmail", "executorUniqueId", "observedAt", "provenAbsent"]),
+    "pending apply receipt de-elevation",
+  );
+  const provenAbsent = array(deElevation.provenAbsent, "pending apply receipt proven-absent set");
+  if (provenAbsent.length < 1 || provenAbsent.length > 256) {
+    throw new Error("Pending apply receipt proven-absent set escaped its bound.");
+  }
+  provenAbsent.forEach((permission, index) => {
+    requiredString(permission, `pending apply receipt proven-absent ${index}`);
+  });
+  canonicalInstant(
+    requiredString(deElevation.observedAt, "pending apply receipt de-elevation time"),
+    "pending apply receipt de-elevation time",
+  );
+
+  // Exactly one observation per consumer, in the contracted order.
+  const observed = array(parsed.observedPools, "pending apply receipt observed pools");
+  if (observed.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Pending apply receipt does not observe every consumer pool.");
+  }
+  REPOSITORY_NAMES.forEach((repository, index) => {
+    const pool = record(observed[index], `pending apply receipt observed pool ${index}`);
+    exactKeys(
+      pool,
+      new Set(["disabled", "fingerprint", "name", "observedAt", "repository"]),
+      `pending apply receipt observed pool ${index}`,
+    );
+    exact(pool.repository, repository, "pending apply receipt observed pool order");
+    exact(pool.disabled, false, "pending apply receipt observed pool state");
+    exact(
+      requiredString(pool.name, "pending apply receipt observed pool name"),
+      `projects/${
+        REPOSITORIES[repository].projectId
+      }/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`,
+      "pending apply receipt observed pool name",
+    );
+    requiredString(pool.fingerprint, "pending apply receipt observed pool fingerprint");
+    canonicalInstant(
+      requiredString(pool.observedAt, "pending apply receipt observed pool time"),
+      "pending apply receipt observed pool time",
+    );
+  });
+
+  return {
+    deElevationExecutorEmail: requiredString(
+      deElevation.executorEmail,
+      "pending apply receipt de-elevation email",
+    ),
+    deElevationExecutorUniqueId: requiredString(
+      deElevation.executorUniqueId,
+      "pending apply receipt de-elevation unique ID",
+    ),
+    intentDigest,
+    intentGeneration,
+    publishedAt: canonicalInstant(
+      requiredString(parsed.publishedAt, "pending apply receipt publication time"),
+      "pending apply receipt publication time",
+    ),
+  };
+}
+
 export async function publishOwnerCompletionProof(
   invocation: Invocation,
   ownerToken: string,
@@ -14086,26 +14267,28 @@ export async function publishOwnerCompletionProof(
     throw new Error("The pending final receipt did not match its recorded size.");
   }
   exact(sha256Hex(observedBody), pending.digest, "owner completion final receipt digest");
-  const pendingReceipt = record(JSON.parse(observedBody) as unknown, "pending final receipt");
-  exact(pendingReceipt.status, "pending", "pending final receipt status");
-  exact(pendingReceipt.kind, "apply", "pending final receipt kind");
-  exact(pendingReceipt.countable, false, "pending final receipt countability");
-  exact(pendingReceipt.runId, invocation.githubRunId, "pending final receipt run ID");
-  exact(pendingReceipt.repository, invocation.repository, "pending final receipt repository");
-  exact(pendingReceipt.terraformRoot, invocation.terraformRoot, "pending final receipt root");
-  exact(pendingReceipt.platformSha, invocation.platformSha, "pending final receipt platform SHA");
-  exact(pendingReceipt.consumerSha, invocation.consumerSha, "pending final receipt consumer SHA");
-  const deElevation = record(pendingReceipt.deElevation, "pending final receipt de-elevation");
+  // Whole-document validation against this run's contract identity, not a
+  // handful of spot checks on a parsed blob.
+  const pendingReceipt = pendingApplyReceiptFromBody(observedBody, {
+    consumerSha: invocation.consumerSha,
+    platformSha: invocation.platformSha,
+    repository: invocation.repository,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  });
   exact(
-    deElevation.executorEmail,
+    pendingReceipt.deElevationExecutorEmail,
     pending.deElevationExecutorEmail,
     "pending final receipt de-elevation email",
   );
   exact(
-    deElevation.executorUniqueId,
+    pendingReceipt.deElevationExecutorUniqueId,
     pending.deElevationExecutorUniqueId,
     "pending final receipt de-elevation unique ID",
   );
+  // The reference must describe the object it points at, down to when it says
+  // it was published.
+  exact(pendingReceipt.publishedAt, pending.publishedAt, "pending final receipt publication time");
   const body = `${canonicalJson(json({
     completedAt: new Date(nowMs).toISOString(),
     countable: true,
