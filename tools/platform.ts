@@ -55,6 +55,7 @@ const requiredDirectories = [
 ];
 const workflowFiles = [
   "application.yml",
+  "bun-dependency-update.yml",
   "socket-firewall.yml",
   "infrastructure.yml",
   "deploy-prod.yml",
@@ -64,6 +65,7 @@ const workflowFiles = [
 ];
 const expectedReusableCalls: Readonly<Record<string, readonly string[]>> = {
   "application.yml": ["application.yml"],
+  "bun-dependency-update.yml": ["bun-dependency-update.yml"],
   "socket-firewall.yml": ["socket-firewall.yml"],
   "infrastructure.yml": ["infrastructure.yml"],
   "deploy-prod.yml": ["infrastructure.yml", "deploy-prod.yml"],

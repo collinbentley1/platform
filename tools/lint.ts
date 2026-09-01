@@ -15,6 +15,7 @@ const root = join(import.meta.dir, "..");
 const failures: string[] = [];
 const reusableWorkflows = [
   "application.yml",
+  "bun-dependency-update.yml",
   "socket-firewall.yml",
   "infrastructure.yml",
   "deploy-prod.yml",
@@ -98,6 +99,135 @@ for (const workflow of platformWorkflows) {
   if (unreviewedVariables.includes("${{ vars.")) {
     failures.push(`${path}: unreviewed repository or environment variable reference.`);
   }
+}
+
+const bunDependencyUpdateWorkflow = await read(".github/workflows/bun-dependency-update.yml");
+const bunResolveJob = sectionBetween(
+  bunDependencyUpdateWorkflow,
+  "  resolve:\n",
+  "\n  verify:\n",
+);
+const bunVerifyJob = sectionBetween(
+  bunDependencyUpdateWorkflow,
+  "  verify:\n",
+  "\n  propose:\n",
+);
+const bunProposeJob = bunDependencyUpdateWorkflow.slice(
+  bunDependencyUpdateWorkflow.indexOf("\n  propose:\n"),
+);
+for (const [job, section] of [
+  ["resolve", bunResolveJob],
+  ["verify", bunVerifyJob],
+] as const) {
+  requireContains(
+    ".github/workflows/bun-dependency-update.yml",
+    section,
+    "contents: read",
+    `Bun ${job} job must remain read-only.`,
+  );
+  rejectContains(
+    ".github/workflows/bun-dependency-update.yml",
+    section,
+    "contents: write",
+    `Bun ${job} job must never receive repository write authority.`,
+  );
+  rejectContains(
+    ".github/workflows/bun-dependency-update.yml",
+    section,
+    "pull-requests: write",
+    `Bun ${job} job must never receive pull-request write authority.`,
+  );
+}
+for (const boundary of [
+  "needs: [resolve, verify]",
+  "needs.verify.result == 'success'",
+  "contents: write",
+  "pull-requests: write",
+  "Revalidate the artifact in the fresh privileged runner",
+  'test "$digest" = "$RESOLVED_DIGEST"',
+  'test "$digest" = "$VERIFIED_DIGEST"',
+  'test "$current_main" = "$GITHUB_SHA"',
+  "GIT_CONFIG_NOSYSTEM: \"1\"",
+  "GIT_CONFIG_GLOBAL: /dev/null",
+  "credential.helper=",
+]) {
+  requireContains(
+    ".github/workflows/bun-dependency-update.yml",
+    bunProposeJob,
+    boundary,
+    `Fresh Bun proposal boundary is missing ${boundary}.`,
+  );
+}
+for (const boundary of [
+  "--registry=https://registry.npmjs.org",
+  "--ignore-scripts",
+  "--validate-proposal",
+  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  "bun-dependency-proposal-${{ github.run_id }}",
+  'test "$GITHUB_RUN_ATTEMPT" = "1"',
+  'test "$GITHUB_REF" = "refs/heads/main"',
+  'test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"',
+]) {
+  requireContains(
+    ".github/workflows/bun-dependency-update.yml",
+    bunDependencyUpdateWorkflow,
+    boundary,
+    `Bun updater is missing fail-closed boundary ${boundary}.`,
+  );
+}
+const bunDependencyUpdater = await read("tools/ci/update-bun-dependencies.ts");
+for (const boundary of [
+  'const OFFICIAL_REGISTRY = "https://registry.npmjs.org"',
+  "const MINIMUM_RELEASE_AGE_SECONDS = 7 * 24 * 60 * 60",
+  '`--minimum-release-age=${MINIMUM_RELEASE_AGE_SECONDS}`',
+  '`--registry=${OFFICIAL_REGISTRY}`',
+  '"--ignore-scripts"',
+  '"--lockfile-only"',
+  "validateBunDependencyProposal",
+  'canonical(["bun.lock", "package.json"])',
+  "base and proposal roots must be distinct",
+  "package.json and bun.lock must move together",
+  "coordinated TypeScript lock entries",
+  "the updater retargeted dependency ${name}",
+  "the updater did not strictly upgrade dependency ${name}",
+  "Bun.semver.order",
+  'stderr: "ignore"',
+  'stdout: "ignore"',
+]) {
+  requireContains(
+    "tools/ci/update-bun-dependencies.ts",
+    bunDependencyUpdater,
+    boundary,
+    `Bun resolver is missing fail-closed boundary ${boundary}.`,
+  );
+}
+for (const forbidden of ["registry?:", "minimumReleaseAgeSeconds?:", "bunExecutable?:"]) {
+  rejectContains(
+    "tools/ci/update-bun-dependencies.ts",
+    bunDependencyUpdater,
+    forbidden,
+    `Bun resolver must not expose production-policy override ${forbidden}.`,
+  );
+}
+if (bunDependencyUpdateWorkflow.split("contents: write").length !== 2) {
+  failures.push(
+    ".github/workflows/bun-dependency-update.yml: exactly one fresh job may receive contents: write.",
+  );
+}
+for (const forbidden of [
+  "--force",
+  "environment:",
+  "id-token: write",
+  "pull_request_target:",
+  "secrets.",
+]) {
+  rejectContains(
+    ".github/workflows/bun-dependency-update.yml",
+    bunDependencyUpdateWorkflow,
+    forbidden,
+    `Bun dependency proposals must not contain privileged escape ${forbidden}.`,
+  );
 }
 
 const deployProd = await read(".github/workflows/deploy-prod.yml");

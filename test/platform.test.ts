@@ -199,6 +199,19 @@ describe("platform scaffold and doctor", () => {
     expect(result.stderr).toContain("unreviewed additional workflow .github/workflows/rogue.yml");
   });
 
+  test("doctor and immutable contract reject Bun updater caller drift", async () => {
+    const app = await scaffold("bun-updater-caller-drift");
+    const path = join(app, ".github/workflows/bun-dependency-update.yml");
+    await writeFile(
+      path,
+      (await readFile(path, "utf8")).replace('cron: "23 13 * * 2"', 'cron: "24 13 * * 2"'),
+    );
+    for (const result of [await run(["doctor", app]), await runContract(app)]) {
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("must exactly match the rendered");
+    }
+  });
+
   test("doctor requires the expected full-SHA Terraform module source", async () => {
     const app = await scaffold("mutable-terraform");
     const path = join(app, "infra/terraform/prod/main.tf");
@@ -370,7 +383,13 @@ describe("platform scaffold and doctor", () => {
 
   test("immutable contract binds Terraform mirrors to the resolved reusable workflow SHA", async () => {
     const app = await scaffold("immutable-workflow-sha");
-    const result = await runContract(app, "123456789", "b".repeat(40));
+    const alternatePlatformSha = "b".repeat(40);
+    const updaterCallerPath = join(app, ".github/workflows/bun-dependency-update.yml");
+    await writeFile(
+      updaterCallerPath,
+      (await readFile(updaterCallerPath, "utf8")).replaceAll(platformSha, alternatePlatformSha),
+    );
+    const result = await runContract(app, "123456789", alternatePlatformSha);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("module source must match the active reusable workflow SHA");
   });
