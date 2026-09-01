@@ -1770,8 +1770,12 @@ export function buildReceiptLeases(
   // storage.objects.create)`. Separating the scopes lets elevate remove exactly
   // the consumed grant while the result grant, which is still needed to publish
   // the post-apply receipt, survives.
-  const creatorResources = consumedResource === undefined
-    ? [planResource, ...(finalResource === undefined ? [] : [finalResource])]
+  // A rehearsal publishes exactly one object and reviews no plan, so it gets
+  // create on the final receipt and nothing else.
+  const creatorResources = mode === "rehearsal"
+    ? [finalResource!]
+    : consumedResource === undefined
+    ? [planResource]
     : [resultResource!, finalResource!];
   return [
     ...(consumedResource === undefined ? [] : [{

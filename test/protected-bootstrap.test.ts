@@ -66,6 +66,8 @@ import {
   federationQuarantineRecordFromJson,
   restoreQuarantinedFederation,
   PRODUCTION_APPLY_ENABLED,
+  recoverFederationQuarantines,
+  type FederationRecoverySummary,
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
   proveExposure,
@@ -3848,6 +3850,9 @@ describe("protected owner Terraform bridge", () => {
     const dependencies = fakeDependencies(events);
     await runProtectedBootstrap(invocation, dependencies);
     expect(events).toEqual([
+      // No protected work of any kind begins before the fleet is known free of
+      // unrepaired federation quarantines.
+      "federation:preflight",
       "prepare",
       "acquire",
       "freeze",
@@ -6024,6 +6029,276 @@ describe("protected owner Terraform bridge", () => {
     ))
       .rejects.toThrow("active GitHub Actions run");
     expect(requestedPages).toEqual([1, 2]);
+  });
+
+  // Abrupt loss, exercised through the real recovery entrypoint. Only the HTTP
+  // layer and the executor-containment probe are stand-ins; runProtectedRecovery
+  // calls the same recoverFederationQuarantines and restoreQuarantinedFederation
+  // a lost runner would.
+  const POOL_PROJECTS: Record<string, string> = {
+    cdbentley: "cdbentley",
+    "critical-history": "critical-history-16823277",
+    healthmcp: "medlock-1025243085",
+    runsetta: "runsetta",
+  };
+  const intentBody = (repository: string, root: string, runId: string) => {
+    const pools = [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([name, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(
+          {
+            description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+            disabled: false,
+            displayName: "GitHub Actions",
+            name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+            state: "ACTIVE",
+          },
+          project!,
+        ),
+      ),
+      name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+      repository: name,
+    }));
+    return JSON.stringify({
+      capturedAt: "2026-09-01T12:00:00.000Z",
+      platformSha: "b".repeat(40),
+      pools,
+      repository,
+      root,
+      runId,
+    });
+  };
+
+  // A whole fleet: four pools, every state bucket, and immutable object writes.
+  function recoveryWorld(options: {
+    readonly disabled: Record<string, boolean>;
+    readonly objects: Record<string, Record<string, string>>;
+  }) {
+    const writes: string[] = [];
+    const patched: string[] = [];
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname === "iam.googleapis.com") {
+        const project = url.pathname.split("/")[3]!;
+        if (init?.method === "PATCH") {
+          patched.push(project);
+          options.disabled[project] = JSON.parse(String(init.body)).disabled;
+          return Response.json({ name: "operations/1" });
+        }
+        return Response.json({
+          description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+          disabled: options.disabled[project] ?? false,
+          displayName: "GitHub Actions",
+          name: `projects/${project}/locations/global/workloadIdentityPools/github-actions`,
+          state: "ACTIVE",
+        });
+      }
+      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
+      const store = options.objects[bucket] ?? (options.objects[bucket] = {});
+      if (url.pathname.startsWith("/upload/")) {
+        const name = url.searchParams.get("name")!;
+        if (store[name] !== undefined) return new Response("exists", { status: 412 });
+        store[name] = String(init!.body);
+        writes.push(`${bucket}/${name}`);
+        return Response.json({ name });
+      }
+      if (url.searchParams.get("alt") === "media") {
+        const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+        return store[name] === undefined
+          ? new Response("missing", { status: 404 })
+          : new Response(store[name]);
+      }
+      const prefix = url.searchParams.get("prefix") ?? "";
+      return Response.json({
+        items: Object.keys(store).filter((name) => name.startsWith(prefix)).map((name) => ({
+          generation: "1",
+          metageneration: "1",
+          name,
+        })),
+      });
+    }) as unknown as typeof fetch;
+    return { fetcher, patched, writes };
+  }
+
+  const recoveryInvocation = {
+    githubRunId: "999111",
+    ownerAccessToken: "owner-token-value",
+    platformRoot: "/platform",
+    platformSha: "c".repeat(40),
+    repository: "cdbentley" as const,
+    runnerTemp: "/tmp",
+  };
+  const CDB_BOOTSTRAP_BUCKET = "cdbentley-tfstate-882468538648-bootstrap";
+  const INTENT_KEY =
+    "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/123456.json";
+
+  const driveRecovery = async (world: ReturnType<typeof recoveryWorld>, contained = true) => {
+    const summaries: FederationRecoverySummary[] = [];
+    await runProtectedRecovery(recoveryInvocation, {
+      now: () => 1_800_000_000_000,
+      recoverArtifacts: async () => {},
+      recoverFederation: async (invocation, deadlineMs) => {
+        const summary = await recoverFederationQuarantines(
+          invocation.ownerAccessToken,
+          world.fetcher,
+          deadlineMs,
+          async () => contained,
+          async () => {},
+          () => 1_800_000_000_000,
+        );
+        summaries.push(summary);
+        return summary;
+      },
+      verifySource: async () => {},
+    });
+    return summaries[0]!;
+  };
+
+  test.each([
+    ["after the intent was written but before any pool moved", {}],
+    ["after the first pool PATCH", { cdbentley: true }],
+    ["after every pool PATCH, at elevation", {
+      cdbentley: true,
+      "critical-history-16823277": true,
+      "medlock-1025243085": true,
+      runsetta: true,
+    }],
+    ["mid-restore, with two pools already handed back", {
+      "medlock-1025243085": true,
+      runsetta: true,
+    }],
+  ])("recovery repairs a run lost %s", async (_label, disabled) => {
+    const world = recoveryWorld({
+      disabled: { ...disabled } as Record<string, boolean>,
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const summary = await driveRecovery(world);
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.restored).toEqual([INTENT_KEY]);
+    // Only the pools that were still disabled are touched, and all of them end
+    // enabled.
+    for (const project of Object.values(POOL_PROJECTS)) {
+      expect(world.patched.includes(project)).toBe(Boolean((disabled as Record<string, boolean>)[project]));
+    }
+    // And the completion marker binds the exact record it repaired.
+    expect(world.writes).toEqual([`${CDB_BOOTSTRAP_BUCKET}/${INTENT_KEY}.restored`]);
+  });
+
+  test("recovery lost after restore but before the marker is idempotent", async () => {
+    const world = recoveryWorld({
+      disabled: {},
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const first = await driveRecovery(world);
+    const second = await driveRecovery(world);
+
+    expect(first.restored).toEqual([INTENT_KEY]);
+    // The marker now exists, so the second pass will not replay the record and
+    // undo a disable somebody intended later.
+    expect(second.restored).toEqual([]);
+    expect(second.skippedComplete).toEqual([INTENT_KEY]);
+    expect(world.patched).toEqual([]);
+  });
+
+  test("recovery for one target repairs an intent left by a run for another", async () => {
+    // The lost run was healthmcp/prod; this recovery run was pointed at
+    // cdbentley. A per-target scan would never have seen it.
+    const key = "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json";
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        "medlock-tfstate-1025243085": {
+          [key]: intentBody("healthmcp", "prod", "777888"),
+        },
+      },
+    });
+    const summary = await driveRecovery(world);
+
+    expect(summary.restored).toEqual([key]);
+    expect(world.patched.toSorted()).toEqual(
+      ["cdbentley", "critical-history-16823277", "medlock-1025243085", "runsetta"],
+    );
+  });
+
+  test("an intent whose executor is not contained is left closed and reported", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+
+    await expect(runProtectedRecovery(recoveryInvocation, {
+      now: () => 1_800_000_000_000,
+      recoverArtifacts: async () => {},
+      recoverFederation: async (invocation, deadlineMs) =>
+        await recoverFederationQuarantines(
+          invocation.ownerAccessToken,
+          world.fetcher,
+          deadlineMs,
+          async () => false,
+          async () => {},
+          () => 1_800_000_000_000,
+        ),
+      verifySource: async () => {},
+    })).rejects.toThrow("not provably contained");
+
+    // Nothing was handed back, and no marker was written.
+    expect(world.patched).toEqual([]);
+    expect(world.writes).toEqual([]);
+  });
+
+  test("an intent whose object name disagrees with its own identity is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          // Body says run 123456; the object claims 999999.
+          "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/999999.json":
+            intentBody("cdbentley", "bootstrap", "123456"),
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow("federation intent object name");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an intent that was rewritten after it was armed is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const rewritten = (async (input: string | URL, init?: RequestInit) => {
+      const response = await world.fetcher(input as string, init);
+      const url = new URL(String(input));
+      if (url.searchParams.get("prefix") !== null) {
+        const body = await response.json() as { items: { metageneration: string }[] };
+        // The durable intent is written once; a second generation means
+        // somebody rewrote the record this restore would act on.
+        return Response.json({ items: body.items.map((item) => ({ ...item, metageneration: "2" })) });
+      }
+      return response;
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      rewritten,
+      1_800_000_060_000,
+      async () => true,
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("federation intent metageneration");
+    expect(world.patched).toEqual([]);
   });
 
   // Stage one of the rollout. The subsystem that closes the privileged window
