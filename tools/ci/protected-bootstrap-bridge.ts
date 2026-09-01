@@ -284,6 +284,7 @@ const BRIDGE_PHASES = [
   "controller.federation-preflight",
   "controller.federation-restore",
   "controller.final-audit",
+  "controller.local-cleanup",
   "controller.owner-completion",
   "controller.quarantine",
   "controller.complete",
@@ -1367,7 +1368,10 @@ export function validateInvocation(
     source.EXPOSURE_ADOPTION_RUN_ID,
     "exposure adoption run ID",
   );
-  if (repository === "runsetta" && terraformRoot === "prod") {
+  // Mode-specific, not repository-specific alone. A rehearsal adopts nothing,
+  // and buildReceiptLeases refuses a rehearsal that names an adoption -- so
+  // requiring one here would make Runsetta prod rehearsals unconstructible.
+  if (repository === "runsetta" && terraformRoot === "prod" && mode !== "rehearsal") {
     numeric(exposureAdoptionRunId, "Runsetta exposure adoption run ID");
   } else {
     exact(exposureAdoptionRunId, "", "non-Runsetta-prod exposure adoption run ID");
@@ -1413,8 +1417,10 @@ export function validateInvocation(
   }
   const approvedManifestSha256 = source.APPROVED_MANIFEST_SHA256 ?? "";
   const approvedPlanRunId = source.APPROVED_PLAN_RUN_ID ?? "";
-  if (mode === "plan" && (approvedManifestSha256 !== "" || approvedPlanRunId !== "")) {
-    throw new Error("Plan mode forbids an approved plan run or manifest digest.");
+  // Every non-apply mode, not just plan. Naming an approved run in a rehearsal
+  // would let it carry apply authority it can never legitimately exercise.
+  if (mode !== "apply" && (approvedManifestSha256 !== "" || approvedPlanRunId !== "")) {
+    throw new Error("Only apply mode may name an approved plan run or manifest digest.");
   }
   if (mode === "apply") {
     hash(approvedManifestSha256, "approved manifest digest");
@@ -4680,7 +4686,18 @@ export async function runProtectedBootstrap(
   let federationRestored = false;
   let pendingReceipt: FinalReceiptReference | undefined;
   let completedReleaseProof: ExecutorReleaseProof | undefined;
+  let privateCleanupComplete = false;
   try {
+    // Private cleanup is a PREREQUISITE for either artifact, not an epilogue.
+    // Publishing first would leave a pending receipt a later finalizer could
+    // count -- or a terminal rehearsal record claiming success -- for a run
+    // whose plan file, Terraform data directory and sandbox were still on disk.
+    const proveLocalCleanup = async (): Promise<void> => {
+      for (const path of [planPath, tfDataPath, sandboxPath]) {
+        await dependencies.removePrivatePath(path);
+      }
+      privateCleanupComplete = true;
+    };
     // Nothing starts until the fleet is known to be free of unrepaired
     // quarantines, for any target, not just this one.
     telemetry.phase("controller.federation-preflight");
@@ -4758,6 +4775,8 @@ export async function runProtectedBootstrap(
           terraformRoot: invocation.terraformRoot,
         }, "rehearsal review identity"))),
       };
+      telemetry.phase("controller.local-cleanup");
+      await proveLocalCleanup();
       telemetry.phase("controller.apply-publish");
       pendingReceipt = await dependencies.publishFinalReceipt(
         invocation,
@@ -5087,6 +5106,8 @@ export async function runProtectedBootstrap(
       terraformDirectory,
       operationDeadlineMs,
     );
+    telemetry.phase("controller.local-cleanup");
+    await proveLocalCleanup();
     telemetry.phase("controller.apply-publish");
     // One receipt. The legacy post-apply receipt is gone: it was written before
     // privilege was surrendered and before federation was handed back, so it
@@ -5130,9 +5151,9 @@ export async function runProtectedBootstrap(
       Promise.resolve().then(() =>
         dependencies.releaseExecutor(invocation, session, cleanupDeadlineMs)
       ),
-      ...[planPath, tfDataPath, sandboxPath].map((path) =>
+      ...(privateCleanupComplete ? [] : [planPath, tfDataPath, sandboxPath].map((path) =>
         Promise.resolve().then(() => dependencies.removePrivatePath(path))
-      ),
+      )),
     ]);
     const cleanupErrors: unknown[] = [releaseResult, ...pathResults].flatMap((result) =>
       result.status === "rejected" ? [result.reason] : []
@@ -13854,7 +13875,7 @@ export async function consumePlanReceipt(
 // captured, and the restored world audited to zero diff.
 export async function publishFinalProtectedReceipt(
   invocation: Invocation,
-  executorToken: string,
+  ownerToken: string,
   review: ReviewManifestResult,
   proof: FinalProtectedProof,
   nowMs: number,
@@ -13933,13 +13954,11 @@ export async function publishFinalProtectedReceipt(
     invocation.mode === "rehearsal" ? "rehearsals" : "final",
     invocation.githubRunId,
   );
-  const generation = await writeImmutableObject(
-    state.bucket,
-    object,
-    body,
-    executorToken,
-    fetcher,
-  );
+  // Reconciled like every other immutable write: a terminal rehearsal receipt
+  // whose response was lost must not turn a finished rehearsal into a failure.
+  await writeImmutableObjectIdempotent(state.bucket, object, body, ownerToken, fetcher);
+  const written = await readObjectMetadata(state.bucket, object, ownerToken, fetcher);
+  const generation = written.generation;
   return {
     bucket: state.bucket,
     deElevationExecutorEmail: proof.deElevation.executorEmail,

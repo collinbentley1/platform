@@ -196,9 +196,14 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "EXPOSURE_ADOPTION_RUN_ID: ${{ inputs.exposure_adoption_run_id }}",
     );
+    // Runsetta-prod adoption is mode-specific: a rehearsal adopts nothing.
     expect(workflow).toContain(
-      'if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ]; then',
+      'if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ] \\',
     );
+    expect(workflow).toContain('&& [ "$EXECUTION_MODE" != "rehearsal" ]; then');
+    // Approval fields belong to an apply and to nothing else.
+    expect(workflow).toContain('if [ "$EXECUTION_MODE" = "apply" ]; then');
+    expect(workflow).toContain('case "$EXECUTION_MODE" in plan|apply|rehearsal) ;; *) exit 1 ;; esac');
     expect(workflow).toContain("PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}");
     expect(workflow).toContain("/usr/bin/env -i");
     expect(workflow.match(/OWNER_OAUTH_ACCESS_TOKEN: \$\{\{ secrets\.OWNER_OAUTH_ACCESS_TOKEN \}\}/g)).toHaveLength(
@@ -1643,7 +1648,7 @@ describe("protected owner Terraform bridge", () => {
         ...environment,
         APPROVED_MANIFEST_SHA256: "d".repeat(64),
       }),
-    ).toThrow("Plan mode forbids");
+    ).toThrow("Only apply mode may name an approved plan run");
     expect(() =>
       validateInvocation({
         ...environment,
@@ -6915,7 +6920,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events).not.toContain("publish:final");
   });
 
-  test("a private-path cleanup failure does not hold federation closed", async () => {
+  test("a private-path cleanup failure publishes nothing and holds no federation", async () => {
     const raw = plan([]);
     const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
     const events: string[] = [];
@@ -6935,11 +6940,16 @@ describe("protected owner Terraform bridge", () => {
         runTerraform: async () => {},
         verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       }),
-    )).rejects.toThrow("cleanup did not complete exactly");
+    )).rejects.toThrow();
 
-    // A leftover scratch path is recoverable at leisure; the executor was
-    // contained, so federation is handed back.
+    // Cleanup is a prerequisite, so no artifact a finalizer could ever count
+    // exists for a run whose plan file and sandbox are still on disk.
+    expect(events).not.toContain("publish:final");
+    expect(events).not.toContain("owner:completion");
+    // Federation was handed back before cleanup ran, and containment succeeded,
+    // so it is not left closed either.
     expect(events).toContain("federation:restore");
+    expect(events).toContain("release");
   });
 
   test("a pool that reports success without converging is refused before elevation", () => {
@@ -7417,6 +7427,73 @@ describe("protected owner Terraform bridge", () => {
   // fake controller dependencies. Building its receipt scope used to derive a
   // plan object name from an approved run id it does not have, so it threw on
   // numeric("") long before the live lifecycle it exists to exercise.
+  // The rehearsal matrix has to be self-consistent across validate, leases and
+  // the projection, for every repository and root -- Runsetta prod especially,
+  // where an adoption run id is mandatory for an apply and forbidden for a
+  // rehearsal. A contradiction between any two of those three makes the route
+  // unconstructible at exactly the moment it is needed.
+  test.each([
+    ["cdbentley", "bootstrap"],
+    ["cdbentley", "prod"],
+    ["runsetta", "bootstrap"],
+    ["runsetta", "prod"],
+    ["healthmcp", "bootstrap"],
+    ["healthmcp", "prod"],
+    ["critical-history", "bootstrap"],
+    ["critical-history", "prod"],
+  ])("a %s %s rehearsal validates, leases and projects consistently", (repository, root) => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      CONSUMER_SHA: "b".repeat(40),
+      EXECUTION_MODE: "rehearsal",
+      TARGET_REPOSITORY: repository,
+      TERRAFORM_ROOT: root,
+    });
+
+    expect(invocation.mode).toBe("rehearsal");
+    // No approval identity and no adoption identity, whatever the target is.
+    expect(invocation.approvedPlanRunId).toBe("");
+    expect(invocation.approvedManifestSha256).toBe("");
+    expect(invocation.exposureAdoptionRunId).toBe("");
+    // And the lease builder agrees rather than contradicting it.
+    expect(
+      buildReceiptLeases(
+        repository as "cdbentley",
+        root as "bootstrap",
+        invocation.githubRunId,
+        new Date("2026-08-30T12:00:00.000Z"),
+        "rehearsal",
+        "",
+        executorEmail,
+        "",
+      ),
+    ).toEqual([]);
+  });
+
+  test("a rehearsal that carries approval fields is refused", () => {
+    expect(() =>
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: "d".repeat(64),
+        APPROVED_PLAN_RUN_ID: "123455",
+        EXECUTION_MODE: "rehearsal",
+      })
+    ).toThrow("Only apply mode may name an approved plan run");
+  });
+
+  test("a Runsetta prod rehearsal that names an adoption run is refused", () => {
+    expect(() =>
+      validateInvocation({
+        ...validEnvironment(),
+        CONSUMER_SHA: "b".repeat(40),
+        EXECUTION_MODE: "rehearsal",
+        EXPOSURE_ADOPTION_RUN_ID: "123455",
+        TARGET_REPOSITORY: "runsetta",
+        TERRAFORM_ROOT: "prod",
+      })
+    ).toThrow("non-Runsetta-prod exposure adoption run ID");
+  });
+
   test("a rehearsal builds no receipt lease and does not derive a plan object", () => {
     const leases = buildReceiptLeases(
       "cdbentley",
