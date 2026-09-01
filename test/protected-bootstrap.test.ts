@@ -7286,6 +7286,14 @@ describe("protected owner Terraform bridge", () => {
       }
       return value;
     }) satisfies ControllerMockMutation, "controller result completeness drifted"],
+    ["a numeric attachment substituted into an ID-scoped analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        main.analysisResults[0]!.attachedResourceFullName =
+          `//cloudresourcemanager.googleapis.com/projects/${REPOSITORIES.cdbentley.exposure.projectNumber}`;
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller policy attachment drifted"],
     ["an empty analysis result", ((kind, repository, value) => {
       if (kind === "analysis" && repository === "cdbentley") {
         (value.mainAnalysis as Record<string, unknown>).analysisResults = [];

@@ -3857,6 +3857,11 @@ function validateFederationControllerAnalysis(
 ): void {
   const repository = snapshot.repository;
   const projectId = REPOSITORIES[repository].projectId;
+  // The request path and analysis scope both use the immutable contracted
+  // project ID. Cloud Asset echoes that ID in attachedResourceFullName (and in
+  // each ACL resource) for this ID-scoped query; substituting the numeric
+  // project identity would reject every live response. Keep the exact echo so
+  // a result from another scope cannot be admitted by suffix or alias.
   const projectFullName = `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
   const response = record(value, `${repository} federation controller analysis`);
   exactKeys(
