@@ -3374,6 +3374,8 @@ export const FEDERATION_POOL_ID = "github-actions";
 const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
 const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
 const MAX_FEDERATION_INTENT_PAGES = 32;
+const FEDERATION_MARKER_SKEW_MS = 5 * 60_000;
+const FEDERATION_MARKER_MAX_AGE_MS = 365 * 24 * 60 * 60_000;
 
 export interface FederationPoolState {
   readonly description: string;
@@ -3499,8 +3501,12 @@ interface StorageObjectListing {
   readonly generation: string;
   readonly metageneration: string;
   readonly name: string;
+  readonly size: number;
 }
 
+// A listing that cannot be trusted cannot bound a restore. Duplicate names, a
+// repeated or looping page token, and a page that arrives after the token said
+// there were none are all refused rather than absorbed.
 async function listStorageObjects(
   bucket: string,
   prefix: string,
@@ -3508,47 +3514,176 @@ async function listStorageObjects(
   fetcher: Fetcher,
 ): Promise<readonly StorageObjectListing[]> {
   const items: StorageObjectListing[] = [];
+  const names = new Set<string>();
+  const seenTokens = new Set<string>();
   let pageToken: string | undefined;
   for (let page = 0; page < MAX_FEDERATION_INTENT_PAGES; page += 1) {
     const url = new URL(`https://storage.googleapis.com/storage/v1/b/${bucket}/o`);
     url.searchParams.set("prefix", prefix);
     url.searchParams.set("maxResults", "200");
-    url.searchParams.set("fields", "items(name,generation,metageneration),nextPageToken");
+    url.searchParams.set("fields", "items(name,generation,metageneration,size),nextPageToken");
     if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
     const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
     if (!response.ok) {
       throw new Error(`Federation intent listing failed with HTTP ${response.status}.`);
     }
     const body = record(await boundedJson(response, 4 * 1024 * 1024), "federation intent listing");
+    exactKeys(body, new Set(["items", "nextPageToken"]), "federation intent listing");
     for (const raw of array(body.items ?? [], "federation intent listing items")) {
       const item = record(raw, "federation intent listing item");
+      const name = requiredString(item.name, "federation intent object name");
+      if (!name.startsWith(prefix)) {
+        throw new Error("Federation intent listing returned an object outside its prefix.");
+      }
+      // A name that appears twice means the pages shifted under the walk, and
+      // the set that came back is not the set that exists.
+      if (names.has(name)) {
+        throw new Error(`Federation intent listing repeated ${name} across pages.`);
+      }
+      names.add(name);
+      const size = Number(requiredString(item.size, "federation intent object size"));
+      if (!Number.isSafeInteger(size) || size < 1 || size > 32 * 1024) {
+        throw new Error("Federation intent object size escaped its bound.");
+      }
+      const generation = requiredString(item.generation, "federation intent generation");
+      if (!/^[0-9]+$/.test(generation)) {
+        throw new Error("Federation intent generation is malformed.");
+      }
       items.push({
-        generation: requiredString(item.generation, "federation intent generation"),
+        generation,
         metageneration: requiredString(item.metageneration, "federation intent metageneration"),
-        name: requiredString(item.name, "federation intent object name"),
+        name,
+        size,
       });
     }
     const next = body.nextPageToken;
     if (next === undefined || next === null) return items;
-    pageToken = requiredString(next, "federation intent page token");
+    const nextToken = requiredString(next, "federation intent page token");
+    // A token the server has already handed out is a loop, not a page.
+    if (seenTokens.has(nextToken)) {
+      throw new Error("Federation intent listing repeated a page token.");
+    }
+    seenTokens.add(nextToken);
+    pageToken = nextToken;
   }
   throw new Error("Federation intent listing did not terminate within its page bound.");
 }
 
-// The production recovery path. It runs from --recover-only and as a preflight
-// before every protected run, and it is the only thing that repairs a run that
-// died holding four disabled pools.
+export interface FederationRestoreMarker {
+  readonly intentDigest: string;
+  readonly intentGeneration: string;
+  readonly repository: RepositoryName;
+  readonly restoredAt: string;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+export function federationRestoreMarkerBody(marker: FederationRestoreMarker): string {
+  return `${canonicalJson(json({ ...marker }, "federation restore marker"))}\n`;
+}
+
+// A marker is only a completion record if it says, in full, which exact bytes
+// of which exact object it completed. A file that merely has the right NAME
+// proves nothing, and treating it as proof would let anyone suppress a restore
+// by creating an empty object.
+export function federationRestoreMarkerFromJson(
+  value: unknown,
+  nowMs: number,
+): FederationRestoreMarker {
+  const source = record(value, "federation restore marker");
+  exactKeys(
+    source,
+    new Set(["intentDigest", "intentGeneration", "repository", "restoredAt", "root", "runId"]),
+    "federation restore marker",
+  );
+  const intentDigest = requiredString(source.intentDigest, "federation restore marker digest");
+  if (!/^[0-9a-f]{64}$/.test(intentDigest)) {
+    throw new Error("Federation restore marker digest is not a SHA-256 digest.");
+  }
+  const intentGeneration = requiredString(
+    source.intentGeneration,
+    "federation restore marker intent generation",
+  );
+  if (!/^[0-9]+$/.test(intentGeneration)) {
+    throw new Error("Federation restore marker intent generation is malformed.");
+  }
+  const restoredAt = requiredString(source.restoredAt, "federation restore marker time");
+  const restoredAtMs = Date.parse(restoredAt);
+  if (
+    !Number.isFinite(restoredAtMs) ||
+    new Date(restoredAtMs).toISOString() !== restoredAt ||
+    restoredAtMs > nowMs + FEDERATION_MARKER_SKEW_MS ||
+    restoredAtMs < nowMs - FEDERATION_MARKER_MAX_AGE_MS
+  ) {
+    throw new Error("Federation restore marker time is malformed or out of bounds.");
+  }
+  return {
+    intentDigest,
+    intentGeneration,
+    repository: repositoryName(requiredString(source.repository, "federation restore marker repository")),
+    restoredAt,
+    root: rootName(requiredString(source.root, "federation restore marker root")),
+    runId: numeric(requiredString(source.runId, "federation restore marker run ID"), "federation restore marker run ID"),
+  };
+}
+
+// The production recovery path. It runs from --recover-only and as the preflight
+// before every protected run, over the identical code, and it is the only thing
+// that repairs a run that died holding four disabled pools.
 //
-// A pool is re-enabled only when: the object sits at exactly the contracted
-// prefix, its body digest matches what the record says it is, the record itself
-// validates completely, no completion marker exists, and the executor for that
-// record's own repository and run is provably contained. Anything else is left
-// alone and reported.
+// A pool is re-enabled only when all of this holds: the object sits at exactly
+// the contracted key for the identity inside it, its listed size and generation
+// match the bytes actually read back at that generation, it was written once,
+// no VALIDATED completion marker exists for those exact bytes, and the executor
+// for that record's own repository and run has been driven to provable absence
+// through the same stable-empty recovery a lost run would get. Anything else is
+// left closed and reported.
+// The one containment path, shared verbatim by --recover-only and by the
+// preflight every protected run performs. A single artifact probe is not
+// containment: the executor is driven to provable absence through the same
+// stable-empty, propagation-horizon recovery a lost run would receive, against
+// the intent's OWN repository, run, project, and platform SHA -- never against
+// whichever target this recovery run happens to be pointed at.
+export function federationIntentContainment(options: {
+  readonly fetcher: Fetcher;
+  readonly now: () => number;
+  readonly ownerAccessToken: string;
+  readonly platformRoot: string;
+  readonly runnerTemp: string;
+  readonly sleep: (milliseconds: number) => Promise<void>;
+  readonly telemetry?: BridgeTelemetry;
+}): (intent: FederationQuarantineRecord, deadlineMs: number) => Promise<boolean> {
+  return async (intent, deadlineMs) => {
+    try {
+      await recoverBridgeArtifactsUntilStable(
+        {
+          githubRunId: intent.runId,
+          ownerAccessToken: options.ownerAccessToken,
+          platformRoot: options.platformRoot,
+          platformSha: intent.platformSha,
+          repository: intent.repository,
+          runnerTemp: options.runnerTemp,
+        },
+        options.fetcher,
+        options.sleep,
+        deadlineMs,
+        options.now,
+        options.telemetry,
+      );
+      return true;
+    } catch {
+      // Not contained is a state, not a crash: the caller leaves the pools
+      // closed and reports the intent rather than guessing.
+      return false;
+    }
+  };
+}
+
 export async function recoverFederationQuarantines(
   ownerAccessToken: string,
   fetcher: Fetcher,
   deadlineMs: number,
-  proveContained: (record: FederationQuarantineRecord) => Promise<boolean>,
+  containIntent: (intent: FederationQuarantineRecord, deadlineMs: number) => Promise<boolean>,
   sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
   now: () => number = () => Date.now(),
 ): Promise<FederationRecoverySummary> {
@@ -3564,66 +3699,128 @@ export async function recoverFederationQuarantines(
       ownerAccessToken,
       fetcher,
     );
-    const complete = new Set(
-      objects.filter((entry) => entry.name.endsWith(".restored")).map((entry) => entry.name),
-    );
+    const byName = new Map(objects.map((entry) => [entry.name, entry]));
+    // Nothing unknown may sit in a prefix whose contents authorize a restore.
     for (const entry of objects) {
-      if (!entry.name.endsWith(".json")) continue;
-      scanned += 1;
-      // An intent whose restoration already completed must never be replayed:
-      // doing so would undo an intentional later disable.
-      if (complete.has(`${entry.name}.restored`)) {
-        skippedComplete.push(entry.name);
-        continue;
+      const tail = entry.name.slice(location.prefix.length);
+      if (!/^[1-9][0-9]*\.json(\.restored)?$/.test(tail)) {
+        throw new Error(
+          `Federation intent prefix holds an unrecognised object: ${entry.name}.`,
+        );
       }
+    }
+    for (const entry of objects) {
+      if (entry.name.endsWith(".restored")) continue;
+      scanned += 1;
       assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery");
-      const body = await readObject(location.bucket, entry.name, ownerAccessToken, fetcher);
+      // Bound to the generation the listing named, so the object cannot be
+      // swapped between discovery and validation.
+      const body = await readObjectGeneration(
+        location.bucket,
+        entry.name,
+        entry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (Buffer.byteLength(body) !== entry.size) {
+        throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
+      }
       const digest = sha256Hex(body);
-      const parsed: unknown = JSON.parse(body);
-      const intent = federationQuarantineRecordFromJson(parsed);
-      // The object's own name has to agree with the identity inside it, or the
+      const intent = federationQuarantineRecordFromJson(JSON.parse(body) as unknown);
+      const state = REPOSITORIES[intent.repository].state[intent.root];
+      // The object's own key has to agree with the identity inside it, or the
       // two describe different runs and neither can be trusted.
       exact(
         entry.name,
-        federationIntentObjectFor(
-          REPOSITORIES[intent.repository].state[intent.root],
-          intent.runId,
-        ),
+        federationIntentObjectFor(state, intent.runId),
         "federation intent object name",
       );
-      exact(location.bucket, REPOSITORIES[intent.repository].state[intent.root].bucket,
-        "federation intent bucket");
+      exact(location.bucket, state.bucket, "federation intent bucket");
       // Written once, immutably: a metageneration past its first value means
       // somebody rewrote the record this restore would act on.
       exact(entry.metageneration, "1", "federation intent metageneration");
-      if (!/^[0-9]+$/.test(entry.generation)) {
-        throw new Error("Federation intent generation is malformed.");
+
+      const markerEntry = byName.get(`${entry.name}.restored`);
+      if (markerEntry !== undefined) {
+        // A name is not a completion record. Read the marker at its own
+        // generation and require it to name these exact bytes and this exact
+        // object; a marker that does not is a forgery or a stale artifact, and
+        // either way it must not suppress the restore.
+        exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
+        const marker = federationRestoreMarkerFromJson(
+          JSON.parse(
+            await readObjectGeneration(
+              location.bucket,
+              markerEntry.name,
+              markerEntry.generation,
+              ownerAccessToken,
+              fetcher,
+            ),
+          ) as unknown,
+          now(),
+        );
+        exact(marker.intentDigest, digest, "federation restore marker intent digest");
+        exact(marker.intentGeneration, entry.generation, "federation restore marker intent generation");
+        exact(marker.repository, intent.repository, "federation restore marker repository");
+        exact(marker.root, intent.root, "federation restore marker root");
+        exact(marker.runId, intent.runId, "federation restore marker run ID");
+        skippedComplete.push(entry.name);
+        continue;
       }
-      if (!await proveContained(intent)) {
+
+      if (!await containIntent(intent, deadlineMs)) {
         // The run that armed this may still hold privilege. Handing federation
         // back now is exactly the overlap the quarantine exists to prevent.
         skippedUncontained.push(entry.name);
         continue;
       }
       await restoreQuarantinedFederation(intent, ownerAccessToken, fetcher, deadlineMs, sleep, now);
-      await writeImmutableObject(
+      await writeFederationRestoreMarker(
         location.bucket,
-        `${entry.name}.restored`,
-        `${canonicalJson(json({
+        entry.name,
+        {
           intentDigest: digest,
           intentGeneration: entry.generation,
           repository: intent.repository,
           restoredAt: new Date(now()).toISOString(),
           root: intent.root,
           runId: intent.runId,
-        }, "federation restore marker"))}\n`,
+        },
         ownerAccessToken,
         fetcher,
+        now,
       );
       restored.push(entry.name);
     }
   }
   return { restored, scanned, skippedComplete, skippedUncontained };
+}
+
+// Idempotent under a lost write response: if the marker is already there, it
+// must be the marker this run would have written, byte for byte. Anything else
+// is a conflict, not a retry.
+export async function writeFederationRestoreMarker(
+  bucket: string,
+  intentObject: string,
+  marker: FederationRestoreMarker,
+  token: string,
+  fetcher: Fetcher,
+  now: () => number = () => Date.now(),
+): Promise<void> {
+  const body = federationRestoreMarkerBody(marker);
+  try {
+    await writeImmutableObject(bucket, `${intentObject}.restored`, body, token, fetcher);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("already published or consumed")) throw error;
+    const observed = await readObject(bucket, `${intentObject}.restored`, token, fetcher);
+    // Validate it as a marker rather than trusting a string compare alone, so
+    // a malformed object cannot pass by matching some other run's bytes.
+    federationRestoreMarkerFromJson(JSON.parse(observed) as unknown, now());
+    if (observed !== body) {
+      throw new Error("A different federation restore marker already exists for this intent.");
+    }
+  }
 }
 
 export function federationIntentLocations(): readonly {
@@ -3791,7 +3988,11 @@ export async function restoreQuarantinedFederation(
   deadlineMs: number,
   sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
   now: () => number = () => Date.now(),
-): Promise<void> {
+): Promise<readonly ObservedFederationPool[]> {
+  // What the world actually looks like afterwards, read back from the API. A
+  // receipt that copied the pre-mutation intent forward would be asserting the
+  // very thing it was supposed to be proving.
+  const observedFinal: ObservedFederationPool[] = [];
   for (const pool of record.pools) {
     const projectId = REPOSITORIES[pool.repository].projectId;
     const observed = await readFederationPool(projectId, token, fetcher);
@@ -3814,9 +4015,13 @@ export async function restoreQuarantinedFederation(
           `The ${pool.repository} workload identity pool was disabled before this run and is now enabled.`,
         );
       }
+      observedFinal.push(observedPool(pool.repository, observed));
       continue;
     }
-    if (!observed.disabled) continue;
+    if (!observed.disabled) {
+      observedFinal.push(observedPool(pool.repository, observed));
+      continue;
+    }
     const restored = await setFederationPoolDisabled(
       projectId,
       pool.disabled,
@@ -3838,7 +4043,33 @@ export async function restoreQuarantinedFederation(
       pool.disabled,
       `restored ${pool.repository} workload identity pool disabled flag`,
     );
+    observedFinal.push(observedPool(pool.repository, restored));
   }
+  if (observedFinal.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Federation restoration did not observe every consumer pool.");
+  }
+  return observedFinal;
+}
+
+export interface ObservedFederationPool {
+  readonly disabled: boolean;
+  readonly fingerprint: string;
+  readonly name: string;
+  readonly observedAt: string;
+  readonly repository: RepositoryName;
+}
+
+function observedPool(
+  repository: RepositoryName,
+  pool: FederationPoolState,
+): ObservedFederationPool {
+  return {
+    disabled: pool.disabled,
+    fingerprint: federationPoolFingerprint(pool),
+    name: pool.name,
+    observedAt: new Date(Date.now()).toISOString(),
+    repository,
+  };
 }
 
 export function federationPoolUrl(projectId: string): string {
@@ -5881,22 +6112,15 @@ function defaultBridgeDependencies(
         invocation.ownerAccessToken,
         api,
         operationDeadlineMs,
-        async (intent) => {
-          const probe = await bridgeArtifactsRemain(
-            REPOSITORIES[intent.repository].projectId,
-            invocation.ownerAccessToken,
-            api,
-            {
-              githubRunId: intent.runId,
-              ownerAccessToken: invocation.ownerAccessToken,
-              platformRoot: invocation.platformRoot,
-              platformSha: invocation.platformSha,
-              repository: intent.repository,
-              runnerTemp: invocation.runnerTemp,
-            },
-          );
-          return !probe.active && probe.exactAccountAbsentOrDenied;
-        },
+        federationIntentContainment({
+          fetcher: api,
+          now: () => Date.now(),
+          ownerAccessToken: invocation.ownerAccessToken,
+          platformRoot: invocation.platformRoot,
+          runnerTemp: invocation.runnerTemp,
+          sleep: (milliseconds) => Bun.sleep(milliseconds),
+          telemetry,
+        }),
       ),
     restoreFederation: async (invocation, record, operationDeadlineMs) => {
       await restoreQuarantinedFederation(
@@ -5967,22 +6191,15 @@ function defaultRecoveryDependencies(
         invocation.ownerAccessToken,
         api,
         recoveryDeadlineMs,
-        // Containment is proven per record, against that record's own project
-        // and run -- not against the repository this recovery run was pointed
-        // at, which may be a different one entirely.
-        async (intent) => {
-          const probe = await bridgeArtifactsRemain(
-            REPOSITORIES[intent.repository].projectId,
-            invocation.ownerAccessToken,
-            api,
-            {
-              ...invocation,
-              githubRunId: intent.runId,
-              repository: intent.repository,
-            },
-          );
-          return !probe.active && probe.exactAccountAbsentOrDenied;
-        },
+        federationIntentContainment({
+          fetcher: api,
+          now: () => Date.now(),
+          ownerAccessToken: invocation.ownerAccessToken,
+          platformRoot: invocation.platformRoot,
+          runnerTemp: invocation.runnerTemp,
+          sleep: (milliseconds) => Bun.sleep(milliseconds),
+          telemetry,
+        }),
         (milliseconds) => Bun.sleep(milliseconds),
         () => Date.now(),
       );
@@ -13534,7 +13751,7 @@ async function writeImmutableObject(
   body: string,
   token: string,
   fetcher: Fetcher,
-): Promise<void> {
+): Promise<string> {
   if (Buffer.byteLength(body) > 32 * 1024) throw new Error("Receipt exceeded its size bound.");
   const url = new URL(`https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o`);
   url.searchParams.set("uploadType", "media");
@@ -13553,9 +13770,36 @@ async function writeImmutableObject(
     throw new Error("The immutable protected receipt was already published or consumed.");
   }
   if (!response.ok) throw new Error(`Receipt upload failed with HTTP ${response.status}.`);
-  await boundedJson(response, 256 * 1024);
+  const created = record(await boundedJson(response, 256 * 1024), "immutable object write");
+  const generation = requiredString(created.generation, "immutable object generation");
+  if (!/^[0-9]+$/.test(generation)) {
+    throw new Error("Immutable object generation is malformed.");
+  }
   const observed = await readObject(bucket, object, token, fetcher);
   if (observed !== body) throw new Error("Immutable receipt readback was not byte-equivalent.");
+  return generation;
+}
+
+// Reads exactly the bytes a listing named. Without the generation an object can
+// be replaced between the listing and the read, and every check below would
+// then be validating something other than what was discovered.
+async function readObjectGeneration(
+  bucket: string,
+  object: string,
+  generation: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<string> {
+  const url = new URL(
+    `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(object)}`,
+  );
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("generation", generation);
+  const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+  if (!response.ok) {
+    throw new Error(`Generation-bound read failed with HTTP ${response.status}.`);
+  }
+  return await boundedText(response, 32 * 1024);
 }
 
 async function readObject(

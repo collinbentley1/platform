@@ -2277,6 +2277,7 @@ describe("protected owner Terraform bridge", () => {
         expect(url.searchParams.get("name")).toBe("runsetta/exposure/default.tfstate");
         stored = String(init?.body);
         return Response.json({
+          generation: "11",
           bucket: "runsetta-tfstate-601124730704-bootstrap",
           generation,
           name: "runsetta/exposure/default.tfstate",
@@ -5667,7 +5668,11 @@ describe("protected owner Terraform bridge", () => {
         if (name === null) return new Response("", { status: 400 });
         if (objects.has(name)) return new Response("", { status: 412 });
         objects.set(name, String(init?.body));
-        return Response.json({ bucket: "cdbentley-tfstate-882468538648-bootstrap", name });
+        return Response.json({
+          bucket: "cdbentley-tfstate-882468538648-bootstrap",
+          generation: String(1_700_000_000 + objects.size),
+          name,
+        });
       }
       if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
         const encoded = url.pathname.split("/o/")[1];
@@ -5771,7 +5776,11 @@ describe("protected owner Terraform bridge", () => {
         if (name === null) return new Response("", { status: 400 });
         if (objects.has(name)) return new Response("", { status: 412 });
         objects.set(name, String(init?.body));
-        return Response.json({ bucket: REPOSITORIES.runsetta.state.exposure.bucket, name });
+        return Response.json({
+          bucket: REPOSITORIES.runsetta.state.exposure.bucket,
+          generation: String(1_700_000_000 + objects.size),
+          name,
+        });
       }
       if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
         const encoded = url.pathname.split("/o/")[1];
@@ -6081,6 +6090,11 @@ describe("protected owner Terraform bridge", () => {
   }) {
     const writes: string[] = [];
     const patched: string[] = [];
+    const generations: Record<string, string> = {};
+    for (const [bucket, store] of Object.entries(options.objects)) {
+      void bucket;
+      for (const name of Object.keys(store)) generations[name] = "1";
+    }
     const fetcher = (async (input: string | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       if (url.hostname === "iam.googleapis.com") {
@@ -6105,7 +6119,8 @@ describe("protected owner Terraform bridge", () => {
         if (store[name] !== undefined) return new Response("exists", { status: 412 });
         store[name] = String(init!.body);
         writes.push(`${bucket}/${name}`);
-        return Response.json({ name });
+        generations[name] = String(1_700_000_000 + writes.length);
+        return Response.json({ generation: generations[name], name });
       }
       if (url.searchParams.get("alt") === "media") {
         const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
@@ -6113,12 +6128,19 @@ describe("protected owner Terraform bridge", () => {
           ? new Response("missing", { status: 404 })
           : new Response(store[name]);
       }
+      if (url.pathname.includes("/o/")) {
+        const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+        return store[name] === undefined
+          ? new Response("missing", { status: 404 })
+          : Response.json({ generation: generations[name], name });
+      }
       const prefix = url.searchParams.get("prefix") ?? "";
       return Response.json({
         items: Object.keys(store).filter((name) => name.startsWith(prefix)).map((name) => ({
-          generation: "1",
+          generation: generations[name] ?? "1",
           metageneration: "1",
           name,
+          size: String(Buffer.byteLength(store[name]!)),
         })),
       });
     }) as unknown as typeof fetch;
