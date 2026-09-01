@@ -7718,6 +7718,58 @@ describe("protected owner Terraform bridge", () => {
     expect(events.at(-1)).toBe("publish:final");
   });
 
+  test("the final audit preserves a target pool that was disabled before quarantine", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    let auditedFederationQuarantined: boolean | undefined;
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        armFederationQuarantine: async (invocation, session) => {
+          events.push("quarantine:arm");
+          const captured = quarantineIntent(invocation, session);
+          return {
+            generation: "1700000001",
+            record: federationQuarantineRecordFromJson({
+              ...captured,
+              pools: captured.pools.map((pool) =>
+                pool.repository === invocation.repository
+                  ? { ...pool, disabled: true }
+                  : pool
+              ),
+            }),
+          };
+        },
+        auditRestoredState: async (
+          _invocation,
+          _session,
+          _directory,
+          federationQuarantined,
+        ) => {
+          events.push("final-audit");
+          auditedFederationQuarantined = federationQuarantined;
+          return {
+            detailedExitCode: 0 as const,
+            observedAt: "2026-09-01T12:30:00.000Z",
+            outputSha256: "a".repeat(64),
+          };
+        },
+        planJson: JSON.stringify(raw),
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    );
+
+    expect(auditedFederationQuarantined).toBe(true);
+    expect(events).toContain("publish:final");
+  });
+
   test("a quarantine that fails halfway is still undone by this run", async () => {
     // The intent is armed before the first PATCH precisely so that a partial
     // disable is still a disable this run owns.

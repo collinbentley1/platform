@@ -1269,6 +1269,7 @@ export interface BridgeDependencies {
     invocation: Invocation,
     session: ExecutorSession,
     terraformDirectory: string,
+    federationQuarantined: boolean,
     operationDeadlineMs: number,
   ) => Promise<{
     readonly detailedExitCode: 0;
@@ -6218,14 +6219,21 @@ export async function runProtectedBootstrap(
     );
     federationRestored = true;
     // The post-apply audit ran with the pools quarantined, so it attests a
-    // state restoration immediately ends. This one attests the state the run
-    // actually leaves behind: desired state with federation enabled, zero diff,
-    // and its output digest is what the receipt binds.
+    // state restoration immediately ends. This one attests the exact state the
+    // run actually leaves behind, including a target pool that was already
+    // disabled before this run, and its output digest is what the receipt binds.
     telemetry.phase("controller.final-audit");
+    const restoredTargetPools = quarantinedFederation!.record.pools.filter(
+      (pool) => pool.repository === invocation.repository,
+    );
+    if (restoredTargetPools.length !== 1) {
+      throw new Error("The federation quarantine record does not contain one exact target pool.");
+    }
     const restoredAudit = await dependencies.auditRestoredState(
       invocation,
       session,
       terraformDirectory,
+      restoredTargetPools[0]!.disabled,
       operationDeadlineMs,
     );
     // Nothing is published here either. The terminal receipt must not exist
@@ -7714,7 +7722,13 @@ function defaultBridgeDependencies(
       );
       return observed;
     },
-    auditRestoredState: async (invocation, session, terraformDirectory, operationDeadlineMs) => {
+    auditRestoredState: async (
+      invocation,
+      session,
+      terraformDirectory,
+      federationQuarantined,
+      operationDeadlineMs,
+    ) => {
       const contract = REPOSITORIES[invocation.repository];
       const output = await sandbox.run(
         invocation,
@@ -7731,7 +7745,7 @@ function defaultBridgeDependencies(
           ...(invocation.terraformRoot === "bootstrap"
             ? [
               `-var=active_workflow_sha=${invocation.platformSha}`,
-              `-var=federation_quarantined=false`,
+              `-var=federation_quarantined=${federationQuarantined ? "true" : "false"}`,
               `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
               `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
             ]
