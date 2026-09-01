@@ -6192,9 +6192,9 @@ describe("protected owner Terraform bridge", () => {
       }),
     )).rejects.toThrow("cleanup did not complete exactly");
 
-    // The final receipt was written by a de-elevated identity that still
-    // exists. Without the owner's countersignature it is a claim, not a success.
-    expect(events).toContain("publish:final");
+    // Publication happens only after the whole cleanup succeeds, so a failed
+    // executor deletion leaves NO artifact at all -- not a pending one either.
+    expect(events).not.toContain("publish:final");
     expect(events).not.toContain("owner:completion");
   });
 
@@ -6815,13 +6815,18 @@ describe("protected owner Terraform bridge", () => {
     // handed back.
     expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("de-elevate"));
     expect(events.indexOf("de-elevate")).toBeLessThan(events.indexOf("federation:restore"));
-    // And no countable success exists until after both.
+    // And nothing is published until every cleanup prerequisite has succeeded:
+    // the Docker sandbox and the executor both go through releaseExecutor, and
+    // the private paths through removePrivatePath, all before the first write.
     expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("final-audit"));
-    expect(events.indexOf("final-audit")).toBeLessThan(events.indexOf("publish:final"));
-    expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("release"));
-    // The countable object is the owner's, written last, after the executor is
-    // provably gone.
-    expect(events.indexOf("release")).toBeLessThan(events.indexOf("owner:completion"));
+    expect(events.indexOf("final-audit")).toBeLessThan(events.indexOf("release"));
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
+    for (const path of ["remove:tfplan", "remove:tfdata", "remove:sandbox"]) {
+      expect(events.indexOf(path)).toBeGreaterThan(-1);
+      expect(events.indexOf(path)).toBeLessThan(events.indexOf("publish:final"));
+    }
+    // The countable object is the owner's, written last.
+    expect(events.indexOf("publish:final")).toBeLessThan(events.indexOf("owner:completion"));
     expect(events.at(-1)).toBe("owner:completion");
   });
 
@@ -6925,7 +6930,18 @@ describe("protected owner Terraform bridge", () => {
     expect(events).not.toContain("publish:final");
   });
 
-  test("a private-path cleanup failure publishes nothing and holds no federation", async () => {
+  test.each([
+    ["a private path cannot be removed", {
+      removePrivatePath: async () => {
+        throw new Error("a scratch path could not be removed");
+      },
+    }],
+    ["the Docker sandbox and executor release fail together", {
+      releaseExecutor: async () => {
+        throw new Error("sandbox and executor cleanup did not both complete");
+      },
+    }],
+  ])("no owner artifact exists when %s", async (_label, override) => {
     const raw = plan([]);
     const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
     const events: string[] = [];
@@ -6939,22 +6955,65 @@ describe("protected owner Terraform bridge", () => {
       }, true),
       fakeDependencies(events, {
         planJson: JSON.stringify(raw),
-        removePrivatePath: async () => {
-          throw new Error("a scratch path could not be removed");
-        },
         runTerraform: async () => {},
         verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+        ...override,
       }),
     )).rejects.toThrow();
 
-    // Cleanup is a prerequisite, so no artifact a finalizer could ever count
-    // exists for a run whose plan file and sandbox are still on disk.
+    // Publication is downstream of every cleanup prerequisite, so a failure in
+    // any of them leaves nothing a finalizer could ever count -- and no
+    // terminal record claiming the run finished.
     expect(events).not.toContain("publish:final");
     expect(events).not.toContain("owner:completion");
-    // Federation was handed back before cleanup ran, and containment succeeded,
-    // so it is not left closed either.
+  });
+
+  test("a rehearsal whose cleanup fails leaves no terminal record", async () => {
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "900",
+        EXECUTION_MODE: "rehearsal",
+      }),
+      fakeDependencies(events, {
+        releaseExecutor: async () => {
+          throw new Error("sandbox and executor cleanup did not both complete");
+        },
+      }),
+    )).rejects.toThrow();
+
+    // The rehearsal reached its payload but never published it: an early return
+    // here would have exited through `finally` and skipped publication entirely,
+    // which is why there is no longer one.
     expect(events).toContain("federation:restore");
-    expect(events).toContain("release");
+    expect(events).not.toContain("publish:final");
+  });
+
+  test("a rehearsal that completes cleanly publishes exactly one terminal record", async () => {
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "900",
+        EXECUTION_MODE: "rehearsal",
+      }),
+      fakeDependencies(events),
+    );
+
+    expect(events.filter((event) => event === "publish:final")).toHaveLength(1);
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
+    // A rehearsal is never countable, so it never countersigns.
+    expect(events).not.toContain("owner:completion");
+  });
+
+  test("a plan publishes no owner artifact at all", async () => {
+    const events: string[] = [];
+    await runProtectedBootstrap(validateInvocation(validEnvironment()), fakeDependencies(events));
+
+    expect(events).not.toContain("publish:final");
+    expect(events).not.toContain("owner:completion");
+    expect(events).not.toContain("quarantine:arm");
   });
 
   test("a pool that reports success without converging is refused before elevation", () => {

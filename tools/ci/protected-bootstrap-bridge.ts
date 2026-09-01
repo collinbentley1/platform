@@ -291,7 +291,6 @@ const BRIDGE_PHASES = [
   "controller.federation-preflight",
   "controller.federation-restore",
   "controller.final-audit",
-  "controller.local-cleanup",
   "controller.owner-completion",
   "controller.quarantine",
   "controller.complete",
@@ -4715,20 +4714,16 @@ export async function runProtectedBootstrap(
     | { readonly generation: string; readonly record: FederationQuarantineRecord }
     | undefined;
   let federationRestored = false;
-  let pendingReceipt: FinalReceiptReference | undefined;
+  // Held in memory until every cleanup prerequisite has proven itself, so a
+  // crash anywhere before the publication phase leaves no success claim at all.
+  type OwnerPublication = {
+    readonly proof: FinalProtectedProof;
+    readonly review: ReviewManifestResult;
+  };
+  let rehearsalPublication: OwnerPublication | undefined;
+  let applyPublication: OwnerPublication | undefined;
   let completedReleaseProof: ExecutorReleaseProof | undefined;
-  let privateCleanupComplete = false;
   try {
-    // Private cleanup is a PREREQUISITE for either artifact, not an epilogue.
-    // Publishing first would leave a pending receipt a later finalizer could
-    // count -- or a terminal rehearsal record claiming success -- for a run
-    // whose plan file, Terraform data directory and sandbox were still on disk.
-    const proveLocalCleanup = async (): Promise<void> => {
-      for (const path of [planPath, tfDataPath, sandboxPath]) {
-        await dependencies.removePrivatePath(path);
-      }
-      privateCleanupComplete = true;
-    };
     // Nothing starts until the fleet is known to be free of unrepaired
     // quarantines, for any target, not just this one.
     telemetry.phase("controller.federation-preflight");
@@ -4806,13 +4801,14 @@ export async function runProtectedBootstrap(
           terraformRoot: invocation.terraformRoot,
         }, "rehearsal review identity"))),
       };
-      telemetry.phase("controller.local-cleanup");
-      await proveLocalCleanup();
-      telemetry.phase("controller.apply-publish");
-      pendingReceipt = await dependencies.publishFinalReceipt(
-        invocation,
-        rehearsalReview,
-        buildFinalProtectedProof({
+      // Nothing is published here. The entire cleanup -- Docker sandbox, exact
+      // executor release, and every private path -- has to succeed first, or a
+      // failure in `finally` would leave a terminal "rehearsal-complete" record
+      // behind for a run that did not complete. The payload waits in memory,
+      // and there is deliberately no early return: an early return would exit
+      // through `finally` and skip the publication phase entirely.
+      rehearsalPublication = {
+        proof: buildFinalProtectedProof({
           deElevation: rehearsalDeElevation,
           intent: quarantinedFederation.record,
           intentDigest: sha256Hex(
@@ -4824,10 +4820,9 @@ export async function runProtectedBootstrap(
           observedPools: rehearsalPools,
           review: rehearsalReview,
         }),
-        dependencies.now(),
-      );
-      return;
-    }
+        review: rehearsalReview,
+      };
+    } else {
 
     const approved = invocation.mode === "apply"
       ? await dependencies.verifyApproval(invocation, session, proof, dependencies.now())
@@ -5137,16 +5132,13 @@ export async function runProtectedBootstrap(
       terraformDirectory,
       operationDeadlineMs,
     );
-    telemetry.phase("controller.local-cleanup");
-    await proveLocalCleanup();
-    telemetry.phase("controller.apply-publish");
-    // One receipt. The legacy post-apply receipt is gone: it was written before
-    // privilege was surrendered and before federation was handed back, so it
-    // could be counted as success for a run that never finished either.
-    pendingReceipt = await dependencies.publishFinalReceipt(
-      invocation,
+    // Nothing is published here either. The pending receipt is the artifact a
+    // detached finalizer may later count, so it must not exist until the
+    // sandbox is torn down, the executor is provably gone, and every private
+    // path is removed. Only the payload is held.
+    applyPublication = {
       review,
-      buildFinalProtectedProof({
+      proof: buildFinalProtectedProof({
         deElevation: deElevationProof,
         intent: quarantinedFederation!.record,
         intentDigest: sha256Hex(
@@ -5160,8 +5152,7 @@ export async function runProtectedBootstrap(
         restoredAudit,
         review,
       }),
-      dependencies.now(),
-    );
+    };
     await dependencies.appendSummary(
       invocation,
       reviewSummary(invocation, review, {
@@ -5169,6 +5160,7 @@ export async function runProtectedBootstrap(
         planRunId: invocation.approvedPlanRunId,
       }),
     );
+    }
   } catch (error) {
     primaryFailure = error;
     throw error;
@@ -5182,9 +5174,9 @@ export async function runProtectedBootstrap(
       Promise.resolve().then(() =>
         dependencies.releaseExecutor(invocation, session, cleanupDeadlineMs)
       ),
-      ...(privateCleanupComplete ? [] : [planPath, tfDataPath, sandboxPath].map((path) =>
+      ...[planPath, tfDataPath, sandboxPath].map((path) =>
         Promise.resolve().then(() => dependencies.removePrivatePath(path))
-      )),
+      ),
     ]);
     const cleanupErrors: unknown[] = [releaseResult, ...pathResults].flatMap((result) =>
       result.status === "rejected" ? [result.reason] : []
@@ -5236,29 +5228,49 @@ export async function runProtectedBootstrap(
       );
     }
   }
-  // Only reachable when nothing above threw: the apply succeeded, privilege was
-  // surrendered, federation was handed back, the restored state audited clean,
-  // and cleanup completed. The owner now proves the executor is gone and
-  // countersigns the receipt. Until this object exists the final receipt is a
-  // claim, not a countable success -- which is what stops a run whose executor
-  // deletion failed from being counted as one.
-  if (pendingReceipt !== undefined) {
-    if (completedReleaseProof === undefined) {
-      // The receipt the executor wrote stays pending. Nothing counts it, and a
-      // later fresh recovery run -- which has the full propagation budget --
-      // finalizes it once absence is proven there.
-      throw new Error(
-        "The protected run produced no exact executor release proof, so its final receipt stays pending until recovery finalizes it.",
-      );
-    }
-    telemetry.phase("controller.owner-completion");
-    await dependencies.publishOwnerCompletion(
+  // The post-cleanup publication phase.
+  //
+  // Reached only when the try block completed AND the whole finally cleanup
+  // succeeded, so by construction the Docker sandbox is torn down, the executor
+  // is provably released, every private path is gone, and federation is back.
+  // A crash before this point therefore leaves no claim of any kind. The only
+  // recoverable gap left is between the apply pending receipt and its
+  // completion, which is exactly what the detached finalizer exists for.
+  //
+  // A plan reaches here with neither payload set and publishes nothing.
+  if (rehearsalPublication !== undefined) {
+    telemetry.phase("controller.apply-publish");
+    await dependencies.publishFinalReceipt(
       invocation,
-      pendingReceipt,
-      completedReleaseProof,
-      publicationDeadlineMs,
+      rehearsalPublication.review,
+      rehearsalPublication.proof,
+      dependencies.now(),
+    );
+    return;
+  }
+  if (applyPublication === undefined) return;
+  if (completedReleaseProof === undefined) {
+    // Cleanup succeeded without yielding an exact release proof, so there is
+    // nothing to bind a completion to. Publish nothing rather than leave a
+    // pending object a finalizer would later have to reason about.
+    throw new Error(
+      "The protected run produced no exact executor release proof, so no apply receipt may be published.",
     );
   }
+  telemetry.phase("controller.apply-publish");
+  const publishedPending = await dependencies.publishFinalReceipt(
+    invocation,
+    applyPublication.review,
+    applyPublication.proof,
+    dependencies.now(),
+  );
+  telemetry.phase("controller.owner-completion");
+  await dependencies.publishOwnerCompletion(
+    invocation,
+    publishedPending,
+    completedReleaseProof,
+    publicationDeadlineMs,
+  );
 }
 
 export async function main(
