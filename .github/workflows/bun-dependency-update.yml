@@ -413,11 +413,34 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config core.hooksPath /dev/null
-          git checkout -b "$branch"
           git add -- package.json bun.lock
-          git commit -m "chore(deps): refresh Bun dependencies"
-          git -c credential.helper='!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' \
-            push origin "$branch"
+          proposal_tree="$(git write-tree)"
+          git_with_token() {
+            git -c credential.helper='!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f' "$@"
+          }
+          remote_line="$(git_with_token ls-remote --heads origin "refs/heads/$branch")"
+          if [ -n "$remote_line" ]; then
+            if [[ "$remote_line" == *$'\n'* ]]; then
+              echo "refusing ambiguous remote branch result: $branch" >&2
+              exit 1
+            fi
+            read -r remote_sha remote_ref remote_extra <<< "$remote_line"
+            [[ "$remote_sha" =~ ^[0-9a-f]{40}$ ]]
+            test "$remote_ref" = "refs/heads/$branch"
+            test -z "${remote_extra:-}"
+            validation_ref="refs/remotes/platform-bun-updater/$digest"
+            git_with_token fetch --no-tags --no-write-fetch-head origin \
+              "$remote_ref:$validation_ref"
+            test "$(git rev-parse "$validation_ref")" = "$remote_sha"
+            test "$(git rev-list --parents -n 1 "$remote_sha")" = \
+              "$remote_sha $GITHUB_SHA"
+            test "$(git rev-parse "$remote_sha^{tree}")" = "$proposal_tree"
+            echo "reusing the exact digest-bound branch after validating its parent and tree: $branch"
+          else
+            git checkout -b "$branch"
+            git commit -m "chore(deps): refresh Bun dependencies"
+            git_with_token push origin "$branch"
+          fi
           gh pr create --base main --head "$branch" \
             --title "chore(deps): refresh Bun dependencies" \
             --body-file "$RUNNER_TEMP/pr-body.md"

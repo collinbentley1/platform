@@ -212,6 +212,15 @@ test("the weekly workflow verifies on a read-only runner before a fresh writer o
   expect(proposeJob.indexOf("Revalidate the artifact")).toBeLessThan(
     proposeJob.indexOf("GH_TOKEN: ${{ github.token }}"),
   );
+  expect(proposeJob).toContain(
+    'git_with_token ls-remote --heads origin "refs/heads/$branch"',
+  );
+  expect(proposeJob).toContain(
+    'test "$(git rev-list --parents -n 1 "$remote_sha")" =',
+  );
+  expect(proposeJob).toContain(
+    'test "$(git rev-parse "$remote_sha^{tree}")" = "$proposal_tree"',
+  );
   expect(workflow.split("contents: write")).toHaveLength(2);
   expect(workflow).not.toContain("--force");
   expect(workflow).not.toContain("environment:");
