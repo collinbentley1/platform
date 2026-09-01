@@ -4358,8 +4358,13 @@ describe("protected owner Terraform bridge", () => {
         now = mutationCompletedAtMs + 7 * 60_000;
       },
     }));
-    expect(acquireDeadline).toBe(startedAt + 33 * 60_000);
-    expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
+    // 32 minutes, not 33: an apply publishes an owner artifact after cleanup, so
+    // one reviewed minute of the envelope is now reserved for that publication.
+    // Both five-minute IAM consistency windows still fit inside it with 22
+    // minutes to spare, which is the property this test exists to hold.
+    expect(acquireDeadline).toBe(startedAt + 32 * 60_000);
+    expect(acquireDeadline - startedAt).toBeGreaterThan(2 * 5 * 60_000);
+    expect(cleanupDeadline).toBe(startedAt + 37 * 60_000);
     expect(events).toContain("terraform:apply");
     expect(events).toContain("publish:final");
     for (const budget of ["2319", "2341"]) {

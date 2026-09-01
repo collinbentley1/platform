@@ -111,6 +111,13 @@ const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
 // exact-cleanup reserve.
 const WRAPPER_CLEANUP_LEAD_SECONDS = 60;
 const EXACT_CLEANUP_RESERVE_SECONDS = 5 * 60;
+// Owner artifacts are published after cleanup has proven itself, which is past
+// the operation deadline the API fetcher was pinned to during prepare. Without
+// a window of its own, an otherwise-successful late run reaches its final
+// read-and-write with an already-expired API deadline and fails at the last
+// step. The work is deterministic and small: a metadata read, a
+// generation-bound read, and two write-plus-readback pairs.
+const OWNER_PUBLICATION_RESERVE_SECONDS = 60;
 const APPLY_CLEANUP_OVERHEAD_SECONDS = WRAPPER_CLEANUP_LEAD_SECONDS +
   EXACT_CLEANUP_RESERVE_SECONDS;
 // How much of that window setup may consume. The worst pre-elevation instant
@@ -1052,6 +1059,11 @@ export interface FinalReceiptReference {
 
 export interface ExecutorReleaseProof {
   readonly artifactsDeleted: true;
+  // How absence was established. The inline path has exact, direct evidence
+  // about one named account; a detached finalizer has the full propagation
+  // horizon instead. Both are proofs; they are not the same proof, and a
+  // verifier is entitled to know which it is reading.
+  readonly provenBy: "exact-release" | "propagation-horizon";
   readonly executorEmail: string;
   readonly executorUniqueId: string;
   readonly observedAt: string;
@@ -1386,7 +1398,11 @@ export function validateInvocation(
   // A rehearsal runs the federation lifecycle and no Terraform mutation, so it
   // budgets like a plan rather than like an apply.
   const budgetsLikePlan = mode === "plan" || mode === "rehearsal";
-  const minimumOperationBudgetSeconds = budgetsLikePlan
+  const minimumOperationBudgetSeconds = mode === "rehearsal"
+    // A rehearsal takes the plan envelope but still publishes an owner
+    // artifact, so its floor carries the publication reserve plan does not.
+    ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS + OWNER_PUBLICATION_RESERVE_SECONDS
+    : budgetsLikePlan
     ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS
     : MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS;
   const maximumOperationBudgetSeconds = (
@@ -4653,7 +4669,14 @@ export async function runProtectedBootstrap(
   telemetry = bestEffortTelemetry(telemetry);
   const startedAtMs = dependencies.now();
   const wrapperDeadlineMs = startedAtMs + invocation.operationBudgetSeconds * 1_000;
-  const cleanupDeadlineMs = wrapperDeadlineMs - WRAPPER_CLEANUP_LEAD_SECONDS * 1_000;
+  const publicationDeadlineMs = wrapperDeadlineMs - WRAPPER_CLEANUP_LEAD_SECONDS * 1_000;
+  // Only a run that publishes an owner artifact needs the window. A plan writes
+  // its receipt inside the operation window and produces nothing afterwards, so
+  // reserving time it cannot use would shrink the reviewed plan envelope for no
+  // reason -- and would push the seven-minute floor below zero operation time.
+  const cleanupDeadlineMs = invocation.mode === "plan"
+    ? publicationDeadlineMs
+    : publicationDeadlineMs - OWNER_PUBLICATION_RESERVE_SECONDS * 1_000;
   const internalOperationMinutes = invocation.mode === "plan"
     ? PLAN_INTERNAL_OPERATION_MINUTES
     : APPLY_INTERNAL_OPERATION_MINUTES;
@@ -4661,8 +4684,16 @@ export async function runProtectedBootstrap(
     startedAtMs + internalOperationMinutes * 60_000,
     cleanupDeadlineMs - EXACT_CLEANUP_RESERVE_SECONDS * 1_000,
   );
-  if (operationDeadlineMs <= startedAtMs) {
-    throw new Error("Bridge operation budget cannot cover primary work plus exact cleanup.");
+  // Fail closed before anything mutates: if the envelope cannot cover primary
+  // work, exact cleanup AND the owner publication that makes a run countable,
+  // the run must not start rather than discover it at the last step.
+  if (
+    operationDeadlineMs <= startedAtMs ||
+    (invocation.mode !== "plan" && publicationDeadlineMs <= cleanupDeadlineMs)
+  ) {
+    throw new Error(
+      "Bridge operation budget cannot cover primary work, exact cleanup, and owner publication.",
+    );
   }
   const leaseExpiresAt = new Date(startedAtMs + LEASE_MINUTES * 60_000);
   const contract = REPOSITORIES[invocation.repository];
@@ -5225,7 +5256,7 @@ export async function runProtectedBootstrap(
       invocation,
       pendingReceipt,
       completedReleaseProof,
-      cleanupDeadlineMs,
+      publicationDeadlineMs,
     );
   }
 }
@@ -6321,8 +6352,12 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishOwnerCompletion: async (invocation, pending, releaseProof, cleanupDeadlineMs) => {
-      assertBeforeDeadline(Date.now(), cleanupDeadlineMs, "owner completion proof");
+    publishOwnerCompletion: async (invocation, pending, releaseProof, publicationDeadlineMs) => {
+      // This phase runs past the operation deadline the fetcher was pinned to
+      // during prepare, so the API deadline must be advanced to the reviewed
+      // publication window or every late run fails on an expired deadline.
+      apiDeadlineMs = publicationDeadlineMs;
+      assertBeforeDeadline(Date.now(), publicationDeadlineMs, "owner completion proof");
       await publishOwnerCompletionProof(
         invocation,
         invocation.ownerAccessToken,
@@ -7687,6 +7722,7 @@ export class ExecutorLeaseManager {
       observedAt: new Date(Date.now()).toISOString(),
       permissionsProvenGone: true,
       projectBindingsCleared: true,
+      provenBy: "exact-release",
     };
   }
 
@@ -14080,6 +14116,7 @@ export async function publishOwnerCompletionProof(
       observedAt: releaseProof.observedAt,
       permissionsProvenGone: releaseProof.permissionsProvenGone,
       projectBindingsCleared: releaseProof.projectBindingsCleared,
+      provenBy: releaseProof.provenBy,
     },
     finalReceipt: {
       bucket: pending.bucket,
