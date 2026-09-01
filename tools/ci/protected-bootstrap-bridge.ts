@@ -315,6 +315,7 @@ const BRIDGE_PHASES = [
   "recovery.inventory",
   "recovery.complete",
   "recovery.federation",
+  "recovery.finalize",
   "recovery.failed",
 ] as const;
 const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
@@ -1276,6 +1277,12 @@ export interface RecoveryDependencies {
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
   ) => Promise<FederationRecoverySummary>;
+  // Closes the one gap the design leaves: a run that published its pending
+  // apply receipt and died before countersigning it.
+  readonly finalizePendingReceipts: (
+    invocation: RecoveryInvocation,
+    recoveryDeadlineMs: number,
+  ) => Promise<PendingFinalizationSummary>;
   readonly recoverArtifacts: (
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
@@ -4096,6 +4103,254 @@ export async function writeFederationRestoreMarker(
   );
 }
 
+export interface PendingFinalizationSummary {
+  readonly alreadyComplete: readonly string[];
+  readonly finalized: readonly string[];
+  readonly scanned: number;
+  readonly skippedUncontained: readonly string[];
+}
+
+const MAX_RECEIPT_BODY_BYTES = 32 * 1024;
+
+function receiptPrefix(state: { readonly prefix: string }, kind: "completion" | "final"): string {
+  return `${state.prefix}/.protected-bootstrap/${kind}/`;
+}
+
+// The detached owner finalizer.
+//
+// A protected apply publishes its pending receipt after cleanup, then
+// countersigns it. A crash between those two writes is the ONLY gap the design
+// leaves, and this is what closes it -- from a fresh runner, with a fresh owner
+// token, and with the full propagation-horizon plus stable-empty containment
+// proof that the inline path cannot afford inside its five-minute reserve.
+//
+// It never invents evidence. A pending receipt is finalized only when the whole
+// document validates, the durable quarantine intent it names still exists at the
+// exact generation and digest it claims, that intent carries a validated restore
+// marker, and the executor for that run is driven to provable absence. A
+// rehearsal is not eligible: its record lives under a different prefix and is
+// terminal on its own.
+export async function finalizePendingApplyReceipts(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  containRun: (
+    identity: {
+      readonly platformSha: string;
+      readonly repository: RepositoryName;
+      readonly runId: string;
+    },
+    deadlineMs: number,
+  ) => Promise<boolean>,
+  sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<PendingFinalizationSummary> {
+  const alreadyComplete: string[] = [];
+  const finalized: string[] = [];
+  const skippedUncontained: string[] = [];
+  let scanned = 0;
+
+  for (const location of federationIntentLocations()) {
+    assertBeforeDeadline(now(), deadlineMs, "pending receipt finalization scan");
+    const state = REPOSITORIES[location.repository].state[location.root];
+    const pendingObjects = await listStorageObjects(
+      location.bucket,
+      receiptPrefix(state, "final"),
+      ownerAccessToken,
+      fetcher,
+    );
+    const completionObjects = await listStorageObjects(
+      location.bucket,
+      receiptPrefix(state, "completion"),
+      ownerAccessToken,
+      fetcher,
+    );
+    const pendingRuns = new Map<string, StorageObjectListing>();
+    for (const entry of pendingObjects) {
+      const tail = entry.name.slice(receiptPrefix(state, "final").length);
+      if (!/^[1-9][0-9]*\.json$/.test(tail)) {
+        throw new Error(`The pending receipt prefix holds an unrecognised object: ${entry.name}.`);
+      }
+      const runId = tail.slice(0, -".json".length);
+      // Two objects claiming the same run cannot both be that run's receipt.
+      if (pendingRuns.has(runId)) {
+        throw new Error(`Two pending receipts claim run ${runId}.`);
+      }
+      pendingRuns.set(runId, entry);
+    }
+    const completions = new Map<string, StorageObjectListing>();
+    for (const entry of completionObjects) {
+      const tail = entry.name.slice(receiptPrefix(state, "completion").length);
+      if (!/^[1-9][0-9]*\.json$/.test(tail)) {
+        throw new Error(`The completion prefix holds an unrecognised object: ${entry.name}.`);
+      }
+      const runId = tail.slice(0, -".json".length);
+      if (completions.has(runId)) {
+        throw new Error(`Two completions claim run ${runId}.`);
+      }
+      // A completion with no pending receipt has nothing to countersign; it is
+      // either a deletion nobody reviewed or an object nobody should have
+      // written, and either way this stops rather than reasoning past it.
+      if (!pendingRuns.has(runId)) {
+        throw new Error(`Completion ${entry.name} has no pending receipt to countersign.`);
+      }
+      completions.set(runId, entry);
+    }
+
+    for (const [runId, entry] of [...pendingRuns].toSorted(([left], [right]) =>
+      left < right ? -1 : 1
+    )) {
+      scanned += 1;
+      assertBeforeDeadline(now(), deadlineMs, "pending receipt finalization");
+      if (entry.size > MAX_RECEIPT_BODY_BYTES) {
+        throw new Error(`Pending receipt ${entry.name} exceeds its reviewed size bound.`);
+      }
+      const body = await readObjectGeneration(
+        location.bucket,
+        entry.name,
+        entry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (Buffer.byteLength(body) !== entry.size) {
+        throw new Error(`Pending receipt ${entry.name} did not match its listed size.`);
+      }
+      // Repository, root and run come from where the object lives and what it
+      // is called; the platform and consumer commits come from the receipt and
+      // are cross-checked against the durable intent below.
+      const receipt = pendingApplyReceiptFromBody(body, {
+        repository: location.repository,
+        root: location.root,
+        runId,
+      });
+
+      // The durable quarantine intent this receipt names must still exist, at
+      // exactly the generation and digest it claims, and must agree about which
+      // platform commit was running.
+      const intentEntry = await readObjectMetadata(
+        location.bucket,
+        federationIntentObjectFor(state, runId),
+        ownerAccessToken,
+        fetcher,
+      );
+      exact(intentEntry.generation, receipt.intentGeneration, "pending receipt intent generation");
+      const intentBody = await readObjectGeneration(
+        location.bucket,
+        federationIntentObjectFor(state, runId),
+        intentEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      exact(sha256Hex(intentBody), receipt.intentDigest, "pending receipt intent digest");
+      const intent = federationQuarantineRecordFromJson(JSON.parse(intentBody) as unknown);
+      exact(intent.repository, location.repository, "pending receipt intent repository");
+      exact(intent.root, location.root, "pending receipt intent root");
+      exact(intent.runId, runId, "pending receipt intent run ID");
+      exact(intent.platformSha, receipt.platformSha, "pending receipt intent platform SHA");
+
+      // And that intent must carry a validated completion marker: federation
+      // was handed back before this run could ever have published a receipt.
+      const markerObject = `${federationIntentObjectFor(state, runId)}.restored`;
+      const markerEntry = await readObjectMetadata(
+        location.bucket,
+        markerObject,
+        ownerAccessToken,
+        fetcher,
+      );
+      const markerBody = await readObjectGeneration(
+        location.bucket,
+        markerObject,
+        markerEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      const marker = federationRestoreMarkerFromJson(
+        JSON.parse(markerBody) as unknown,
+        now(),
+        Date.parse(intent.capturedAt),
+      );
+      exact(markerBody, federationRestoreMarkerBody(marker), "pending receipt restore marker bytes");
+      exact(marker.intentDigest, receipt.intentDigest, "pending receipt restore marker digest");
+      exact(
+        marker.intentGeneration,
+        receipt.intentGeneration,
+        "pending receipt restore marker intent generation",
+      );
+
+      const existing = completions.get(runId);
+      if (existing !== undefined) {
+        const completionBody = await readObjectGeneration(
+          location.bucket,
+          existing.name,
+          existing.generation,
+          ownerAccessToken,
+          fetcher,
+        );
+        ownerCompletionFromBody(completionBody, {
+          consumerSha: receipt.consumerSha,
+          finalReceiptDigest: sha256Hex(body),
+          finalReceiptGeneration: entry.generation,
+          finalReceiptObject: entry.name,
+          platformSha: receipt.platformSha,
+          repository: location.repository,
+          root: location.root,
+          runId,
+        });
+        alreadyComplete.push(entry.name);
+        continue;
+      }
+
+      if (
+        !await containRun(
+          { platformSha: receipt.platformSha, repository: location.repository, runId },
+          deadlineMs,
+        )
+      ) {
+        skippedUncontained.push(entry.name);
+        continue;
+      }
+
+      await publishOwnerCompletionProof(
+        {
+          consumerSha: receipt.consumerSha,
+          githubRunId: runId,
+          mode: "apply",
+          platformSha: receipt.platformSha,
+          repository: location.repository,
+          terraformRoot: location.root,
+        } as Invocation,
+        ownerAccessToken,
+        {
+          bucket: location.bucket,
+          deElevationExecutorEmail: receipt.deElevationExecutorEmail,
+          deElevationExecutorUniqueId: receipt.deElevationExecutorUniqueId,
+          digest: sha256Hex(body),
+          generation: entry.generation,
+          object: entry.name,
+          publishedAt: receipt.publishedAt,
+          size: entry.size,
+        },
+        {
+          artifactsDeleted: true,
+          executorEmail: receipt.deElevationExecutorEmail,
+          executorUniqueId: receipt.deElevationExecutorUniqueId,
+          observedAt: new Date(now()).toISOString(),
+          permissionsProvenGone: true,
+          projectBindingsCleared: true,
+          // A detached finalizer has the horizon proof, not the inline exact
+          // release, and the completion says so.
+          provenBy: "propagation-horizon",
+        },
+        now(),
+        fetcher,
+      );
+      finalized.push(entry.name);
+      void sleep;
+    }
+  }
+  return { alreadyComplete, finalized, scanned, skippedUncontained };
+}
+
 export function federationIntentLocations(): readonly {
   readonly bucket: string;
   readonly prefix: string;
@@ -5350,6 +5605,19 @@ export async function runProtectedRecovery(
   if (federation.skippedUncontained.length > 0) {
     throw new Error(
       `Federation quarantine recovery left ${federation.skippedUncontained.length} intent(s) closed because their executors are not provably contained.`,
+    );
+  }
+  // Only after federation is provably back does a pending receipt mean what it
+  // says: the run got as far as publishing, and all that is missing is the
+  // countersignature.
+  telemetry.phase("recovery.finalize");
+  const pending = await activeDependencies.finalizePendingReceipts(
+    invocation,
+    recoveryDeadlineMs,
+  );
+  if (pending.skippedUncontained.length > 0) {
+    throw new Error(
+      `Pending receipt finalization left ${pending.skippedUncontained.length} receipt(s) uncounted because their executors are not provably contained.`,
     );
   }
 }
@@ -6615,6 +6883,41 @@ function defaultRecoveryDependencies(
           sleep: (milliseconds) => Bun.sleep(milliseconds),
           telemetry,
         }),
+        (milliseconds) => Bun.sleep(milliseconds),
+        () => Date.now(),
+      );
+    },
+    finalizePendingReceipts: async (invocation, recoveryDeadlineMs) => {
+      apiDeadlineMs = recoveryDeadlineMs;
+      return await finalizePendingApplyReceipts(
+        invocation.ownerAccessToken,
+        api,
+        recoveryDeadlineMs,
+        // The full propagation-horizon and stable-empty proof, against the
+        // receipt's OWN repository, run and platform commit -- the same one a
+        // lost run would receive, not a single artifact probe.
+        async (identity, deadlineMs) => {
+          try {
+            await recoverBridgeArtifactsUntilStable(
+              {
+                githubRunId: identity.runId,
+                ownerAccessToken: invocation.ownerAccessToken,
+                platformRoot: invocation.platformRoot,
+                platformSha: identity.platformSha,
+                repository: identity.repository,
+                runnerTemp: invocation.runnerTemp,
+              },
+              api,
+              (milliseconds) => Bun.sleep(milliseconds),
+              deadlineMs,
+              () => Date.now(),
+              telemetry,
+            );
+            return true;
+          } catch {
+            return false;
+          }
+        },
         (milliseconds) => Bun.sleep(milliseconds),
         () => Date.now(),
       );

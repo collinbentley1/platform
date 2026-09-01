@@ -4791,6 +4791,12 @@ describe("protected owner Terraform bridge", () => {
     const events: string[] = [];
     const dependencies: RecoveryDependencies = {
       now: () => 1_800_000_000_000,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async () => ({
         restored: [],
         scanned: 0,
@@ -5188,6 +5194,12 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async () => ({
         restored: [],
         scanned: 0,
@@ -5216,6 +5228,12 @@ describe("protected owner Terraform bridge", () => {
     const startedAt = fixture.now();
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async () => ({
         restored: [],
         scanned: 0,
@@ -5286,6 +5304,12 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async () => ({
         restored: [],
         scanned: 0,
@@ -5305,6 +5329,12 @@ describe("protected owner Terraform bridge", () => {
     virtualNow = startedAt;
     await expect(runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async () => ({
         restored: [],
         scanned: 0,
@@ -6083,6 +6113,12 @@ describe("protected owner Terraform bridge", () => {
     await runProtectedRecovery(recoveryInvocation, {
       now: () => 1_800_000_000_000,
       recoverArtifacts: async () => {},
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async (invocation, deadlineMs) => {
         const summary = await recoverFederationQuarantines(
           invocation.ownerAccessToken,
@@ -6448,6 +6484,12 @@ describe("protected owner Terraform bridge", () => {
     await expect(runProtectedRecovery(recoveryInvocation, {
       now: () => 1_800_000_000_000,
       recoverArtifacts: async () => {},
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
       recoverFederation: async (invocation, deadlineMs) =>
         await recoverFederationQuarantines(
           invocation.ownerAccessToken,
