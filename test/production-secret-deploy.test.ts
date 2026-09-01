@@ -19,7 +19,7 @@ afterEach(async () => {
 describe("production Secret Manager deploy boundary", () => {
   test("generates a key only for an empty binding/inventory and never exposes its payload", async () => {
     const deployScript = await productionDeployScript();
-    const created = await runDeployScript(deployScript, serviceWithWaitlistEntries([]), []);
+    const created = await runDeployScript(deployScript, serviceWithWaitlistEntries([], []), []);
 
     expect({ exitCode: created.exitCode, stderr: created.stderr }).toEqual({
       exitCode: 0,
@@ -44,6 +44,7 @@ describe("production Secret Manager deploy boundary", () => {
       RECAPTCHA_PROJECT_ID: "medlock-1025243085",
       RECAPTCHA_SITE_KEY: recaptchaSiteKey,
     });
+    expect(created.calls).toContain("recaptcha\tkeys\tlist\t");
     expect(created.calls).toContain(`recaptcha\tkeys\tdescribe\t${recaptchaSiteKey}`);
     expect(created.calls).not.toContain(created.stdinDigest);
     expect(created.deployArguments).not.toContain(created.stdinDigest);
@@ -63,6 +64,7 @@ describe("production Secret Manager deploy boundary", () => {
     });
     expect(reused.calls).not.toContain("secrets\tversions\tlist");
     expect(reused.calls).not.toContain("secrets\tversions\tadd");
+    expect(reused.calls).not.toContain("recaptcha\tkeys\tlist");
     expect(reused.calls).toContain("secrets\tversions\tdescribe\t6");
     expect(reused.stdinDigest).toBe("");
     expect(reused.deployArguments).toContain(
@@ -119,7 +121,7 @@ describe("production Secret Manager deploy boundary", () => {
     }
   });
 
-  test("rejects missing, duplicated, or changed ownership runtime settings", async () => {
+  test("rejects partially populated, duplicated, or changed ownership runtime settings", async () => {
     const deployScript = await productionDeployScript();
     const exact = ownershipEntries();
     const cases = [
@@ -131,6 +133,7 @@ describe("production Secret Manager deploy boundary", () => {
       exact.map((entry) => entry.name === "RECAPTCHA_SITE_KEY"
         ? { ...entry, value: "not a key" }
         : entry),
+      [...exact, { name: "RECAPTCHA_SITE_KEY", valueFrom: { secretKeyRef: {} } }],
     ];
 
     for (const ownership of cases) {
@@ -140,6 +143,35 @@ describe("production Secret Manager deploy boundary", () => {
         [],
       );
       expect(rejected.exitCode).not.toBe(0);
+      expect(rejected.calls).not.toContain("run\tdeploy");
+    }
+  });
+
+  test("the bootstrap inventory requires exactly one Terraform-named ownership key", async () => {
+    const deployScript = await productionDeployScript();
+    const otherKey = {
+      ...exactRecaptchaKey(),
+      name: "projects/229383559510/keys/6LmedlockWaitlistOwnershipKey_0987654321",
+    };
+    const cases: unknown[][] = [
+      [],
+      [exactRecaptchaKey(), otherKey],
+      [{ ...exactRecaptchaKey(), displayName: "Foreign key" }],
+      [{ ...exactRecaptchaKey(), name: `projects/foreign-project/keys/${recaptchaSiteKey}` }],
+    ];
+
+    for (const inventory of cases) {
+      const rejected = await runDeployScript(
+        deployScript,
+        serviceWithWaitlistEntries([], []),
+        [],
+        "ENABLED",
+        exactRecaptchaKey(),
+        inventory,
+      );
+      expect(rejected.exitCode).not.toBe(0);
+      expect(rejected.calls).toContain("recaptcha\tkeys\tlist\t");
+      expect(rejected.calls).not.toContain("recaptcha\tkeys\tdescribe");
       expect(rejected.calls).not.toContain("run\tdeploy");
     }
   });
@@ -308,6 +340,7 @@ async function runDeployScript(
   versionsSnapshot: unknown[],
   versionState: "DISABLED" | "ENABLED" = "ENABLED",
   keySnapshot: unknown = exactRecaptchaKey(),
+  keyInventorySnapshot: unknown[] = [exactRecaptchaKey()],
 ): Promise<{
   calls: string;
   capturedEnvironment: string;
@@ -327,12 +360,14 @@ async function runDeployScript(
   const serviceFixture = join(root, "service-fixture.json");
   const revisionFixture = join(root, "revision-fixture.json");
   const keyFixture = join(root, "key-fixture.json");
+  const keyInventoryFixture = join(root, "key-inventory-fixture.json");
   const versionsFixture = join(root, "versions-fixture.json");
   const v2ServiceFixture = join(root, "v2-service-fixture.json");
   const v2RevisionFixture = join(root, "v2-revision-fixture.json");
   await writeFile(serviceFixture, JSON.stringify(serviceSnapshot));
   await writeFile(revisionFixture, JSON.stringify(productionRevisionFixture()));
   await writeFile(keyFixture, JSON.stringify(keySnapshot));
+  await writeFile(keyInventoryFixture, JSON.stringify(keyInventorySnapshot));
   await writeFile(versionsFixture, JSON.stringify(versionsSnapshot));
   await writeFile(v2ServiceFixture, JSON.stringify({
     defaultUriDisabled: false,
@@ -385,6 +420,9 @@ async function runDeployScript(
       "    ;;",
       "  recaptcha:keys:describe)",
       '    cat "$GCLOUD_RECAPTCHA_KEY_FIXTURE"',
+      "    ;;",
+      "  recaptcha:keys:list)",
+      '    cat "$GCLOUD_RECAPTCHA_KEY_INVENTORY_FIXTURE"',
       "    ;;",
       "  secrets:versions:list)",
       '    cat "$GCLOUD_VERSIONS_FIXTURE"',
@@ -452,6 +490,7 @@ async function runDeployScript(
       GCLOUD_SERVICE_FIXTURE: serviceFixture,
       GCLOUD_REVISION_FIXTURE: revisionFixture,
       GCLOUD_RECAPTCHA_KEY_FIXTURE: keyFixture,
+      GCLOUD_RECAPTCHA_KEY_INVENTORY_FIXTURE: keyInventoryFixture,
       GCLOUD_STDIN_DIGEST: stdinDigest,
       GCLOUD_VERSIONS_FIXTURE: versionsFixture,
       GCLOUD_VERSION_STATE: versionState,

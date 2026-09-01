@@ -202,13 +202,24 @@ describe("the protected apply identity gains only what TTL and config need", () 
     ]);
   });
 
-  test("the production deployer can only get the Terraform-created key metadata", async () => {
+  test("the production deployer can only inventory and get public key metadata", async () => {
     const source = await readFile(bootstrapModule, "utf8");
     const role = block(
       source,
       'resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader"',
     );
-    expect(grantedPermissions(role)).toEqual(["recaptchaenterprise.keys.get"]);
+    expect(grantedPermissions(role)).toEqual([
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.list",
+    ]);
+    for (const forbidden of [
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.delete",
+      "recaptchaenterprise.keys.retrievelegacysecretkey",
+      "recaptchaenterprise.keys.update",
+    ]) {
+      expect(grantedPermissions(role)).not.toContain(forbidden);
+    }
     expect(role).toContain(
       'contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0',
     );

@@ -476,9 +476,11 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
 
 # The routine Medlock deploy must preserve the Terraform-created public site
 # key, but it must not trust a mutable Cloud Run environment value by itself.
-# This one-permission role lets the deploy re-read that exact key's public
-# policy. It grants no key listing, creation, update, deletion, legacy-secret
-# retrieval, assessment creation, or account access.
+# This metadata-only role lets the first deploy discover the Terraform-created
+# public site key and every later deploy re-read its exact policy. Site keys are
+# public browser identifiers; neither permission reveals the unavailable legacy
+# secret. The role grants no creation, update, deletion, secret retrieval,
+# assessment creation, or account access.
 resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader" {
   count = contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0
 
@@ -488,6 +490,7 @@ resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader" {
   description = "Reads only public reCAPTCHA key metadata so a production deploy can preserve and verify the Terraform-created ownership key."
   permissions = [
     "recaptchaenterprise.keys.get",
+    "recaptchaenterprise.keys.list",
   ]
 
   depends_on = [google_project_service.required]

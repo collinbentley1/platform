@@ -11,10 +11,10 @@
   "requiredFiles": {
     ".github/workflows/cleanup-preview.yml": "sha256:44c8b8a21e14dddc37225cf30e8f853ffc8448e27fbb88fd3ce1b1d41bbb0783",
     ".github/workflows/deploy-preview.yml": "sha256:a7c7e3974fa7cb6c1b7f584935f59035458f107d2d9545e1f38d5d660b79cbdc",
-    ".github/workflows/deploy-prod.yml": "sha256:9043cec23dd9fe7a0500523fc4be8601b337cb06d720c596d8734891eed4434d",
+    ".github/workflows/deploy-prod.yml": "sha256:8aa21cd1e6128452db290feb44bd32d3865d961af827f5a8ba4f24cbff16ee01",
     ".github/workflows/infrastructure.yml": "sha256:25d224b5009d8b587b515a8678dd434f9d29b03846974f13cf235d35ad21ad22",
     ".github/workflows/reconcile-previews.yml": "sha256:0172ca48e6e14ce3cf01b19aa4345fb08d3c3ea9f252e4aa144a7877fa2e76a2",
-    "terraform/modules/bootstrap/main.tf": "sha256:150969da5aa7573dd8beb13e0399e2c8a11923a3fd4913f7074ef91864ebda9e",
+    "terraform/modules/bootstrap/main.tf": "sha256:912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801",
     "terraform/modules/bootstrap/variables.tf": "sha256:a321e07c1a99db6a9aed02960294b0ab885d6e83c9e77a1859d8951fc8649a60",
     "terraform/modules/cloud-run-service/main.tf": "sha256:349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",
     "tools/ci/cloud-run-dhi-parity.sh": "sha256:bb3b759148c081b0135378046db1b09c32f710733bca9a96c00fa34d1815ce32",

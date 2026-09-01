@@ -2865,7 +2865,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "150969da5aa7573dd8beb13e0399e2c8a11923a3fd4913f7074ef91864ebda9e",
+      "912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
