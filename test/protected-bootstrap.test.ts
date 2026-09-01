@@ -7413,6 +7413,141 @@ describe("protected owner Terraform bridge", () => {
     expect(viewer.condition!.expression).not.toContain("/final/");
   });
 
+  // A rehearsal has to be executable through the REAL manager, not only through
+  // fake controller dependencies. Building its receipt scope used to derive a
+  // plan object name from an approved run id it does not have, so it threw on
+  // numeric("") long before the live lifecycle it exists to exercise.
+  test("a rehearsal builds no receipt lease and does not derive a plan object", () => {
+    const leases = buildReceiptLeases(
+      "cdbentley",
+      "bootstrap",
+      "123456",
+      new Date("2026-08-30T12:00:00.000Z"),
+      "rehearsal",
+      "",
+      executorEmail,
+      "",
+    );
+    expect(leases).toEqual([]);
+  });
+
+  test("a rehearsal that names an approved plan or an adoption is refused", () => {
+    const build = (approved: string, adoption: string) =>
+      buildReceiptLeases(
+        "cdbentley",
+        "bootstrap",
+        "123456",
+        new Date("2026-08-30T12:00:00.000Z"),
+        "rehearsal",
+        approved,
+        executorEmail,
+        adoption,
+      );
+    expect(() => build("123455", "")).toThrow("cannot name one");
+    expect(() => build("", "123455")).toThrow("has no exposure adoption");
+  });
+
+  test("a rehearsal executor round-trips through the real provenance parser", () => {
+    // Crash recovery reads this string. Collapsing every non-plan mode to
+    // "apply" would make it clean up a rehearsal executor as though it had been
+    // an apply, with a different lease shape and a different receipt inventory.
+    const description = executorDescription({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      expiresAt: new Date("2026-08-30T12:00:00.000Z"),
+      exposureAdoptionRunId: "",
+      mode: "rehearsal",
+      repository: "cdbentley",
+      root: "bootstrap",
+      runId: "123456",
+    });
+    expect(description).toContain("mode=rehearsal");
+    const parsed = parseExecutorProvenance(description, "cdbentley");
+    expect(parsed.mode).toBe("rehearsal");
+    expect(parsed.runId).toBe("123456");
+    expect(parsed.repository).toBe("cdbentley");
+    expect(parsed.approvedPlanRunId).toBe("");
+  });
+
+  test("the frozen pbt-v1 contract still refuses a rehearsal description", () => {
+    // v1 predates rehearsal. Widening it would make artifacts left by an older
+    // build stop being recognisable as what they actually are.
+    expect(() =>
+      parseExecutorProvenance(
+        "pbt-v1;repository=cdbentley;run=123456;root=bootstrap;" +
+          "mode=rehearsal;approved=none;expires=2026-08-30T12:00:00.000Z",
+        "cdbentley",
+      )
+    ).toThrow("unknown legacy provenance");
+  });
+
+  test("the real projection accepts a rehearsal with no approved plan run", () => {
+    // The regression for the defect this route kept hitting: every path that
+    // derives a receipt object name from approvedPlanRunId must be skipped for
+    // a rehearsal, or the projection dies on numeric("") before it ever probes
+    // anything. Driven through the real waitForStatePermissions.
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXECUTION_MODE: "rehearsal",
+    });
+    expect(invocation.approvedPlanRunId).toBe("");
+    const probed: string[] = [];
+    let clock = 0;
+
+    return waitForStatePermissions(
+      REPOSITORIES.cdbentley.state.bootstrap,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input: URL | string): Promise<Response> => {
+        return Response.json({
+          kind: "storage#testIamPermissionsResponse",
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async () => {
+        clock += 1_000;
+      },
+      {
+        testObjectOverwrite: async ({ objectName }) => {
+          probed.push(objectName);
+          return false;
+        },
+        testObjectPermissions: async ({ permissions, resource }) => {
+          probed.push(resource);
+          // Read phase: state is readable, the lock is not reachable at all,
+          // and every owner-written receipt grants nothing.
+          if (resource.endsWith("default.tflock")) return { denied: false, permissions: [] };
+          if (resource.includes("/.protected-bootstrap/")) {
+            return { denied: false, permissions: [] };
+          }
+          return {
+            denied: false,
+            permissions: permissions.filter((permission) =>
+              permission === "storage.objects.get" || permission === "storage.objects.list"
+            ),
+          };
+        },
+      },
+      300_000,
+      () => clock,
+    ).then(() => {
+      const prefix = REPOSITORIES.cdbentley.state.bootstrap.prefix;
+      // No plan or adoption probe: a rehearsal has neither.
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/plans/"))).toBe(false);
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/adoptions/"))).toBe(false);
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/consumed/"))).toBe(false);
+      // All four owner-written keys are actively probed and grant nothing.
+      for (const kind of ["results", "final", "completion", "rehearsals"]) {
+        expect(
+          probed.some((name) =>
+            name.includes(`${prefix}/.protected-bootstrap/${kind}/123456.json`)
+          ),
+        ).toBe(true);
+      }
+    });
+  });
+
   test("elevation leaves an apply executor with no receipt creator lease at all", () => {
     const leases = applyReceiptLeases();
     const remaining = leases.filter(

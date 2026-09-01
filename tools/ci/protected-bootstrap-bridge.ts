@@ -1794,11 +1794,21 @@ export function buildReceiptLeases(
 ): readonly IamBinding[] {
   numeric(runId, "GitHub run ID");
   if (mode === "apply") numeric(approvedPlanRunId, "approved plan run ID");
-  if (mode === "plan" && approvedPlanRunId !== "") {
-    throw new Error("Plan receipt scope cannot name an approved run.");
+  if (mode !== "apply" && approvedPlanRunId !== "") {
+    throw new Error("A run that consumes no approved plan cannot name one.");
   }
   const contract = REPOSITORIES[repository];
   const state = contract.state[root];
+  // A rehearsal reviews no plan, consumes no receipt, and publishes nothing
+  // itself -- its receipt is the owner's. So it is granted no receipt scope at
+  // all, and there is deliberately no plan resource to construct: doing so
+  // would derive an object name from an approved run id that does not exist.
+  if (mode === "rehearsal") {
+    if (exposureAdoptionRunId !== "") {
+      throw new Error("A rehearsal has no exposure adoption.");
+    }
+    return [];
+  }
   const planRunId = mode === "plan" ? runId : approvedPlanRunId;
   const planReceiptKind = root === "exposure" ? "adoptions" : "plans";
   const planResource =
@@ -10384,7 +10394,7 @@ export function executorDescription(provenance: ExecutorProvenance): string {
   } else if (
     provenance.approvedPlanRunId !== "" || provenance.approvedManifestSha256 !== ""
   ) {
-    throw new Error("Plan executor provenance cannot name an approved run.");
+    throw new Error("Only apply executor provenance may name an approved run.");
   }
   const adoptionRequired = provenance.repository === "runsetta" && provenance.root === "prod";
   if ((provenance.exposureAdoptionRunId !== "") !== adoptionRequired) {
@@ -10434,7 +10444,7 @@ function parseCurrentExecutorProvenance(
 ): ExecutorProvenance {
   const match = new RegExp(
     `^${EXECUTOR_DESCRIPTION_VERSION};repository=(${REPOSITORY_NAMES.join("|")});` +
-      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply);" +
+      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply|rehearsal);" +
       "approved=(none|[1-9][0-9]{0,19});manifest=(none|[0-9a-f]{64});" +
       "adoption=(none|[1-9][0-9]{0,19});expires=([^;]+)$",
   ).exec(description);
@@ -10445,7 +10455,11 @@ function parseCurrentExecutorProvenance(
   exact(REPOSITORIES[repository].projectId, projectId, "executor provenance project");
   const runId = executorProvenanceNumeric(match[2]!, "executor provenance run ID");
   const root = rootName(match[3]!);
-  const mode = match[4] === "plan" ? "plan" : "apply";
+  // Exact, never a fallback. Collapsing every non-plan mode to "apply"
+  // would make crash recovery treat an abruptly lost REHEARSAL executor as
+  // an apply executor -- a different lease shape, a different receipt
+  // inventory, and a different idea of what the run was allowed to do.
+  const mode = executionMode(match[4]!);
   const approvedPlanRunId = match[5] === "none"
     ? ""
     : executorProvenanceNumeric(match[5]!, "executor provenance approved plan run ID");
@@ -12042,7 +12056,12 @@ export async function waitForStatePermissions(
       name: `${state.prefix}/default.tflock`,
       required: expected === "mutation" ? readWrite : noAccess,
     },
-    {
+    // Plan and apply only. A rehearsal reviews no plan and consumes no approved
+    // run, so there is no plan or adoption object for it to name -- and naming
+    // one would derive an object from an approved run id that is empty, which
+    // is a numeric() failure long before the live lifecycle this projection is
+    // supposed to be checking.
+    ...(invocation.mode === "rehearsal" ? [] : [{
       bucket: state.bucket,
       name: receiptObjectName(
         state,
@@ -12052,7 +12071,7 @@ export async function waitForStatePermissions(
       required: expected === "none"
         ? noAccess
         : invocation.mode === "plan" ? createRead : readOnly,
-    },
+    }]),
     ...(invocation.mode === "apply"
       ? [{
           bucket: state.bucket,
@@ -13869,12 +13888,17 @@ export async function publishFinalProtectedReceipt(
   const receipt: JsonValue = json(
     {
       consumerSha: proof.consumerSha,
-      // Never countable, whatever the run was. This object is written by an
-      // identity that still exists, before its deletion has been proven, so at
-      // the moment it is written it can only be a claim. The owner's completion
-      // object, written after exact release, is the only countable artifact.
+      // Never countable, whatever the run was.
+      //
+      // An apply's object is `pending`: it is written before the executor's
+      // deletion has been proven, so at that moment it can only be a claim, and
+      // the owner's completion object is what makes it a success.
+      //
+      // A rehearsal's object is `rehearsal-complete`: terminal, and never
+      // eligible for completion at all. It runs no Terraform, so there is
+      // nothing for a completion to attest.
       countable: false,
-      status: "pending",
+      status: invocation.mode === "rehearsal" ? "rehearsal-complete" : "pending",
       deElevation: {
         executorEmail: proof.deElevation.executorEmail,
         executorUniqueId: proof.deElevation.executorUniqueId,
@@ -13904,7 +13928,11 @@ export async function publishFinalProtectedReceipt(
     "final protected receipt",
   );
   const body = `${canonicalJson(receipt)}\n`;
-  const object = receiptObjectName(state, "final", invocation.githubRunId);
+  const object = receiptObjectName(
+    state,
+    invocation.mode === "rehearsal" ? "rehearsals" : "final",
+    invocation.githubRunId,
+  );
   const generation = await writeImmutableObject(
     state.bucket,
     object,
@@ -13971,6 +13999,58 @@ export async function publishOwnerCompletionProof(
   }
   const contract = REPOSITORIES[invocation.repository];
   const state = contract.state[invocation.terraformRoot];
+  // The reference is a caller's claim until this reads the object it names.
+  // Exact bucket, exact key, exact generation, exact size, exact bytes -- and
+  // then the receipt inside them has to be a pending apply receipt belonging to
+  // this very run. A completion that countersigned an unread reference would be
+  // countersigning whatever the caller said, which is not a proof of anything.
+  exact(pending.bucket, state.bucket, "owner completion final receipt bucket");
+  exact(
+    pending.object,
+    receiptObjectName(state, "final", invocation.githubRunId),
+    "owner completion final receipt key",
+  );
+  const observedMetadata = await readObjectMetadata(
+    pending.bucket,
+    pending.object,
+    ownerToken,
+    fetcher,
+  );
+  exact(observedMetadata.generation, pending.generation, "owner completion final receipt generation");
+  if (observedMetadata.size !== pending.size) {
+    throw new Error("The pending final receipt is not the size the completion names.");
+  }
+  const observedBody = await readObjectGeneration(
+    pending.bucket,
+    pending.object,
+    pending.generation,
+    ownerToken,
+    fetcher,
+  );
+  if (Buffer.byteLength(observedBody) !== pending.size) {
+    throw new Error("The pending final receipt did not match its recorded size.");
+  }
+  exact(sha256Hex(observedBody), pending.digest, "owner completion final receipt digest");
+  const pendingReceipt = record(JSON.parse(observedBody) as unknown, "pending final receipt");
+  exact(pendingReceipt.status, "pending", "pending final receipt status");
+  exact(pendingReceipt.kind, "apply", "pending final receipt kind");
+  exact(pendingReceipt.countable, false, "pending final receipt countability");
+  exact(pendingReceipt.runId, invocation.githubRunId, "pending final receipt run ID");
+  exact(pendingReceipt.repository, invocation.repository, "pending final receipt repository");
+  exact(pendingReceipt.terraformRoot, invocation.terraformRoot, "pending final receipt root");
+  exact(pendingReceipt.platformSha, invocation.platformSha, "pending final receipt platform SHA");
+  exact(pendingReceipt.consumerSha, invocation.consumerSha, "pending final receipt consumer SHA");
+  const deElevation = record(pendingReceipt.deElevation, "pending final receipt de-elevation");
+  exact(
+    deElevation.executorEmail,
+    pending.deElevationExecutorEmail,
+    "pending final receipt de-elevation email",
+  );
+  exact(
+    deElevation.executorUniqueId,
+    pending.deElevationExecutorUniqueId,
+    "pending final receipt de-elevation unique ID",
+  );
   const body = `${canonicalJson(json({
     completedAt: new Date(nowMs).toISOString(),
     countable: true,
