@@ -126,10 +126,17 @@ jobs:
             echo "JSON Terraform roots are outside the reviewed platform contract." >&2
             exit 1
           fi
+          # The immutable platform doctor below compares each parsed Terraform
+          # document with its repository-specific reviewed mirror. That is the
+          # authority for the small set of direct resources a consumer must
+          # mirror (currently Medlock's TTL, Identity Platform, and reCAPTCHA
+          # controls). Keep this early scan focused on executable escape hatches;
+          # a blanket resource/data ban would reject the exact reviewed mirror
+          # before the stronger parsed-document comparison can authenticate it.
           if grep -raE \
-            '(^|[^[:alnum:]_])(resource|data)[[:space:]]+"|provisioner[[:space:]]+"(local-exec|remote-exec)"|(^|[^[:alnum:]_])external([^[:alnum:]_]|$)' \
+            'provisioner[[:space:]]+"(local-exec|remote-exec)"|(^|[^[:alnum:]_])external([^[:alnum:]_]|$)' \
             infra/terraform >/dev/null; then
-            echo "Consumer roots may configure only the reviewed platform modules; direct resources and executable provisioners are forbidden." >&2
+            echo "Consumer roots may contain only the exact reviewed Terraform mirror; executable provisioners and external execution are forbidden." >&2
             exit 1
           else
             search_status="$?"

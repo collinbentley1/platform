@@ -1571,7 +1571,7 @@ rejectContains(
 for (const boundary of [
   "validate_root infra/terraform/bootstrap bootstrap terraform/modules/bootstrap",
   "validate_root infra/terraform/prod site terraform/modules/cloud-run-service",
-  "Consumer roots may configure only the reviewed platform modules",
+  "Consumer roots may contain only the exact reviewed Terraform mirror",
   "platform.ts\" doctor",
   "Committed Terraform caches and substituted modules/providers are forbidden",
   "Checkout only the exact trusted platform source",
@@ -1584,6 +1584,12 @@ for (const boundary of [
     `Infrastructure workflow is missing trusted module boundary: ${boundary}`,
   );
 }
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  '(resource|data)[[:space:]]+"',
+  "The fail-fast shell scan must not reject direct resources before the immutable doctor authenticates the exact reviewed consumer mirror.",
+);
 rejectContains(
   ".github/workflows/infrastructure.yml",
   sectionFrom(infrastructure, "  terraform-convergence:\n"),
