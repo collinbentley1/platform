@@ -2002,7 +2002,13 @@ describe("platform scaffold and doctor", () => {
     expect(infrastructure).not.toContain("--binary-files=without-match");
     expect(infrastructure.match(/grep -raE/g)).toHaveLength(2);
     expect(infrastructure.match(/grep -rahcE/g)).toHaveLength(2);
-    expect(infrastructure).toContain("(^|[^[:alnum:]_])(resource|data)[[:space:]]+");
+    expect(infrastructure).not.toContain("(^|[^[:alnum:]_])(resource|data)[[:space:]]+");
+    expect(infrastructure).toContain(
+      'provisioner[[:space:]]+"(local-exec|remote-exec)"',
+    );
+    expect(infrastructure).toContain(
+      "Consumer roots may contain only the exact reviewed Terraform mirror",
+    );
     expect(infrastructure).toContain("(^|[^[:alnum:]_])module[[:space:]]+");
     expect(infrastructure).toContain("infra/terraform >/dev/null; then");
     expect(infrastructure).toContain("' . >/dev/null; then");
