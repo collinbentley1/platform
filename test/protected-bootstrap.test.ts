@@ -56,10 +56,31 @@ import {
   parseRecoverySecretBundle,
   parseExecutorProvenance,
   publishPlanReceipt,
-  publishPostApplyReceipt,
+  type FederationPoolState,
+  type FederationProviderState,
+  federationPoolFromJson,
+  federationProviderFromJson,
+  type FederationQuarantineRecord,
+  publishFinalProtectedReceipt,
+  writeImmutableObject,
+  writeFederationRestoreMarker,
+  RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+  RECOVERY_STABLE_EMPTY_MINUTES,
+  RECOVERY_OPERATION_MINUTES,
+  assertQuarantinedPool,
+  buildFinalProtectedProof,
+  federationPoolFingerprint,
+  federationProviderFingerprint,
+  setFederationPoolDisabled,
+  federationQuarantineRecordFromJson,
+  restoreQuarantinedFederation,
+  PRODUCTION_APPLY_ENABLED,
+  recoverFederationQuarantines,
+  type FederationRecoverySummary,
   proveConsumerFreeze,
   proveDeploymentParityMarkers,
   proveExposure,
+  proveNoUntrustedFederationControllers,
   probeStorageObjectOverwritePermission,
   probeStorageObjectPermissions,
   retryableGoogleReadStatus,
@@ -126,7 +147,22 @@ const root = join(import.meta.dir, "..");
 const platformSha = "a".repeat(40);
 const consumerSha = "b".repeat(40);
 const consumerTreeSha = "c".repeat(40);
-const executorEmail = "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com";
+const executorEmail = `${randomExecutorAccountId(
+  deterministicArtifactHex("cdbentley", "123456", "service-account"),
+)}@cdbentley.iam.gserviceaccount.com`;
+
+function federationPoolName(projectId: string): string {
+  const repository = REPOSITORY_NAMES.find(
+    (candidate) => REPOSITORIES[candidate].projectId === projectId,
+  );
+  if (repository === undefined) throw new Error(`Unknown test project ${projectId}.`);
+  return `projects/${REPOSITORIES[repository].exposure.projectNumber}/locations/global/workloadIdentityPools/github-actions`;
+}
+
+function federationProviderName(projectId: string): string {
+  return `${federationPoolName(projectId)}/providers/github`;
+}
+
 const capabilityFiles = [
   ".github/workflows/cleanup-preview.yml",
   ".github/workflows/deploy-preview.yml",
@@ -160,7 +196,11 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain('test "$GITHUB_ACTOR_ID_EXACT" = "16823277"');
     expect(workflow).toContain('test "$GITHUB_REPOSITORY_ID_EXACT" = "1255856466"');
     expect(workflow).toContain("environment: protected-bootstrap-owner-token");
-    expect(workflow).toContain("group: protected-owner-terraform-${{ inputs.target_repository }}");
+    // Fleet-global, not per target: a protected apply quarantines every
+    // consumer workload identity pool, so two concurrent runs would capture and
+    // restore each other's federation state.
+    expect(workflow).toContain("group: protected-owner-terraform-federation");
+    expect(workflow).not.toContain("group: protected-owner-terraform-${{ inputs.target_repository }}");
     expect(workflow).toContain("cancel-in-progress: false");
     expect(workflow.match(/^  owner-terraform:$/gm)).toHaveLength(1);
     expect(workflow).toContain("actions: read");
@@ -181,9 +221,14 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "EXPOSURE_ADOPTION_RUN_ID: ${{ inputs.exposure_adoption_run_id }}",
     );
+    // Runsetta-prod adoption is mode-specific: a rehearsal adopts nothing.
     expect(workflow).toContain(
-      'if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ]; then',
+      'if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ] \\',
     );
+    expect(workflow).toContain('&& [ "$EXECUTION_MODE" != "rehearsal" ]; then');
+    // Approval fields belong to an apply and to nothing else.
+    expect(workflow).toContain('if [ "$EXECUTION_MODE" = "apply" ]; then');
+    expect(workflow).toContain('case "$EXECUTION_MODE" in plan|apply|rehearsal) ;; *) exit 1 ;; esac');
     expect(workflow).toContain("PLATFORM_ACTIONS_READ_TOKEN: ${{ github.token }}");
     expect(workflow).toContain("/usr/bin/env -i");
     expect(workflow.match(/OWNER_OAUTH_ACCESS_TOKEN: \$\{\{ secrets\.OWNER_OAUTH_ACCESS_TOKEN \}\}/g)).toHaveLength(
@@ -199,20 +244,20 @@ describe("protected owner Terraform bridge", () => {
       workflow.match(
         /if: \$\{\{ always\(\) && \(steps\.protected-bridge\.outcome == 'failure' \|\| steps\.protected-bridge\.outcome == 'cancelled'\) \}\}/g,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(workflow).toContain(
-      "id: recovery-route\n        if: ${{ always() }}",
+      "if: ${{ always() && inputs.mode != 'apply' && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}",
     );
     expect(workflow).toContain(
-      "id: recovery-source\n        if: ${{ always() && steps.recovery-route.outcome == 'success' }}",
+      "id: recovery-runtime\n        if: ${{ always() }}",
     );
     expect(workflow).toContain(
-      "id: recovery-bun\n        if: ${{ always() && steps.recovery-source.outcome == 'success' }}",
+      "if: ${{ always() && steps.recovery-runtime.outcome == 'success' }}",
     );
-    expect(workflow).toContain(
-      "if: ${{ always() && steps.recovery-bun.outcome == 'success' }}",
-    );
-    expect(workflow).toContain("bridge_reserve_seconds=$((16 * 60))");
+    expect(workflow).not.toContain("id: recovery-route");
+    expect(workflow).not.toContain("id: recovery-source");
+    expect(workflow).not.toContain("id: recovery-bun");
+    expect(workflow).toContain("bridge_reserve_seconds=$((17 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((25 * 60))");
     expect(workflow).toContain("bridge_reserve_seconds=$((2 * 60))");
     // The apply floor is the ceiling less the reviewed setup tolerance; a
@@ -222,15 +267,15 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).not.toContain("bridge_minimum_seconds=$((34 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((39 * 60))");
     expect(workflow).toContain(
-      "bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))",
+      "available_bridge_seconds=$((42 * 60 - elapsed_seconds - bridge_reserve_seconds))",
     );
+    expect(workflow).toContain('bridge_budget_seconds="$available_bridge_seconds"');
     expect(workflow).toContain(
       'test "$bridge_budget_seconds" -ge "$bridge_minimum_seconds"',
     );
     expect(workflow).toContain(
       'test "$bridge_budget_seconds" -le "$bridge_maximum_seconds"',
     );
-    expect(workflow.match(/timeout-minutes: 14/g)).toHaveLength(2);
     const recoveryBlocks = [
       workflow.slice(
         workflow.indexOf("- name: Recover exact IAM artifacts after bridge failure"),
@@ -241,18 +286,18 @@ describe("protected owner Terraform bridge", () => {
       ),
     ];
     for (const recoveryBlock of recoveryBlocks) {
-      expect(recoveryBlock).toContain("timeout-minutes: 14");
+      expect(recoveryBlock).toContain("timeout-minutes: 15");
       expect(recoveryBlock).toContain(
-        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \\\n" +
+        "exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \\\n" +
           "            /usr/bin/env -i \\",
       );
       expect(recoveryBlock).not.toContain("} | \\\n          exec /usr/bin/env -i");
       expect(recoveryBlock).toContain("--no-env-file --no-orphans");
     }
-    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1 + 1) * 60;
-    const recoveryWrapperSeconds = 795;
+    const recoveryInternalDeadlineSeconds = (1 + 7 + 3 + 1 + 1 + 1) * 60;
+    const recoveryWrapperSeconds = 855;
     const recoveryKillAfterSeconds = 15;
-    const recoveryActionsStepSeconds = 14 * 60;
+    const recoveryActionsStepSeconds = 15 * 60;
     expect(recoveryWrapperSeconds).toBeGreaterThan(recoveryInternalDeadlineSeconds);
     expect(recoveryWrapperSeconds + recoveryKillAfterSeconds).toBeLessThan(
       recoveryActionsStepSeconds,
@@ -260,7 +305,7 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).toContain(
       "owner-terraform-recovery:\n    name: Recover ${{ inputs.target_repository }} protected Terraform bridge\n" +
         "    needs: owner-terraform\n    if: ${{ always() && needs.owner-terraform.result != 'success' }}\n" +
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 18",
+        "    runs-on: ubuntu-24.04\n    timeout-minutes: 17",
     );
     expect(
       workflow.match(
@@ -566,6 +611,39 @@ describe("protected owner Terraform bridge", () => {
     expect(() =>
       buildReviewManifest(
         withMember("serviceAccount:cloud-run-preview@someone-else.iam.gserviceaccount.com"),
+        planIdentity,
+      )
+    ).not.toThrow();
+
+    // Executor authority is created out of band by the bridge for the exact
+    // current run. Terraform may never grant a pool-mutation role to an
+    // executor-shaped account: its name alone does not bind it to this session,
+    // and a plan could otherwise create a peer controller during quarantine.
+    const poolControllerGrant = (member: string) =>
+      plan([
+        resourceChange(
+          "module.bootstrap.google_project_iam_member.pool_controller",
+          "google_project_iam_member",
+          null,
+          {
+            member,
+            project: "cdbentley",
+            role: "roles/iam.workloadIdentityPoolAdmin",
+          },
+        ),
+      ]);
+    expect(() =>
+      buildReviewManifest(
+        poolControllerGrant(
+          "serviceAccount:gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+        ),
+        planIdentity,
+      )
+    ).toThrow("could re-enable a quarantined workload identity pool");
+    // The stable owner controller remains the sole Terraform-managed exception.
+    expect(() =>
+      buildReviewManifest(
+        poolControllerGrant("user:CollinBentley1@gmail.com"),
         planIdentity,
       )
     ).not.toThrow();
@@ -1628,14 +1706,14 @@ describe("protected owner Terraform bridge", () => {
         ...environment,
         APPROVED_MANIFEST_SHA256: "d".repeat(64),
       }),
-    ).toThrow("Plan mode forbids");
+    ).toThrow("Only apply mode may name an approved plan run");
     expect(() =>
       validateInvocation({
         ...environment,
         APPROVED_MANIFEST_SHA256: "",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
     ).toThrow("approved manifest digest");
     expect(() =>
       validateInvocation({ ...environment, LEGACY_COMPATIBILITY_MODE: "1" })
@@ -1682,7 +1760,7 @@ describe("protected owner Terraform bridge", () => {
       EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "exposure",
-    })).toThrow("locked to a Runsetta plan run");
+    }, true)).toThrow("locked to a Runsetta plan run");
     expect(validateInvocation({
       ...environment,
       EXPOSURE_ADOPTION_CONFIRMATION: "ADOPT_RUNSETTA_EXPOSURE_STATE",
@@ -2262,6 +2340,8 @@ describe("protected owner Terraform bridge", () => {
         expect(url.searchParams.get("name")).toBe("runsetta/exposure/default.tfstate");
         stored = String(init?.body);
         return Response.json({
+          generation: "11",
+          metageneration: "1",
           bucket: "runsetta-tfstate-601124730704-bootstrap",
           generation,
           name: "runsetta/exposure/default.tfstate",
@@ -2902,6 +2982,81 @@ describe("protected owner Terraform bridge", () => {
     expect(prod).toContain("datastore.databases.update");
   });
 
+  test("HealthMCP prod executor can manage only the reviewed ownership control plane", () => {
+    const read = executorControlPermissions("healthmcp", "prod", "read");
+    const mutation = executorControlPermissions("healthmcp", "prod", "mutation");
+    const ownershipRead = [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "firebaseauth.configs.get",
+      "recaptchaenterprise.keys.get",
+    ];
+    const ownershipMutation = [
+      "datastore.indexes.update",
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.update",
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.update",
+    ];
+    for (const permission of ownershipRead) {
+      expect(read).toContain(permission);
+      expect(mutation).toContain(permission);
+    }
+    for (const permission of ownershipMutation) {
+      expect(read).not.toContain(permission);
+      expect(mutation).toContain(permission);
+    }
+    for (const forbidden of [
+      "datastore.indexes.create",
+      "datastore.indexes.delete",
+      "firebaseauth.configs.getSecret",
+      "recaptchaenterprise.keys.delete",
+      "recaptchaenterprise.keys.list",
+      "recaptchaenterprise.keys.retrievelegacysecretkey",
+      "serviceusage.services.enable",
+      "serviceusage.services.disable",
+    ]) {
+      expect(read).not.toContain(forbidden);
+      expect(mutation).not.toContain(forbidden);
+    }
+
+    // The same authority must not leak into any other consumer's role.
+    for (const repository of ["cdbentley", "runsetta", "critical-history"] as const) {
+      const foreign = executorControlPermissions(repository, "prod", "mutation");
+      for (const permission of [...ownershipRead, ...ownershipMutation]) {
+        expect(foreign).not.toContain(permission);
+      }
+    }
+  });
+
+  test("pre-ownership HealthMCP prod executor roles remain exactly recoverable", () => {
+    const ownershipPermissions = new Set([
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "datastore.indexes.update",
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.get",
+      "firebaseauth.configs.update",
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.update",
+    ]);
+    for (const phase of ["read", "mutation"] as const) {
+      const prior = executorControlPermissions("healthmcp", "prod", phase).filter(
+        (permission) => !ownershipPermissions.has(permission),
+      );
+      expect(bridgeRolePermissionsRecognized(prior, "healthmcp", "prod", phase)).toBeTrue();
+      expect(
+        bridgeRolePermissionsRecognized(
+          [...prior, "datastore.entities.get"],
+          "healthmcp",
+          "prod",
+          phase,
+        ),
+      ).toBeFalse();
+    }
+  });
+
   // Terraform fixes the ordering of none of the plan's lists. The digest must
   // therefore be invariant under permutation of every one of them, not only
   // resource_changes -- which is all the determinism test below shuffles.
@@ -3257,6 +3412,81 @@ describe("protected owner Terraform bridge", () => {
     foreignProvider.provider_name = "registry.terraform.io/evil/google";
     expect(() => buildReviewManifest(plan([foreignProvider]), identity())).toThrow(
       "provider drifted",
+    );
+  });
+
+  test("HealthMCP prod admits only its exact reviewed root resources", () => {
+    const healthIdentity: PlanIdentity = {
+      ...identity(),
+      projectId: REPOSITORIES.healthmcp.projectId,
+      repository: "healthmcp",
+      repositoryId: REPOSITORIES.healthmcp.repositoryId,
+    };
+    const rootChange = (address: string, type: string) => {
+      const change = resourceChange(address, type, {}, {});
+      delete (change as { module_address?: string }).module_address;
+      return change;
+    };
+    const exactResources = [
+      ["google_firestore_field.waitlist_entry_ttl[0]", "google_firestore_field"],
+      ["google_firestore_field.waitlist_quota_ttl[0]", "google_firestore_field"],
+      ["google_identity_platform_config.default[0]", "google_identity_platform_config"],
+      ["google_recaptcha_enterprise_key.waitlist[0]", "google_recaptcha_enterprise_key"],
+    ] as const;
+
+    const review = buildReviewManifest(
+      plan(exactResources.map(([address, type]) => rootChange(address, type))),
+      healthIdentity,
+    );
+    for (const [address] of exactResources) expect(review.canonical).toContain(address);
+
+    const extra = rootChange("google_project_service.unreviewed", "google_project_service");
+    expect(() => buildReviewManifest(plan([extra]), healthIdentity)).toThrow(
+      "escaped the exact root module",
+    );
+
+    const swapped = rootChange(
+      "google_recaptcha_enterprise_key.waitlist[0]",
+      "google_project_service",
+    );
+    expect(() => buildReviewManifest(plan([swapped]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const nested = rootChange(
+      "google_recaptcha_enterprise_key.waitlist[0]",
+      "google_recaptcha_enterprise_key",
+    );
+    nested.module_address = "module.site";
+    expect(() => buildReviewManifest(plan([nested]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const dataSource = rootChange(
+      "google_identity_platform_config.default[0]",
+      "google_identity_platform_config",
+    );
+    dataSource.mode = "data";
+    expect(() => buildReviewManifest(plan([dataSource]), healthIdentity)).toThrow(
+      "escaped the exact HealthMCP prod root resource map",
+    );
+
+    const otherConsumer = rootChange(
+      "google_recaptcha_enterprise_key.waitlist[0]",
+      "google_recaptcha_enterprise_key",
+    );
+    expect(() => buildReviewManifest(plan([otherConsumer]), identity())).toThrow(
+      "escaped the exact root module",
+    );
+
+    const moduleSmuggling = resourceChange(
+      "module.site.google_recaptcha_enterprise_key.waitlist",
+      "google_recaptcha_enterprise_key",
+      {},
+      {},
+    );
+    expect(() => buildReviewManifest(plan([moduleSmuggling]), healthIdentity)).toThrow(
+      "escaped the root resource allowlist",
     );
   });
 
@@ -3641,7 +3871,7 @@ describe("protected owner Terraform bridge", () => {
       return Number(match?.[1]);
     };
     expect(controller).toContain("} finally {");
-    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 41;");
+    expect(controller).toContain("const JOB_TIMEOUT_MINUTES = 42;");
     expect(controller).toContain("const LEASE_MINUTES = 54;");
     expect(controller).toContain("const PLAN_INTERNAL_OPERATION_MINUTES = 24;");
     expect(controller).toContain("const APPLY_INTERNAL_OPERATION_MINUTES = 33;");
@@ -3662,9 +3892,9 @@ describe("protected owner Terraform bridge", () => {
       "requiredOwnerTokenRemainingSeconds(invocation)",
     );
     const userAccessTokenMinutes = 60;
-    const mainJobMinutes = 41;
-    const freshRecoveryJobMinutes = 18;
-    const freshRecoveryTokenRequirementMinutes = 14 + 1;
+    const mainJobMinutes = 42;
+    const freshRecoveryJobMinutes = 17;
+    const freshRecoveryTokenRequirementMinutes = 15 + 1;
     const planTokenRequirementMinutes = requiredOwnerTokenRemainingSeconds({
       mode: "plan",
       operationBudgetSeconds: 25 * 60,
@@ -3673,8 +3903,8 @@ describe("protected owner Terraform bridge", () => {
       mode: "apply",
       operationBudgetSeconds: 39 * 60,
     }) / 60;
-    expect(planTokenRequirementMinutes).toBe(42);
-    expect(applyTokenRequirementMinutes).toBe(59);
+    expect(planTokenRequirementMinutes).toBe(43);
+    expect(applyTokenRequirementMinutes).toBe(58);
     expect(applyTokenRequirementMinutes).toBeLessThan(userAccessTokenMinutes);
     expect(mainJobMinutes + freshRecoveryTokenRequirementMinutes).toBeLessThan(
       userAccessTokenMinutes,
@@ -3728,7 +3958,7 @@ describe("protected owner Terraform bridge", () => {
       join(root, ".github/workflows/protected-bootstrap-implementation.yml"),
       "utf8",
     );
-    expect(workflow).toContain("timeout-minutes: 41");
+    expect(workflow).toContain("timeout-minutes: 42");
   });
 
   test("Terraform sandbox create argv keeps only its work bind writable", () => {
@@ -3835,6 +4065,9 @@ describe("protected owner Terraform bridge", () => {
     const dependencies = fakeDependencies(events);
     await runProtectedBootstrap(invocation, dependencies);
     expect(events).toEqual([
+      // No protected work of any kind begins before the fleet is known free of
+      // unrepaired federation quarantines.
+      "federation:preflight",
       "prepare",
       "acquire",
       "freeze",
@@ -3887,7 +4120,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events).toContain("publish:adoption");
     expect(events).not.toContain("consume");
     expect(events).not.toContain("elevate");
-    expect(events).not.toContain("publish:post");
+    expect(events).not.toContain("publish:final");
     expect(publishedProof?.seedContract?.confirmation).toBe(
       "ADOPT_RUNSETTA_EXPOSURE_STATE",
     );
@@ -4153,7 +4386,7 @@ describe("protected owner Terraform bridge", () => {
       GITHUB_RUN_ID_EXACT: "7654321",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "prod",
-    });
+    }, true);
     const expiresAt = new Date("2026-08-26T23:00:00.000Z");
     const accountId = "gha-pbt-33333333333333333333";
     const email = `${accountId}@runsetta.iam.gserviceaccount.com`;
@@ -4256,6 +4489,14 @@ describe("protected owner Terraform bridge", () => {
       now: () => startedAt,
       releaseExecutor: async (_invocation, _session, deadline) => {
         cleanupDeadline = deadline;
+        return {
+          artifactsDeleted: true as const,
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          observedAt: "2026-09-01T12:00:00.000Z",
+          permissionsProvenGone: true as const,
+          projectBindingsCleared: true as const,
+        };
       },
     }));
     expect(acquireDeadline).toBe(startedAt + 60_000);
@@ -4280,7 +4521,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     let acquireDeadline = 0;
     let cleanupDeadline = 0;
@@ -4310,6 +4551,14 @@ describe("protected owner Terraform bridge", () => {
       releaseExecutor: async (_invocation, _session, deadline) => {
         events.push("release");
         cleanupDeadline = deadline;
+        return {
+          artifactsDeleted: true as const,
+          executorEmail,
+          executorUniqueId: "123456789012345678901",
+          observedAt: "2026-09-01T12:00:00.000Z",
+          permissionsProvenGone: true as const,
+          projectBindingsCleared: true as const,
+        };
       },
       verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
       waitForPostMutationDrain: async (_invocation, mutationCompletedAtMs) => {
@@ -4317,10 +4566,15 @@ describe("protected owner Terraform bridge", () => {
         now = mutationCompletedAtMs + 7 * 60_000;
       },
     }));
-    expect(acquireDeadline).toBe(startedAt + 33 * 60_000);
-    expect(cleanupDeadline).toBe(startedAt + 38 * 60_000);
+    // 32 minutes, not 33: an apply publishes an owner artifact after cleanup, so
+    // one reviewed minute of the envelope is now reserved for that publication.
+    // Both five-minute IAM consistency windows still fit inside it with 22
+    // minutes to spare, which is the property this test exists to hold.
+    expect(acquireDeadline).toBe(startedAt + 32 * 60_000);
+    expect(acquireDeadline - startedAt).toBeGreaterThan(2 * 5 * 60_000);
+    expect(cleanupDeadline).toBe(startedAt + 37 * 60_000);
     expect(events).toContain("terraform:apply");
-    expect(events).toContain("publish:post");
+    expect(events).toContain("publish:final");
     for (const budget of ["2319", "2341"]) {
       expect(() => validateInvocation({
         ...validEnvironment(),
@@ -4328,7 +4582,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: budget,
         EXECUTION_MODE: "apply",
-      })).toThrow("2320..2340 second apply range");
+      }, true)).toThrow("2320..2340 second apply range");
     }
   });
 
@@ -4412,7 +4666,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(events, {
         planJson: JSON.stringify(atApplyRun),
         // The receipt digest comes from the PLAN run's fixture, never from what
@@ -4461,7 +4715,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(events, {
         appendSummary: async (_invocation, body) => {
           events.push("summary");
@@ -4594,7 +4848,7 @@ describe("protected owner Terraform bridge", () => {
         APPROVED_PLAN_RUN_ID: "123455",
         BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
         EXECUTION_MODE: "apply",
-      }),
+      }, true),
       fakeDependencies(atFloor, walk(atFloor)),
     );
     expect(atFloor).toContain("elevate");
@@ -4616,7 +4870,7 @@ describe("protected owner Terraform bridge", () => {
           APPROVED_PLAN_RUN_ID: "123455",
           BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
           EXECUTION_MODE: "apply",
-        }),
+        }, true),
         operationBudgetSeconds: 34 * 60,
       },
       fakeDependencies(retired, walk(retired)),
@@ -4743,6 +4997,18 @@ describe("protected owner Terraform bridge", () => {
     const events: string[] = [];
     const dependencies: RecoveryDependencies = {
       now: () => 1_800_000_000_000,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (invocation) => {
         expect(invocation.ownerAccessToken).toBe(ownerToken);
         events.push("recover");
@@ -5134,6 +5400,18 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (invocation, deadlineMs) => {
         recoveryDeadlineMs = deadlineMs;
         await recoverBridgeArtifactsUntilStable(
@@ -5146,7 +5424,7 @@ describe("protected owner Terraform bridge", () => {
       },
       verifySource: async () => undefined,
     });
-    expect(recoveryDeadlineMs - startedAt).toBe(12 * 60_000);
+    expect(recoveryDeadlineMs - startedAt).toBe(RECOVERY_OPERATION_MINUTES * 60_000);
     expect(fixture.now() - startedAt).toBe(10 * 60_000);
     expect(fixture.role.deleted).toBeTrue();
   });
@@ -5156,6 +5434,18 @@ describe("protected owner Terraform bridge", () => {
     const startedAt = fixture.now();
     await runProtectedRecovery(fixture.invocation, {
       now: fixture.now,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: (invocation, deadlineMs) =>
         recoverBridgeArtifactsUntilStable(
           invocation,
@@ -5220,6 +5510,18 @@ describe("protected owner Terraform bridge", () => {
     let recoveryDeadlineMs = 0;
     await runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async (_invocation, deadlineMs) => {
         recoveryDeadlineMs = deadlineMs;
       },
@@ -5227,12 +5529,26 @@ describe("protected owner Terraform bridge", () => {
         virtualNow += 59_000;
       },
     });
-    expect(recoveryDeadlineMs).toBe(startedAt + 59_000 + 12 * 60_000);
+    expect(recoveryDeadlineMs).toBe(
+      startedAt + 59_000 + RECOVERY_OPERATION_MINUTES * 60_000,
+    );
 
     let recoveryStarted = false;
     virtualNow = startedAt;
     await expect(runProtectedRecovery(fixture.invocation, {
       now: () => virtualNow,
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async () => ({
+        restored: [],
+        scanned: 0,
+        skippedComplete: [],
+        skippedUncontained: [],
+      }),
       recoverArtifacts: async () => {
         recoveryStarted = true;
       },
@@ -5360,7 +5676,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     const terraformArgv: Array<readonly string[]> = [];
     const dependencies = fakeDependencies(events, {
@@ -5384,7 +5700,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events.indexOf("terraform:audit")).toBeGreaterThan(events.indexOf("terraform:apply"));
     expect(events.indexOf("drain:post")).toBeGreaterThan(events.indexOf("terraform:audit"));
     expect(events.indexOf("markers:post")).toBeGreaterThan(events.indexOf("terraform:audit"));
-    expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("markers:post"));
+    expect(events.indexOf("publish:final")).toBeGreaterThan(events.indexOf("markers:post"));
     expect(events.filter((event) => event === "consume")).toHaveLength(1);
     expect(events).toContain("release");
     const auditArgv = terraformArgv.find((args) =>
@@ -5393,6 +5709,48 @@ describe("protected owner Terraform bridge", () => {
     expect(auditArgv).toBeDefined();
     expect(auditArgv).toContain("-json");
     expect(auditArgv).toContain("-detailed-exitcode");
+  });
+
+  test("the two freeze snapshots bracketing elevation must be stable", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, {
+      ...identity(),
+      terraformRoot: "bootstrap",
+    });
+    const events: string[] = [];
+    let freezeCalls = 0;
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        proveFreeze: async (_invocation, tokenDrainSeconds) => {
+          freezeCalls += 1;
+          const snapshot = freezeSnapshot(1_800_000_000_000 + freezeCalls, tokenDrainSeconds);
+          if (freezeCalls !== 3) return snapshot;
+          return {
+            ...snapshot,
+            repositories: snapshot.repositories.map((entry, index) =>
+              index === 0
+                ? { ...entry, latestPossibleTokenIssuance: "2026-08-22T20:00:00.000Z" }
+                : entry
+            ),
+          };
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("stable pre-apply freeze repository snapshot");
+
+    expect(freezeCalls).toBe(3);
+    expect(events).toContain("elevate");
+    expect(events).not.toContain("terraform:apply");
+    expect(events).toContain("release");
+    expect(events).toContain("federation:restore");
   });
 
   test("Runsetta production revalidates adoption through elevation and reaches apply", async () => {
@@ -5415,7 +5773,7 @@ describe("protected owner Terraform bridge", () => {
       EXPOSURE_ADOPTION_RUN_ID: "123454",
       TARGET_REPOSITORY: "runsetta",
       TERRAFORM_ROOT: "prod",
-    });
+    }, true);
     const events: string[] = [];
     const dependencies = fakeDependencies(events, {
       planJson: JSON.stringify(raw),
@@ -5429,7 +5787,7 @@ describe("protected owner Terraform bridge", () => {
     expect(events.filter((event) => event === "exposure")).toHaveLength(4);
     expect(events.indexOf("elevate")).toBeGreaterThan(events.indexOf("consume"));
     expect(events.indexOf("terraform:apply")).toBeGreaterThan(events.indexOf("elevate"));
-    expect(events.indexOf("publish:post")).toBeGreaterThan(events.indexOf("terraform:apply"));
+    expect(events.indexOf("publish:final")).toBeGreaterThan(events.indexOf("terraform:apply"));
 
     const rejectedEvents: string[] = [];
     await expect(runProtectedBootstrap(
@@ -5514,7 +5872,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const events: string[] = [];
     const dependencies = fakeDependencies(events, {
       now: () => now,
@@ -5585,121 +5943,6 @@ describe("protected owner Terraform bridge", () => {
     await expect(bounded("https://example.invalid/hanging-body")).rejects.toThrow("timed out");
   });
 
-  test("fresh plan receipt is source-bound, byte-verified, and consumed exactly once", async () => {
-    const now = Date.parse("2026-08-22T21:30:00.000Z");
-    const planInvocation = validateInvocation(validEnvironment());
-    const review = buildReviewManifest(plan([]), {
-      ...identity(),
-      terraformRoot: "bootstrap",
-    });
-    const objects = new Map<string, string>();
-    const fetcher = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const url = new URL(String(input));
-      if (url.hostname === "api.github.com" && url.pathname.endsWith("/actions/runs/123456")) {
-        return Response.json({
-          actor: { id: 16823277 },
-          conclusion: "success",
-          created_at: "2026-08-22T21:29:00.000Z",
-          event: "workflow_dispatch",
-          head_branch: "main",
-          head_sha: platformSha,
-          id: 123456,
-          repository: { id: 1255856466 },
-          run_attempt: 1,
-          status: "completed",
-          updated_at: "2026-08-22T21:29:30.000Z",
-          workflow_id: 77,
-        });
-      }
-      if (url.hostname === "api.github.com" && url.pathname.endsWith("/actions/workflows/77")) {
-        return Response.json({ path: ".github/workflows/protected-bootstrap-implementation.yml" });
-      }
-      if (url.hostname === "storage.googleapis.com" && url.pathname.startsWith("/upload/")) {
-        const name = url.searchParams.get("name");
-        if (name === null) return new Response("", { status: 400 });
-        if (objects.has(name)) return new Response("", { status: 412 });
-        objects.set(name, String(init?.body));
-        return Response.json({ bucket: "cdbentley-tfstate-882468538648-bootstrap", name });
-      }
-      if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
-        const encoded = url.pathname.split("/o/")[1];
-        const name = encoded === undefined ? "" : decodeURIComponent(encoded);
-        const body = objects.get(name);
-        return body === undefined ? new Response("", { status: 404 }) : new Response(body);
-      }
-      return new Response("", { status: 500 });
-    };
-    const executorToken = "short-lived-executor-access-token-value";
-    await publishPlanReceipt(
-      planInvocation,
-      executorToken,
-      review,
-      executionProof(),
-      now,
-      fetcher,
-    );
-    const publishedReceipt = JSON.parse(
-      objects.get("cdbentley/bootstrap/.protected-bootstrap/plans/123456.json") ?? "{}",
-    ) as Record<string, unknown>;
-    expect(publishedReceipt.mode).toBe("plan");
-    expect(publishedReceipt.schemaVersion).toBe(4);
-    expect(publishedReceipt.exposureProof).toBeNull();
-    expect(publishedReceipt.legacyCompatibilityMode).toBeFalse();
-    expect(publishedReceipt.markerProof).toEqual(markers());
-    expect(publishedReceipt.transitionWorkflowSha).toBe("");
-    const applyInvocation = validateInvocation({
-      ...validEnvironment(),
-      APPROVED_MANIFEST_SHA256: review.sha256,
-      APPROVED_PLAN_RUN_ID: "123456",
-      BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
-      EXECUTION_MODE: "apply",
-      GITHUB_RUN_ID_EXACT: "123457",
-    });
-    const approved = await verifyPlanApproval(
-      applyInvocation,
-      executorToken,
-      executionProof(),
-      now,
-      fetcher,
-    );
-    expect(approved.sha256).toBe(review.sha256);
-    const changedMarkers = markers().map((marker, index) =>
-      index === 0 ? { ...marker, generation: "999" } : marker
-    );
-    await expect(verifyPlanApproval(
-      applyInvocation,
-      executorToken,
-      executionProof({ markerProof: changedMarkers }),
-      now,
-      fetcher,
-    )).rejects.toThrow("approved deployment-parity marker proof");
-    await consumePlanReceipt(applyInvocation, executorToken, review, executionProof(), now, fetcher);
-    await expect(
-      consumePlanReceipt(applyInvocation, executorToken, review, executionProof(), now, fetcher),
-    )
-      .rejects.toThrow("already published or consumed");
-    expect([...objects.keys()].filter((name) => name.includes("/consumed/"))).toHaveLength(1);
-    const postProof = executionProof({
-      freezeProof: freezeSnapshot(now + 420_000),
-    });
-    await publishPostApplyReceipt(
-      applyInvocation,
-      executorToken,
-      review,
-      postProof,
-      now + 420_000,
-      fetcher,
-    );
-    const result = JSON.parse(
-      objects.get("cdbentley/bootstrap/.protected-bootstrap/results/123457.json") ?? "{}",
-    ) as Record<string, unknown>;
-    expect(result.mode).toBe("post-apply");
-    expect(result.markerProof).toEqual(markers());
-    expect((result.freezeProof as Record<string, unknown>).observedAt).toBe(
-      new Date(now + 420_000).toISOString(),
-    );
-  });
-
   test("Runsetta adoption publishes one immutable terminal receipt with no apply capability", async () => {
     const now = Date.parse("2026-08-26T16:00:00.000Z");
     const invocation = validateInvocation({
@@ -5723,7 +5966,13 @@ describe("protected owner Terraform bridge", () => {
         if (name === null) return new Response("", { status: 400 });
         if (objects.has(name)) return new Response("", { status: 412 });
         objects.set(name, String(init?.body));
-        return Response.json({ bucket: REPOSITORIES.runsetta.state.exposure.bucket, name });
+        return Response.json({
+          bucket: REPOSITORIES.runsetta.state.exposure.bucket,
+          generation: String(1_700_000_000 + objects.size),
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(String(init?.body))),
+        });
       }
       if (url.hostname === "storage.googleapis.com" && url.searchParams.get("alt") === "media") {
         const encoded = url.pathname.split("/o/")[1];
@@ -5840,6 +6089,7 @@ describe("protected owner Terraform bridge", () => {
           return Response.json({
             bucket: REPOSITORIES.runsetta.state.exposure.bucket,
             generation: "8",
+            metageneration: "1",
             name,
             size: String(Buffer.byteLength(raw)),
           });
@@ -5960,7 +6210,8 @@ describe("protected owner Terraform bridge", () => {
           requestedPages.push(page);
           return Response.json({
             total_count: 101,
-            workflow_runs: Array.from({ length: page === 1 ? 100 : 1 }, () => ({
+            workflow_runs: Array.from({ length: page === 1 ? 100 : 1 }, (_, index) => ({
+              id: (page - 1) * 100 + index + 1,
               status: "requested",
             })),
           });
@@ -5981,6 +6232,1811 @@ describe("protected owner Terraform bridge", () => {
     ))
       .rejects.toThrow("active GitHub Actions run");
     expect(requestedPages).toEqual([1, 2]);
+  });
+
+  const freezeProofFetcher = (
+    runs: (
+      repository: string,
+      status: string | null,
+      page: number,
+    ) => { readonly total_count: number; readonly workflow_runs: readonly object[] },
+  ) => async (input: string | URL | Request): Promise<Response> => {
+    const url = new URL(String(input));
+    const repository = url.pathname.split("/")[3] ?? "";
+    const ids: Record<string, string> = {
+      cdbentley: "1255553151",
+      "critical-history": "280932482",
+      healthmcp: "1025243085",
+      runsetta: "711292980",
+    };
+    if (url.pathname.endsWith("/actions/permissions")) return Response.json({ enabled: false });
+    if (url.pathname.endsWith("/actions/runs")) {
+      return Response.json(runs(
+        repository,
+        url.searchParams.get("status"),
+        Number(url.searchParams.get("page")),
+      ));
+    }
+    return Response.json({
+      full_name: `collinbentley1/${repository}`,
+      id: Number(ids[repository]),
+      owner: { id: 16823277 },
+    });
+  };
+
+  test("consumer freeze refuses an incomplete active-status page", async () => {
+    const fetcher = freezeProofFetcher((repository, status) =>
+      repository === "cdbentley" && status === "requested"
+        ? { total_count: 1, workflow_runs: [] }
+        : { total_count: 0, workflow_runs: [] }
+    );
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("short or overfilled requested run page");
+  });
+
+  test("consumer freeze refuses duplicate run IDs across unfiltered pages", async () => {
+    const terminalRun = (id: number) => ({
+      created_at: "2026-08-22T20:00:00.000Z",
+      id,
+      status: "completed",
+      updated_at: "2026-08-22T20:00:00.000Z",
+    });
+    const fetcher = freezeProofFetcher((repository, status, page) => {
+      if (repository !== "cdbentley" || status !== null) {
+        return { total_count: 0, workflow_runs: [] };
+      }
+      return {
+        total_count: 101,
+        workflow_runs: page === 1
+          ? Array.from({ length: 100 }, (_, index) => terminalRun(index + 1))
+          : [terminalRun(100)],
+      };
+    });
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("repeated a run ID");
+  });
+
+  test("consumer freeze cross-checks active status in unfiltered history", async () => {
+    const fetcher = freezeProofFetcher((repository, status) =>
+      repository === "cdbentley" && status === null
+        ? {
+          total_count: 1,
+          workflow_runs: [{
+            created_at: "2026-08-22T20:00:00.000Z",
+            id: 1,
+            status: "in_progress",
+            updated_at: "2026-08-22T20:00:00.000Z",
+          }],
+        }
+        : { total_count: 0, workflow_runs: [] }
+    );
+
+    await expect(proveConsumerFreeze(
+      "consumer-actions-token-value",
+      300,
+      fetcher,
+      Date.parse("2026-08-22T21:30:00.000Z"),
+    )).rejects.toThrow("unfiltered history still contains an active");
+  });
+
+  // Abrupt loss, exercised through the real recovery entrypoint. Only the HTTP
+  // layer and the executor-containment probe are stand-ins; runProtectedRecovery
+  // calls the same recoverFederationQuarantines and restoreQuarantinedFederation
+  // a lost runner would.
+  const POOL_PROJECTS: Record<string, string> = {
+    cdbentley: "cdbentley",
+    "critical-history": "critical-history-16823277",
+    healthmcp: "medlock-1025243085",
+    runsetta: "runsetta",
+  };
+  const intentBody = (repository: string, root: string, runId: string) => {
+    const pools = [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([name, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(
+          {
+            description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+            disabled: false,
+            displayName: "GitHub Actions",
+            name: federationPoolName(project!),
+            state: "ACTIVE",
+          },
+          project!,
+        ),
+      ),
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
+      repository: name,
+    }));
+    const projectId = REPOSITORIES[repository as keyof typeof REPOSITORIES].projectId;
+    return JSON.stringify({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      capturedAt: "2026-09-01T12:00:00.000Z",
+      consumerSha: "c".repeat(40),
+      executorEmail: `${randomExecutorAccountId(
+        deterministicArtifactHex(repository, runId, "service-account"),
+      )}@${projectId}.iam.gserviceaccount.com`,
+      executorUniqueId: "123456789012345678901",
+      platformSha: "b".repeat(40),
+      pools,
+      repository,
+      root,
+      runId,
+    });
+  };
+
+  // A whole fleet: four pools, every state bucket, and immutable object writes.
+  function recoveryWorld(options: {
+    readonly disabled: Record<string, boolean>;
+    readonly objects: Record<string, Record<string, string>>;
+  }) {
+    const writes: string[] = [];
+    const patched: string[] = [];
+    const generations: Record<string, string> = {};
+    for (const [bucket, store] of Object.entries(options.objects)) {
+      void bucket;
+      for (const name of Object.keys(store)) generations[name] = "1";
+    }
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.hostname === "iam.googleapis.com") {
+        const project = url.pathname.split("/")[3]!;
+        if (url.pathname.endsWith("/providers/github")) {
+          return Response.json({
+            attributeCondition: "assertion.repository_owner_id == '16823277'",
+            attributeMapping: {
+              "attribute.repository": "assertion.repository_id",
+              "google.subject": "assertion.sub",
+            },
+            description: "GitHub Actions OIDC provider.",
+            disabled: false,
+            displayName: "GitHub",
+            name: federationProviderName(project),
+            oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
+            state: "ACTIVE",
+          });
+        }
+        if (init?.method === "PATCH") {
+          patched.push(project);
+          options.disabled[project] = JSON.parse(String(init.body)).disabled;
+          return Response.json({ name: "operations/1" });
+        }
+        return Response.json({
+          description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+          disabled: options.disabled[project] ?? false,
+          displayName: "GitHub Actions",
+          name: federationPoolName(project),
+          state: "ACTIVE",
+        });
+      }
+      const bucket = decodeURIComponent(url.pathname.split("/b/")[1]!.split("/")[0]!);
+      const store = options.objects[bucket] ?? (options.objects[bucket] = {});
+      if (url.pathname.startsWith("/upload/")) {
+        const name = url.searchParams.get("name")!;
+        if (store[name] !== undefined) return new Response("exists", { status: 412 });
+        store[name] = String(init!.body);
+        writes.push(`${bucket}/${name}`);
+        generations[name] = String(1_700_000_000 + writes.length);
+        return Response.json({
+          bucket,
+          generation: generations[name],
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(store[name]!)),
+        });
+      }
+      if (url.searchParams.get("alt") === "media") {
+        const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+        return store[name] === undefined
+          ? new Response("missing", { status: 404 })
+          : new Response(store[name]);
+      }
+      if (url.pathname.includes("/o/")) {
+        const name = decodeURIComponent(url.pathname.split("/o/")[1]!);
+        return store[name] === undefined
+          ? new Response("missing", { status: 404 })
+          : Response.json({ generation: generations[name], name });
+      }
+      const prefix = url.searchParams.get("prefix") ?? "";
+      return Response.json({
+        items: Object.keys(store).filter((name) => name.startsWith(prefix)).map((name) => ({
+          generation: generations[name] ?? "1",
+          metageneration: "1",
+          name,
+          size: String(Buffer.byteLength(store[name]!)),
+        })),
+      });
+    }) as unknown as typeof fetch;
+    return { fetcher, patched, writes };
+  }
+
+  const recoveryInvocation = {
+    githubRunId: "999111",
+    ownerAccessToken: "owner-token-value",
+    platformRoot: "/platform",
+    platformSha: "c".repeat(40),
+    repository: "cdbentley" as const,
+    runnerTemp: "/tmp",
+  };
+  const CDB_BOOTSTRAP_BUCKET = "cdbentley-tfstate-882468538648-bootstrap";
+  const INTENT_KEY =
+    "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/123456.json";
+
+  // The typed horizon proof a real containment path returns. `undefined` means
+  // "not covered by this run's horizon", which is now how a different project,
+  // or a still-live executor, is reported.
+  const horizonProofFor = (repository: string) => ({
+    artifactsDeleted: true as const,
+    executorEmail: `gha-pbt-${"a".repeat(20)}@${repository}.iam.gserviceaccount.com`,
+    executorUniqueId: "",
+    observedAt: "2026-09-01T12:30:00.000Z",
+    permissionsProvenGone: true as const,
+    projectBindingsCleared: true as const,
+    provenBy: "propagation-horizon" as const,
+  });
+
+  const driveRecovery = async (world: ReturnType<typeof recoveryWorld>, contained = true) => {
+    const summaries: FederationRecoverySummary[] = [];
+    await runProtectedRecovery(recoveryInvocation, {
+      now: () => 1_800_000_000_000,
+      recoverArtifacts: async () => ({
+        emptySinceAt: "2026-09-01T12:20:00.000Z",
+        observationStartedAt: "2026-09-01T12:10:00.000Z",
+        observedAt: "2026-09-01T12:23:00.000Z",
+        projectId: "cdbentley",
+        propagationMinutes: 7,
+        repository: "cdbentley" as const,
+        stableEmptyMinutes: 3,
+      }),
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async (invocation, _horizon, deadlineMs) => {
+        const summary = await recoverFederationQuarantines(
+          invocation.ownerAccessToken,
+          world.fetcher,
+          deadlineMs,
+          async (identity: { repository: string }) =>
+            contained ? horizonProofFor(identity.repository) : undefined,
+          async () => {},
+          () => 1_800_000_000_000,
+        );
+        summaries.push(summary);
+        return summary;
+      },
+      verifySource: async () => {},
+    });
+    return summaries[0]!;
+  };
+
+  test.each([
+    ["after the intent was written but before any pool moved", {}],
+    ["after the first pool PATCH", { cdbentley: true }],
+    ["after every pool PATCH, at elevation", {
+      cdbentley: true,
+      "critical-history-16823277": true,
+      "medlock-1025243085": true,
+      runsetta: true,
+    }],
+    ["mid-restore, with two pools already handed back", {
+      "medlock-1025243085": true,
+      runsetta: true,
+    }],
+  ])("recovery repairs a run lost %s", async (_label, disabled) => {
+    const world = recoveryWorld({
+      disabled: { ...disabled } as Record<string, boolean>,
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const summary = await driveRecovery(world);
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.restored).toEqual([INTENT_KEY]);
+    // Only the pools that were still disabled are touched, and all of them end
+    // enabled.
+    for (const project of Object.values(POOL_PROJECTS)) {
+      expect(world.patched.includes(project)).toBe(Boolean((disabled as Record<string, boolean>)[project]));
+    }
+    // And the completion marker binds the exact record it repaired.
+    expect(world.writes).toEqual([`${CDB_BOOTSTRAP_BUCKET}/${INTENT_KEY}.restored`]);
+  });
+
+  test("recovery lost after restore but before the marker is idempotent", async () => {
+    const world = recoveryWorld({
+      disabled: {},
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const first = await driveRecovery(world);
+    const second = await driveRecovery(world);
+
+    expect(first.restored).toEqual([INTENT_KEY]);
+    // The marker now exists, so the second pass will not replay the record and
+    // undo a disable somebody intended later.
+    expect(second.restored).toEqual([]);
+    expect(second.skippedComplete).toEqual([INTENT_KEY]);
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an intent outside this run's horizon is reported, not restored", async () => {
+    // The redesign's honest bound. A containment horizon is project-wide but
+    // only for ONE project, and the twelve-minute recovery envelope funds
+    // exactly one. So an intent belonging to a different project is not covered
+    // by this run's evidence and is reported for a recovery run of its own --
+    // rather than restored on the strength of a horizon that never observed it.
+    const key = "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json";
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        "medlock-tfstate-1025243085": { [key]: intentBody("healthmcp", "prod", "777888") },
+      },
+    });
+
+    const summary = await recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      // Faithful to containedByHorizon: only the horizon's own repository.
+      async (identity: { repository: string }) =>
+        identity.repository === "cdbentley" ? horizonProofFor("cdbentley") : undefined,
+      async () => {},
+      () => 1_800_000_000_000,
+    );
+
+    expect(summary.scanned).toBe(1);
+    expect(summary.restored).toEqual([]);
+    expect(summary.skippedUncontained).toEqual([key]);
+    expect(world.patched).toEqual([]);
+  });
+
+  test("recovery for one target repairs an intent left by a run for another", async () => {
+    // The lost run was healthmcp/prod; this recovery run was pointed at
+    // cdbentley. A per-target scan would never have seen it.
+    const key = "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json";
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        "medlock-tfstate-1025243085": {
+          [key]: intentBody("healthmcp", "prod", "777888"),
+        },
+      },
+    });
+    const summary = await driveRecovery(world);
+
+    expect(summary.restored).toEqual([key]);
+    expect(world.patched.toSorted()).toEqual(
+      ["cdbentley", "critical-history-16823277", "medlock-1025243085", "runsetta"],
+    );
+  });
+
+  test("a run whose executor deletion fails produces no countable success", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        releaseExecutor: async () => {
+          throw new Error("the executor could not be deleted");
+        },
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("cleanup did not complete exactly");
+
+    // Publication happens only after the whole cleanup succeeds, so a failed
+    // executor deletion leaves no terminal artifact at all.
+    expect(events).not.toContain("publish:final");
+  });
+
+  test("a rehearsal receipt is explicitly non-countable and claims no Terraform", () => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXECUTION_MODE: "rehearsal",
+    });
+    const intent = quarantineIntent(invocation);
+    const proof = buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: "2026-09-01T12:00:00.000Z",
+        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+      },
+      intent,
+      intentDigest: "a".repeat(64),
+      intentGeneration: "1700000001",
+      invocation,
+      kind: "rehearsal",
+      observedPools: intent.pools.map((pool) => ({
+        disabled: pool.disabled,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: "2026-09-01T12:01:00.000Z",
+        repository: pool.repository,
+      })),
+      review: { canonical: "", sha256: "b".repeat(64) },
+    });
+
+    expect(proof.countable).toBe(false);
+    expect(proof.kind).toBe("rehearsal");
+    // A rehearsal runs no Terraform, so these fields do not exist on it at all.
+    expect("quarantinedApplyProofDigest" in proof).toBe(false);
+    expect("restoredAudit" in proof).toBe(false);
+  });
+
+  test("the final proof carries post-restore observations, not the intent", () => {
+    const invocation = validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "rehearsal" });
+    const intent = quarantineIntent(invocation);
+    const observed = intent.pools.map((pool) => ({
+      disabled: false,
+      fingerprint: pool.fingerprint,
+      name: pool.name,
+      observedAt: "2026-09-01T12:01:00.000Z",
+      repository: pool.repository,
+    }));
+    const proof = buildFinalProtectedProof({
+      deElevation: {
+        executorEmail,
+        executorUniqueId: "123456789012345678901",
+        observedAt: "2026-09-01T12:00:00.000Z",
+        provenAbsent: [],
+      },
+      intent,
+      intentDigest: "a".repeat(64),
+      intentGeneration: "1700000001",
+      invocation,
+      kind: "rehearsal",
+      observedPools: observed,
+      review: { canonical: "", sha256: "b".repeat(64) },
+    });
+
+    // Every entry carries an observation time, which an intent copy never would.
+    expect(proof.observedPools.every((pool) => pool.observedAt === "2026-09-01T12:01:00.000Z"))
+      .toBe(true);
+    expect(proof.observedPools).toHaveLength(4);
+  });
+
+  test("a short pass caused by a shifting page is refused before any restore", async () => {
+    // The pages omit an object rather than repeating one: every within-pass
+    // check passes and the set that comes back is still not the set that exists.
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") },
+      },
+    });
+    let listings = 0;
+    const shifting = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("prefix") !== null && url.hostname === "storage.googleapis.com") {
+        listings += 1;
+        // The second canonical listing drops the object entirely.
+        if (listings > 2) return Response.json({ items: [] });
+      }
+      return await world.fetcher(input as string, init);
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      shifting,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("inventory changed size between two listings");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an object replaced between listing and read is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") },
+      },
+    });
+    const swapped = (async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("alt") === "media" && url.searchParams.get("generation") !== null) {
+        // Same key, different bytes: the generation-bound read is what makes
+        // this detectable at all.
+        return new Response(intentBody("cdbentley", "bootstrap", "123456") + " ");
+      }
+      return await world.fetcher(input as string, init);
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      swapped,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("did not match its listed size");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("a future-dated intent cannot hold recovery authority", async () => {
+    const future = intentBody("cdbentley", "bootstrap", "123456").replace(
+      "2026-09-01T12:00:00.000Z",
+      "2099-09-01T12:00:00.000Z",
+    );
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: future } },
+    });
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("dated into the future");
+    expect(world.patched).toEqual([]);
+  });
+
+  test.each([
+    ["names the wrong intent bytes", { intentDigest: "0".repeat(64) }],
+    ["names the wrong intent generation", { intentGeneration: "999" }],
+    ["names another repository", { repository: "runsetta" }],
+    ["names another run", { runId: "555555" }],
+    ["is dated before the intent it claims to complete", { restoredAt: "2020-01-01T00:00:00.000Z" }],
+  ])("a completion marker that %s does not suppress the restore", async (_label, override) => {
+    const body = intentBody("cdbentley", "bootstrap", "123456");
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          [INTENT_KEY]: body,
+          [`${INTENT_KEY}.restored`]: `${JSON.stringify({
+            intentDigest: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+            intentGeneration: "1",
+            repository: "cdbentley",
+            restoredAt: "2026-09-01T12:30:00.000Z",
+            root: "bootstrap",
+            runId: "123456",
+            ...override,
+          })}\n`,
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow();
+    // Nothing was handed back on the strength of a marker that does not
+    // describe this intent.
+    expect(world.patched).toEqual([]);
+  });
+
+  test("one uncontained intent stops every other intent from being restored", async () => {
+    // Both intents cover all four pools. Restoring the contained one would hand
+    // federation back to the executor of the uncontained one.
+    const contained = intentBody("cdbentley", "bootstrap", "123456");
+    const stuck = intentBody("healthmcp", "prod", "777888");
+    const world = recoveryWorld({
+      disabled: {
+        cdbentley: true,
+        "critical-history-16823277": true,
+        "medlock-1025243085": true,
+        runsetta: true,
+      },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: contained },
+        "medlock-tfstate-1025243085": {
+          "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json": stuck,
+        },
+      },
+    });
+
+    const summary = await recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async (identity: { repository: string }) =>
+        identity.repository === "cdbentley" ? horizonProofFor(identity.repository) : undefined,
+      async () => {},
+      () => 1_800_000_000_000,
+    );
+
+    expect(summary.scanned).toBe(2);
+    expect(summary.restored).toEqual([]);
+    expect(summary.skippedUncontained).toHaveLength(1);
+    // Not one pool moved.
+    expect(world.patched).toEqual([]);
+  });
+
+  test("incomplete intents that disagree about the prior pool state fail closed", async () => {
+    const agreeing = intentBody("cdbentley", "bootstrap", "123456");
+    const disagreeing = JSON.parse(intentBody("healthmcp", "prod", "777888")) as {
+      pools: { disabled: boolean }[];
+    };
+    // This one captured runsetta as already disabled; the other captured it
+    // enabled. Restoring either invents a state nobody reviewed.
+    disagreeing.pools[1]!.disabled = true;
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: agreeing },
+        "medlock-tfstate-1025243085": {
+          "medlock/prod/.protected-bootstrap/federation-quarantine/777888.json":
+            JSON.stringify(disagreeing),
+        },
+      },
+    });
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      world.fetcher,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("disagree about the pre-quarantine pool state");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an unrecognised object in the protected prefix stops recovery", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456"),
+          "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/notes.txt": "hello",
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow("unrecognised object");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an intent whose executor is not contained is left closed and reported", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+
+    await expect(runProtectedRecovery(recoveryInvocation, {
+      now: () => 1_800_000_000_000,
+      recoverArtifacts: async () => ({
+        emptySinceAt: "2026-09-01T12:20:00.000Z",
+        observationStartedAt: "2026-09-01T12:10:00.000Z",
+        observedAt: "2026-09-01T12:23:00.000Z",
+        projectId: "cdbentley",
+        propagationMinutes: 7,
+        repository: "cdbentley" as const,
+        stableEmptyMinutes: 3,
+      }),
+      finalizePendingReceipts: async () => ({
+        alreadyComplete: [],
+        finalized: [],
+        scanned: 0,
+        skippedUncontained: [],
+      }),
+      recoverFederation: async (invocation, _horizon, deadlineMs) =>
+        await recoverFederationQuarantines(
+          invocation.ownerAccessToken,
+          world.fetcher,
+          deadlineMs,
+          async () => undefined,
+          async () => {},
+          () => 1_800_000_000_000,
+        ),
+      verifySource: async () => {},
+    })).rejects.toThrow("not provably contained");
+
+    // Nothing was handed back, and no marker was written.
+    expect(world.patched).toEqual([]);
+    expect(world.writes).toEqual([]);
+  });
+
+  test("an intent whose object name disagrees with its own identity is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: {
+        [CDB_BOOTSTRAP_BUCKET]: {
+          // Body says run 123456; the object claims 999999.
+          "cdbentley/bootstrap/.protected-bootstrap/federation-quarantine/999999.json":
+            intentBody("cdbentley", "bootstrap", "123456"),
+        },
+      },
+    });
+
+    await expect(driveRecovery(world)).rejects.toThrow("federation intent object name");
+    expect(world.patched).toEqual([]);
+  });
+
+  test("an intent that was rewritten after it was armed is refused", async () => {
+    const world = recoveryWorld({
+      disabled: { cdbentley: true },
+      objects: { [CDB_BOOTSTRAP_BUCKET]: { [INTENT_KEY]: intentBody("cdbentley", "bootstrap", "123456") } },
+    });
+    const rewritten = (async (input: string | URL, init?: RequestInit) => {
+      const response = await world.fetcher(input as string, init);
+      const url = new URL(String(input));
+      if (url.searchParams.get("prefix") !== null) {
+        const body = await response.json() as { items: { metageneration: string }[] };
+        // The durable intent is written once; a second generation means
+        // somebody rewrote the record this restore would act on.
+        return Response.json({ items: body.items.map((item) => ({ ...item, metageneration: "2" })) });
+      }
+      return response;
+    }) as unknown as typeof fetch;
+
+    await expect(recoverFederationQuarantines(
+      "owner-token-value",
+      rewritten,
+      1_800_000_060_000,
+      async (identity: { repository: string }) => horizonProofFor(identity.repository),
+      async () => {},
+      () => 1_800_000_000_000,
+    )).rejects.toThrow("federation intent metageneration");
+    expect(world.patched).toEqual([]);
+  });
+
+  // Stage one of the rollout. The subsystem that closes the privileged window
+  // lands with production apply refused, so the first live exercise of this
+  // code cannot grant an unvalidated production apply.
+  test("a deployed build refuses production apply outright", () => {
+    expect(PRODUCTION_APPLY_ENABLED).toBe(false);
+    expect(() =>
+      validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "apply" })
+    ).toThrow("Production protected apply is disabled in this build");
+  });
+
+  test("plan and rehearsal remain available while apply is refused", () => {
+    expect(validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "plan" }).mode).toBe("plan");
+    expect(validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "rehearsal" }).mode)
+      .toBe("rehearsal");
+  });
+
+  test("an unknown execution mode is still refused by the allowlist", () => {
+    expect(() => validateInvocation({ ...validEnvironment(), EXECUTION_MODE: "canary" }))
+      .toThrow("Execution mode escaped the closed allowlist");
+  });
+
+  test("reading an already-published apply receipt is not gated by the rollout", () => {
+    // Stage two turns the gate off; stage one must still be able to read the
+    // history stage two depends on.
+    expect(() =>
+      executorDescription({
+        mode: "apply",
+        repository: "cdbentley",
+        root: "bootstrap",
+        runId: "123455",
+      })
+    ).not.toThrow("Production protected apply is disabled");
+  });
+
+  // Federation quarantine. A disabled workload identity pool blocks token
+  // exchange AND stops already-issued tokens reaching resources, which is why
+  // the pool -- not the provider, and not a clock -- is what closes the
+  // privileged window.
+  const poolBody = (project: string, disabled: boolean) => ({
+    description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+    disabled,
+    displayName: "GitHub Actions",
+    name: federationPoolName(project),
+    state: "ACTIVE",
+  });
+  const providerBody = (project: string, condition = "assertion.repository_owner_id == '16823277'") => ({
+    attributeCondition: condition,
+    attributeMapping: {
+      "attribute.repository": "assertion.repository_id",
+      "google.subject": "assertion.sub",
+    },
+    description: "GitHub Actions OIDC provider.",
+    disabled: false,
+    displayName: "GitHub",
+    name: federationProviderName(project),
+    oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
+    state: "ACTIVE",
+  });
+
+  type TestRepository = (typeof REPOSITORY_NAMES)[number];
+  type ControllerMockKind =
+    | "analysis"
+    | "poolPolicy"
+    | "project"
+    | "projectPolicy"
+    | "role";
+  type ControllerMockMutation = (
+    kind: ControllerMockKind,
+    repository: TestRepository | undefined,
+    value: Record<string, unknown>,
+    occurrence: number,
+  ) => unknown | Response;
+  const controllerOwner = "user:CollinBentley1@gmail.com";
+  const controllerPermissions = [
+    "iam.googleapis.com/workloadIdentityPools.setIamPolicy",
+    "iam.googleapis.com/workloadIdentityPools.update",
+    "iam.workloadIdentityPools.createPolicyBinding",
+    "iam.workloadIdentityPools.deletePolicyBinding",
+    "iam.workloadIdentityPools.updatePolicyBinding",
+    "resourcemanager.projects.setIamPolicy",
+  ] as const;
+  const controllerOptions = {
+    analyzeServiceAccountImpersonation: true,
+    expandResources: true,
+    expandRoles: true,
+    outputGroupEdges: true,
+    outputResourceEdges: true,
+  };
+  const repositoryForProjectId = (projectId: string): TestRepository => {
+    const repository = REPOSITORY_NAMES.find(
+      (candidate) => REPOSITORIES[candidate].projectId === projectId,
+    );
+    if (repository === undefined) throw new Error(`Unknown controller test project ${projectId}.`);
+    return repository;
+  };
+  const repositoryForProjectNumber = (projectNumber: string): TestRepository => {
+    const repository = REPOSITORY_NAMES.find(
+      (candidate) => REPOSITORIES[candidate].exposure.projectNumber === projectNumber,
+    );
+    if (repository === undefined) {
+      throw new Error(`Unknown controller test project number ${projectNumber}.`);
+    }
+    return repository;
+  };
+  const controllerAnalysisBody = (repository: TestRepository) => {
+    const projectId = REPOSITORIES[repository].projectId;
+    const projectFullName = `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
+    return {
+      fullyExplored: true,
+      mainAnalysis: {
+        analysisQuery: {
+          accessSelector: { permissions: [...controllerPermissions].toSorted() },
+          options: controllerOptions,
+          scope: `projects/${projectId}`,
+        },
+        analysisResults: [{
+          accessControlLists: [{
+            accesses: controllerPermissions.map((permission) => ({ permission })),
+            resources: [{ fullResourceName: projectFullName }],
+          }],
+          attachedResourceFullName: projectFullName,
+          fullyExplored: true,
+          iamBinding: { members: [controllerOwner], role: "roles/owner" },
+          identityList: { identities: [{ name: controllerOwner }] },
+        }],
+        fullyExplored: true,
+      },
+    };
+  };
+  const controllerProofFetcher = (mutation?: ControllerMockMutation) => {
+    const counts = new Map<string, number>();
+    const requests: Array<{ method: string; url: string }> = [];
+    const respond = (
+      kind: ControllerMockKind,
+      repository: TestRepository | undefined,
+      value: Record<string, unknown>,
+    ): Response => {
+      const key = `${kind}:${repository ?? "shared"}`;
+      const occurrence = (counts.get(key) ?? 0) + 1;
+      counts.set(key, occurrence);
+      const copy = structuredClone(value) as Record<string, unknown>;
+      const changed = mutation?.(kind, repository, copy, occurrence) ?? copy;
+      return changed instanceof Response ? changed : Response.json(changed);
+    };
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? "GET";
+      requests.push({ method, url: url.toString() });
+      if (url.hostname === "cloudresourcemanager.googleapis.com") {
+        const policy = /^\/v1\/projects\/([^/:]+):getIamPolicy$/.exec(url.pathname);
+        if (policy !== null && method === "POST") {
+          const repository = repositoryForProjectId(policy[1]!);
+          return respond("projectPolicy", repository, {
+            bindings: [{ members: [controllerOwner], role: "roles/owner" }],
+            etag: `project-policy-${repository}`,
+            version: 1,
+          });
+        }
+        const project = /^\/v1\/projects\/([^/:]+)$/.exec(url.pathname);
+        if (project !== null && method === "GET") {
+          const repository = repositoryForProjectId(project[1]!);
+          const contract = REPOSITORIES[repository];
+          return respond("project", repository, {
+            lifecycleState: "ACTIVE",
+            name: repository,
+            projectId: contract.projectId,
+            projectNumber: contract.exposure.projectNumber,
+          });
+        }
+      }
+      if (url.hostname === "iam.googleapis.com") {
+        const pool = /^\/v1\/projects\/([^/]+)\/locations\/global\/workloadIdentityPools\/github-actions:getIamPolicy$/.exec(
+          url.pathname,
+        );
+        if (pool !== null && method === "POST") {
+          return respond("poolPolicy", repositoryForProjectNumber(pool[1]!), {});
+        }
+        if (url.pathname === "/v1/roles/owner" && method === "GET") {
+          return respond("role", undefined, {
+            description: "Full access to the reviewed project control plane.",
+            etag: "owner-role-etag",
+            includedPermissions: [...controllerPermissions],
+            name: "roles/owner",
+            stage: "GA",
+            title: "Owner",
+          });
+        }
+      }
+      if (url.hostname === "cloudasset.googleapis.com" && method === "GET") {
+        const analysis = /^\/v1\/projects\/([^/:]+):analyzeIamPolicy$/.exec(url.pathname);
+        if (analysis !== null) {
+          const repository = repositoryForProjectId(analysis[1]!);
+          return respond("analysis", repository, controllerAnalysisBody(repository));
+        }
+      }
+      throw new Error(`Unexpected controller proof request ${method} ${url.toString()}`);
+    }) as typeof fetch;
+    return { fetcher, requests };
+  };
+
+  test("the live controller proof brackets exact policies and fully expands every mutator", async () => {
+    const { fetcher, requests } = controllerProofFetcher();
+
+    await proveNoUntrustedFederationControllers(
+      "owner-token-value-long-enough",
+      fetcher,
+    );
+
+    const analyses = requests.filter((request) =>
+      new URL(request.url).hostname === "cloudasset.googleapis.com"
+    );
+    expect(analyses).toHaveLength(4);
+    for (const request of analyses) {
+      const url = new URL(request.url);
+      expect(request.method).toBe("GET");
+      expect(
+        url.searchParams.getAll("analysisQuery.accessSelector.permissions"),
+      ).toEqual([...controllerPermissions]);
+      for (const option of Object.keys(controllerOptions)) {
+        expect(url.searchParams.get(`analysisQuery.options.${option}`)).toBe("true");
+      }
+      expect(url.searchParams.get("executionTimeout")).toBe("120s");
+    }
+    for (const repository of REPOSITORY_NAMES) {
+      const projectId = REPOSITORIES[repository].projectId;
+      expect(requests.filter((request) =>
+        request.url.includes(`/v1/projects/${projectId}:getIamPolicy`)
+      )).toHaveLength(2);
+      expect(requests.filter((request) =>
+        request.url.includes(`/v1/projects/${projectId}`) &&
+        !request.url.includes(":getIamPolicy") &&
+        !request.url.includes(":analyzeIamPolicy")
+      )).toHaveLength(2);
+    }
+  });
+
+  test.each([
+    ["an inherited project", ((kind, repository, value) => {
+      if (kind === "project" && repository === "cdbentley") {
+        value.parent = { id: "1", type: "organization" };
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "acquired an organization or folder parent"],
+    ["a resource-level pool binding", ((kind, repository, value) => {
+      if (kind === "poolPolicy" && repository === "cdbentley") {
+        value.bindings = [{ members: [controllerOwner], role: "roles/owner" }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "resource-level IAM binding"],
+    ["an untrusted live project mutator", ((kind, repository, value) => {
+      if (kind === "projectPolicy" && repository === "cdbentley") {
+        const bindings = value.bindings as Array<{ members: string[] }>;
+        bindings[0]!.members.push("serviceAccount:attacker@evil.invalid");
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "outside the exact owner identity"],
+    ["no direct owner mutator", ((kind, _repository, value) => {
+      if (kind === "role") value.includedPermissions = ["resourcemanager.projects.get"];
+      return value;
+    }) satisfies ControllerMockMutation, "has no exact owner federation-controller binding"],
+    ["a partial top-level analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") value.fullyExplored = false;
+      return value;
+    }) satisfies ControllerMockMutation, "controller analysis completeness drifted"],
+    ["an analysis warning", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        (value.mainAnalysis as Record<string, unknown>).nonCriticalErrors = [{ code: "UNKNOWN" }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "returned non-critical errors"],
+    ["an incomplete binding analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        main.analysisResults[0]!.fullyExplored = false;
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller result completeness drifted"],
+    ["a numeric attachment substituted into an ID-scoped analysis", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        main.analysisResults[0]!.attachedResourceFullName =
+          `//cloudresourcemanager.googleapis.com/projects/${REPOSITORIES.cdbentley.exposure.projectNumber}`;
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller policy attachment drifted"],
+    ["an empty analysis result", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        (value.mainAnalysis as Record<string, unknown>).analysisResults = [];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "returned no or too many bindings"],
+    ["an impersonation path", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        value.serviceAccountImpersonationAnalysis = [{ fullyExplored: true }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "found a service-account impersonation path"],
+    ["an untrusted analyzed identity", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        const result = main.analysisResults[0]!;
+        result.iamBinding = {
+          members: ["group:attackers@evil.invalid"],
+          role: "roles/owner",
+        };
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "outside the unconditional exact owner binding"],
+    ["a group-derived identity", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisResults: Array<Record<string, unknown>> };
+        const identityList = main.analysisResults[0]!.identityList as Record<string, unknown>;
+        identityList.groupEdges = [{ sourceNode: "group:x", targetNode: controllerOwner }];
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "found a group-derived identity"],
+    ["a changed analyzer query", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        const main = value.mainAnalysis as { analysisQuery: Record<string, unknown> };
+        main.analysisQuery.scope = "projects/attacker";
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "controller analysis scope drifted"],
+    ["a project-policy race", ((kind, repository, value, occurrence) => {
+      if (kind === "projectPolicy" && repository === "cdbentley" && occurrence === 2) {
+        value.etag = "changed-policy-etag";
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "federation controller snapshot drifted"],
+    ["a role-definition race", ((kind, _repository, value, occurrence) => {
+      if (kind === "role" && occurrence === 2) value.etag = "changed-role-etag";
+      return value;
+    }) satisfies ControllerMockMutation, "federation controller snapshot drifted"],
+    ["an analyzer HTTP failure", ((kind, repository, value) => {
+      if (kind === "analysis" && repository === "cdbentley") {
+        return new Response(JSON.stringify(value), { status: 503 });
+      }
+      return value;
+    }) satisfies ControllerMockMutation, "analysis failed with HTTP 503"],
+  ])("the live controller proof refuses %s", async (_label, mutation, message) => {
+    const { fetcher } = controllerProofFetcher(mutation);
+    await expect(proveNoUntrustedFederationControllers(
+      "owner-token-value-long-enough",
+      fetcher,
+    )).rejects.toThrow(message);
+  });
+
+  test("a pool from another project is refused, not accepted by suffix", () => {
+    expect(() =>
+      federationPoolFromJson(
+        {
+          ...poolBody("cdbentley", false),
+          name: "projects/attacker/locations/global/workloadIdentityPools/github-actions",
+        },
+        "cdbentley",
+      )
+    ).toThrow("not the contracted GitHub Actions pool");
+  });
+
+  test("a soft-deleted pool is refused rather than treated as isolation", () => {
+    expect(() => federationPoolFromJson({ ...poolBody("cdbentley", true), state: "DELETED" }, "cdbentley"))
+      .toThrow("is DELETED, not ACTIVE");
+  });
+
+  test("the live legacy pool shape is bound to its numeric resource identity", () => {
+    const live = federationPoolFromJson({
+      description: "GitHub Actions OIDC identities for collinbentley1/cdbentley.",
+      displayName: "GitHub Actions",
+      name: "projects/882468538648/locations/global/workloadIdentityPools/github-actions",
+      state: "ACTIVE",
+    }, "cdbentley");
+    const explicit = federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "FEDERATION_ONLY",
+    }, "cdbentley");
+    const legacyExplicit = federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "MODE_UNSPECIFIED",
+    }, "cdbentley");
+
+    expect(live.disabled).toBe(false);
+    expect(live.mode).toBe("FEDERATION_ONLY");
+    expect(federationPoolFingerprint(live)).toBe(federationPoolFingerprint(explicit));
+    expect(federationPoolFingerprint(live)).toBe(federationPoolFingerprint(legacyExplicit));
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      name: "projects/cdbentley/locations/global/workloadIdentityPools/github-actions",
+    }, "cdbentley")).toThrow("not the contracted GitHub Actions pool");
+  });
+
+  test("trust-domain or expiring pool configuration is refused", () => {
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      mode: "TRUST_DOMAIN",
+    }, "cdbentley")).toThrow("not federation-only");
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      inlineTrustConfig: {},
+    }, "cdbentley")).toThrow("trust-domain configuration");
+    expect(() => federationPoolFromJson({
+      ...poolBody("cdbentley", false),
+      expireTime: "2026-09-02T00:00:00Z",
+    }, "cdbentley")).toThrow("expiry time");
+  });
+
+  test("the fingerprint excludes only the flag the run is allowed to move", () => {
+    const enabled = federationPoolFromJson(poolBody("cdbentley", false), "cdbentley");
+    const disabled = federationPoolFromJson(poolBody("cdbentley", true), "cdbentley");
+    const renamed = federationPoolFromJson(
+      { ...poolBody("cdbentley", false), displayName: "Something Else" },
+      "cdbentley",
+    );
+
+    expect(federationPoolFingerprint(enabled)).toBe(federationPoolFingerprint(disabled));
+    expect(federationPoolFingerprint(renamed)).not.toBe(federationPoolFingerprint(enabled));
+  });
+
+  test("the provider fingerprint binds the exact GitHub mapping and condition", () => {
+    const provider = federationProviderFromJson(providerBody("cdbentley"), "cdbentley");
+    const broadened = federationProviderFromJson(
+      providerBody("cdbentley", "assertion.repository_owner_id != ''"),
+      "cdbentley",
+    );
+    expect(federationProviderFingerprint(provider)).not.toBe(
+      federationProviderFingerprint(broadened),
+    );
+    expect(() =>
+      federationProviderFromJson(
+        {
+          ...providerBody("cdbentley"),
+          name:
+            "projects/999999999999/locations/global/workloadIdentityPools/github-actions/providers/github",
+        },
+        "cdbentley",
+      )
+    ).toThrow("provider identity");
+  });
+
+  test("disabling is proved by reading the pool back, not by the accepted PATCH", async () => {
+    // Google returns a long-running operation, so an accepted request is not a
+    // disabled pool. The first read still reports enabled.
+    let reads = 0;
+    const sleeps: number[] = [];
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      if (init?.method === "PATCH") return Response.json({ name: "operations/1" });
+      reads += 1;
+      return Response.json(poolBody("cdbentley", reads > 1));
+    }) as unknown as typeof fetch;
+
+    const converged = await setFederationPoolDisabled(
+      "cdbentley",
+      true,
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async (ms) => {
+        sleeps.push(ms);
+      },
+    );
+
+    expect(converged.disabled).toBe(true);
+    expect(reads).toBe(2);
+    expect(sleeps).toEqual([2_000]);
+  });
+
+  test("a pool that never converges is refused at the deadline", async () => {
+    const fetcher = (async (input: string | URL, init?: RequestInit) =>
+      init?.method === "PATCH"
+        ? Response.json({ name: "operations/1" })
+        : Response.json(poolBody("cdbentley", false))) as unknown as typeof fetch;
+    let clock = 1_800_000_000_000;
+
+    await expect(setFederationPoolDisabled(
+      "cdbentley",
+      true,
+      "owner-token",
+      fetcher,
+      clock + 5_000,
+      async (ms) => {
+        clock += ms;
+      },
+      () => clock,
+    )).rejects.toThrow("workload identity pool convergence");
+  });
+
+  const quarantineRecord = (overrides: Record<string, unknown> = {}) => ({
+    approvedManifestSha256: "f".repeat(64),
+    approvedPlanRunId: "123455",
+    capturedAt: "2026-09-01T12:00:00.000Z",
+    consumerSha: "b".repeat(40),
+    executorEmail: `${randomExecutorAccountId(
+      deterministicArtifactHex("cdbentley", "123456", "service-account"),
+    )}@cdbentley.iam.gserviceaccount.com`,
+    executorUniqueId: "123456789012345678901",
+    pools: [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([repository, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(poolBody(project!, false), project!),
+      ),
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
+      repository,
+    })),
+    platformSha: "a".repeat(40),
+    repository: "cdbentley",
+    root: "bootstrap",
+    runId: "123456",
+    ...overrides,
+  });
+
+  test("the durable record must cover every consumer pool", () => {
+    const partial = quarantineRecord();
+    expect(() =>
+      federationQuarantineRecordFromJson({ ...partial, pools: partial.pools.slice(0, 2) })
+    ).toThrow("does not cover every consumer pool");
+  });
+
+  test("the durable record only ever names contracted pools", () => {
+    const forged = quarantineRecord();
+    forged.pools[0]!.name = "projects/attacker/locations/global/workloadIdentityPools/github-actions";
+    expect(() => federationQuarantineRecordFromJson(forged))
+      .toThrow("federation quarantine pool name");
+  });
+
+  // Abrupt loss. A fresh runner restores from the durable record alone, and the
+  // record is written before the first PATCH, so every boundary is covered.
+  const restoreFetcher = (
+    live: Record<string, { disabled: boolean; body?: object; providerBody?: object }>,
+  ) => {
+    const patched: string[] = [];
+    const fetcher = (async (input: string | URL, init?: RequestInit) => {
+      const project = new URL(String(input)).pathname.split("/")[3]!;
+      const entry = live[project]!;
+      if (init?.method === "PATCH") {
+        patched.push(project);
+        entry.disabled = JSON.parse(String(init.body)).disabled;
+        return Response.json({ name: "operations/1" });
+      }
+      if (new URL(String(input)).pathname.endsWith("/providers/github")) {
+        return Response.json(entry.providerBody ?? providerBody(project));
+      }
+      return Response.json(entry.body ?? poolBody(project, entry.disabled));
+    }) as unknown as typeof fetch;
+    return { fetcher, patched };
+  };
+  const allProjects = ["cdbentley", "runsetta", "medlock-1025243085", "critical-history-16823277"];
+
+  test.each([
+    ["after the pre-disable, before any privilege existed", true],
+    ["after the apply audit", true],
+    ["mid-restore, with some pools already back", false],
+  ])("a fresh runner restores cleanly when the run was lost %s", async (_label, allDisabled) => {
+    const live = Object.fromEntries(
+      allProjects.map((project, index) => [
+        project,
+        { disabled: allDisabled ? true : index % 2 === 0 },
+      ]),
+    );
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    // Every pool ends enabled, and only the ones that were still disabled were
+    // touched.
+    expect(allProjects.every((project) => live[project]!.disabled === false)).toBe(true);
+    expect(patched).toHaveLength(allDisabled ? 4 : 2);
+  });
+
+  test("restore is idempotent when the run was lost after it already finished", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: false }]));
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    expect(patched).toEqual([]);
+  });
+
+  test("a pool that drifted while the run held privilege is never written over", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = {
+      disabled: true,
+      body: { ...poolBody("runsetta", true), description: "changed by somebody else" },
+    } as { disabled: boolean; body?: object };
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("restored runsetta workload identity pool");
+    // Every fingerprint is validated before the first PATCH, so drift leaves
+    // the entire fleet closed rather than partially restoring it.
+    expect(patched).toEqual([]);
+  });
+
+  test("a provider that broadened while the pool was closed keeps every pool closed", async () => {
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = {
+      disabled: true,
+      providerBody: providerBody("runsetta", "assertion.repository_owner_id != ''"),
+    };
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(quarantineRecord()),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("restored runsetta workload identity provider");
+    expect(patched).toEqual([]);
+  });
+
+  test("a pool that was already disabled before the run is never re-enabled", async () => {
+    const record = quarantineRecord();
+    record.pools[1]!.disabled = true;
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    const { fetcher, patched } = restoreFetcher(live);
+
+    await restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(record),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    );
+
+    // runsetta was disabled beforehand, so it stays disabled: turning it on
+    // would be inventing a state nobody reviewed.
+    expect(live["runsetta"]!.disabled).toBe(true);
+    expect(patched).not.toContain("runsetta");
+    expect(patched).toHaveLength(3);
+  });
+
+  test("a pool that was disabled beforehand but is now enabled fails the run", async () => {
+    const record = quarantineRecord();
+    record.pools[1]!.disabled = true;
+    const live = Object.fromEntries(allProjects.map((project) => [project, { disabled: true }]));
+    live["runsetta"] = { disabled: false };
+    const { fetcher } = restoreFetcher(live);
+
+    await expect(restoreQuarantinedFederation(
+      federationQuarantineRecordFromJson(record),
+      "owner-token",
+      fetcher,
+      Date.now() + 60_000,
+      async () => {},
+    )).rejects.toThrow("was disabled before this run and is now enabled");
+  });
+
+  test("federation is quarantined before elevation and restored after the executor is gone", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          events.push(
+            args[0] === "plan" && args.includes("-detailed-exitcode")
+              ? "terraform:audit"
+              : `terraform:${args[0]}`,
+          );
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    );
+
+    expect(events.indexOf("quarantine:arm")).toBeLessThan(events.indexOf("quarantine"));
+    expect(events.indexOf("quarantine")).toBeLessThan(events.indexOf("elevate"));
+    expect(events.indexOf("elevate")).toBeLessThan(events.indexOf("terraform:apply"));
+    // No window in which consumer tokens work again while privilege still does:
+    // mutation authority is revoked and proven gone before a single pool is
+    // handed back.
+    expect(events.indexOf("terraform:audit")).toBeLessThan(events.indexOf("de-elevate"));
+    expect(events.indexOf("de-elevate")).toBeLessThan(events.indexOf("federation:restore"));
+    // And nothing is published until every cleanup prerequisite has succeeded:
+    // the Docker sandbox and the executor both go through releaseExecutor, and
+    // the private paths through removePrivatePath, all before the first write.
+    expect(events.indexOf("federation:restore")).toBeLessThan(events.indexOf("final-audit"));
+    expect(events.indexOf("final-audit")).toBeLessThan(events.indexOf("release"));
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
+    for (const path of ["remove:tfplan", "remove:tfdata", "remove:sandbox"]) {
+      expect(events.indexOf(path)).toBeGreaterThan(-1);
+      expect(events.indexOf(path)).toBeLessThan(events.indexOf("publish:final"));
+    }
+    // The single countable owner object is written last.
+    expect(events.at(-1)).toBe("publish:final");
+  });
+
+  test("the final audit preserves a target pool that was disabled before quarantine", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    let auditedFederationQuarantined: boolean | undefined;
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        armFederationQuarantine: async (invocation, session) => {
+          events.push("quarantine:arm");
+          const captured = quarantineIntent(invocation, session);
+          return {
+            generation: "1700000001",
+            record: federationQuarantineRecordFromJson({
+              ...captured,
+              pools: captured.pools.map((pool) =>
+                pool.repository === invocation.repository
+                  ? { ...pool, disabled: true }
+                  : pool
+              ),
+            }),
+          };
+        },
+        auditRestoredState: async (
+          _invocation,
+          _session,
+          _directory,
+          federationQuarantined,
+        ) => {
+          events.push("final-audit");
+          auditedFederationQuarantined = federationQuarantined;
+          return {
+            detailedExitCode: 0 as const,
+            observedAt: "2026-09-01T12:30:00.000Z",
+            outputSha256: "a".repeat(64),
+          };
+        },
+        planJson: JSON.stringify(raw),
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    );
+
+    expect(auditedFederationQuarantined).toBe(true);
+    expect(events).toContain("publish:final");
+  });
+
+  test("a quarantine that fails halfway is still undone by this run", async () => {
+    // The intent is armed before the first PATCH precisely so that a partial
+    // disable is still a disable this run owns.
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        disableFederation: async () => {
+          events.push("quarantine:partial");
+          throw new Error("the runsetta workload identity pool did not converge");
+        },
+        planJson: JSON.stringify(raw),
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("did not converge");
+
+    expect(events).toContain("quarantine:arm");
+    expect(events).not.toContain("elevate");
+    // Armed, so the undo still happens even though the disable never completed.
+    expect(events).toContain("federation:restore");
+  });
+
+  test("federation stays closed when a failed run cannot prove executor containment", async () => {
+    // The success path proves containment positively, by revoking mutation
+    // authority and probing the live control plane for its absence, before a
+    // single pool is handed back. This is the other path: the run died before
+    // de-elevation, so the only containment evidence available is whether
+    // releaseExecutor succeeded -- and it did not.
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    const failure = await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        releaseExecutor: async () => {
+          events.push("release:failed");
+          throw new Error("the executor could not be disabled");
+        },
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          if (args[0] === "apply") throw new Error("terraform apply failed");
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    ).catch((error: unknown) => error);
+
+    expect(events).not.toContain("de-elevate");
+    expect(events).not.toContain("federation:restore");
+    expect(events).not.toContain("publish:final");
+    const reasons = (failure as AggregateError).errors.flatMap((entry: unknown) =>
+      entry instanceof AggregateError
+        ? entry.errors.map((inner: unknown) => inner instanceof Error ? inner.message : String(inner))
+        : [entry instanceof Error ? entry.message : String(entry)]
+    );
+    expect(reasons.some((reason) => reason.includes("stays quarantined because executor containment was not proven")))
+      .toBe(true);
+  });
+
+  test("a run that dies before de-elevation still hands federation back once contained", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        runTerraform: async (_invocation, _session, _directory, args) => {
+          if (args[0] === "apply") throw new Error("terraform apply failed");
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("terraform apply failed");
+
+    // Containment succeeded, so the quarantine is undone even though the run
+    // failed -- and no countable success was written.
+    expect(events).toContain("release");
+    expect(events).toContain("federation:restore");
+    expect(events).not.toContain("publish:final");
+  });
+
+  test.each([
+    ["a private path cannot be removed", {
+      removePrivatePath: async () => {
+        throw new Error("a scratch path could not be removed");
+      },
+    }],
+    ["the Docker sandbox and executor release fail together", {
+      releaseExecutor: async () => {
+        throw new Error("sandbox and executor cleanup did not both complete");
+      },
+    }],
+  ])("no owner artifact exists when %s", async (_label, override) => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        runTerraform: async () => {},
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+        ...override,
+      }),
+    )).rejects.toThrow();
+
+    // Publication is downstream of every cleanup prerequisite, so a failure in
+    // any of them leaves no terminal record claiming the run finished.
+    expect(events).not.toContain("publish:final");
+  });
+
+  test("a rehearsal whose cleanup fails leaves no terminal record", async () => {
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "900",
+        EXECUTION_MODE: "rehearsal",
+      }),
+      fakeDependencies(events, {
+        releaseExecutor: async () => {
+          throw new Error("sandbox and executor cleanup did not both complete");
+        },
+      }),
+    )).rejects.toThrow();
+
+    // The rehearsal reached its payload but never published it: an early return
+    // here would have exited through `finally` and skipped publication entirely,
+    // which is why there is no longer one.
+    expect(events).toContain("federation:restore");
+    expect(events).not.toContain("publish:final");
+  });
+
+  test("a rehearsal that completes cleanly publishes exactly one terminal record", async () => {
+    const events: string[] = [];
+    await runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "900",
+        EXECUTION_MODE: "rehearsal",
+      }),
+      fakeDependencies(events),
+    );
+
+    expect(events.filter((event) => event === "publish:final")).toHaveLength(1);
+    expect(events.indexOf("release")).toBeLessThan(events.indexOf("publish:final"));
+  });
+
+  // The envelope, measured rather than assumed.
+  //
+  // runProtectedRecovery grants ONE RECOVERY_OPERATION_MINUTES deadline for
+  // everything. recoverArtifacts alone must burn the 7-minute propagation
+  // horizon plus the 3-minute stable-empty window before it can conclude
+  // anything, so whatever follows it inherits a nearly exhausted budget. Any
+  // phase that needs a horizon of its own therefore cannot run at all -- and a
+  // containment stub that returns true hides exactly that.
+  test("the recovery envelope cannot fund a second containment horizon", () => {
+    const horizonMs = (RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
+      RECOVERY_STABLE_EMPTY_MINUTES) * 60_000;
+    const operationMs = RECOVERY_OPERATION_MINUTES * 60_000;
+
+    // One horizon fits, with only the scan-latency and late-retry margins spare.
+    expect(operationMs).toBeGreaterThanOrEqual(horizonMs);
+    // Two do not. This is the arithmetic that makes a per-item horizon
+    // unreachable, whatever the item is.
+    expect(operationMs).toBeLessThan(horizonMs * 2);
+    expect(operationMs - horizonMs).toBeLessThan(horizonMs);
+  });
+
+  test("a plan publishes no owner artifact at all", async () => {
+    const events: string[] = [];
+    await runProtectedBootstrap(validateInvocation(validEnvironment()), fakeDependencies(events));
+
+    expect(events).not.toContain("publish:final");
+    expect(events).not.toContain("quarantine:arm");
+  });
+
+  test("a pool that reports success without converging is refused before elevation", () => {
+    const captured = federationQuarantineRecordFromJson(quarantineRecord()).pools[0]!;
+    const stillEnabled = federationPoolFromJson(poolBody("cdbentley", false), "cdbentley");
+    const drifted = federationPoolFromJson(
+      { ...poolBody("cdbentley", true), description: "changed" },
+      "cdbentley",
+    );
+
+    expect(() => assertQuarantinedPool(stillEnabled, captured))
+      .toThrow("quarantined cdbentley workload identity pool state");
+    expect(() => assertQuarantinedPool(drifted, captured))
+      .toThrow("quarantined cdbentley workload identity pool");
+    expect(() =>
+      assertQuarantinedPool(federationPoolFromJson(poolBody("cdbentley", true), "cdbentley"), captured)
+    ).not.toThrow();
+  });
+
+  test.each([
+    ["a repeated repository", { pools: "duplicate" }],
+    ["a reordered pool set", { pools: "reversed" }],
+    ["a malformed platform SHA", { platformSha: "not-a-sha" }],
+    ["a malformed capture time", { capturedAt: "yesterday" }],
+    ["an unknown root", { root: "somewhere" }],
+  ])("a record with %s is refused before any pool is touched", (_label, override) => {
+    const base = quarantineRecord();
+    const forged: Record<string, unknown> = { ...base, ...override };
+    if (override.pools === "duplicate") forged.pools = [base.pools[0], ...base.pools.slice(1, 3), base.pools[0]];
+    if (override.pools === "reversed") forged.pools = [...base.pools].reverse();
+
+    expect(() => federationQuarantineRecordFromJson(forged)).toThrow();
+  });
+
+  test("a run that cannot quarantine federation never elevates", async () => {
+    const raw = plan([]);
+    const review = buildReviewManifest(raw, { ...identity(), terraformRoot: "bootstrap" });
+    const events: string[] = [];
+    await expect(runProtectedBootstrap(
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: review.sha256,
+        APPROVED_PLAN_RUN_ID: "123455",
+        BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
+        EXECUTION_MODE: "apply",
+      }, true),
+      fakeDependencies(events, {
+        planJson: JSON.stringify(raw),
+        armFederationQuarantine: async () => {
+          throw new Error("the cdbentley workload identity pool is absent");
+        },
+        verifyApproval: async () => ({ canonical: "", sha256: review.sha256 }),
+      }),
+    )).rejects.toThrow("workload identity pool is absent");
+
+    expect(events).not.toContain("elevate");
+    expect(events).not.toContain("terraform:apply");
+    // Nothing was quarantined, so nothing is restored.
+    expect(events).not.toContain("federation:restore");
   });
 
   test("state validation uses exact gRPC/overwrite probes and never reads or writes object bytes", async () => {
@@ -6137,7 +8193,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
 
   const applyReceiptLeases = () =>
     buildReceiptLeases(
@@ -6172,8 +8228,32 @@ describe("protected owner Terraform bridge", () => {
       expected,
       async (input) => {
         nowMs += 100;
+        const url = new URL(String(input));
+        const requested = url.searchParams.getAll("permissions");
+        // Faithful to the leases under test: a permission is granted only when
+        // some lease expression actually names that object with that role.
+        // Echoing every request back would hand the executor capabilities IAM
+        // never issued, which is precisely what this projection exists to catch.
+        const object = decodeURIComponent(url.pathname.split("/o/")[1] ?? "");
+        const bucket = decodeURIComponent(url.pathname.split("/b/")[1]?.split("/")[0] ?? "");
+        const resource = `projects/_/buckets/${bucket}/objects/${object}`;
+        void resource;
+        // Receipt objects are named exactly by their leases; state objects are
+        // covered by prefix conditions, so match on the object path either way.
+        const namedBy = (role: string) =>
+          leases.some((lease) =>
+            lease.role === role && (lease.condition?.expression ?? "").includes(object)
+          );
+        const isReceipt = object.includes("/.protected-bootstrap/");
+        const creator = namedBy("roles/storage.objectCreator");
+        const viewer = namedBy("roles/storage.objectViewer");
         return Response.json({
-          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+          permissions: requested.filter((permission) => {
+            if (!isReceipt) return true;
+            if (permission === "storage.objects.create") return creator;
+            if (permission === "storage.objects.get") return viewer;
+            return creator || viewer;
+          }),
         });
       },
       async (milliseconds) => {
@@ -6198,7 +8278,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const acquireLeases = [
       ...buildStorageAcquisitionLeases(
         "cdbentley", "bootstrap", "apply", "123456", leaseExpiresAt, executorEmail,
@@ -6256,9 +8336,12 @@ describe("protected owner Terraform bridge", () => {
         written.bindings.some((b) => b.condition?.title === lease.condition?.title),
       ).toBeTrue();
     }
+    // No creator lease survives elevation, because an apply executor is granted
+    // none beyond the consumed-receipt scope this write removes. The only
+    // receipt a post-elevation run produces is the owner's.
     expect(
       written.bindings.some((b) => b.condition?.title === "codex-receipt-create-123456"),
-    ).toBeTrue();
+    ).toBeFalse();
 
     // And mutation authority arrived in the same write.
     for (const lease of elevation.leases) {
@@ -6287,7 +8370,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     expect(() =>
       elevationPolicyRecord(
         invocation, executorEmail, new Date("2026-08-30T12:00:00.000Z"),
@@ -6337,37 +8420,245 @@ describe("protected owner Terraform bridge", () => {
       /consumed\/123455\.json\(unexpectedly holds storage\.objects\.create\)/,
     );
 
-    // v0.5.29 shape: elevate removes exactly that binding and the projection
-    // converges. The result receipt keeps its create grant, which it needs to
-    // publish the post-apply receipt.
+    // Elevate removes exactly that binding and the projection converges. No
+    // creator grant survives it: the only receipt a post-elevation run produces
+    // is written by the owner.
     const elevated = receipts.filter((lease) => lease.condition?.title !== consumeTitle);
     await runProjection("mutation", [...elevated, ...elevatedStateLeases()]);
   });
 
-  test("apply receipt leases split the creator scope and leave the reader whole", () => {
+  test("an apply executor can create the consumed receipt and nothing else", () => {
     const leases = applyReceiptLeases();
     const creators = leases.filter((lease) => lease.role === "roles/storage.objectCreator");
-    expect(creators).toHaveLength(2);
-    const consume = creators.find(
-      (lease) => lease.condition?.title === receiptConsumeLeaseTitle("123456"),
-    )!;
-    const create = creators.find(
-      (lease) => lease.condition?.title !== receiptConsumeLeaseTitle("123456"),
-    )!;
-    // Disjoint: neither creator scope names the other's object.
+    // Exactly one creator lease now. The results receipt is gone and the final
+    // receipt is the owner's, so IAM itself -- not statement order -- is what
+    // stops the executor publishing a result while it still holds mutation
+    // authority.
+    expect(creators).toHaveLength(1);
+    const consume = creators[0]!;
+    expect(consume.condition!.title).toBe(receiptConsumeLeaseTitle("123456"));
     expect(consume.condition!.expression).toContain("/consumed/123455.json");
     expect(consume.condition!.expression).not.toContain("/results/");
-    expect(create.condition!.expression).toContain("/results/123456.json");
-    expect(create.condition!.expression).not.toContain("/consumed/");
-    // The plan receipt is never creatable during apply.
-    for (const creator of creators) {
-      expect(creator.condition!.expression).not.toContain("/plans/");
-    }
-    // Read scope is unchanged: all three receipts remain readable.
+    expect(consume.condition!.expression).not.toContain("/final/");
+    expect(consume.condition!.expression).not.toContain("/plans/");
+
+    // Read scope covers only what an apply still reads.
     const viewer = leases.find((lease) => lease.role === "roles/storage.objectViewer")!;
-    for (const fragment of ["/plans/123455.json", "/consumed/123455.json", "/results/123456.json"]) {
+    for (const fragment of ["/plans/123455.json", "/consumed/123455.json"]) {
       expect(viewer.condition!.expression).toContain(fragment);
     }
+    expect(viewer.condition!.expression).not.toContain("/results/");
+    expect(viewer.condition!.expression).not.toContain("/final/");
+  });
+
+  // A rehearsal has to be executable through the REAL manager, not only through
+  // fake controller dependencies. Building its receipt scope used to derive a
+  // plan object name from an approved run id it does not have, so it threw on
+  // numeric("") long before the live lifecycle it exists to exercise.
+  // The rehearsal matrix has to be self-consistent across validate, leases and
+  // the projection, for every repository and root -- Runsetta prod especially,
+  // where an adoption run id is mandatory for an apply and forbidden for a
+  // rehearsal. A contradiction between any two of those three makes the route
+  // unconstructible at exactly the moment it is needed.
+  test.each([
+    ["cdbentley", "bootstrap"],
+    ["cdbentley", "prod"],
+    ["runsetta", "bootstrap"],
+    ["runsetta", "prod"],
+    ["healthmcp", "bootstrap"],
+    ["healthmcp", "prod"],
+    ["critical-history", "bootstrap"],
+    ["critical-history", "prod"],
+  ])("a %s %s rehearsal validates, leases and projects consistently", (repository, root) => {
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      CONSUMER_SHA: "b".repeat(40),
+      EXECUTION_MODE: "rehearsal",
+      TARGET_REPOSITORY: repository,
+      TERRAFORM_ROOT: root,
+    });
+
+    expect(invocation.mode).toBe("rehearsal");
+    // No approval identity and no adoption identity, whatever the target is.
+    expect(invocation.approvedPlanRunId).toBe("");
+    expect(invocation.approvedManifestSha256).toBe("");
+    expect(invocation.exposureAdoptionRunId).toBe("");
+    // And the lease builder agrees rather than contradicting it.
+    expect(
+      buildReceiptLeases(
+        repository as "cdbentley",
+        root as "bootstrap",
+        invocation.githubRunId,
+        new Date("2026-08-30T12:00:00.000Z"),
+        "rehearsal",
+        "",
+        executorEmail,
+        "",
+      ),
+    ).toEqual([]);
+  });
+
+  test("a rehearsal that carries approval fields is refused", () => {
+    expect(() =>
+      validateInvocation({
+        ...validEnvironment(),
+        APPROVED_MANIFEST_SHA256: "d".repeat(64),
+        APPROVED_PLAN_RUN_ID: "123455",
+        EXECUTION_MODE: "rehearsal",
+      })
+    ).toThrow("Only apply mode may name an approved plan run");
+  });
+
+  test("a Runsetta prod rehearsal that names an adoption run is refused", () => {
+    expect(() =>
+      validateInvocation({
+        ...validEnvironment(),
+        CONSUMER_SHA: "b".repeat(40),
+        EXECUTION_MODE: "rehearsal",
+        EXPOSURE_ADOPTION_RUN_ID: "123455",
+        TARGET_REPOSITORY: "runsetta",
+        TERRAFORM_ROOT: "prod",
+      })
+    ).toThrow("non-Runsetta-prod exposure adoption run ID");
+  });
+
+  test("a rehearsal builds no receipt lease and does not derive a plan object", () => {
+    const leases = buildReceiptLeases(
+      "cdbentley",
+      "bootstrap",
+      "123456",
+      new Date("2026-08-30T12:00:00.000Z"),
+      "rehearsal",
+      "",
+      executorEmail,
+      "",
+    );
+    expect(leases).toEqual([]);
+  });
+
+  test("a rehearsal that names an approved plan or an adoption is refused", () => {
+    const build = (approved: string, adoption: string) =>
+      buildReceiptLeases(
+        "cdbentley",
+        "bootstrap",
+        "123456",
+        new Date("2026-08-30T12:00:00.000Z"),
+        "rehearsal",
+        approved,
+        executorEmail,
+        adoption,
+      );
+    expect(() => build("123455", "")).toThrow("cannot name one");
+    expect(() => build("", "123455")).toThrow("has no exposure adoption");
+  });
+
+  test("a rehearsal executor round-trips through the real provenance parser", () => {
+    // Crash recovery reads this string. Collapsing every non-plan mode to
+    // "apply" would make it clean up a rehearsal executor as though it had been
+    // an apply, with a different lease shape and a different receipt inventory.
+    const description = executorDescription({
+      approvedManifestSha256: "",
+      approvedPlanRunId: "",
+      expiresAt: new Date("2026-08-30T12:00:00.000Z"),
+      exposureAdoptionRunId: "",
+      mode: "rehearsal",
+      repository: "cdbentley",
+      root: "bootstrap",
+      runId: "123456",
+    });
+    expect(description).toContain("mode=rehearsal");
+    const parsed = parseExecutorProvenance(description, "cdbentley");
+    expect(parsed.mode).toBe("rehearsal");
+    expect(parsed.runId).toBe("123456");
+    expect(parsed.repository).toBe("cdbentley");
+    expect(parsed.approvedPlanRunId).toBe("");
+  });
+
+  test("the frozen pbt-v1 contract still refuses a rehearsal description", () => {
+    // v1 predates rehearsal. Widening it would make artifacts left by an older
+    // build stop being recognisable as what they actually are.
+    expect(() =>
+      parseExecutorProvenance(
+        "pbt-v1;repository=cdbentley;run=123456;root=bootstrap;" +
+          "mode=rehearsal;approved=none;expires=2026-08-30T12:00:00.000Z",
+        "cdbentley",
+      )
+    ).toThrow("unknown legacy provenance");
+  });
+
+  test("the real projection accepts a rehearsal with no approved plan run", () => {
+    // The regression for the defect this route kept hitting: every path that
+    // derives a receipt object name from approvedPlanRunId must be skipped for
+    // a rehearsal, or the projection dies on numeric("") before it ever probes
+    // anything. Driven through the real waitForStatePermissions.
+    const invocation = validateInvocation({
+      ...validEnvironment(),
+      EXECUTION_MODE: "rehearsal",
+    });
+    expect(invocation.approvedPlanRunId).toBe("");
+    const probed: string[] = [];
+    let clock = 0;
+
+    return waitForStatePermissions(
+      REPOSITORIES.cdbentley.state.bootstrap,
+      invocation,
+      "short-lived-executor-access-token-value",
+      "read",
+      async (input: URL | string): Promise<Response> => {
+        return Response.json({
+          kind: "storage#testIamPermissionsResponse",
+          permissions: new URL(String(input)).searchParams.getAll("permissions"),
+        });
+      },
+      async () => {
+        clock += 1_000;
+      },
+      {
+        testObjectOverwrite: async ({ objectName }) => {
+          probed.push(objectName);
+          return false;
+        },
+        testObjectPermissions: async ({ permissions, resource }) => {
+          probed.push(resource);
+          // Read phase: state is readable, the lock is not reachable at all,
+          // and every owner-written receipt grants nothing.
+          if (resource.endsWith("default.tflock")) return { denied: false, permissions: [] };
+          if (resource.includes("/.protected-bootstrap/")) {
+            return { denied: false, permissions: [] };
+          }
+          return {
+            denied: false,
+            permissions: permissions.filter((permission) =>
+              permission === "storage.objects.get" || permission === "storage.objects.list"
+            ),
+          };
+        },
+      },
+      300_000,
+      () => clock,
+    ).then(() => {
+      const prefix = REPOSITORIES.cdbentley.state.bootstrap.prefix;
+      // No plan or adoption probe: a rehearsal has neither.
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/plans/"))).toBe(false);
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/adoptions/"))).toBe(false);
+      expect(probed.some((name) => name.includes("/.protected-bootstrap/consumed/"))).toBe(false);
+      // All three owner-written keys are actively probed and grant nothing.
+      for (const kind of ["results", "final", "rehearsals"]) {
+        expect(
+          probed.some((name) =>
+            name.includes(`${prefix}/.protected-bootstrap/${kind}/123456.json`)
+          ),
+        ).toBe(true);
+      }
+    });
+  });
+
+  test("elevation leaves an apply executor with no receipt creator lease at all", () => {
+    const leases = applyReceiptLeases();
+    const remaining = leases.filter(
+      (lease) => lease.condition?.title !== receiptConsumeLeaseTitle("123456"),
+    );
+    expect(remaining.some((lease) => lease.role === "roles/storage.objectCreator")).toBe(false);
   });
 
   test("recovery still recognises an orphan left by the pre-revocation shape", () => {
@@ -6379,15 +8670,25 @@ describe("protected owner Terraform bridge", () => {
       "cdbentley", "bootstrap", "123456", new Date("2026-08-30T12:00:00.000Z"),
       "123455", executorEmail,
     );
+    // Pinned verbatim. This recognizer is frozen history, so an exact-expression
+    // assertion is the point: if it ever tracks current grants again, recovery
+    // stops recognising the orphans it exists to clean up.
     expect(legacy.condition.title).toBe("codex-receipt-create-123456");
-    expect(legacy.condition.expression).toContain("/consumed/123455.json");
-    expect(legacy.condition.expression).toContain("/results/123456.json");
-    // It is distinguishable from the current pair: same title as the current
-    // result-only creator, different expression.
-    const current = applyReceiptLeases().find(
-      (lease) => lease.condition?.title === "codex-receipt-create-123456",
-    )!;
-    expect(current.condition!.expression).not.toBe(legacy.condition.expression);
+    expect(legacy.condition.expression).toBe(
+      "request.time < timestamp('2026-08-30T12:00:00.000Z') && " +
+        "(resource.name == 'projects/_/buckets/cdbentley-tfstate-882468538648-bootstrap/objects/" +
+        "cdbentley/bootstrap/.protected-bootstrap/consumed/123455.json' || " +
+        "resource.name == 'projects/_/buckets/cdbentley-tfstate-882468538648-bootstrap/objects/" +
+        "cdbentley/bootstrap/.protected-bootstrap/results/123456.json')",
+    );
+    expect(legacy.condition.expression).not.toContain("/final/");
+    // A current apply issues no lease under this title at all, so the orphan is
+    // unambiguous: anything wearing it is historical by definition.
+    expect(
+      applyReceiptLeases().some((lease) =>
+        lease.condition?.title === "codex-receipt-create-123456"
+      ),
+    ).toBe(false);
   });
 
   // Apply run 33305344368 died at controller.proof on a single transient
@@ -7075,7 +9376,7 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "123455",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2320",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     let nowMs = 1_000;
     const state = REPOSITORIES.cdbentley.state.bootstrap;
     const consumed = `${state.prefix}/.protected-bootstrap/consumed/123455.json`;
@@ -7736,15 +10037,18 @@ describe("protected owner Terraform bridge", () => {
       APPROVED_PLAN_RUN_ID: "33230835879",
       BRIDGE_OPERATION_BUDGET_SECONDS_EXACT: "2340",
       EXECUTION_MODE: "apply",
-    });
+    }, true);
     const state = {
       bucket: "cdbentley-tfstate-882468538648-bootstrap",
       prefix: "cdbentley/bootstrap",
     };
     const consumed = `${state.prefix}/.protected-bootstrap/consumed/33230835879.json`;
+    const finalReceipt = `${state.prefix}/.protected-bootstrap/final/123456.json`;
     const results = `${state.prefix}/.protected-bootstrap/results/123456.json`;
+    const ownerWritten = [results, finalReceipt];
     const plans = `${state.prefix}/.protected-bootstrap/plans/33230835879.json`;
     const overwritten: string[] = [];
+    const observedOwnerWritten: Record<string, readonly string[]> = {};
     let clock = 0;
 
     await waitForStatePermissions(
@@ -7768,16 +10072,29 @@ describe("protected owner Terraform bridge", () => {
         // exist yet, so create is both provable and required there.
         testObjectOverwrite: async ({ objectName }) => {
           overwritten.push(objectName);
-          return !(objectName === consumed || objectName === plans);
+          // The executor can overwrite neither the receipts it already wrote
+          // nor any owner-written object, which are not its objects at all.
+          return !(objectName === consumed || objectName === plans ||
+            ownerWritten.includes(objectName));
         },
         // `storage.objects.create` is never reported here -- it is excluded from
         // STORAGE_OBJECT_RPC_PERMISSIONS and arrives only via the probe above.
-        testObjectPermissions: async ({ permissions, resource }) => ({
-          denied: false,
-          permissions: resource.includes("/.protected-bootstrap/")
-            ? permissions.filter((permission) => permission === "storage.objects.get")
-            : permissions.filter((permission) => permission !== "storage.objects.create"),
-        }),
+        testObjectPermissions: async ({ permissions, resource }) => {
+          // Owner-written objects: the executor holds nothing on them, in this
+          // phase or any other, and the projection must observe that actively
+          // rather than infer it from a missing lease.
+          const owner = ownerWritten.find((name) => resource.endsWith(name));
+          if (owner !== undefined) {
+            observedOwnerWritten[owner] = [];
+            return { denied: false, permissions: [] };
+          }
+          return {
+            denied: false,
+            permissions: resource.includes("/.protected-bootstrap/")
+              ? permissions.filter((permission) => permission === "storage.objects.get")
+              : permissions.filter((permission) => permission !== "storage.objects.create"),
+          };
+        },
       },
       300_000,
       () => clock,
@@ -7785,7 +10102,13 @@ describe("protected owner Terraform bridge", () => {
 
     // It probed the object that matters, and did not need it to be overwritable.
     expect(overwritten).toContain(consumed);
-    expect(overwritten).toContain(results);
+    // No executor lease AND a live negative proof. Every owner-written key is
+    // probed in this phase and observed to grant nothing -- which is what would
+    // catch a bucket-level or out-of-band binding that no lease explains.
+    for (const name of ownerWritten) {
+      expect(overwritten).toContain(name);
+      expect(observedOwnerWritten[name]).toEqual([]);
+    }
 
     // The "read" projection runs inside `acquire`, before `consumeApproval`.
     // The receipt is still absent and the lease already grants objectCreator, so
@@ -7812,13 +10135,13 @@ describe("protected owner Terraform bridge", () => {
         // Only the two receipts this run will write are absent and leased to the
         // executor as creator. The plan receipt already exists, and the read
         // projection holds no write lease on the state objects at all.
-        testObjectOverwrite: async ({ objectName }) =>
-          objectName === consumed || objectName === results,
+        testObjectOverwrite: async ({ objectName }) => objectName === consumed,
         // The lock object is reachable only by the mutation projection, so the
         // read projection must observe nothing at all on it.
         testObjectPermissions: async ({ permissions, resource }) => ({
           denied: false,
-          permissions: resource.endsWith("default.tflock")
+          permissions: resource.endsWith("default.tflock") ||
+              ownerWritten.some((name) => resource.endsWith(name))
             ? []
             : permissions.filter((permission) => permission === "storage.objects.get"),
         }),
@@ -9682,14 +12005,21 @@ function fakeDependencies(
   const now = overrides.now ?? (() => fakeNow);
   const session: ExecutorSession = {
     accessToken: "short-lived-executor-access-token-value",
-    executorEmail: "gha-pbt-0123456789abcdefabcd@cdbentley.iam.gserviceaccount.com",
+    executorEmail,
     executorUniqueId: "123456789012345678901",
     tokenExpiresAtMs: defaultNow + 35 * 60_000,
   };
   return {
-    acquireExecutor: overrides.acquireExecutor ?? (async () => {
+    acquireExecutor: overrides.acquireExecutor ?? (async (invocation) => {
       events.push("acquire");
-      return { ...session, tokenExpiresAtMs: now() + 35 * 60_000 };
+      const projectId = REPOSITORIES[invocation.repository].projectId;
+      return {
+        ...session,
+        executorEmail: `${randomExecutorAccountId(
+          deterministicArtifactHex(invocation.repository, invocation.githubRunId, "service-account"),
+        )}@${projectId}.iam.gserviceaccount.com`,
+        tokenExpiresAtMs: now() + 35 * 60_000,
+      };
     }),
     appendSummary: overrides.appendSummary ?? (async () => {
       events.push("summary");
@@ -9720,15 +12050,21 @@ function fakeDependencies(
     publishPlanReceipt: overrides.publishPlanReceipt ?? (async () => {
       events.push("publish");
     }),
-    publishPostApplyReceipt: overrides.publishPostApplyReceipt ?? (async () => {
-      events.push("publish:post");
-    }),
     readPlanJson: overrides.readPlanJson ?? (async () => {
       events.push("show");
       return overrides.planJson ?? JSON.stringify(plan([]));
     }),
-    releaseExecutor: overrides.releaseExecutor ?? (async () => {
+    releaseExecutor: overrides.releaseExecutor ?? (async (_invocation, receivedSession) => {
       events.push("release");
+      return {
+        artifactsDeleted: true as const,
+        executorEmail: receivedSession?.executorEmail ?? executorEmail,
+        executorUniqueId: receivedSession?.executorUniqueId ?? "123456789012345678901",
+        observedAt: new Date(now()).toISOString(),
+        permissionsProvenGone: true as const,
+        projectBindingsCleared: true as const,
+        provenBy: "exact-release" as const,
+      };
     }),
     removePrivatePath: overrides.removePrivatePath ?? (async (path) => {
       events.push(`remove:${path.endsWith(".tfplan") ? "tfplan" : path.endsWith("/tfdata") ? "tfdata" : "sandbox"}`);
@@ -9744,6 +12080,50 @@ function fakeDependencies(
     }),
     verifyApproval: overrides.verifyApproval ?? (async () => {
       throw new Error("Unexpected approval verification in plan mode.");
+    }),
+    recoverFederationPreflight: overrides.recoverFederationPreflight ?? (async () => {
+      events.push("federation:preflight");
+      return { restored: [], scanned: 0, skippedComplete: [], skippedUncontained: [] };
+    }),
+    auditRestoredState: overrides.auditRestoredState ?? (async () => {
+      events.push("final-audit");
+      return {
+        detailedExitCode: 0 as const,
+        observedAt: new Date(now()).toISOString(),
+        outputSha256: "a".repeat(64),
+      };
+    }),
+    deElevateExecutor: overrides.deElevateExecutor ?? (async (_invocation, receivedSession) => {
+      events.push("de-elevate");
+      return {
+        executorEmail: receivedSession.executorEmail,
+        executorUniqueId: receivedSession.executorUniqueId,
+        observedAt: new Date(now()).toISOString(),
+        provenAbsent: ["resourcemanager.projects.setIamPolicy"],
+      };
+    }),
+    publishFinalReceipt: overrides.publishFinalReceipt ?? (async () => {
+      events.push("publish:final");
+    }),
+    armFederationQuarantine: overrides.armFederationQuarantine ?? (async (invocation, receivedSession) => {
+      events.push("quarantine:arm");
+      return {
+        generation: "1700000001",
+        record: quarantineIntent(invocation, receivedSession),
+      };
+    }),
+    disableFederation: overrides.disableFederation ?? (async () => {
+      events.push("quarantine");
+    }),
+    restoreFederation: overrides.restoreFederation ?? (async (_invocation, record) => {
+      events.push("federation:restore");
+      return record.pools.map((pool) => ({
+        disabled: pool.disabled,
+        fingerprint: pool.fingerprint,
+        name: pool.name,
+        observedAt: new Date(now()).toISOString(),
+        repository: pool.repository,
+      }));
     }),
     waitForPostMutationDrain: overrides.waitForPostMutationDrain ?? (async (
       invocation,
@@ -10257,6 +12637,88 @@ function executionProof(overrides: Partial<ExecutionProof> = {}): ExecutionProof
     freezeProof: freezeSnapshot(1_800_000_000_000),
     markerProof: markers(),
     ...overrides,
+  };
+}
+
+function quarantineIntent(invocation: {
+  approvedManifestSha256?: string;
+  approvedPlanRunId?: string;
+  consumerSha?: string;
+  githubRunId: string;
+  platformSha: string;
+  repository: string;
+  terraformRoot: string;
+}, session?: Pick<ExecutorSession, "executorEmail" | "executorUniqueId">): FederationQuarantineRecord {
+  const repository = invocation.repository as keyof typeof REPOSITORIES;
+  const projectId = REPOSITORIES[repository].projectId;
+  const deterministicEmail = `${randomExecutorAccountId(
+    deterministicArtifactHex(repository, invocation.githubRunId, "service-account"),
+  )}@${projectId}.iam.gserviceaccount.com`;
+  return federationQuarantineRecordFromJson({
+    approvedManifestSha256: invocation.approvedManifestSha256 ?? "",
+    approvedPlanRunId: invocation.approvedPlanRunId ?? "",
+    capturedAt: "2026-09-01T12:00:00.000Z",
+    consumerSha: invocation.consumerSha ?? consumerSha,
+    executorEmail: session?.executorEmail ?? deterministicEmail,
+    executorUniqueId: session?.executorUniqueId ?? "123456789012345678901",
+    platformSha: invocation.platformSha,
+    pools: [
+      ["cdbentley", "cdbentley"],
+      ["runsetta", "runsetta"],
+      ["healthmcp", "medlock-1025243085"],
+      ["critical-history", "critical-history-16823277"],
+    ].map(([repository, project]) => ({
+      disabled: false,
+      fingerprint: federationPoolFingerprint(
+        federationPoolFromJson(
+          {
+            description: `GitHub Actions OIDC identities for collinbentley1/${project}.`,
+            disabled: false,
+            displayName: "GitHub Actions",
+            name: federationPoolName(project!),
+            state: "ACTIVE",
+          },
+          project!,
+        ),
+      ),
+      name: federationPoolName(project!),
+      providerFingerprint: federationProviderFingerprint(federationProvider(project!)),
+      providerName: federationProviderName(project!),
+      repository,
+    })),
+    repository: invocation.repository,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  });
+}
+
+function federationProvider(project = "cdbentley"): FederationProviderState {
+  return federationProviderFromJson(
+    {
+      attributeCondition: "assertion.repository_owner_id == '16823277'",
+      attributeMapping: {
+        "attribute.repository": "assertion.repository_id",
+        "google.subject": "assertion.sub",
+      },
+      description: "GitHub Actions OIDC provider.",
+      disabled: false,
+      displayName: "GitHub",
+      name: federationProviderName(project),
+      oidc: { issuerUri: "https://token.actions.githubusercontent.com/" },
+      state: "ACTIVE",
+    },
+    project,
+  );
+}
+
+function federationPool(disabled = false): FederationPoolState {
+  return {
+    description: "GitHub Actions OIDC identities for collinbentley1/cdbentley.",
+    disabled,
+    displayName: "GitHub Actions",
+    mode: "FEDERATION_ONLY",
+    name: federationPoolName("cdbentley"),
+    state: "ACTIVE",
   };
 }
 

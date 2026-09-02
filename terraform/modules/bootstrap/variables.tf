@@ -122,6 +122,12 @@ variable "manage_automatic_default_service_account_grants_policy" {
   type        = bool
 }
 
+variable "federation_quarantined" {
+  description = "Disable the GitHub Actions workload identity pool for the duration of a protected apply. A disabled pool cannot be used to exchange tokens OR to use already-issued tokens against resources, so it removes consumer federation from the privileged window outright rather than arguing about token lifetimes. The protected bridge sets this true for the apply it performs and restores the reviewed state afterwards."
+  type        = bool
+  default     = false
+}
+
 variable "required_services" {
   description = "Google APIs required by the application project."
   type        = set(string)
@@ -136,6 +142,12 @@ variable "required_services" {
     "storage.googleapis.com",
     "sts.googleapis.com",
   ]
+}
+
+variable "manage_firestore_field_ttl" {
+  description = "Whether the protected apply identity may patch Firestore field TTL policies. Off by default: only an application that declares google_firestore_field needs it, and it is the difference between reading index metadata and rewriting it."
+  type        = bool
+  default     = false
 }
 
 variable "runtime_project_roles" {

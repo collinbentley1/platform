@@ -1260,6 +1260,9 @@ jobs:
           IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
           RUNNABLE_DIGEST: ${{ needs.publish.outputs.runnable-digest }}
           MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}
+          # This is a platform-compiled rollout gate, never a caller input.
+          # Stage two flips it only after the protected resources are live.
+          MEDLOCK_OWNERSHIP_REQUIRED: "false"
           PLATFORM_WORKFLOW_SHA: ${{ job.workflow_sha }}
           PROJECT_ID: ${{ steps.app.outputs.project_id }}
           PROJECT_NUMBER: ${{ steps.app.outputs.project_number }}
@@ -1277,17 +1280,25 @@ jobs:
              [[ ! "$PLATFORM_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] ||
              [[ ! "$REPOSITORY_ID" =~ ^[0-9]+$ ]] ||
              [[ ! "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] ||
+             [[ ! "$MEDLOCK_OWNERSHIP_REQUIRED" =~ ^(false|true)$ ]] ||
              [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then
             echo "Invalid production source, run, repository, or image identity." >&2
+            exit 1
+          fi
+          if [ "$REPOSITORY_ID" != "1025243085" ] &&
+             [ "$MEDLOCK_OWNERSHIP_REQUIRED" != "false" ]; then
+            echo "Only the immutable Medlock caller may require the ownership boundary." >&2
             exit 1
           fi
 
           umask 077
           env_file="$RUNNER_TEMP/production-env.json"
           service_snapshot="$RUNNER_TEMP/production-service.json"
+          key_inventory_snapshot="$RUNNER_TEMP/waitlist-recaptcha-keys.json"
+          key_snapshot="$RUNNER_TEMP/waitlist-recaptcha-key.json"
           version_snapshot="$RUNNER_TEMP/waitlist-secret-version.json"
           versions_snapshot="$RUNNER_TEMP/waitlist-secret-versions.json"
-          trap 'rm -f "$env_file" "${env_file}.next" "$service_snapshot" "$version_snapshot" "$versions_snapshot" "${deployed_revision_snapshot:-}" "${parity_outputs:-}" "${rest_token_file:-}" "${rest_header_file:-}" "${v2_service_snapshot:-}" "${v2_revision_snapshot:-}"' EXIT
+          trap 'rm -f "$env_file" "${env_file}.next" "$service_snapshot" "$key_inventory_snapshot" "$key_snapshot" "$version_snapshot" "$versions_snapshot" "${deployed_revision_snapshot:-}" "${parity_outputs:-}" "${rest_token_file:-}" "${rest_header_file:-}" "${v2_service_snapshot:-}" "${v2_revision_snapshot:-}"' EXIT
           jq -n --arg index "$IMAGE_DIGEST" --arg runnable "$RUNNABLE_DIGEST" '{
             PLATFORM_IMAGE_INDEX_DIGEST: $index,
             PLATFORM_IMAGE_RUNNABLE_DIGEST: $runnable
@@ -1313,6 +1324,94 @@ jobs:
                 --project="$PROJECT_ID" \
                 --region="$REGION" \
                 --format=json > "$service_snapshot"
+              ownership_state="$(jq -cer '
+                def entries($name):
+                  [.spec.template.spec.containers[0].env[]?
+                   | select(.name == $name)];
+                {
+                  audience: entries("IDENTITY_PLATFORM_AUDIENCE"),
+                  continue_url: entries("IDENTITY_PLATFORM_CONTINUE_URL"),
+                  project: entries("RECAPTCHA_PROJECT_ID"),
+                  site_key: entries("RECAPTCHA_SITE_KEY")
+                }
+              ' "$service_snapshot")"
+              ownership_value_count="$(jq -er '[.audience, .continue_url, .project, .site_key] | map(length) | add' <<< "$ownership_state")"
+              if [ "$MEDLOCK_OWNERSHIP_REQUIRED" = "false" ]; then
+                # Stage one lands while protected production applies are
+                # compiled out. It must preserve the already-deployable Medlock
+                # shape, but it may never clear a boundary that has appeared.
+                # Stage two flips the immutable caller input only after the
+                # protected resources have been provisioned and proven.
+                if [ "$ownership_value_count" != "0" ]; then
+                  echo "The staged Medlock deploy may not clear an existing ownership boundary." >&2
+                  exit 1
+                fi
+              elif [ "$ownership_value_count" = "0" ]; then
+                # The protected prod apply creates the key but intentionally
+                # cannot rewrite the deploy-owned Cloud Run environment. On
+                # that one bootstrap shape, inventory public key metadata and
+                # require exactly one Terraform-named candidate before the
+                # same strict describe/readback used on every later deploy.
+                gcloud recaptcha keys list \
+                  --project="$PROJECT_ID" \
+                  --format=json > "$key_inventory_snapshot"
+                recaptcha_site_key="$(jq -er --arg project "$PROJECT_ID" --arg project_number "$PROJECT_NUMBER" '
+                  if type != "array" then error("key inventory is not an array") else . end
+                  | [
+                      .[]
+                      | select(.displayName == "Medlock waitlist ownership")
+                      | .name
+                      | select(type == "string")
+                      | capture("^projects/(?<project>[A-Za-z0-9_-]+)/keys/(?<key>[A-Za-z0-9_-]{20,100})$")
+                      | select(.project == $project or .project == $project_number)
+                      | .key
+                    ]
+                  | if length == 1 then .[0]
+                    else error("expected exactly one Terraform-named Medlock ownership key")
+                    end
+                ' "$key_inventory_snapshot")"
+              elif [ "$ownership_value_count" = "4" ]; then
+                recaptcha_site_key="$(jq -er '
+                  def exact_entry($entries; $value):
+                    ($entries | length) == 1 and
+                    ($entries[0] | keys | sort) == ["name", "value"] and
+                    $entries[0].value == $value;
+                  if (exact_entry(.audience; "medlock-1025243085") | not) or
+                     (exact_entry(.continue_url; "https://medlock.ai/api/waitlist/confirm") | not) or
+                     (exact_entry(.project; "medlock-1025243085") | not) or
+                     (.site_key | length) != 1 or
+                     (.site_key[0] | keys | sort) != ["name", "value"]
+                  then error("ownership configuration drifted or is duplicated")
+                  else .site_key[0].value
+                    | select(type == "string" and test("^[A-Za-z0-9_-]{20,100}$"))
+                  end
+                ' <<< "$ownership_state")"
+              else
+                echo "The live Medlock ownership configuration is only partially populated." >&2
+                exit 1
+              fi
+              if [ "$MEDLOCK_OWNERSHIP_REQUIRED" = "true" ]; then
+                gcloud recaptcha keys describe "$recaptcha_site_key" \
+                  --project="$PROJECT_ID" \
+                  --format=json > "$key_snapshot"
+                jq -e --arg project "$PROJECT_ID" --arg project_number "$PROJECT_NUMBER" --arg key "$recaptcha_site_key" '
+                  (.name == ("projects/" + $project + "/keys/" + $key) or
+                   .name == ("projects/" + $project_number + "/keys/" + $key)) and
+                  .displayName == "Medlock waitlist ownership" and
+                  .webSettings.integrationType == "SCORE" and
+                  (.webSettings.allowAllDomains // false) == false and
+                  (.webSettings.allowAmpTraffic // false) == false and
+                  .webSettings.allowedDomains == ["medlock.ai"] and
+                  (.testingOptions // null) == null and
+                  (.wafSettings // null) == null and
+                  (.androidSettings // null) == null and
+                  (.iosSettings // null) == null and
+                  (.expressSettings // null) == null
+                ' "$key_snapshot" >/dev/null || {
+                  echo "The live Medlock reCAPTCHA key escaped its Terraform-reviewed public policy." >&2
+                  exit 1
+                }
+              fi
               waitlist_entries="$(jq -ce '[
                 .spec.template.spec.containers[0].env[]?
                 | select(.name == "WAITLIST_IDENTITY_KEYSET")
@@ -1384,6 +1483,15 @@ jobs:
                 WAITLIST_BACKEND: "firestore"
               }' "$env_file" > "${env_file}.next"
               mv "${env_file}.next" "$env_file"
+              if [ "$MEDLOCK_OWNERSHIP_REQUIRED" = "true" ]; then
+                jq --arg recaptcha_site_key "$recaptcha_site_key" '. + {
+                  IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085",
+                  IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm",
+                  RECAPTCHA_PROJECT_ID: "medlock-1025243085",
+                  RECAPTCHA_SITE_KEY: $recaptcha_site_key
+                }' "$env_file" > "${env_file}.next"
+                mv "${env_file}.next" "$env_file"
+              fi
               ;;
             280932482)
               if [[ ! "$MAPBOX_PUBLIC_TOKEN" =~ ^pk\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
@@ -1471,6 +1579,23 @@ jobs:
             echo "Production v2 revision did not bind the published OCI index to its Cloud Run runnable child." >&2
             exit 1
           }
+          if [ "$REPOSITORY_ID" = "1025243085" ] &&
+             [ "$MEDLOCK_OWNERSHIP_REQUIRED" = "true" ]; then
+            jq -e --arg site_key "$recaptcha_site_key" '
+              def exact_value($name):
+                [.containers[0].env[]?
+                 | select(.name == $name and (keys | sort) == ["name", "value"])
+                 | .value]
+                | if length == 1 then .[0] else error("missing or duplicate ownership configuration") end;
+              exact_value("IDENTITY_PLATFORM_AUDIENCE") == "medlock-1025243085" and
+              exact_value("IDENTITY_PLATFORM_CONTINUE_URL") == "https://medlock.ai/api/waitlist/confirm" and
+              exact_value("RECAPTCHA_PROJECT_ID") == "medlock-1025243085" and
+              exact_value("RECAPTCHA_SITE_KEY") == $site_key
+            ' "$v2_revision_snapshot" >/dev/null || {
+              echo "The served Medlock revision did not preserve the verified ownership configuration." >&2
+              exit 1
+            }
+          fi
           parity_outputs="$RUNNER_TEMP/deployed-production-parity.outputs"
           GITHUB_OUTPUT="$parity_outputs" \
             PARITY_SERVICE_JSON="$service_snapshot" \

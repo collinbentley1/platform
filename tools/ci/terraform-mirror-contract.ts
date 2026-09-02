@@ -20,7 +20,16 @@ export type TerraformMirrorSources = {
 type ReviewedTerraformContract = {
   readonly artifactRegistryDescription?: string;
   readonly artifactRegistryRepositoryId?: string;
-  readonly containerEnv?: readonly (readonly [string, string])[];
+  // Terraform an application may carry in prod/main.tf ALONGSIDE the platform
+  // module. The whole file is compared against module + these, so an
+  // application cannot add a resource the platform has not reviewed, and the
+  // platform cannot silently drop one the application depends on.
+  //
+  // Held comment-free: the comparison runs on parsed documents, which strip
+  // comments, so this pins what the resources DO and leaves the application
+  // free to explain them in prose.
+  readonly additionalProductionResources?: string;
+  readonly containerEnv?: readonly (readonly [string, string | TerraformExpression])[];
   readonly firestoreDatabase?: readonly (readonly [string, string])[];
   readonly githubRepo?: string;
   readonly name?: string;
@@ -34,6 +43,13 @@ type ReviewedTerraformContract = {
   readonly runtimeSecretVersionAdderIds: readonly string[];
   readonly serviceName?: string;
   readonly stateBucketName?: string;
+};
+
+type TerraformExpression = {
+  // Reviewed HCL, not application input. This exists for public values that are
+  // created in the same plan (for example a reCAPTCHA site key) and therefore
+  // must be wired by resource identity rather than copied as a string.
+  readonly expression: string;
 };
 
 type WorkflowShaPartitions = {
@@ -63,6 +79,69 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     stateBucketName: "cdbentley-tfstate-882468538648",
   },
   "1025243085": {
+    // Reviewed verbatim: the Firestore field TTL policies that make `expiresAt`
+    // enforceable, and the Identity Platform/reCAPTCHA configuration behind the
+    // waitlist ownership flow. The trusted platform production root is their
+    // live owner; this consumer mirror remains an exact, reviewable declaration
+    // of the application contract. API enablement belongs only to bootstrap
+    // state and is intentionally not duplicated here.
+    additionalProductionResources: `resource "google_firestore_field" "waitlist_entry_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_identity_platform_config" "default" {
+  project = var.project_id
+
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+
+  authorized_domains = [
+    "medlock.ai",
+    "www.medlock.ai",
+  ]
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  project      = var.project_id
+  display_name = "Medlock waitlist ownership"
+
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+}`,
     artifactRegistryDescription: "Container images for Medlock.",
     artifactRegistryRepositoryId: "site",
     containerEnv: [
@@ -81,6 +160,10 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       ],
       ["MEDLOCK_VERSION", "0.2.0"],
       ["WAITLIST_BACKEND", "firestore"],
+      ["IDENTITY_PLATFORM_AUDIENCE", "medlock-1025243085"],
+      ["IDENTITY_PLATFORM_CONTINUE_URL", "https://medlock.ai/api/waitlist/confirm"],
+      ["RECAPTCHA_PROJECT_ID", "medlock-1025243085"],
+      ["RECAPTCHA_SITE_KEY", { expression: "google_recaptcha_enterprise_key.waitlist.name" }],
     ],
     firestoreDatabase: [
       ["name", "(default)"],
@@ -99,6 +182,8 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
       "firestore.googleapis.com",
       "iam.googleapis.com",
       "iamcredentials.googleapis.com",
+      "identitytoolkit.googleapis.com",
+      "recaptchaenterprise.googleapis.com",
       "run.googleapis.com",
       "secretmanager.googleapis.com",
       "serviceusage.googleapis.com",
@@ -340,9 +425,12 @@ export function validateTerraformMirrorContract(
           "infra/terraform/prod/main.tf module site must exactly match the reviewed repository-specific platform contract",
         );
       }
-      if (compactHcl(parsed.productionMain) !== compactHcl(expectedProductionModule)) {
+      const expectedProductionFile = contract.additionalProductionResources === undefined
+        ? expectedProductionModule
+        : `${expectedProductionModule}\n${contract.additionalProductionResources}`;
+      if (compactHcl(parsed.productionMain) !== compactHcl(expectedProductionFile)) {
         failures.push(
-          "infra/terraform/prod/main.tf must contain only the exact reviewed repository-specific platform module",
+          "infra/terraform/prod/main.tf must contain only the exact reviewed repository-specific platform module and reviewed additional resources",
         );
       }
     }
@@ -1141,13 +1229,24 @@ function renderBootstrapModule(
 
 function renderStringMap(
   name: string,
-  entries: readonly (readonly [string, string])[],
+  entries: readonly (readonly [string, string | TerraformExpression])[],
 ): string[] {
   return [
     `${name} = {`,
-    ...entries.map(([key, value]) => `${key} = ${JSON.stringify(value)}`),
+    ...entries.map(([key, value]) => `${key} = ${renderTerraformValue(value)}`),
     "}",
   ];
+}
+
+function renderTerraformValue(value: string | TerraformExpression): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  // Resource-attribute references only. Refuse calls, interpolation, indexing,
+  // conditionals, or operators even in this reviewed table so extending the
+  // contract cannot quietly turn it into an arbitrary HCL injection surface.
+  if (!/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){2}$/.test(value.expression)) {
+    throw new Error("reviewed Terraform expression must be one resource attribute reference");
+  }
+  return value.expression;
 }
 
 function renderProductionVariables(

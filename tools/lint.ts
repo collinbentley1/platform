@@ -671,6 +671,12 @@ for (const needle of [
   'RUNSETTA_OFFLINE: "1"',
   'WAITLIST_BACKEND: "firestore"',
   'FIRESTORE_PROJECT_ID: "medlock-1025243085"',
+  'gcloud recaptcha keys describe "$recaptcha_site_key"',
+  'IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085"',
+  'IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm"',
+  'RECAPTCHA_PROJECT_ID: "medlock-1025243085"',
+  "RECAPTCHA_SITE_KEY: $recaptcha_site_key",
+  "The served Medlock revision did not preserve the verified ownership configuration.",
 ]) {
   requireContains(
     ".github/workflows/deploy-prod.yml",
@@ -2138,6 +2144,27 @@ for (const needle of [
   );
 }
 for (const needle of [
+  'medlock_ownership_enabled = var.repository_id == "1025243085"',
+  "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+  'resource "google_firestore_field" "waitlist_entry_ttl"',
+  'resource "google_firestore_field" "waitlist_quota_ttl"',
+  'resource "google_identity_platform_config" "default"',
+  'resource "google_recaptcha_enterprise_key" "waitlist"',
+]) {
+  requireContains(
+    "terraform/deployments/prod/main.tf",
+    productionDeployment,
+    needle,
+    `The trusted production root is missing the Medlock ownership resource: ${needle}`,
+  );
+}
+rejectContains(
+  "terraform/deployments/prod/main.tf",
+  productionDeployment,
+  'resource "google_project_service"',
+  "API enablement must have one Terraform owner in bootstrap state, never a second owner in production state.",
+);
+for (const needle of [
   "runtime_secret_accessor_ids              = []",
   'RUNSETTA_OFFLINE   = "1"',
   'RUNSETTA_TTS_MODEL = "gpt-4o-mini-tts"',
@@ -2523,11 +2550,29 @@ for (const publisherVariable of [
   );
 }
 
+// The protected apply disables every consumer workload identity pool for the
+// length of its window. Two concurrent runs against different targets would
+// therefore capture and restore each other's pool state, and the first to finish
+// would re-open federation while the second still held privilege. The group must
+// stay fleet-global and must not interpolate the target.
+requireContains(
+  ".github/workflows/protected-bootstrap-implementation.yml",
+  await read(".github/workflows/protected-bootstrap-implementation.yml"),
+  "group: protected-owner-terraform-federation",
+  "Protected runs must serialise across the whole fleet while federation is quarantined.",
+);
+rejectContains(
+  ".github/workflows/protected-bootstrap-implementation.yml",
+  await read(".github/workflows/protected-bootstrap-implementation.yml"),
+  "group: protected-owner-terraform-${{ inputs.target_repository }}",
+  "A per-target concurrency group lets two protected runs restore each other's federation state.",
+);
+
 const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270"
+  "912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2543,7 +2588,9 @@ const bootstrapIamResources = [
 const approvedBootstrapIamResources = [
   "google_project_iam_binding.editor_absent",
   "google_project_iam_member.preview_iam_auditors",
+  "google_project_iam_member.prod_deploy_waitlist_recaptcha_key_reader",
   "google_project_iam_member.runtime_project_roles",
+  "google_project_iam_member.runtime_waitlist_challenge_sender",
   "google_project_iam_member.terraform_convergence_reader",
   "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
   "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",

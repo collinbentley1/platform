@@ -350,6 +350,14 @@ resource "google_iam_workload_identity_pool" "github" {
   display_name              = "GitHub Actions"
   description               = "GitHub Actions OIDC identities for ${local.github_repo_full_name}."
 
+  # Desired state during a protected apply, so the apply itself cannot re-enable
+  # federation that the bridge disabled a moment earlier. Google's contract for a
+  # disabled pool is the strong one: it blocks token exchange AND blocks
+  # already-issued tokens from reaching resources. The provider-level flag only
+  # blocks new exchanges and lets live tokens through, which is why the pool is
+  # what gets quarantined.
+  disabled = var.federation_quarantined
+
   depends_on = [google_project_service.required]
 }
 
@@ -461,6 +469,28 @@ resource "google_project_iam_custom_role" "cloud_run_revision_deployer" {
     "run.revisions.get",
     "run.services.get",
     "run.services.update",
+  ]
+
+  depends_on = [google_project_service.required]
+}
+
+# The routine Medlock deploy must preserve the Terraform-created public site
+# key, but it must not trust a mutable Cloud Run environment value by itself.
+# This metadata-only role lets the first deploy discover the Terraform-created
+# public site key and every later deploy re-read its exact policy. Site keys are
+# public browser identifiers; neither permission reveals the unavailable legacy
+# secret. The role grants no creation, update, deletion, secret retrieval,
+# assessment creation, or account access.
+resource "google_project_iam_custom_role" "waitlist_recaptcha_key_reader" {
+  count = contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0
+
+  project     = var.project_id
+  role_id     = "waitlistRecaptchaKeyReader"
+  title       = "Waitlist reCAPTCHA Key Reader"
+  description = "Reads only public reCAPTCHA key metadata so a production deploy can preserve and verify the Terraform-created ownership key."
+  permissions = [
+    "recaptchaenterprise.keys.get",
+    "recaptchaenterprise.keys.list",
   ]
 
   depends_on = [google_project_service.required]
@@ -595,6 +625,16 @@ resource "google_project_iam_custom_role" "terraform_convergence_reader" {
       "datastore.databases.getMetadata",
       "datastore.databases.list",
     ] : [],
+    var.manage_firestore_field_ttl ? [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+    ] : [],
+    contains(var.required_services, "identitytoolkit.googleapis.com") ? [
+      "firebaseauth.configs.get",
+    ] : [],
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.keys.get",
+    ] : [],
     contains(var.required_services, "secretmanager.googleapis.com") ? [
       "secretmanager.locations.get",
       "secretmanager.locations.list",
@@ -660,6 +700,39 @@ resource "google_project_iam_custom_role" "protected_terraform_apply" {
       "datastore.operations.get",
       "datastore.operations.list",
     ] : [],
+    # Firestore TTL is a field-level policy, patched through
+    # projects.databases.collectionGroups.fields.patch. Without these the apply
+    # fails and `expiresAt` stays inert: written by the application and enforced
+    # by nothing.
+    #
+    # Three permissions, not the five that exist. A field is never created or
+    # deleted -- Terraform's destroy path is also a patch back to defaults -- so
+    # datastore.indexes.create and .delete are not required.
+    #
+    # roles/datastore.indexAdmin is deliberately NOT used: its permission list
+    # is datastore.schemas.*, which does not include datastore.indexes.update,
+    # so it would grant a different surface and still not work.
+    var.manage_firestore_field_ttl ? [
+      "datastore.indexes.get",
+      "datastore.indexes.list",
+      "datastore.indexes.update",
+    ] : [],
+    # Identity Platform configuration only. Nothing here can read, create, or
+    # delete an account, and configs.getSecret is excluded: the apply identity
+    # writes the sign-in configuration, it never reads provider secrets.
+    contains(var.required_services, "identitytoolkit.googleapis.com") ? [
+      "firebaseauth.configs.create",
+      "firebaseauth.configs.get",
+      "firebaseauth.configs.update",
+    ] : [],
+    # A protected apply creates and updates the one reviewed public score key.
+    # Delete is deliberately absent and the resource uses deletion_policy =
+    # PREVENT. retrievelegacysecretkey is also absent: this design has no secret.
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.keys.create",
+      "recaptchaenterprise.keys.get",
+      "recaptchaenterprise.keys.update",
+    ] : [],
     contains(var.required_services, "secretmanager.googleapis.com") ? [
       "secretmanager.locations.get",
       "secretmanager.locations.list",
@@ -717,6 +790,48 @@ resource "google_project_iam_member" "preview_iam_auditors" {
   project = var.project_id
   role    = google_project_iam_custom_role.preview_iam_auditor.name
   member  = each.value
+}
+
+# The three permissions the waitlist ownership flow needs, and nothing else.
+#
+# The runtime sends an email-link sign-in challenge by calling
+# projects.accounts:sendOobCode with its own identity. roles/firebaseauth.admin
+# would also work and is refused: it carries users.create, users.delete,
+# users.update, users.get, and configs.getSecret, so a compromised runtime could
+# enumerate the account directory, take over accounts, or read provider secrets.
+# Sending mail needs none of that. The same role can create a scored reCAPTCHA
+# assessment, but cannot list, alter, or retrieve a key. serviceusage.services.use
+# is present solely because the documented keyless OOB check names this project
+# as its quota project with X-Goog-User-Project.
+#
+# Scoped to applications that actually declare Identity Platform, so no other
+# project's runtime gains a Firebase Auth permission it never uses.
+resource "google_project_iam_custom_role" "waitlist_challenge_sender" {
+  count = contains(var.required_services, "identitytoolkit.googleapis.com") ? 1 : 0
+
+  project     = var.project_id
+  role_id     = "waitlistChallengeSender"
+  title       = "Waitlist Ownership Runtime"
+  description = "Sends ownership mail, checks reCAPTCHA, and consumes project quota without account or key administration."
+  permissions = concat(
+    [
+      "firebaseauth.users.sendEmail",
+      "serviceusage.services.use",
+    ],
+    contains(var.required_services, "recaptchaenterprise.googleapis.com") ? [
+      "recaptchaenterprise.assessments.create",
+    ] : [],
+  )
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_iam_member" "runtime_waitlist_challenge_sender" {
+  count = contains(var.required_services, "identitytoolkit.googleapis.com") ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.waitlist_challenge_sender[0].name
+  member  = "serviceAccount:${google_service_account.runtime.email}"
 }
 
 resource "google_project_iam_member" "runtime_project_roles" {
@@ -790,6 +905,14 @@ resource "google_service_account_iam_member" "prod_deploy_uses_runtime" {
   service_account_id = google_service_account.runtime.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.prod_deploy.email}"
+}
+
+resource "google_project_iam_member" "prod_deploy_waitlist_recaptcha_key_reader" {
+  count = contains(var.required_services, "recaptchaenterprise.googleapis.com") ? 1 : 0
+
+  project = var.project_id
+  role    = google_project_iam_custom_role.waitlist_recaptcha_key_reader[0].name
+  member  = "serviceAccount:${google_service_account.prod_deploy.email}"
 }
 
 resource "google_service_account_iam_member" "preview_deploy_uses_preview_runtime" {

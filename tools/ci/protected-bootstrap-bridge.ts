@@ -44,20 +44,25 @@ const GOOGLE_PROVIDER_MIRROR_COMPONENTS = [
   "linux_amd64",
 ] as const;
 const PLAN_FORMAT_VERSION = "1.2";
-const JOB_TIMEOUT_MINUTES = 41;
+const JOB_TIMEOUT_MINUTES = 42;
 const PLAN_MAIN_STEP_TIMEOUT_MINUTES = 25;
 const APPLY_MAIN_STEP_TIMEOUT_MINUTES = 39;
 const LEASE_MINUTES = 54;
 const PLAN_INTERNAL_OPERATION_MINUTES = 24;
 const APPLY_INTERNAL_OPERATION_MINUTES = 33;
-const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;
-const RECOVERY_STABLE_EMPTY_MINUTES = 3;
+export const RECOVERY_DOCUMENTED_PROPAGATION_MINUTES = 7;
+export const RECOVERY_STABLE_EMPTY_MINUTES = 3;
 const RECOVERY_SCAN_INTERVAL_MINUTES = 1;
 const RECOVERY_SCAN_LATENCY_MARGIN_MINUTES = 1;
 const RECOVERY_LATE_RETRY_MARGIN_MINUTES = 1;
-const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
+// Once every affected project has completed the parallel propagation horizon,
+// recovery still has to re-inventory all durable intents, restore four pools in
+// parallel, prove their exact fingerprints, and commit generation-bound
+// markers. This is a real budget, not work smuggled into the horizon margin.
+const RECOVERY_POST_CONTAINMENT_MINUTES = 1;
+export const RECOVERY_OPERATION_MINUTES = RECOVERY_DOCUMENTED_PROPAGATION_MINUTES +
   RECOVERY_STABLE_EMPTY_MINUTES + RECOVERY_SCAN_LATENCY_MARGIN_MINUTES +
-  RECOVERY_LATE_RETRY_MARGIN_MINUTES;
+  RECOVERY_LATE_RETRY_MARGIN_MINUTES + RECOVERY_POST_CONTAINMENT_MINUTES;
 const RECOVERY_SOURCE_PROOF_MINUTES = 1;
 const RECOVERY_WATCHDOG_MARGIN_MINUTES = 1;
 const RECOVERY_STEP_TIMEOUT_MINUTES = RECOVERY_SOURCE_PROOF_MINUTES +
@@ -67,7 +72,11 @@ const SAME_JOB_TRANSITION_MARGIN_MINUTES = 1;
 const PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES = SAME_JOB_DOCKER_CLEANUP_MINUTES +
   RECOVERY_STEP_TIMEOUT_MINUTES + SAME_JOB_TRANSITION_MARGIN_MINUTES;
 const APPLY_MAIN_JOB_TAIL_MINUTES = 2;
-const FRESH_RECOVERY_SETUP_STEP_COUNT = 3;
+// Route validation, exact-source fetch, and checksum-pinned Bun installation
+// share one fail-closed setup step. The two independent network transfers run
+// concurrently, so the fresh runner spends one bounded minute rather than
+// serially consuming three minutes of the same one-hour owner token.
+const FRESH_RECOVERY_SETUP_STEP_COUNT = 1;
 const FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES = 1;
 const FRESH_RECOVERY_JOB_TIMEOUT_MINUTES = FRESH_RECOVERY_SETUP_STEP_COUNT +
   RECOVERY_STEP_TIMEOUT_MINUTES + FRESH_RECOVERY_TRANSITION_MARGIN_MINUTES;
@@ -111,6 +120,13 @@ const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
 // exact-cleanup reserve.
 const WRAPPER_CLEANUP_LEAD_SECONDS = 60;
 const EXACT_CLEANUP_RESERVE_SECONDS = 5 * 60;
+// Owner artifacts are published after cleanup has proven itself, which is past
+// the operation deadline the API fetcher was pinned to during prepare. Without
+// a window of its own, an otherwise-successful late run reaches its final
+// read-and-write with an already-expired API deadline and fails at the last
+// step. The work is deterministic and small: a metadata read, a
+// generation-bound read, and two write-plus-readback pairs.
+const OWNER_PUBLICATION_RESERVE_SECONDS = 60;
 const APPLY_CLEANUP_OVERHEAD_SECONDS = WRAPPER_CLEANUP_LEAD_SECONDS +
   EXACT_CLEANUP_RESERVE_SECONDS;
 // How much of that window setup may consume. The worst pre-elevation instant
@@ -280,6 +296,11 @@ const BRIDGE_PHASES = [
   "controller.apply-drain",
   "controller.apply-publish",
   "controller.cleanup",
+  "controller.de-elevate",
+  "controller.federation-preflight",
+  "controller.federation-restore",
+  "controller.final-audit",
+  "controller.quarantine",
   "controller.complete",
   "controller.failed",
   "executor.inventory",
@@ -301,6 +322,7 @@ const BRIDGE_PHASES = [
   "recovery.source-proof",
   "recovery.inventory",
   "recovery.complete",
+  "recovery.federation",
   "recovery.failed",
 ] as const;
 const BRIDGE_PHASE_SET = new Set<string>(BRIDGE_PHASES);
@@ -362,14 +384,15 @@ if (
 if (
   PLAN_MAIN_STEP_TIMEOUT_MINUTES !==
       JOB_TIMEOUT_MINUTES - PLAN_MAIN_JOB_RECOVERY_RESERVE_MINUTES ||
-  APPLY_MAIN_STEP_TIMEOUT_MINUTES !== JOB_TIMEOUT_MINUTES - APPLY_MAIN_JOB_TAIL_MINUTES
+  APPLY_MAIN_STEP_TIMEOUT_MINUTES + APPLY_MAIN_JOB_TAIL_MINUTES > JOB_TIMEOUT_MINUTES
 ) {
   throw new Error("The crash-recovery deadline escaped the main job's reserved tail.");
 }
 if (
   RECOVERY_OPERATION_MINUTES !==
     RECOVERY_DOCUMENTED_PROPAGATION_MINUTES + RECOVERY_STABLE_EMPTY_MINUTES +
-      RECOVERY_SCAN_LATENCY_MARGIN_MINUTES + RECOVERY_LATE_RETRY_MARGIN_MINUTES ||
+      RECOVERY_SCAN_LATENCY_MARGIN_MINUTES + RECOVERY_LATE_RETRY_MARGIN_MINUTES +
+      RECOVERY_POST_CONTAINMENT_MINUTES ||
   RECOVERY_SCAN_LATENCY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
   RECOVERY_LATE_RETRY_MARGIN_MINUTES < RECOVERY_SCAN_INTERVAL_MINUTES ||
   RECOVERY_STEP_TIMEOUT_MINUTES !==
@@ -411,7 +434,21 @@ export const REPOSITORY_NAMES = [
 
 export type RepositoryName = (typeof REPOSITORY_NAMES)[number];
 export type TerraformRoot = "bootstrap" | "prod" | "exposure";
-export type ExecutionMode = "plan" | "apply";
+export type ExecutionMode = "plan" | "apply" | "rehearsal";
+
+// Stage one of the federation-quarantine rollout. The subsystem that closes the
+// privileged window lands FIRST, with production apply refused outright, and a
+// rehearsal route that exercises the whole federation lifecycle -- arm,
+// disable, prove all four converged, de-elevate to a receipt-only identity,
+// prove every mutation permission absent, restore, prove the restored
+// fingerprints, and publish a final receipt -- while touching no business
+// resource and running no Terraform mutation.
+//
+// The point is that the first live exercise of this code CANNOT grant an
+// unvalidated production apply. A second, separately reviewed change flips this
+// to false once the canary and the abrupt-loss recovery drills have both run
+// against the merged code.
+export const PRODUCTION_APPLY_ENABLED = false;
 
 export interface RepositoryContract {
   readonly exposure: {
@@ -527,6 +564,13 @@ export const REPOSITORIES: Readonly<Record<RepositoryName, RepositoryContract>> 
   },
 };
 
+if (
+  new Set(REPOSITORY_NAMES.map((repository) => REPOSITORIES[repository].projectId)).size !==
+    REPOSITORY_NAMES.length
+) {
+  throw new Error("Every protected repository must own one distinct Google Cloud project.");
+}
+
 const BOOTSTRAP_RESOURCE_TYPES = new Set([
   "google_iam_workload_identity_pool",
   "google_iam_workload_identity_pool_provider",
@@ -614,6 +658,18 @@ const PROD_RESOURCE_TYPES = new Set([
   "google_secret_manager_secret_iam_member",
 ]);
 
+// Medlock carries these reviewed project-level resources beside module.site.
+// Keep this as an exact address-to-type map rather than broadening the prod
+// type allowlist: a new root resource, a type swap at a reviewed address, or
+// the same resource in another consumer must require a separate platform
+// review before the protected bridge will admit it.
+const HEALTHMCP_PROD_ROOT_RESOURCES: ReadonlyMap<string, string> = new Map([
+  ["google_firestore_field.waitlist_entry_ttl[0]", "google_firestore_field"],
+  ["google_firestore_field.waitlist_quota_ttl[0]", "google_firestore_field"],
+  ["google_identity_platform_config.default[0]", "google_identity_platform_config"],
+  ["google_recaptcha_enterprise_key.waitlist[0]", "google_recaptcha_enterprise_key"],
+]);
+
 const EXPOSURE_RESOURCE_TYPES = new Set([
   "google_certificate_manager_certificate",
   "google_certificate_manager_certificate_map",
@@ -632,6 +688,7 @@ const EXPOSURE_RESOURCE_TYPES = new Set([
 const TERRAFORM_DIAGNOSTIC_RESOURCE_TYPES = new Set([
   ...BOOTSTRAP_RESOURCE_TYPES,
   ...PROD_RESOURCE_TYPES,
+  ...HEALTHMCP_PROD_ROOT_RESOURCES.values(),
   ...EXPOSURE_RESOURCE_TYPES,
 ]);
 
@@ -642,7 +699,9 @@ const TERRAFORM_DIAGNOSTIC_SERVICES = [
   "firestore.googleapis.com",
   "iam.googleapis.com",
   "iamcredentials.googleapis.com",
+  "identitytoolkit.googleapis.com",
   "orgpolicy.googleapis.com",
+  "recaptchaenterprise.googleapis.com",
   "run.googleapis.com",
   "secretmanager.googleapis.com",
   "serviceusage.googleapis.com",
@@ -968,6 +1027,75 @@ export interface ExecutionProof extends PreparationResult {
   readonly markerProof: readonly MarkerStateProof[];
 }
 
+export interface FinalProtectedProofBase {
+  readonly consumerSha: string;
+  readonly deElevation: ExecutorDeElevationProof;
+  // The digest and generation of the exact durable intent bytes this run armed.
+  readonly intentDigest: string;
+  readonly intentGeneration: string;
+  // Read back from the API AFTER restoration. Never a copy of the intent: the
+  // intent is what the run promised, this is what it left behind.
+  readonly observedPools: readonly ObservedFederationPool[];
+  readonly platformSha: string;
+  readonly repository: RepositoryName;
+  readonly reviewSha256: string;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+// A rehearsal runs no Terraform, so it cannot carry an apply proof, a restored
+// zero-diff audit, or a countable verdict -- and the type is what stops it
+// claiming any of them rather than a comment asking nicely.
+export type FinalProtectedProof =
+  | (FinalProtectedProofBase & {
+    readonly countable: true;
+    readonly kind: "apply";
+    readonly quarantinedApplyProofDigest: string;
+    readonly restoredAudit: {
+      readonly detailedExitCode: 0;
+      readonly observedAt: string;
+      readonly outputSha256: string;
+    };
+  })
+  | (FinalProtectedProofBase & {
+    readonly countable: false;
+    readonly kind: "rehearsal";
+  });
+
+// What an exact release actually establishes, captured before the manager
+// forgets the identity. This is direct evidence about one named account --
+// contained by its stable unique ID, every project binding fenced and re-read
+// as absent, permissions positively proven gone, artifacts deleted -- and it is
+// available inside the five-minute cleanup reserve.
+//
+// It is deliberately NOT the propagation-horizon proof. That proof answers a
+// different question ("is anything left anywhere, for a run whose fate we do
+// not know?"), needs seven minutes of propagation plus three stable, and cannot
+// fit between operationDeadlineMs and cleanupDeadlineMs. Wiring it inline would
+// have failed every apply at its last step.
+export interface ExecutorReleaseProof {
+  readonly artifactsDeleted: true;
+  // How absence was established. The inline path has exact, direct evidence
+  // about one named account; crash recovery has the full propagation horizon
+  // instead. Both are proofs; they are not the same proof, and a verifier is
+  // entitled to know which it is reading.
+  readonly provenBy: "exact-release" | "propagation-horizon";
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly observedAt: string;
+  readonly permissionsProvenGone: true;
+  readonly projectBindingsCleared: true;
+}
+
+export interface ExecutorDeElevationProof {
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly observedAt: string;
+  // Exactly the permissions the mutation role carried that the read role does
+  // not, proven absent against the live control plane after revocation.
+  readonly provenAbsent: readonly string[];
+}
+
 export interface ConsumerFreezeProof {
   readonly observedAt: string;
   readonly repositories: readonly {
@@ -1015,6 +1143,14 @@ export interface BridgeDependencies {
     proof: ExecutionProof,
     nowMs: number,
   ) => Promise<void>;
+  // Revokes mutation authority and proves, against the live control plane, that
+  // every mutation permission is gone while the receipt-scoped read authority
+  // remains. The identity that publishes the final receipt is a reader.
+  readonly deElevateExecutor: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    operationDeadlineMs: number,
+  ) => Promise<ExecutorDeElevationProof>;
   readonly elevateExecutor: (
     invocation: Invocation,
     session: ExecutorSession,
@@ -1048,12 +1184,18 @@ export interface BridgeDependencies {
     proof: ExecutionProof,
     nowMs: number,
   ) => Promise<void>;
-  readonly publishPostApplyReceipt: (
+  // The single countable success. Written only after de-elevation, federation
+  // restoration, and the restored-state audit have all succeeded.
+  // Written by the OWNER, not the executor. The executor holds no capability on
+  // this object at any point in its life, so the ordering claim is enforced by
+  // which credential can write it rather than by the order of two statements.
+  readonly publishFinalReceipt: (
     invocation: Invocation,
-    session: ExecutorSession,
     review: ReviewManifestResult,
-    proof: ExecutionProof,
+    proof: FinalProtectedProof,
+    releaseProof: ExecutorReleaseProof,
     nowMs: number,
+    publicationDeadlineMs: number,
   ) => Promise<void>;
   readonly readPlanJson: (
     invocation: Invocation,
@@ -1066,7 +1208,7 @@ export interface BridgeDependencies {
     invocation: Invocation,
     session: ExecutorSession | undefined,
     operationDeadlineMs: number,
-  ) => Promise<void>;
+  ) => Promise<ExecutorReleaseProof | undefined>;
   readonly removePrivatePath: (path: string) => Promise<void>;
   readonly runTerraform: (
     invocation: Invocation,
@@ -1086,14 +1228,70 @@ export interface BridgeDependencies {
     mutationCompletedAtMs: number,
     operationDeadlineMs: number,
   ) => Promise<void>;
+  // Disables the consumer workload identity pool before any privilege is
+  // granted, and returns the exact state observed beforehand. See the comment
+  // above federationPoolFingerprint for why the pool, and not the provider or a
+  // clock, is what closes the window.
+  // Reads all four pools and writes the durable intent. Deliberately performs
+  // NO mutation: the controller holds the record before the first PATCH, so a
+  // quarantine that fails halfway is still a quarantine this run must undo.
+  readonly armFederationQuarantine: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    operationDeadlineMs: number,
+  ) => Promise<{ readonly generation: string; readonly record: FederationQuarantineRecord }>;
+  // Disables all four, proving each converged to disabled with an otherwise
+  // unchanged fingerprint.
+  readonly disableFederation: (
+    invocation: Invocation,
+    record: FederationQuarantineRecord,
+    operationDeadlineMs: number,
+  ) => Promise<void>;
+  // Restores exactly the captured state and proves it converged. Runs after the
+  // post-apply audit and after the executor is released.
+  // Runs before any protected work. A run that started while an earlier run's
+  // quarantine was still unrepaired would arm a second intent over pools that
+  // are already disabled, and the two runs would then restore each other's
+  // captured state.
+  readonly recoverFederationPreflight: (
+    invocation: Invocation,
+    operationDeadlineMs: number,
+  ) => Promise<FederationRecoverySummary>;
+  readonly restoreFederation: (
+    invocation: Invocation,
+    record: FederationQuarantineRecord,
+    generation: string,
+    operationDeadlineMs: number,
+  ) => Promise<readonly ObservedFederationPool[]>;
+  // The restored-state audit. Its output digest is the zero-diff evidence the
+  // final receipt binds; a timestamp alone would assert nothing.
+  readonly auditRestoredState: (
+    invocation: Invocation,
+    session: ExecutorSession,
+    terraformDirectory: string,
+    federationQuarantined: boolean,
+    operationDeadlineMs: number,
+  ) => Promise<{
+    readonly detailedExitCode: 0;
+    readonly observedAt: string;
+    readonly outputSha256: string;
+  }>;
 }
 
 export interface RecoveryDependencies {
   readonly now: () => number;
+  // Repairs any protected run, for any target, that died holding disabled
+  // consumer pools. Fleet-wide by construction: an abruptly lost run for one
+  // target can be followed by a run for a different one.
+  readonly recoverFederation: (
+    invocation: RecoveryInvocation,
+    horizon: FleetContainmentHorizon,
+    recoveryDeadlineMs: number,
+  ) => Promise<FederationRecoverySummary>;
   readonly recoverArtifacts: (
     invocation: RecoveryInvocation,
     recoveryDeadlineMs: number,
-  ) => Promise<void>;
+  ) => Promise<FleetContainmentHorizon>;
   readonly verifySource: (invocation: RecoveryInvocation) => Promise<void>;
 }
 
@@ -1157,12 +1355,22 @@ function rejectRecoveryCapabilities(source: NodeJS.ProcessEnv): void {
   }
 }
 
-export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Invocation {
+// `productionApplyEnabled` is the rollout gate, not a caller preference. It
+// defaults to the compiled-in PRODUCTION_APPLY_ENABLED, which is false for the
+// whole first stage; main() never passes it, so a deployed build cannot perform
+// a production apply no matter what the environment says. The apply path still
+// has to be exercised by tests, because stage two turns it on unchanged, and
+// those are the only callers that pass it.
+export function validateInvocation(
+  source: NodeJS.ProcessEnv = process.env,
+  productionApplyEnabled: boolean = PRODUCTION_APPLY_ENABLED,
+): Invocation {
   validateProtectedRoute(source);
 
   const repository = repositoryName(required(source, "TARGET_REPOSITORY"));
   const terraformRoot = rootName(required(source, "TERRAFORM_ROOT"));
   const mode = executionMode(required(source, "EXECUTION_MODE"));
+  assertModeIsPermitted(mode, productionApplyEnabled);
   const exposureAdoptionConfirmation = requiredStringOrEmpty(
     source.EXPOSURE_ADOPTION_CONFIRMATION,
     "exposure adoption confirmation",
@@ -1183,7 +1391,10 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     source.EXPOSURE_ADOPTION_RUN_ID,
     "exposure adoption run ID",
   );
-  if (repository === "runsetta" && terraformRoot === "prod") {
+  // Mode-specific, not repository-specific alone. A rehearsal adopts nothing,
+  // and buildReceiptLeases refuses a rehearsal that names an adoption -- so
+  // requiring one here would make Runsetta prod rehearsals unconstructible.
+  if (repository === "runsetta" && terraformRoot === "prod" && mode !== "rehearsal") {
     numeric(exposureAdoptionRunId, "Runsetta exposure adoption run ID");
   } else {
     exact(exposureAdoptionRunId, "", "non-Runsetta-prod exposure adoption run ID");
@@ -1195,11 +1406,18 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
     required(source, "BRIDGE_OPERATION_BUDGET_SECONDS_EXACT"),
     "bridge operation budget seconds",
   ));
-  const minimumOperationBudgetSeconds = mode === "plan"
+  // A rehearsal runs the federation lifecycle and no Terraform mutation, so it
+  // budgets like a plan rather than like an apply.
+  const budgetsLikePlan = mode === "plan" || mode === "rehearsal";
+  const minimumOperationBudgetSeconds = mode === "rehearsal"
+    // A rehearsal takes the plan envelope but still publishes an owner
+    // artifact, so its floor carries the publication reserve plan does not.
+    ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS + OWNER_PUBLICATION_RESERVE_SECONDS
+    : budgetsLikePlan
     ? MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS
     : MINIMUM_APPLY_BRIDGE_BUDGET_SECONDS;
   const maximumOperationBudgetSeconds = (
-    mode === "plan" ? PLAN_MAIN_STEP_TIMEOUT_MINUTES : APPLY_MAIN_STEP_TIMEOUT_MINUTES
+    budgetsLikePlan ? PLAN_MAIN_STEP_TIMEOUT_MINUTES : APPLY_MAIN_STEP_TIMEOUT_MINUTES
   ) * 60;
   if (
     operationBudgetSeconds < minimumOperationBudgetSeconds ||
@@ -1226,8 +1444,10 @@ export function validateInvocation(source: NodeJS.ProcessEnv = process.env): Inv
   }
   const approvedManifestSha256 = source.APPROVED_MANIFEST_SHA256 ?? "";
   const approvedPlanRunId = source.APPROVED_PLAN_RUN_ID ?? "";
-  if (mode === "plan" && (approvedManifestSha256 !== "" || approvedPlanRunId !== "")) {
-    throw new Error("Plan mode forbids an approved plan run or manifest digest.");
+  // Every non-apply mode, not just plan. Naming an approved run in a rehearsal
+  // would let it carry apply authority it can never legitimately exercise.
+  if (mode !== "apply" && (approvedManifestSha256 !== "" || approvedPlanRunId !== "")) {
+    throw new Error("Only apply mode may name an approved plan run or manifest digest.");
   }
   if (mode === "apply") {
     hash(approvedManifestSha256, "approved manifest digest");
@@ -1485,6 +1705,12 @@ export function buildStorageLease(
 // completed their cleanup in process, so no such orphan is believed to exist --
 // but "believed" is not the standard for a path whose failure mode is a manual
 // outage.
+// Historical orphan recognizer ONLY, and therefore FROZEN. This is the exact
+// v0.5.28 shape -- consumed/* plus results/* in one combined creator binding --
+// and it must never track current grants. If it drifts, recovery stops
+// recognising the orphans it exists to clean up, and the protected path refuses
+// every run until somebody clears them by hand. No current run is granted it:
+// results/* no longer exists and final/* is the owner's.
 export function buildLegacyCombinedReceiptCreateLease(
   repository: RepositoryName,
   root: TerraformRoot,
@@ -1601,11 +1827,21 @@ export function buildReceiptLeases(
 ): readonly IamBinding[] {
   numeric(runId, "GitHub run ID");
   if (mode === "apply") numeric(approvedPlanRunId, "approved plan run ID");
-  if (mode === "plan" && approvedPlanRunId !== "") {
-    throw new Error("Plan receipt scope cannot name an approved run.");
+  if (mode !== "apply" && approvedPlanRunId !== "") {
+    throw new Error("A run that consumes no approved plan cannot name one.");
   }
   const contract = REPOSITORIES[repository];
   const state = contract.state[root];
+  // A rehearsal reviews no plan, consumes no receipt, and publishes nothing
+  // itself -- its receipt is the owner's. So it is granted no receipt scope at
+  // all, and there is deliberately no plan resource to construct: doing so
+  // would derive an object name from an approved run id that does not exist.
+  if (mode === "rehearsal") {
+    if (exposureAdoptionRunId !== "") {
+      throw new Error("A rehearsal has no exposure adoption.");
+    }
+    return [];
+  }
   const planRunId = mode === "plan" ? runId : approvedPlanRunId;
   const planReceiptKind = root === "exposure" ? "adoptions" : "plans";
   const planResource =
@@ -1613,14 +1849,15 @@ export function buildReceiptLeases(
   const consumedResource = mode === "apply"
     ? `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "consumed", approvedPlanRunId)}`
     : undefined;
-  const resultResource = mode === "apply"
-    ? `projects/_/buckets/${state.bucket}/objects/${receiptObjectName(state, "results", runId)}`
-    : undefined;
+  // Deliberately absent: the executor is granted NO capability on the final
+  // receipt, at acquire or at any later point. An acquire-time grant would let
+  // IAM permit that object to be published while mutation authority was still
+  // live, which would leave the publish-after-de-elevation ordering enforced by
+  // cooperative code rather than by credentials. The owner writes it instead.
   const member = executorMember(contract.projectId, executorServiceAccountEmail);
   const viewerResources = [
     planResource,
     ...(consumedResource === undefined ? [] : [consumedResource]),
-    ...(resultResource === undefined ? [] : [resultResource]),
     ...(repository === "runsetta" && root === "prod" && exposureAdoptionRunId !== ""
       ? [
           `projects/_/buckets/${contract.state.exposure.bucket}/objects/${receiptObjectName(
@@ -1631,18 +1868,18 @@ export function buildReceiptLeases(
         ]
       : []),
   ];
-  // Apply splits the creator scope in two. The executor must be able to write
-  // the consumed receipt during consumeApproval, and must NOT still be able to
-  // when elevate probes the mutation projection immediately afterwards -- that
-  // projection forbids create on it, and nothing revoked the grant, so the two
-  // contradicted each other permanently and no apply could ever elevate.
+  // The consumed receipt keeps its own short-lived creator lease, revoked at
+  // elevation: the executor must be able to write it during consumeApproval and
+  // must NOT still be able to when elevate probes the mutation projection.
   // Observed on run 33300997122: `consumed/33300628538.json (unexpectedly holds
-  // storage.objects.create)`. Separating the scopes lets elevate remove exactly
-  // the consumed grant while the result grant, which is still needed to publish
-  // the post-apply receipt, survives.
-  const creatorResources = consumedResource === undefined
-    ? [planResource]
-    : [resultResource!];
+  // storage.objects.create)`.
+  //
+  // Beyond that, an apply or rehearsal executor now creates nothing at all. The
+  // results receipt is gone and the final receipt is the owner's, so there is
+  // no second creator lease to grant -- which is what makes "published only
+  // after mutation authority was surrendered" a statement about credentials
+  // rather than about the order of two lines of code.
+  const creatorResources = mode === "plan" ? [planResource] : [];
   return [
     ...(consumedResource === undefined ? [] : [{
       condition: {
@@ -1659,7 +1896,7 @@ export function buildReceiptLeases(
       members: [member],
       role: "roles/storage.objectCreator",
     } satisfies IamBinding]),
-    {
+    ...(creatorResources.length === 0 ? [] : [{
       condition: {
         ...expiringCondition(
           `codex-receipt-create-${runId}`,
@@ -1673,7 +1910,7 @@ export function buildReceiptLeases(
       },
       members: [member],
       role: "roles/storage.objectCreator",
-    },
+    } satisfies IamBinding]),
     {
       condition: {
         ...expiringCondition(
@@ -1798,6 +2035,15 @@ const V0512_BOOTSTRAP_ROLE_PERMISSION_SHA256 = {
   mutation: "6d2e97c830d53859f1040ac1090bd53303fa23d7743e3f2855095972369eca77",
   read: "cd250d221ea684765f6c2c04dbd806e8b6ce094666455ae50dedcc20564f86e4",
 } as const;
+// A protected HealthMCP prod run from before the ownership-control resources
+// landed can have crashed after creating one of these exact roles. The new
+// matrices below are wider only for the newly reviewed control plane, so keep
+// the prior two digests recoverable without accepting any arbitrary subset or
+// superset of either role.
+const PRE_OWNERSHIP_HEALTHMCP_PROD_ROLE_PERMISSION_SHA256 = {
+  mutation: "774f2e503272daf8ffa2f7ec347886b3f728588232aa1ecb6fe5e322bb30c485",
+  read: "45c4fd9ba76793fd5405f7b0cd2132e93c1f6ca4a5dda952f9cd76026e10b9d0",
+} as const;
 
 export function executorControlPermissions(
   repository: RepositoryName,
@@ -1864,6 +2110,10 @@ export function executorControlPermissions(
           "datastore.databases.get",
           "datastore.databases.getMetadata",
           "datastore.databases.list",
+          "datastore.indexes.get",
+          "datastore.indexes.list",
+          "firebaseauth.configs.get",
+          "recaptchaenterprise.keys.get",
         ]
       : []),
   ];
@@ -1917,8 +2167,13 @@ export function executorControlPermissions(
               "datastore.databases.create",
               "datastore.databases.delete",
               "datastore.databases.update",
+              "datastore.indexes.update",
               "datastore.operations.get",
               "datastore.operations.list",
+              "firebaseauth.configs.create",
+              "firebaseauth.configs.update",
+              "recaptchaenterprise.keys.create",
+              "recaptchaenterprise.keys.update",
             ]
           : []),
       ];
@@ -1951,6 +2206,10 @@ export function bridgeRolePermissionsRecognized(
     ...executorControlPermissions(repository, root, phase),
   ].toSorted());
   if (observedJson === controlJson) return true;
+  if (repository === "healthmcp" && root === "prod") {
+    const digest = createHash("sha256").update(observedJson).digest("hex");
+    return digest === PRE_OWNERSHIP_HEALTHMCP_PROD_ROLE_PERMISSION_SHA256[phase];
+  }
   if (root !== "bootstrap") return false;
   // Google retains deleted custom-role tombstones, and abrupt v0.5.12 loss can
   // also leave an active role. The frozen digests recognize only those exact
@@ -2017,6 +2276,50 @@ export function buildRuntimeActAsLeases(
 // Every preview runtime principal in the fleet. The retired deny policy named
 // these four explicitly; the plan gate below derives them so a repository added
 // to REPOSITORIES cannot silently escape the check.
+// Predefined roles that can move a workload-identity pool or rewrite the
+// authority that controls one. The plan gate is deliberately conservative:
+// Editor no longer expands to the update permission in the current role
+// inventory, but retaining it here refuses a historical/high-impact primitive
+// grant instead of making the safety of an approved plan depend on a mutable
+// predefined role definition.
+const POOL_MUTATION_ROLES: ReadonlySet<string> = new Set([
+  "roles/editor",
+  "roles/iam.admin",
+  "roles/iam.securityAdmin",
+  "roles/iam.workloadIdentityPoolAdmin",
+  "roles/owner",
+]);
+
+// The pool PATCH API still documents this legacy permission spelling and the
+// ephemeral executor role must carry it. Cloud Asset and the live IAM role
+// inventory expose the analyzable canonical spelling with the service prefix;
+// the live controller proof below binds both surfaces instead of assuming they
+// are interchangeable.
+export const POOL_MUTATION_PERMISSION = "iam.workloadIdentityPools.update";
+export const POOL_MUTATION_ANALYSIS_PERMISSION =
+  "iam.googleapis.com/workloadIdentityPools.update";
+
+const FEDERATION_CONTROLLER_PERMISSIONS = [
+  "iam.googleapis.com/workloadIdentityPools.setIamPolicy",
+  POOL_MUTATION_ANALYSIS_PERMISSION,
+  "iam.workloadIdentityPools.createPolicyBinding",
+  "iam.workloadIdentityPools.deletePolicyBinding",
+  "iam.workloadIdentityPools.updatePolicyBinding",
+  "resourcemanager.projects.setIamPolicy",
+] as const;
+const FEDERATION_CONTROLLER_PERMISSION_SET: ReadonlySet<string> =
+  new Set(FEDERATION_CONTROLLER_PERMISSIONS);
+
+// Terraform may preserve only the owner controller. The run's ephemeral
+// executor receives its exact, single-run mutation lease out of band from this
+// bridge after the reviewed plan is accepted; it must never be granted pool
+// authority by Terraform. Accepting an account merely because its name looked
+// like an executor would let a plan create a different gha-pbt-* principal and
+// use it to re-enable a quarantined pool.
+function isTrustedFederationController(principal: string): boolean {
+  return principalWithoutUid(principal) === OWNER_MEMBER;
+}
+
 function previewRuntimeMembers(): ReadonlySet<string> {
   const members = new Set<string>();
   for (const repository of REPOSITORY_NAMES) {
@@ -2160,6 +2463,21 @@ function rejectPreviewRuntimeGrant(
     }
   }
   const members = previewRuntimeMembers();
+  // The quarantine is only worth anything if the pools it disables cannot be
+  // re-enabled by a principal inside the window. Terraform may preserve only
+  // the owner controller; the bridge separately grants the exact current
+  // executor its bounded lease. Any Terraform-managed executor-like grant is
+  // therefore refused before it can be applied.
+  const role = typeof state.role === "string" ? state.role : "";
+  if (POOL_MUTATION_ROLES.has(role)) {
+    for (const principal of principals) {
+      if (!isTrustedFederationController(principal)) {
+        throw new Error(
+          `${label} at ${address} grants ${role} to ${principal}, which could re-enable a quarantined workload identity pool.`,
+        );
+      }
+    }
+  }
   for (const principal of principals) {
     if (members.has(principalWithoutUid(principal))) {
       throw new Error(
@@ -3203,6 +3521,2011 @@ function normalizedFreezeProof(
   return { observedAt: proof.observedAt, repositories, tokenDrainSeconds: proof.tokenDrainSeconds };
 }
 
+export const FEDERATION_POOL_ID = "github-actions";
+export const FEDERATION_PROVIDER_ID = "github";
+const FEDERATION_CONVERGENCE_INTERVAL_MS = 2_000;
+const FEDERATION_QUARANTINE_PREFIX = "federation-quarantine";
+const MAX_FEDERATION_INTENT_PAGES = 32;
+const FEDERATION_MARKER_SKEW_MS = 5 * 60_000;
+
+export interface FederationPoolState {
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly displayName: string;
+  readonly mode: "FEDERATION_ONLY";
+  readonly name: string;
+  readonly state: string;
+}
+
+export interface FederationProviderState {
+  readonly attributeCondition: string;
+  readonly attributeMapping: Readonly<Record<string, string>>;
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly displayName: string;
+  readonly name: string;
+  readonly state: string;
+}
+
+// Everything about the pool except the flag the bridge is allowed to move.
+// Restore compares this, so a run cannot hand back a pool whose condition,
+// description, or lifecycle state drifted while it held privilege.
+export function federationPoolFingerprint(pool: FederationPoolState): string {
+  return canonicalJson(
+    json(
+      {
+        description: pool.description,
+        displayName: pool.displayName,
+        mode: pool.mode,
+        name: pool.name,
+        state: pool.state,
+      },
+      "federation pool fingerprint",
+    ),
+  );
+}
+
+function federationPoolResourceName(projectId: string): string {
+  const repository = REPOSITORY_NAMES.find(
+    (candidate) => REPOSITORIES[candidate].projectId === projectId,
+  );
+  if (repository === undefined) {
+    throw new Error("The workload identity pool project escaped the repository contract.");
+  }
+  return `projects/${REPOSITORIES[repository].exposure.projectNumber}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+}
+
+interface FederationControllerRole {
+  readonly canonical: JsonValue;
+  readonly includedPermissions: readonly string[];
+  readonly name: string;
+}
+
+interface FederationControllerBaseSnapshot {
+  readonly poolPolicy: JsonValue;
+  readonly project: JsonValue;
+  readonly projectPolicy: IamPolicy;
+  readonly repository: RepositoryName;
+}
+
+interface FederationControllerSnapshot {
+  readonly canonical: string;
+  readonly mutatorBindings: readonly JsonValue[];
+  readonly repository: RepositoryName;
+}
+
+function normalizedIamBinding(binding: IamBinding): JsonValue {
+  return json({
+    ...(binding.condition === undefined ? {} : { condition: binding.condition }),
+    members: [...binding.members].toSorted(),
+    role: binding.role,
+  }, "normalized IAM binding");
+}
+
+function normalizedIamPolicy(policy: IamPolicy): JsonValue {
+  const bindings = policy.bindings
+    .map((binding) => normalizedIamBinding(binding))
+    .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  const auditConfigs = policy.auditConfigs === undefined
+    ? undefined
+    : [...policy.auditConfigs]
+      .map((entry) => json(entry, "normalized IAM audit config"))
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  return json({
+    ...(auditConfigs === undefined ? {} : { auditConfigs }),
+    bindings,
+    etag: policy.etag,
+    version: policy.version,
+  }, "normalized IAM policy");
+}
+
+async function readFederationControllerProject(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<JsonValue> {
+  const contract = REPOSITORIES[repository];
+  const response = await fetcher(
+    `https://cloudresourcemanager.googleapis.com/v1/projects/${contract.projectId}`,
+    { headers: googleHeaders(ownerToken), redirect: "error" },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `The ${repository} controller project lookup failed with HTTP ${response.status}.`,
+    );
+  }
+  const value = record(
+    await boundedJson(response, 512 * 1024),
+    `${repository} controller project`,
+  );
+  exact(value.projectId, contract.projectId, `${repository} controller project ID`);
+  exact(
+    value.projectNumber,
+    contract.exposure.projectNumber,
+    `${repository} controller project number`,
+  );
+  exact(value.lifecycleState, "ACTIVE", `${repository} controller project lifecycle`);
+  if (value.parent !== undefined && value.parent !== null) {
+    throw new Error(
+      `The ${repository} controller project acquired an organization or folder parent; inherited pool authority is outside this proof.`,
+    );
+  }
+  return json(value, `${repository} controller project`);
+}
+
+async function readFederationPoolPolicy(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<JsonValue> {
+  const projectId = REPOSITORIES[repository].projectId;
+  const value = record(
+    await googleJson(
+      `https://iam.googleapis.com/v1/${federationPoolResourceName(projectId)}:getIamPolicy`,
+      ownerToken,
+      { options: { requestedPolicyVersion: 3 } },
+      fetcher,
+    ),
+    `${repository} workload identity pool policy`,
+  );
+  exactKeys(
+    value,
+    new Set(["auditConfigs", "bindings", "etag", "version"]),
+    `${repository} workload identity pool policy`,
+  );
+  if (array(value.bindings ?? [], `${repository} workload identity pool bindings`).length !== 0) {
+    throw new Error(
+      `The ${repository} workload identity pool has a resource-level IAM binding; only the exact owner project binding is admitted.`,
+    );
+  }
+  if (array(value.auditConfigs ?? [], `${repository} workload identity pool audit configs`).length !== 0) {
+    throw new Error(
+      `The ${repository} workload identity pool has an unreviewed resource-level audit configuration.`,
+    );
+  }
+  if (value.etag !== undefined) requiredString(value.etag, `${repository} pool policy etag`);
+  if (value.version !== undefined) {
+    boundedInteger(value.version, `${repository} pool policy version`, 1, 3);
+  }
+  return json(value, `${repository} workload identity pool policy`);
+}
+
+async function readFederationControllerRole(
+  roleName: string,
+  projectId: string,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<FederationControllerRole> {
+  const predefined = /^roles\/[A-Za-z0-9_.]{3,128}$/.test(roleName);
+  const projectRole = new RegExp(
+    `^projects/${escapeRegExp(projectId)}/roles/[A-Za-z0-9_.]{3,128}$`,
+  ).test(roleName);
+  if (!predefined && !projectRole) {
+    throw new Error(
+      `A ${projectId} project IAM binding names a role outside its project or the predefined-role namespace.`,
+    );
+  }
+  const url = new URL(`https://iam.googleapis.com/v1/${roleName}`);
+  const response = await fetcher(url, {
+    headers: googleHeaders(ownerToken),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`The live IAM role ${roleName} could not be resolved (HTTP ${response.status}).`);
+  }
+  const value = record(await boundedJson(response, 2 * 1024 * 1024), "live IAM role");
+  exactKeys(
+    value,
+    new Set(["deleted", "description", "etag", "includedPermissions", "name", "stage", "title"]),
+    "live IAM role",
+  );
+  exact(value.name, roleName, "live IAM role name");
+  if (value.deleted === true) {
+    throw new Error(`The bound IAM role ${roleName} is soft-deleted and cannot prove authority.`);
+  }
+  if (value.deleted !== undefined && value.deleted !== false) {
+    throw new Error(`The bound IAM role ${roleName} has a malformed deletion state.`);
+  }
+  requiredString(value.description, "live IAM role description");
+  requiredString(value.etag, "live IAM role etag");
+  requiredString(value.stage, "live IAM role stage");
+  requiredString(value.title, "live IAM role title");
+  const includedPermissions = array(
+    value.includedPermissions,
+    "live IAM role permissions",
+  ).map((permission) => requiredString(permission, "live IAM role permission")).toSorted();
+  if (
+    includedPermissions.length > 20_000 ||
+    new Set(includedPermissions).size !== includedPermissions.length
+  ) {
+    throw new Error(`The bound IAM role ${roleName} has a duplicate or oversized permission set.`);
+  }
+  return {
+    canonical: json({
+      deleted: false,
+      description: value.description,
+      etag: value.etag,
+      includedPermissions,
+      name: roleName,
+      stage: value.stage,
+      title: value.title,
+    }, "live IAM role"),
+    includedPermissions,
+    name: roleName,
+  };
+}
+
+async function readFederationControllerBaseSnapshot(
+  repository: RepositoryName,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<FederationControllerBaseSnapshot> {
+  const projectId = REPOSITORIES[repository].projectId;
+  const [project, projectPolicy, poolPolicy] = await Promise.all([
+    readFederationControllerProject(repository, ownerToken, fetcher),
+    getPolicy(projectId, ownerToken, fetcher),
+    readFederationPoolPolicy(repository, ownerToken, fetcher),
+  ]);
+  return { poolPolicy, project, projectPolicy, repository };
+}
+
+async function readFederationControllerSnapshots(
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<readonly FederationControllerSnapshot[]> {
+  const bases = await Promise.all(
+    REPOSITORY_NAMES.map((repository) =>
+      readFederationControllerBaseSnapshot(repository, ownerToken, fetcher)
+    ),
+  );
+  const roleReads = new Map<string, Promise<FederationControllerRole>>();
+  const readRole = (roleName: string, projectId: string) => {
+    const existing = roleReads.get(roleName);
+    if (existing !== undefined) return existing;
+    const created = readFederationControllerRole(roleName, projectId, ownerToken, fetcher);
+    roleReads.set(roleName, created);
+    return created;
+  };
+  const snapshots: FederationControllerSnapshot[] = [];
+  for (const base of bases) {
+    const projectId = REPOSITORIES[base.repository].projectId;
+    const roles = await Promise.all(
+      [...new Set(base.projectPolicy.bindings.map((binding) => binding.role))]
+        .toSorted()
+        .map((roleName) => readRole(roleName, projectId)),
+    );
+    const rolesByName = new Map(roles.map((role) => [role.name, role]));
+    const mutatorBindings = base.projectPolicy.bindings
+      .filter((binding) => {
+        const role = rolesByName.get(binding.role);
+        if (role === undefined) throw new Error("A project IAM binding lost its role definition.");
+        return role.includedPermissions.some((permission) =>
+          permission === POOL_MUTATION_PERMISSION ||
+          FEDERATION_CONTROLLER_PERMISSION_SET.has(permission)
+        );
+      })
+      .map((binding) => {
+        if (binding.condition !== undefined) {
+          throw new Error(
+            `The ${base.repository} federation controller binding ${binding.role} is conditional; the quarantine requires stable owner authority.`,
+          );
+        }
+        if (
+          binding.members.length === 0 ||
+          binding.members.some((member) => member !== OWNER_MEMBER)
+        ) {
+          throw new Error(
+            `The ${base.repository} project grants federation-controller authority outside the exact owner identity.`,
+          );
+        }
+        return normalizedIamBinding(binding);
+      })
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    if (mutatorBindings.length === 0) {
+      throw new Error(
+        `The ${base.repository} project has no exact owner federation-controller binding.`,
+      );
+    }
+    const roleDefinitions = roles
+      .map((role) => role.canonical)
+      .toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+    snapshots.push({
+      canonical: canonicalJson(json({
+        mutatorBindings,
+        poolPolicy: base.poolPolicy,
+        project: base.project,
+        projectPolicy: normalizedIamPolicy(base.projectPolicy),
+        roleDefinitions,
+      }, `${base.repository} federation controller snapshot`)),
+      mutatorBindings,
+      repository: base.repository,
+    });
+  }
+  return snapshots;
+}
+
+function requireEmptyAnalysisState(value: unknown, label: string): void {
+  if (value === undefined) return;
+  if (Object.keys(record(value, label)).length !== 0) {
+    throw new Error(`${label} is not fully resolved.`);
+  }
+}
+
+function validateFederationControllerAnalysis(
+  value: unknown,
+  snapshot: FederationControllerSnapshot,
+): void {
+  const repository = snapshot.repository;
+  const projectId = REPOSITORIES[repository].projectId;
+  // The request path and analysis scope both use the immutable contracted
+  // project ID. Cloud Asset echoes that ID in attachedResourceFullName (and in
+  // each ACL resource) for this ID-scoped query; substituting the numeric
+  // project identity would reject every live response. Keep the exact echo so
+  // a result from another scope cannot be admitted by suffix or alias.
+  const projectFullName = `//cloudresourcemanager.googleapis.com/projects/${projectId}`;
+  const response = record(value, `${repository} federation controller analysis`);
+  exactKeys(
+    response,
+    new Set(["fullyExplored", "mainAnalysis", "serviceAccountImpersonationAnalysis"]),
+    `${repository} federation controller analysis`,
+  );
+  exact(response.fullyExplored, true, `${repository} controller analysis completeness`);
+  const impersonation = array(
+    response.serviceAccountImpersonationAnalysis ?? [],
+    `${repository} controller impersonation analyses`,
+  );
+  if (impersonation.length !== 0) {
+    throw new Error(
+      `The ${repository} controller analysis found a service-account impersonation path.`,
+    );
+  }
+  const main = record(response.mainAnalysis, `${repository} main controller analysis`);
+  exactKeys(
+    main,
+    new Set(["analysisQuery", "analysisResults", "fullyExplored", "nonCriticalErrors"]),
+    `${repository} main controller analysis`,
+  );
+  exact(main.fullyExplored, true, `${repository} main controller analysis completeness`);
+  if (
+    array(main.nonCriticalErrors ?? [], `${repository} controller analysis warnings`).length !== 0
+  ) {
+    throw new Error(`The ${repository} controller analysis returned non-critical errors.`);
+  }
+  const query = record(main.analysisQuery, `${repository} controller analysis query`);
+  exactKeys(
+    query,
+    new Set(["accessSelector", "options", "scope"]),
+    `${repository} controller analysis query`,
+  );
+  exact(query.scope, `projects/${projectId}`, `${repository} controller analysis scope`);
+  const selector = record(query.accessSelector, `${repository} controller access selector`);
+  exactKeys(selector, new Set(["permissions"]), `${repository} controller access selector`);
+  exact(
+    canonicalJson(json(
+      array(selector.permissions, `${repository} controller permissions`).toSorted(),
+      `${repository} controller permissions`,
+    )),
+    canonicalJson(json([...FEDERATION_CONTROLLER_PERMISSIONS].toSorted(), "controller permissions")),
+    `${repository} controller permissions`,
+  );
+  const options = record(query.options, `${repository} controller analysis options`);
+  const expectedOptions = {
+    analyzeServiceAccountImpersonation: true,
+    expandResources: true,
+    expandRoles: true,
+    outputGroupEdges: true,
+    outputResourceEdges: true,
+  };
+  exactKeys(options, new Set(Object.keys(expectedOptions)), `${repository} controller options`);
+  exact(
+    canonicalJson(json(options, `${repository} controller options`)),
+    canonicalJson(json(expectedOptions, "controller options")),
+    `${repository} controller options`,
+  );
+  const results = array(main.analysisResults, `${repository} controller analysis results`);
+  if (results.length === 0 || results.length > 128) {
+    throw new Error(`The ${repository} controller analysis returned no or too many bindings.`);
+  }
+  const observedBindings = results.map((candidate, index) => {
+    const result = record(candidate, `${repository} controller analysis result ${index}`);
+    exactKeys(
+      result,
+      new Set([
+        "accessControlLists",
+        "attachedResourceFullName",
+        "fullyExplored",
+        "iamBinding",
+        "identityList",
+      ]),
+      `${repository} controller analysis result ${index}`,
+    );
+    exact(result.fullyExplored, true, `${repository} controller result completeness`);
+    exact(
+      result.attachedResourceFullName,
+      projectFullName,
+      `${repository} controller policy attachment`,
+    );
+    const binding = iamPolicy({
+      bindings: [result.iamBinding],
+      etag: "analysis-only",
+      version: 3,
+    }).bindings[0]!;
+    if (
+      binding.condition !== undefined ||
+      binding.members.length === 0 ||
+      binding.members.some((member) => member !== OWNER_MEMBER)
+    ) {
+      throw new Error(
+        `The ${repository} controller analysis returned authority outside the unconditional exact owner binding.`,
+      );
+    }
+    const accessLists = array(
+      result.accessControlLists,
+      `${repository} controller access-control lists`,
+    );
+    if (accessLists.length === 0 || accessLists.length > 32) {
+      throw new Error(`The ${repository} controller analysis returned no or too many ACLs.`);
+    }
+    const observedPermissions = new Set<string>();
+    for (const [aclIndex, rawAcl] of accessLists.entries()) {
+      const acl = record(rawAcl, `${repository} controller ACL ${aclIndex}`);
+      exactKeys(
+        acl,
+        new Set(["accesses", "conditionEvaluation", "resourceEdges", "resources"]),
+        `${repository} controller ACL ${aclIndex}`,
+      );
+      if (acl.conditionEvaluation !== undefined) {
+        throw new Error(`The ${repository} controller ACL is conditional.`);
+      }
+      if (array(acl.resourceEdges ?? [], `${repository} controller resource edges`).length !== 0) {
+        throw new Error(`The ${repository} controller ACL escaped the exact project resource.`);
+      }
+      const resources = array(acl.resources, `${repository} controller resources`);
+      if (resources.length === 0) {
+        throw new Error(`The ${repository} controller ACL has no resource.`);
+      }
+      for (const rawResource of resources) {
+        const resource = record(rawResource, `${repository} controller resource`);
+        exactKeys(
+          resource,
+          new Set(["analysisState", "fullResourceName"]),
+          `${repository} controller resource`,
+        );
+        exact(
+          resource.fullResourceName,
+          projectFullName,
+          `${repository} controller ACL resource`,
+        );
+        requireEmptyAnalysisState(
+          resource.analysisState,
+          `${repository} controller resource analysis state`,
+        );
+      }
+      const accesses = array(acl.accesses, `${repository} controller accesses`);
+      if (accesses.length === 0) {
+        throw new Error(`The ${repository} controller ACL has no access.`);
+      }
+      for (const rawAccess of accesses) {
+        const access = record(rawAccess, `${repository} controller access`);
+        exactKeys(
+          access,
+          new Set(["analysisState", "permission", "role"]),
+          `${repository} controller access`,
+        );
+        if (access.role !== undefined) {
+          throw new Error(`The ${repository} controller analysis did not expand a role.`);
+        }
+        const permission = requiredString(
+          access.permission,
+          `${repository} controller permission`,
+        );
+        if (!FEDERATION_CONTROLLER_PERMISSION_SET.has(permission)) {
+          throw new Error(`The ${repository} controller analysis returned an unrequested access.`);
+        }
+        requireEmptyAnalysisState(
+          access.analysisState,
+          `${repository} controller access analysis state`,
+        );
+        observedPermissions.add(permission);
+      }
+    }
+    if (observedPermissions.size === 0) {
+      throw new Error(`The ${repository} controller analysis proved no controller permission.`);
+    }
+    const identities = record(result.identityList, `${repository} controller identity list`);
+    exactKeys(
+      identities,
+      new Set(["groupEdges", "identities"]),
+      `${repository} controller identity list`,
+    );
+    if (array(identities.groupEdges ?? [], `${repository} controller group edges`).length !== 0) {
+      throw new Error(`The ${repository} controller analysis found a group-derived identity.`);
+    }
+    const identityValues = array(
+      identities.identities,
+      `${repository} controller identities`,
+    );
+    if (identityValues.length === 0) {
+      throw new Error(`The ${repository} controller analysis returned no identity.`);
+    }
+    for (const rawIdentity of identityValues) {
+      const identity = record(rawIdentity, `${repository} controller identity`);
+      exactKeys(
+        identity,
+        new Set(["analysisState", "name"]),
+        `${repository} controller identity`,
+      );
+      exact(identity.name, OWNER_MEMBER, `${repository} controller identity`);
+      requireEmptyAnalysisState(
+        identity.analysisState,
+        `${repository} controller identity analysis state`,
+      );
+    }
+    return normalizedIamBinding(binding);
+  }).toSorted((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  exact(
+    canonicalJson(json(observedBindings, `${repository} observed controller bindings`)),
+    canonicalJson(json(snapshot.mutatorBindings, `${repository} live controller bindings`)),
+    `${repository} live/analyzed controller bindings`,
+  );
+}
+
+async function analyzeFederationControllers(
+  snapshot: FederationControllerSnapshot,
+  ownerToken: string,
+  fetcher: Fetcher,
+): Promise<void> {
+  const projectId = REPOSITORIES[snapshot.repository].projectId;
+  const url = new URL(
+    `https://cloudasset.googleapis.com/v1/projects/${projectId}:analyzeIamPolicy`,
+  );
+  for (const permission of FEDERATION_CONTROLLER_PERMISSIONS) {
+    url.searchParams.append("analysisQuery.accessSelector.permissions", permission);
+  }
+  url.searchParams.set("analysisQuery.options.expandRoles", "true");
+  url.searchParams.set("analysisQuery.options.expandResources", "true");
+  url.searchParams.set("analysisQuery.options.outputGroupEdges", "true");
+  url.searchParams.set("analysisQuery.options.outputResourceEdges", "true");
+  url.searchParams.set("analysisQuery.options.analyzeServiceAccountImpersonation", "true");
+  url.searchParams.set("executionTimeout", "120s");
+  const response = await fetcher(url, {
+    headers: googleHeaders(ownerToken),
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(
+      `The ${snapshot.repository} federation controller analysis failed with HTTP ${response.status}.`,
+    );
+  }
+  validateFederationControllerAnalysis(
+    await boundedJson(response, 4 * 1024 * 1024),
+    snapshot,
+  );
+}
+
+// Proves the live state that a reviewed plan cannot: every effective pool
+// updater and every principal able to grant pool-update authority is the exact
+// owner, the projects have no inheritance boundary, and the pools carry no
+// resource-level policy. Policy and role etags bracket a complete Cloud Asset
+// expansion so an eventually-consistent or concurrently changed answer cannot
+// authorize the first quarantine write.
+export async function proveNoUntrustedFederationControllers(
+  ownerToken: string,
+  policyFetcher: Fetcher,
+  analysisFetcher: Fetcher = policyFetcher,
+): Promise<void> {
+  secretValue(ownerToken, "federation controller owner token");
+  const before = await readFederationControllerSnapshots(ownerToken, policyFetcher);
+  await Promise.all(
+    before.map((snapshot) => analyzeFederationControllers(snapshot, ownerToken, analysisFetcher)),
+  );
+  const after = await readFederationControllerSnapshots(ownerToken, policyFetcher);
+  for (const [index, first] of before.entries()) {
+    const second = after[index];
+    if (second === undefined || second.repository !== first.repository) {
+      throw new Error("The federation controller snapshot lost repository order.");
+    }
+    exact(
+      second.canonical,
+      first.canonical,
+      `${first.repository} federation controller snapshot`,
+    );
+  }
+}
+
+function validatedFederationPoolFingerprint(
+  value: unknown,
+  repository: RepositoryName,
+): string {
+  const text = requiredString(value, "federation quarantine fingerprint");
+  if (Buffer.byteLength(text) > 4096) {
+    throw new Error("Federation quarantine fingerprint is oversized.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error("Federation quarantine fingerprint is not JSON.");
+  }
+  const fingerprint = record(parsed, "federation quarantine fingerprint");
+  exactKeys(
+    fingerprint,
+    new Set(["description", "displayName", "mode", "name", "state"]),
+    "federation quarantine fingerprint",
+  );
+  requiredStringOrEmpty(fingerprint.description, "federation quarantine description");
+  requiredStringOrEmpty(fingerprint.displayName, "federation quarantine display name");
+  exact(fingerprint.mode, "FEDERATION_ONLY", "federation quarantine fingerprint mode");
+  exact(
+    fingerprint.name,
+    federationPoolResourceName(REPOSITORIES[repository].projectId),
+    "federation quarantine fingerprint name",
+  );
+  exact(fingerprint.state, "ACTIVE", "federation quarantine fingerprint state");
+  exact(
+    text,
+    canonicalJson(json(fingerprint, "federation quarantine fingerprint")),
+    "federation quarantine fingerprint bytes",
+  );
+  return text;
+}
+
+// The provider contains the actual GitHub claim mapping and CEL admission
+// condition. The pool-level disabled flag is the containment mechanism, but a
+// restore must never re-enable a pool whose provider broadened while it was
+// closed. Store a compact SHA-256 commitment to the complete normalized
+// provider rather than copying four potentially large CEL mappings into every
+// durable intent.
+export function federationProviderFingerprint(provider: FederationProviderState): string {
+  return sha256Hex(canonicalJson(json({
+    attributeCondition: provider.attributeCondition,
+    attributeMapping: provider.attributeMapping,
+    description: provider.description,
+    disabled: provider.disabled,
+    displayName: provider.displayName,
+    name: provider.name,
+    state: provider.state,
+  }, "federation provider fingerprint")));
+}
+
+function validatedFederationProviderFingerprint(value: unknown): string {
+  const text = requiredString(value, "federation quarantine provider fingerprint");
+  if (!/^[0-9a-f]{64}$/.test(text)) {
+    throw new Error("Federation quarantine provider fingerprint is not a SHA-256 digest.");
+  }
+  return text;
+}
+
+export interface FederationQuarantineRecord {
+  readonly approvedManifestSha256: string;
+  readonly approvedPlanRunId: string;
+  readonly capturedAt: string;
+  readonly consumerSha: string;
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly platformSha: string;
+  readonly pools: readonly {
+    readonly disabled: boolean;
+    readonly fingerprint: string;
+    readonly name: string;
+    readonly providerFingerprint: string;
+    readonly providerName: string;
+    readonly repository: RepositoryName;
+  }[];
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+export async function readFederationPool(
+  projectId: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<FederationPoolState | undefined> {
+  const response = await fetcher(federationPoolUrl(projectId), {
+    headers: executorHeaders(token),
+    redirect: "error",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    throw new Error(`Workload identity pool read failed with HTTP ${response.status}.`);
+  }
+  return federationPoolFromJson(await boundedJson(response, 256 * 1024), projectId);
+}
+
+// PATCH returns a long-running operation, so "the request was accepted" is not
+// the same as "the pool is disabled". Convergence is proved by reading the pool
+// back, because that is the only statement that matters to a token holder.
+export async function setFederationPoolDisabled(
+  projectId: string,
+  disabled: boolean,
+  token: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<FederationPoolState> {
+  const url = new URL(federationPoolUrl(projectId));
+  url.searchParams.set("updateMask", "disabled");
+  const response = await fetcher(url, {
+    body: JSON.stringify({ disabled }),
+    headers: { ...executorHeaders(token), "Content-Type": "application/json; charset=utf-8" },
+    method: "PATCH",
+    redirect: "error",
+  });
+  if (!response.ok) {
+    throw new Error(`Workload identity pool update failed with HTTP ${response.status}.`);
+  }
+  await boundedJson(response, 256 * 1024);
+  for (;;) {
+    assertBeforeDeadline(now(), deadlineMs, "workload identity pool convergence");
+    const observed = await readFederationPool(projectId, token, fetcher);
+    if (observed === undefined) {
+      throw new Error("The workload identity pool vanished while it was being updated.");
+    }
+    if (observed.disabled === disabled) return observed;
+    await sleep(FEDERATION_CONVERGENCE_INTERVAL_MS);
+  }
+}
+
+function fortyHex(value: string, label: string): string {
+  if (!/^[0-9a-f]{40}$/.test(value)) throw new Error(`${label} is not a commit SHA.`);
+  return value;
+}
+
+function federationIntentBucket(invocation: Invocation): string {
+  return REPOSITORIES[invocation.repository].state[invocation.terraformRoot].bucket;
+}
+
+function federationIntentPrefix(state: { readonly prefix: string }): string {
+  return `${state.prefix}/.protected-bootstrap/${FEDERATION_QUARANTINE_PREFIX}/`;
+}
+
+function federationIntentObjectFor(state: { readonly prefix: string }, runId: string): string {
+  return `${federationIntentPrefix(state)}${numeric(runId, "federation quarantine run ID")}.json`;
+}
+
+function federationIntentObject(invocation: Invocation): string {
+  return federationIntentObjectFor(
+    REPOSITORIES[invocation.repository].state[invocation.terraformRoot],
+    invocation.githubRunId,
+  );
+}
+
+// Every distinct bucket/prefix a quarantine intent can live under. An abruptly
+// lost run for one target can be followed by a run for a different target, so
+// recovery has to look everywhere rather than only where it happens to be
+// pointed.
+export interface FederationRecoverySummary {
+  readonly restored: readonly string[];
+  readonly scanned: number;
+  readonly skippedComplete: readonly string[];
+  readonly skippedUncontained: readonly string[];
+}
+
+interface StorageObjectListing {
+  readonly generation: string;
+  readonly metageneration: string;
+  readonly name: string;
+  readonly size: number;
+}
+
+// A listing that cannot be trusted cannot bound a restore. Duplicate names, a
+// repeated or looping page token, and a page that arrives after the token said
+// there were none are all refused rather than absorbed.
+async function listStorageObjects(
+  bucket: string,
+  prefix: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<readonly StorageObjectListing[]> {
+  const items: StorageObjectListing[] = [];
+  const names = new Set<string>();
+  const seenTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < MAX_FEDERATION_INTENT_PAGES; page += 1) {
+    const url = new URL(`https://storage.googleapis.com/storage/v1/b/${bucket}/o`);
+    url.searchParams.set("prefix", prefix);
+    url.searchParams.set("maxResults", "200");
+    url.searchParams.set("fields", "items(name,generation,metageneration,size),nextPageToken");
+    if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
+    const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+    if (!response.ok) {
+      throw new Error(`Federation intent listing failed with HTTP ${response.status}.`);
+    }
+    const body = record(await boundedJson(response, 4 * 1024 * 1024), "federation intent listing");
+    exactKeys(body, new Set(["items", "nextPageToken"]), "federation intent listing");
+    for (const raw of array(body.items ?? [], "federation intent listing items")) {
+      const item = record(raw, "federation intent listing item");
+      exactKeys(
+        item,
+        new Set(["generation", "metageneration", "name", "size"]),
+        "federation intent listing item",
+      );
+      const name = requiredString(item.name, "federation intent object name");
+      if (!name.startsWith(prefix)) {
+        throw new Error("Federation intent listing returned an object outside its prefix.");
+      }
+      // A name that appears twice means the pages shifted under the walk, and
+      // the set that came back is not the set that exists.
+      if (names.has(name)) {
+        throw new Error(`Federation intent listing repeated ${name} across pages.`);
+      }
+      names.add(name);
+      const size = Number(requiredString(item.size, "federation intent object size"));
+      if (!Number.isSafeInteger(size) || size < 1 || size > 32 * 1024) {
+        throw new Error("Federation intent object size escaped its bound.");
+      }
+      const generation = requiredString(item.generation, "federation intent generation");
+      if (!/^[1-9][0-9]*$/.test(generation)) {
+        throw new Error("Federation intent generation is malformed.");
+      }
+      const metageneration = requiredString(
+        item.metageneration,
+        "federation intent metageneration",
+      );
+      if (!/^[1-9][0-9]*$/.test(metageneration)) {
+        throw new Error("Federation intent metageneration is malformed.");
+      }
+      items.push({
+        generation,
+        metageneration,
+        name,
+        size,
+      });
+    }
+    const next = body.nextPageToken;
+    if (next === undefined || next === null) return items;
+    const nextToken = requiredString(next, "federation intent page token");
+    // A token the server has already handed out is a loop, not a page.
+    if (seenTokens.has(nextToken)) {
+      throw new Error("Federation intent listing repeated a page token.");
+    }
+    seenTokens.add(nextToken);
+    pageToken = nextToken;
+  }
+  throw new Error("Federation intent listing did not terminate within its page bound.");
+}
+
+export interface FederationRestoreMarker {
+  readonly intentDigest: string;
+  readonly intentGeneration: string;
+  readonly repository: RepositoryName;
+  readonly restoredAt: string;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+export function federationRestoreMarkerBody(marker: FederationRestoreMarker): string {
+  return `${canonicalJson(json({ ...marker }, "federation restore marker"))}\n`;
+}
+
+// A marker is only a completion record if it says, in full, which exact bytes
+// of which exact object it completed. A file that merely has the right NAME
+// proves nothing, and treating it as proof would let anyone suppress a restore
+// by creating an empty object.
+export function federationRestoreMarkerFromJson(
+  value: unknown,
+  nowMs: number,
+  capturedAtMs: number,
+): FederationRestoreMarker {
+  const source = record(value, "federation restore marker");
+  exactKeys(
+    source,
+    new Set(["intentDigest", "intentGeneration", "repository", "restoredAt", "root", "runId"]),
+    "federation restore marker",
+  );
+  const intentDigest = requiredString(source.intentDigest, "federation restore marker digest");
+  if (!/^[0-9a-f]{64}$/.test(intentDigest)) {
+    throw new Error("Federation restore marker digest is not a SHA-256 digest.");
+  }
+  const intentGeneration = requiredString(
+    source.intentGeneration,
+    "federation restore marker intent generation",
+  );
+  if (!/^[1-9][0-9]*$/.test(intentGeneration)) {
+    throw new Error("Federation restore marker intent generation is malformed.");
+  }
+  const restoredAt = requiredString(source.restoredAt, "federation restore marker time");
+  const restoredAtMs = Date.parse(restoredAt);
+  // A completion record is durable: it stays valid for as long as the intent it
+  // completes exists. An arbitrary maximum age would eventually turn a valid
+  // marker into a permanent preflight failure, or tempt someone to replay the
+  // intent it completed. What IS checked is that it is canonical, that it did
+  // not happen before the intent it claims to complete, and that it is not
+  // dated into the future beyond clock skew.
+  if (
+    !Number.isFinite(restoredAtMs) ||
+    new Date(restoredAtMs).toISOString() !== restoredAt ||
+    restoredAtMs + FEDERATION_MARKER_SKEW_MS < capturedAtMs ||
+    restoredAtMs > nowMs + FEDERATION_MARKER_SKEW_MS
+  ) {
+    throw new Error("Federation restore marker time is malformed or out of bounds.");
+  }
+  return {
+    intentDigest,
+    intentGeneration,
+    repository: repositoryName(requiredString(source.repository, "federation restore marker repository")),
+    restoredAt,
+    root: rootName(requiredString(source.root, "federation restore marker root")),
+    runId: numeric(requiredString(source.runId, "federation restore marker run ID"), "federation restore marker run ID"),
+  };
+}
+
+// The production recovery path. It runs from --recover-only and as the preflight
+// before every protected run, over the identical code, and it is the only thing
+// that repairs a run that died holding four disabled pools.
+//
+// A pool is re-enabled only when all of this holds: the object sits at exactly
+// the contracted key for the identity inside it, its listed size and generation
+// match the bytes actually read back at that generation, it was written once,
+// no VALIDATED completion marker exists for those exact bytes, and the executor
+// for that record's own repository and run has been driven to provable absence
+// through the same stable-empty recovery a lost run would get. Anything else is
+// left closed and reported.
+
+interface DiscoveredIntent {
+  readonly bucket: string;
+  readonly capturedAtMs: number;
+  readonly digest: string;
+  readonly generation: string;
+  readonly intent: FederationQuarantineRecord;
+  readonly name: string;
+}
+
+// One canonical listing of every protected prefix, in a fixed order.
+async function federationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+): Promise<readonly (StorageObjectListing & { readonly bucket: string })[]> {
+  // Each bucket is independent authority. Reading them concurrently shortens
+  // elapsed recovery time without weakening pagination or completeness inside
+  // any bucket; every individual listing still has its own strict page walk.
+  const batches = await Promise.all(federationIntentLocations().map(async (location) => {
+    const objects = await listStorageObjects(
+      location.bucket,
+      location.prefix,
+      ownerAccessToken,
+      fetcher,
+    );
+    const entries = objects.map((entry) => {
+      const tail = entry.name.slice(location.prefix.length);
+      // Nothing unknown may sit in a prefix whose contents authorize a restore.
+      if (!/^[1-9][0-9]*\.json(\.restored)?$/.test(tail)) {
+        throw new Error(`Federation intent prefix holds an unrecognised object: ${entry.name}.`);
+      }
+      return { ...entry, bucket: location.bucket };
+    });
+    // A completion marker with no intent behind it is not a harmless leftover:
+    // either the intent it completed was deleted, or somebody planted a marker
+    // to suppress a restore that has not happened. Neither is safe to walk past.
+    const present = new Set(objects.map((entry) => entry.name));
+    for (const entry of objects) {
+      if (!entry.name.endsWith(".restored")) continue;
+      const intentName = entry.name.slice(0, -".restored".length);
+      if (!present.has(intentName)) {
+        throw new Error(
+          `Federation restore marker ${entry.name} has no matching intent object.`,
+        );
+      }
+    }
+    return entries;
+  }));
+  return batches.flat().toSorted((left, right) =>
+    `${left.bucket}/${left.name}` < `${right.bucket}/${right.name}` ? -1 : 1
+  );
+}
+
+// A single pass catches repeats but not omissions: a page that shifts can drop
+// an object entirely and every within-pass check still passes. Two independent
+// canonical listings must agree exactly -- name, generation, metageneration,
+// size, and count -- before anything is restored on the strength of them.
+async function stableFederationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+): Promise<readonly (StorageObjectListing & { readonly bucket: string })[]> {
+  const first = await federationInventory(ownerAccessToken, fetcher);
+  const second = await federationInventory(ownerAccessToken, fetcher);
+  if (first.length !== second.length) {
+    throw new Error("The federation intent inventory changed size between two listings.");
+  }
+  first.forEach((entry, index) => {
+    const later = second[index]!;
+    if (
+      entry.bucket !== later.bucket || entry.name !== later.name ||
+      entry.generation !== later.generation || entry.metageneration !== later.metageneration ||
+      entry.size !== later.size
+    ) {
+      throw new Error(`The federation intent inventory drifted at ${entry.bucket}/${entry.name}.`);
+    }
+  });
+  return first;
+}
+
+interface ValidatedFederationInventory {
+  readonly incomplete: readonly DiscoveredIntent[];
+  readonly inventory: readonly (StorageObjectListing & { readonly bucket: string })[];
+  readonly scanned: number;
+  readonly skippedComplete: readonly string[];
+}
+
+export interface FederationContainmentIdentity {
+  readonly executorEmail: string;
+  readonly executorUniqueId: string;
+  readonly platformSha: string;
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+  readonly runId: string;
+}
+
+const MAX_FEDERATION_CONTAINMENT_IDENTITIES = 32;
+
+// Read the complete durable recovery authority, not a projection of it.
+//
+// The listing is already double-inventoried. This layer binds every listed
+// generation and byte count to canonical whole-document bytes at the exact
+// contracted bucket/key, and validates a restore marker before treating an
+// intent as complete. The same reader is used both before containment and
+// immediately before mutation, so discovery cannot be weaker than restore.
+async function validatedFederationInventory(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  now: () => number,
+): Promise<ValidatedFederationInventory> {
+  const inventory = await stableFederationInventory(ownerAccessToken, fetcher);
+  const byKey = new Map(inventory.map((entry) => [`${entry.bucket}/${entry.name}`, entry]));
+  const incomplete: DiscoveredIntent[] = [];
+  const skippedComplete: string[] = [];
+  let scanned = 0;
+  for (const entry of inventory) {
+    if (entry.name.endsWith(".restored")) continue;
+    scanned += 1;
+    exact(entry.metageneration, "1", "federation intent metageneration");
+    const body = await readObjectGeneration(
+      entry.bucket,
+      entry.name,
+      entry.generation,
+      ownerAccessToken,
+      fetcher,
+    );
+    if (Buffer.byteLength(body) !== entry.size) {
+      throw new Error(`Federation intent ${entry.name} did not match its listed size.`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body) as unknown;
+    } catch {
+      throw new Error(`Federation intent ${entry.name} is not JSON.`);
+    }
+    const intent = federationQuarantineRecordFromJson(parsed);
+    exact(
+      body,
+      canonicalJson(json(intent, "federation quarantine record")),
+      "federation quarantine record bytes",
+    );
+    const state = REPOSITORIES[intent.repository].state[intent.root];
+    exact(entry.bucket, state.bucket, "federation intent bucket");
+    exact(entry.name, federationIntentObjectFor(state, intent.runId), "federation intent object name");
+    const digest = sha256Hex(body);
+    const capturedAtMs = Date.parse(intent.capturedAt);
+    if (capturedAtMs > now() + FEDERATION_MARKER_SKEW_MS) {
+      throw new Error(`Federation intent ${entry.name} is dated into the future.`);
+    }
+    const markerEntry = byKey.get(`${entry.bucket}/${entry.name}.restored`);
+    if (markerEntry !== undefined) {
+      exact(markerEntry.metageneration, "1", "federation restore marker metageneration");
+      const markerBody = await readObjectGeneration(
+        entry.bucket,
+        markerEntry.name,
+        markerEntry.generation,
+        ownerAccessToken,
+        fetcher,
+      );
+      if (Buffer.byteLength(markerBody) !== markerEntry.size) {
+        throw new Error(
+          `Federation restore marker ${markerEntry.name} did not match its listed size.`,
+        );
+      }
+      let markerParsed: unknown;
+      try {
+        markerParsed = JSON.parse(markerBody) as unknown;
+      } catch {
+        throw new Error(`Federation restore marker ${markerEntry.name} is not JSON.`);
+      }
+      const marker = federationRestoreMarkerFromJson(markerParsed, now(), capturedAtMs);
+      exact(markerBody, federationRestoreMarkerBody(marker), "federation restore marker bytes");
+      exact(marker.intentDigest, digest, "federation restore marker intent digest");
+      exact(
+        marker.intentGeneration,
+        entry.generation,
+        "federation restore marker intent generation",
+      );
+      exact(marker.repository, intent.repository, "federation restore marker repository");
+      exact(marker.root, intent.root, "federation restore marker root");
+      exact(marker.runId, intent.runId, "federation restore marker run ID");
+      skippedComplete.push(entry.name);
+      continue;
+    }
+    incomplete.push({
+      bucket: entry.bucket,
+      capturedAtMs,
+      digest,
+      generation: entry.generation,
+      intent,
+      name: entry.name,
+    });
+  }
+  return { incomplete, inventory, scanned, skippedComplete };
+}
+
+export async function discoverFederationContainmentIdentities(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  now: () => number = () => Date.now(),
+): Promise<readonly FederationContainmentIdentity[]> {
+  const snapshot = await validatedFederationInventory(ownerAccessToken, fetcher, now);
+  if (snapshot.incomplete.length > MAX_FEDERATION_CONTAINMENT_IDENTITIES) {
+    throw new Error("Federation recovery found more incomplete identities than its reviewed bound.");
+  }
+  const seen = new Set<string>();
+  const identities = snapshot.incomplete.map(({ intent }) => {
+    const key = `${intent.repository}/${intent.runId}`;
+    if (seen.has(key)) {
+      throw new Error(`Federation recovery found two incomplete intents for ${key}.`);
+    }
+    seen.add(key);
+    return {
+      executorEmail: intent.executorEmail,
+      executorUniqueId: intent.executorUniqueId,
+      platformSha: intent.platformSha,
+      repository: intent.repository,
+      root: intent.root,
+      runId: intent.runId,
+    };
+  });
+  return identities.toSorted((left, right) => {
+    const leftKey = `${left.repository}/${left.runId}`;
+    const rightKey = `${right.repository}/${right.runId}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+}
+
+// The production recovery path, shared verbatim by --recover-only and by the
+// preflight every protected run performs.
+//
+// It is deliberately two-phase and fleet-global. Every intent covers ALL FOUR
+// consumer pools, so restoring one intent re-enables federation everywhere. If
+// a second incomplete intent existed whose executor was still privileged,
+// restoring the first would hand that executor its credentials back. Nothing is
+// therefore restored until every incomplete intent in the whole inventory has
+// been validated and contained -- and if any one of them cannot be, none of
+// them is touched.
+export async function recoverFederationQuarantines(
+  ownerAccessToken: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  containIntent: (
+    identity: {
+      readonly executorEmail: string;
+      readonly executorUniqueId: string;
+      readonly platformSha: string;
+      readonly repository: RepositoryName;
+      readonly root: TerraformRoot;
+      readonly runId: string;
+    },
+  ) => Promise<ExecutorReleaseProof | undefined>,
+  sleep: (milliseconds: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<FederationRecoverySummary> {
+  assertBeforeDeadline(now(), deadlineMs, "federation quarantine recovery scan");
+  const snapshot = await validatedFederationInventory(ownerAccessToken, fetcher, now);
+  const { incomplete, inventory, scanned, skippedComplete } = snapshot;
+
+  if (incomplete.length === 0) {
+    return { restored: [], scanned, skippedComplete, skippedUncontained: [] };
+  }
+
+  // Overlapping incomplete intents describe the same four pools. They can only
+  // be restored together if they agree about what those pools looked like
+  // before anything moved; if they disagree, restoring either one invents a
+  // state nobody reviewed, so this stops for a human.
+  const shapes = new Set(
+    incomplete.map((entry) => canonicalJson(json([...entry.intent.pools], "intent pool shape"))),
+  );
+  if (shapes.size > 1) {
+    throw new Error(
+      `Federation recovery found ${incomplete.length} incomplete quarantine intents that disagree about the pre-quarantine pool state; restore none and recover by hand.`,
+    );
+  }
+
+  const uncontained: string[] = [];
+  for (const entry of incomplete) {
+    assertBeforeDeadline(now(), deadlineMs, "federation quarantine containment");
+    const contained = await containIntent({
+      executorEmail: entry.intent.executorEmail,
+      executorUniqueId: entry.intent.executorUniqueId,
+      platformSha: entry.intent.platformSha,
+      repository: entry.intent.repository,
+      root: entry.intent.root,
+      runId: entry.intent.runId,
+    });
+    if (contained === undefined) uncontained.push(entry.name);
+  }
+  if (uncontained.length > 0) {
+    // Restore NOTHING. Every intent covers every pool, so handing back the
+    // pools for a contained intent would also hand them back to the executor of
+    // an uncontained one.
+    return { restored: [], scanned, skippedComplete, skippedUncontained: uncontained };
+  }
+
+  // Containment takes minutes. A new intent can be armed, or a marker written,
+  // in that window -- and phase one's conclusions would then be about a world
+  // that no longer exists. Re-prove the inventory is byte-identical to the one
+  // those conclusions were drawn from, immediately before the first pool moves.
+  // The first snapshot already validated the canonical bytes at an immutable
+  // generation. Re-reading every body here adds no mutation detection: if the
+  // double-listed generation, metageneration, size, key, and count are
+  // byte-for-byte identical, those already-validated immutable bytes are the
+  // same authority. Re-prove exactly that metadata immediately before PATCH.
+  const confirmed = await stableFederationInventory(ownerAccessToken, fetcher);
+  if (confirmed.length !== inventory.length) {
+    throw new Error(
+      "The federation intent inventory changed while incomplete intents were being contained; restore none and rescan.",
+    );
+  }
+  inventory.forEach((entry, index) => {
+    const later = confirmed[index]!;
+    if (
+      entry.bucket !== later.bucket || entry.name !== later.name ||
+      entry.generation !== later.generation || entry.metageneration !== later.metageneration ||
+      entry.size !== later.size
+    ) {
+      throw new Error(
+        `The federation intent inventory changed at ${entry.bucket}/${entry.name} while incomplete intents were being contained; restore none and rescan.`,
+      );
+    }
+  });
+
+  // ---- phase two: restore, deterministically -------------------------------
+  assertBeforeDeadline(now(), deadlineMs, "federation quarantine restore");
+  // Shape equality above proves every incomplete intent captured the same four
+  // pools. Restore and read back that shared world once; repeating the same
+  // four PATCH/convergence cycles for each historical intent only extends the
+  // privileged outage and consumes the owner-token deadline without adding a
+  // distinct proof.
+  await restoreQuarantinedFederation(
+    incomplete[0]!.intent,
+    ownerAccessToken,
+    fetcher,
+    deadlineMs,
+    sleep,
+    now,
+  );
+  const restoredAt = new Date(now()).toISOString();
+  await Promise.all(incomplete.map((entry) => writeFederationRestoreMarker(
+    entry.bucket,
+    entry.name,
+    {
+      intentDigest: entry.digest,
+      intentGeneration: entry.generation,
+      repository: entry.intent.repository,
+      restoredAt,
+      root: entry.intent.root,
+      runId: entry.intent.runId,
+    },
+    ownerAccessToken,
+    fetcher,
+    now,
+    entry.capturedAtMs,
+  )));
+  const restored = incomplete.map((entry) => entry.name);
+  return { restored, scanned, skippedComplete, skippedUncontained: [] };
+}
+
+// Idempotent under a lost write response: if the marker is already there, it
+// must be the marker this run would have written, byte for byte. Anything else
+// is a conflict, not a retry.
+// One write, reconciled honestly.
+//
+// A write can fail three ways: it never happened, it happened and the response
+// was lost, or the key was already taken. Only the first is a real failure, and
+// the caller cannot tell them apart from the error alone. So on ANY failure --
+// a precondition conflict, a transport error after the bytes were committed, a
+// truncated response -- this asks the one question that settles it: is there an
+// object at this key, written once, of exactly this size, whose bytes at its
+// own generation are exactly the bytes we meant to write?
+//
+// If yes, the write committed and this is a retry. If anything about that is
+// not exactly so, the ORIGINAL failure is rethrown -- never a message about the
+// reconciliation, which would hide what actually went wrong.
+async function writeImmutableObjectIdempotent(
+  bucket: string,
+  object: string,
+  body: string,
+  token: string,
+  fetcher: Fetcher,
+  validate: (parsed: unknown) => void = () => {},
+): Promise<string> {
+  let original: unknown;
+  try {
+    // The generation the write committed at. Returning it means a successful
+    // publish never has to follow itself with an unbound metadata read, which
+    // would be a second way for a finished write to report failure.
+    return await writeImmutableObject(bucket, object, body, token, fetcher);
+  } catch (error) {
+    original = error;
+  }
+  try {
+    const metadata = await readObjectMetadata(bucket, object, token, fetcher);
+    if (metadata.size !== Buffer.byteLength(body)) throw original;
+    const observed = await readObjectGeneration(
+      bucket,
+      object,
+      metadata.generation,
+      token,
+      fetcher,
+    );
+    if (observed !== body) throw original;
+    validate(JSON.parse(observed) as unknown);
+    return metadata.generation;
+  } catch {
+    throw original;
+  }
+}
+
+export async function writeFederationRestoreMarker(
+  bucket: string,
+  intentObject: string,
+  marker: FederationRestoreMarker,
+  token: string,
+  fetcher: Fetcher,
+  now: () => number = () => Date.now(),
+  capturedAtMs: number = Date.parse(marker.restoredAt),
+): Promise<void> {
+  await writeImmutableObjectIdempotent(
+    bucket,
+    `${intentObject}.restored`,
+    federationRestoreMarkerBody(marker),
+    token,
+    fetcher,
+    (parsed) => federationRestoreMarkerFromJson(parsed, now(), capturedAtMs),
+  );
+}
+
+const MAX_RECEIPT_BODY_BYTES = 32 * 1024;
+
+export function federationIntentLocations(): readonly {
+  readonly bucket: string;
+  readonly prefix: string;
+  readonly repository: RepositoryName;
+  readonly root: TerraformRoot;
+}[] {
+  const seen = new Set<string>();
+  const locations: {
+    bucket: string;
+    prefix: string;
+    repository: RepositoryName;
+    root: TerraformRoot;
+  }[] = [];
+  for (const repository of REPOSITORY_NAMES) {
+    for (const root of ["bootstrap", "exposure", "prod"] as const) {
+      const state = REPOSITORIES[repository].state[root];
+      const key = `${state.bucket}|${federationIntentPrefix(state)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      locations.push({
+        bucket: state.bucket,
+        prefix: federationIntentPrefix(state),
+        repository,
+        root,
+      });
+    }
+  }
+  return locations;
+}
+
+// Disabled is necessary but not sufficient: the pool must also still be the
+// pool that was captured. A PATCH that returned success against a pool whose
+// description or lifecycle state moved is not the pool this run reasoned about.
+export function assertQuarantinedPool(
+  observed: FederationPoolState,
+  captured: FederationQuarantineRecord["pools"][number],
+): void {
+  exact(observed.name, captured.name, "quarantined workload identity pool identity");
+  exact(
+    federationPoolFingerprint(observed),
+    captured.fingerprint,
+    `quarantined ${captured.repository} workload identity pool`,
+  );
+  exact(observed.disabled, true, `quarantined ${captured.repository} workload identity pool state`);
+}
+
+// Everything the run is claiming, bound together in one value. A verifier that
+// trusts this receipt is trusting exactly: which plan was reviewed, what the
+// apply proved while federation was closed, that mutation authority was gone
+// before any of this was written, which pools were handed back and in what
+// state, that the restored world audits to zero diff, and which durable intent
+// this all belongs to.
+export function buildFinalProtectedProof(
+  input:
+    & {
+      readonly deElevation: ExecutorDeElevationProof;
+      readonly intentDigest: string;
+      readonly intentGeneration: string;
+      readonly intent: FederationQuarantineRecord;
+      readonly invocation: Invocation;
+      readonly observedPools: readonly ObservedFederationPool[];
+      readonly review: ReviewManifestResult;
+    }
+    & (
+      | {
+        readonly kind: "apply";
+        readonly quarantinedApplyProof: ExecutionProof;
+        readonly restoredAudit: {
+          readonly detailedExitCode: 0;
+          readonly observedAt: string;
+          readonly outputSha256: string;
+        };
+      }
+      | { readonly kind: "rehearsal" }
+    ),
+): FinalProtectedProof {
+  const { deElevation, intent, intentDigest, intentGeneration, invocation, observedPools, review } =
+    input;
+  exact(intent.repository, invocation.repository, "final receipt intent repository");
+  exact(intent.root, invocation.terraformRoot, "final receipt intent root");
+  exact(intent.runId, invocation.githubRunId, "final receipt intent run ID");
+  exact(intent.platformSha, invocation.platformSha, "final receipt intent platform SHA");
+  exact(intent.consumerSha, invocation.consumerSha, "final receipt intent consumer SHA");
+  exact(
+    intent.approvedPlanRunId,
+    invocation.approvedPlanRunId,
+    "final receipt intent approved plan run ID",
+  );
+  exact(
+    intent.approvedManifestSha256,
+    invocation.approvedManifestSha256,
+    "final receipt intent approved manifest digest",
+  );
+  exact(intent.executorEmail, deElevation.executorEmail, "final receipt intent executor email");
+  exact(
+    intent.executorUniqueId,
+    deElevation.executorUniqueId,
+    "final receipt intent executor unique ID",
+  );
+  if (observedPools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Final receipt did not observe every consumer pool after restoration.");
+  }
+  REPOSITORY_NAMES.forEach((repository, index) => {
+    exact(observedPools[index]!.repository, repository, "final receipt observed pool order");
+  });
+  const base: FinalProtectedProofBase = {
+    consumerSha: invocation.consumerSha,
+    deElevation,
+    intentDigest,
+    intentGeneration,
+    observedPools: observedPools.map((pool) => ({ ...pool })),
+    platformSha: invocation.platformSha,
+    repository: invocation.repository,
+    reviewSha256: review.sha256,
+    root: invocation.terraformRoot,
+    runId: invocation.githubRunId,
+  };
+  if (input.kind === "rehearsal") {
+    return { ...base, countable: false, kind: "rehearsal" };
+  }
+  return {
+    ...base,
+    countable: true,
+    kind: "apply",
+    quarantinedApplyProofDigest: sha256Hex(
+      canonicalJson(json(input.quarantinedApplyProof, "final receipt apply proof")),
+    ),
+    restoredAudit: { ...input.restoredAudit },
+  };
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+export function federationQuarantineRecordFromJson(value: unknown): FederationQuarantineRecord {
+  const source = record(value, "federation quarantine record");
+  exactKeys(
+    source,
+    new Set([
+      "approvedManifestSha256",
+      "approvedPlanRunId",
+      "capturedAt",
+      "consumerSha",
+      "executorEmail",
+      "executorUniqueId",
+      "platformSha",
+      "pools",
+      "repository",
+      "root",
+      "runId",
+    ]),
+    "federation quarantine record",
+  );
+  const pools = array(source.pools, "federation quarantine pools").map((raw, index) => {
+    const entry = record(raw, `federation quarantine pool ${index}`);
+    exactKeys(
+      entry,
+      new Set([
+        "disabled",
+        "fingerprint",
+        "name",
+        "providerFingerprint",
+        "providerName",
+        "repository",
+      ]),
+      `federation quarantine pool ${index}`,
+    );
+    const repository = repositoryName(
+      requiredString(entry.repository, "federation quarantine repository"),
+    );
+    const expected = federationPoolResourceName(REPOSITORIES[repository].projectId);
+    const expectedProvider = `${expected}/providers/${FEDERATION_PROVIDER_ID}`;
+    // Only the exact contracted pools are ever touched by a restore.
+    exact(entry.name, expected, "federation quarantine pool name");
+    if (typeof entry.disabled !== "boolean") {
+      throw new Error("Federation quarantine disabled flag is malformed.");
+    }
+    return {
+      disabled: entry.disabled,
+      fingerprint: validatedFederationPoolFingerprint(entry.fingerprint, repository),
+      name: expected,
+      providerFingerprint: validatedFederationProviderFingerprint(entry.providerFingerprint),
+      providerName: (() => {
+        exact(entry.providerName, expectedProvider, "federation quarantine provider name");
+        return expectedProvider;
+      })(),
+      repository,
+    };
+  });
+  // Exactly one entry per consumer, in the contracted order. A record that
+  // repeats a repository or omits one cannot be restored from safely, and a
+  // partial restore is worse than none.
+  if (pools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Federation quarantine record does not cover every consumer pool.");
+  }
+  REPOSITORY_NAMES.forEach((repository, index) => {
+    exact(pools[index]!.repository, repository, "federation quarantine repository order");
+  });
+  const capturedAt = requiredString(source.capturedAt, "federation quarantine capture time");
+  const capturedAtMs = Date.parse(capturedAt);
+  if (!Number.isFinite(capturedAtMs) || new Date(capturedAtMs).toISOString() !== capturedAt) {
+    throw new Error("Federation quarantine capture time is malformed.");
+  }
+  const repository = repositoryName(
+    requiredString(source.repository, "federation quarantine repository"),
+  );
+  const root = rootName(requiredString(source.root, "federation quarantine root"));
+  const runId = numeric(
+    requiredString(source.runId, "federation quarantine run ID"),
+    "federation quarantine run ID",
+  );
+  const platformSha = fortyHex(
+    requiredString(source.platformSha, "federation quarantine platform SHA"),
+    "federation quarantine platform SHA",
+  );
+  const consumerSha = fortyHex(
+    requiredString(source.consumerSha, "federation quarantine consumer SHA"),
+    "federation quarantine consumer SHA",
+  );
+  const approvedPlanRunId = requiredStringOrEmpty(
+    source.approvedPlanRunId,
+    "federation quarantine approved plan run ID",
+  );
+  const approvedManifestSha256 = requiredStringOrEmpty(
+    source.approvedManifestSha256,
+    "federation quarantine approved manifest digest",
+  );
+  if ((approvedPlanRunId === "") !== (approvedManifestSha256 === "")) {
+    throw new Error("Federation quarantine approval identity is only partially populated.");
+  }
+  if (approvedPlanRunId !== "") {
+    numeric(approvedPlanRunId, "federation quarantine approved plan run ID");
+    hash(approvedManifestSha256, "federation quarantine approved manifest digest");
+  }
+  const executorEmail = requiredString(
+    source.executorEmail,
+    "federation quarantine executor email",
+  );
+  exact(
+    executorEmail,
+    deterministicExecutorEmail({
+      githubRunId: runId,
+      ownerAccessToken: "",
+      platformRoot: "/",
+      platformSha,
+      repository,
+      runnerTemp: "/",
+    }),
+    "federation quarantine executor email",
+  );
+  const executorUniqueId = requiredString(
+    source.executorUniqueId,
+    "federation quarantine executor unique ID",
+  );
+  if (!/^[1-9][0-9]{5,30}$/.test(executorUniqueId)) {
+    throw new Error("Federation quarantine executor unique ID is malformed.");
+  }
+  return {
+    approvedManifestSha256,
+    approvedPlanRunId,
+    capturedAt,
+    consumerSha,
+    executorEmail,
+    executorUniqueId,
+    platformSha,
+    pools,
+    repository,
+    root,
+    runId,
+  };
+}
+
+function hexOrCanonical(value: unknown, label: string): string {
+  const text = requiredString(value, label);
+  if (text.length > 4096) throw new Error(`${label} is oversized.`);
+  return text;
+}
+
+// The one restore path. A pool is re-enabled only when this run is the one that
+// disabled it, the pool is exactly a contracted pool, it is still the pool that
+// was captured, and it was enabled beforehand. A pool that was already disabled
+// when the run started stays disabled: turning it on would be inventing a state
+// nobody reviewed.
+export async function restoreQuarantinedFederation(
+  record: FederationQuarantineRecord,
+  token: string,
+  fetcher: Fetcher,
+  deadlineMs: number,
+  sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
+  now: () => number = () => Date.now(),
+): Promise<readonly ObservedFederationPool[]> {
+  // Validate every pool before moving any of them. A sequential
+  // validate-and-write loop could re-enable the first consumer and only then
+  // discover drift in the fourth. Once all four fingerprints are proven, the
+  // independent PATCHes can converge concurrently inside one shared deadline.
+  const initial = await Promise.all(record.pools.map(async (pool) => {
+    const projectId = REPOSITORIES[pool.repository].projectId;
+    const [observed, provider] = await Promise.all([
+      readFederationPool(projectId, token, fetcher),
+      readFederationProvider(projectId, token, fetcher),
+    ]);
+    if (observed === undefined) {
+      throw new Error(`The ${pool.repository} workload identity pool vanished during the protected run.`);
+    }
+    if (provider === undefined) {
+      throw new Error(`The ${pool.repository} GitHub provider vanished during the protected run.`);
+    }
+    exact(observed.name, pool.name, "restored workload identity pool identity");
+    // Drift in anything other than the flag this run is allowed to move means
+    // the pool is no longer the one that was captured, so it is left alone and
+    // the run fails rather than writing over somebody else's change.
+    exact(
+      federationPoolFingerprint(observed),
+      pool.fingerprint,
+      `restored ${pool.repository} workload identity pool`,
+    );
+    if (pool.disabled) {
+      // Never re-enable a pool that was already disabled before this run.
+      if (!observed.disabled) {
+        throw new Error(
+          `The ${pool.repository} workload identity pool was disabled before this run and is now enabled.`,
+        );
+      }
+    }
+    exact(provider.name, pool.providerName, "restored workload identity provider identity");
+    exact(
+      federationProviderFingerprint(provider),
+      pool.providerFingerprint,
+      `restored ${pool.repository} workload identity provider`,
+    );
+    return { observed, pool, projectId };
+  }));
+
+  await Promise.all(initial.map(async ({ observed, pool, projectId }) => {
+    if (observed.disabled === pool.disabled) return;
+    await setFederationPoolDisabled(
+      projectId, pool.disabled, token, fetcher, deadlineMs, sleep, now,
+    );
+  }));
+
+  // What the world actually looks like afterwards, read back from the API. A
+  // receipt that copied the pre-mutation intent forward would be asserting the
+  // very thing it was supposed to be proving.
+  const observedFinal = await Promise.all(record.pools.map(async (pool) => {
+    const projectId = REPOSITORIES[pool.repository].projectId;
+    const [restored, provider] = await Promise.all([
+      readFederationPool(projectId, token, fetcher),
+      readFederationProvider(projectId, token, fetcher),
+    ]);
+    if (restored === undefined) {
+      throw new Error(`The ${pool.repository} workload identity pool vanished during restoration.`);
+    }
+    if (provider === undefined) {
+      throw new Error(`The ${pool.repository} GitHub provider vanished during restoration.`);
+    }
+    exact(
+      federationPoolFingerprint(restored),
+      pool.fingerprint,
+      `restored ${pool.repository} workload identity pool`,
+    );
+    // The flag is not part of the fingerprint, so it is asserted separately:
+    // the pool must end the run in exactly the state it started it in.
+    exact(
+      restored.disabled,
+      pool.disabled,
+      `restored ${pool.repository} workload identity pool disabled flag`,
+    );
+    exact(provider.name, pool.providerName, "restored workload identity provider identity");
+    exact(
+      federationProviderFingerprint(provider),
+      pool.providerFingerprint,
+      `restored ${pool.repository} workload identity provider`,
+    );
+    return {
+      disabled: restored.disabled,
+      fingerprint: federationPoolFingerprint(restored),
+      name: restored.name,
+      observedAt: new Date(now()).toISOString(),
+      repository: pool.repository,
+    } satisfies ObservedFederationPool;
+  }));
+  if (observedFinal.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Federation restoration did not observe every consumer pool.");
+  }
+  return observedFinal;
+}
+
+export interface ObservedFederationPool {
+  readonly disabled: boolean;
+  readonly fingerprint: string;
+  readonly name: string;
+  readonly observedAt: string;
+  readonly repository: RepositoryName;
+}
+
+function observedPool(
+  repository: RepositoryName,
+  pool: FederationPoolState,
+): ObservedFederationPool {
+  return {
+    disabled: pool.disabled,
+    fingerprint: federationPoolFingerprint(pool),
+    name: pool.name,
+    observedAt: new Date(Date.now()).toISOString(),
+    repository,
+  };
+}
+
+export function federationPoolUrl(projectId: string): string {
+  return `https://iam.googleapis.com/v1/projects/${projectId}/locations/global/workloadIdentityPools/${FEDERATION_POOL_ID}`;
+}
+
+export function federationProviderUrl(projectId: string): string {
+  return `${federationPoolUrl(projectId)}/providers/${FEDERATION_PROVIDER_ID}`;
+}
+
+export function federationPoolFromJson(value: unknown, projectId: string): FederationPoolState {
+  const pool = record(value, "workload identity pool");
+  exactKeys(
+    pool,
+    new Set([
+      "description",
+      "disabled",
+      "displayName",
+      "expireTime",
+      "inlineCertificateIssuanceConfig",
+      "inlineTrustConfig",
+      "mode",
+      "name",
+      "state",
+    ]),
+    "workload identity pool",
+  );
+  const name = requiredString(pool.name, "workload identity pool name");
+  const expected = federationPoolResourceName(projectId);
+  // Identity first, and exactly. A suffix test would accept
+  // projects/<anything>/locations/global/workloadIdentityPools/github-actions,
+  // which says nothing about the pool actually under contract.
+  if (name !== expected) {
+    throw new Error("The workload identity pool is not the contracted GitHub Actions pool.");
+  }
+  const state = requiredString(pool.state, "workload identity pool state");
+  if (state !== "ACTIVE") {
+    // DELETED means soft-deleted; it also blocks token use, but restoring it is
+    // not this bridge's job and pretending otherwise would hide a real problem.
+    throw new Error(`The workload identity pool is ${state}, not ACTIVE.`);
+  }
+  if (pool.disabled !== undefined && typeof pool.disabled !== "boolean") {
+    throw new Error("The workload identity pool disabled flag is malformed.");
+  }
+  if (pool.expireTime !== undefined) {
+    throw new Error("The active workload identity pool unexpectedly has an expiry time.");
+  }
+  if (
+    pool.inlineCertificateIssuanceConfig !== undefined ||
+    pool.inlineTrustConfig !== undefined
+  ) {
+    throw new Error("The GitHub federation pool unexpectedly contains trust-domain configuration.");
+  }
+  const rawMode = pool.mode === undefined
+    ? "MODE_UNSPECIFIED"
+    : requiredString(pool.mode, "workload identity pool mode");
+  if (rawMode !== "MODE_UNSPECIFIED" && rawMode !== "FEDERATION_ONLY") {
+    throw new Error(`The workload identity pool mode is ${rawMode}, not federation-only.`);
+  }
+  return {
+    description: requiredStringOrEmpty(pool.description, "workload identity pool description"),
+    disabled: pool.disabled === true,
+    displayName: requiredStringOrEmpty(pool.displayName, "workload identity pool display name"),
+    mode: "FEDERATION_ONLY",
+    name,
+    state,
+  };
+}
+
+export function federationProviderFromJson(
+  value: unknown,
+  projectId: string,
+): FederationProviderState {
+  const provider = record(value, "workload identity pool provider");
+  exactKeys(
+    provider,
+    new Set([
+      "attributeCondition",
+      "attributeMapping",
+      "description",
+      "disabled",
+      "displayName",
+      "expireTime",
+      "name",
+      "oidc",
+      "state",
+    ]),
+    "workload identity pool provider",
+  );
+  const name = requiredString(provider.name, "workload identity pool provider name");
+  const expected = `${federationPoolResourceName(projectId)}/providers/${FEDERATION_PROVIDER_ID}`;
+  exact(name, expected, "workload identity pool provider identity");
+  const state = requiredString(provider.state, "workload identity pool provider state");
+  exact(state, "ACTIVE", "workload identity pool provider state");
+  if (provider.expireTime !== undefined) {
+    throw new Error("The active workload identity pool provider unexpectedly has an expiry time.");
+  }
+  if (provider.disabled !== undefined && typeof provider.disabled !== "boolean") {
+    throw new Error("The workload identity pool provider disabled flag is malformed.");
+  }
+  const attributeCondition = requiredString(
+    provider.attributeCondition,
+    "workload identity pool provider attribute condition",
+  );
+  if (attributeCondition.length > 4_096) {
+    throw new Error("The workload identity pool provider attribute condition is oversized.");
+  }
+  const rawMapping = record(
+    provider.attributeMapping,
+    "workload identity pool provider attribute mapping",
+  );
+  const mappingEntries = Object.entries(rawMapping).map(([rawKey, rawValue]) => {
+    const key = requiredString(rawKey, "workload identity pool provider mapping key");
+    const expression = requiredString(
+      rawValue,
+      `workload identity pool provider mapping ${key}`,
+    );
+    if (key.length > 100 || expression.length > 2_048) {
+      throw new Error("The workload identity pool provider mapping escaped its documented bound.");
+    }
+    return [key, expression] as const;
+  }).toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+  if (mappingEntries.length === 0 || mappingEntries.length > 50) {
+    throw new Error("The workload identity pool provider mapping count escaped its reviewed bound.");
+  }
+  const attributeMapping = Object.fromEntries(mappingEntries);
+  if (attributeMapping["google.subject"] === undefined) {
+    throw new Error("The workload identity pool provider does not map google.subject.");
+  }
+  const oidc = record(provider.oidc, "workload identity pool provider OIDC configuration");
+  exactKeys(
+    oidc,
+    new Set(["allowedAudiences", "issuerUri", "jwksJson"]),
+    "workload identity pool provider OIDC configuration",
+  );
+  const issuer = requiredString(oidc.issuerUri, "workload identity pool provider issuer");
+  if (
+    issuer !== "https://token.actions.githubusercontent.com" &&
+    issuer !== "https://token.actions.githubusercontent.com/"
+  ) {
+    throw new Error("The workload identity pool provider issuer is not GitHub Actions.");
+  }
+  const audiences = array(
+    oidc.allowedAudiences ?? [],
+    "workload identity pool provider allowed audiences",
+  );
+  if (audiences.length !== 0) {
+    throw new Error("The contracted GitHub provider unexpectedly overrides its canonical audience.");
+  }
+  if (oidc.jwksJson !== undefined && oidc.jwksJson !== "") {
+    throw new Error("The contracted GitHub provider unexpectedly embeds custom signing keys.");
+  }
+  return {
+    attributeCondition,
+    attributeMapping,
+    description: requiredStringOrEmpty(
+      provider.description,
+      "workload identity pool provider description",
+    ),
+    disabled: provider.disabled === true,
+    displayName: requiredStringOrEmpty(
+      provider.displayName,
+      "workload identity pool provider display name",
+    ),
+    name,
+    state,
+  };
+}
+
+export async function readFederationProvider(
+  projectId: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<FederationProviderState | undefined> {
+  const response = await fetcher(federationProviderUrl(projectId), {
+    headers: executorHeaders(token),
+    redirect: "error",
+  });
+  if (response.status === 404) return undefined;
+  if (!response.ok) {
+    throw new Error(`Workload identity pool provider read failed with HTTP ${response.status}.`);
+  }
+  return federationProviderFromJson(await boundedJson(response, 256 * 1024), projectId);
+}
+
+// What actually authorizes the privileged window.
+//
+// Not the run listings. GitHub's offset pages are not snapshot-bound; the
+// status-filtered and unfiltered listings come from one authority, so a server
+// that hides a run from both satisfies every cross-check; and a summary can be
+// restored by deleting the run that produced it. Every one of those attacks
+// works by editing the record of activity.
+//
+// Nor a clock. Observing Actions disabled at T0 and again at T1 does not mean
+// they were disabled in between: they can be re-enabled at T0+4m50s, a consumer
+// workflow can mint a service-account token, and Actions can be disabled again
+// before the next snapshot. Both observations agree and the token is alive.
+//
+// So the window is closed at the authorization layer instead. Google's contract
+// for a DISABLED workload identity pool is the strong one:
+//
+//   "You cannot use a disabled pool to exchange tokens, or use existing tokens
+//    to access resources."
+//
+// -- which is why the POOL is quarantined and not the provider, whose contract
+// is explicitly weaker ("existing tokens still grant access"). With the pool
+// disabled, a token minted a second before the quarantine is as useless as one
+// that was never minted, and the token-lifetime timing argument disappears
+// rather than being bounded.
+//
+// The reviewed plan carries `federation_quarantined = true`, so the apply's own
+// desired state keeps the pool disabled and cannot re-enable what the bridge
+// disabled a moment earlier. Restoration happens after the post-apply audit and
+// after the executor is released, and only to the exact fingerprint captured
+// before quarantine.
+//
+// An IAM deny policy would be stronger still and is provably unavailable here:
+// `iam.denypolicies.*` is NOT_SUPPORTED in project custom roles,
+// `roles/iam.denyAdmin` is not grantable at project scope, and these four
+// projects have no organization or folder parent to grant it at instead.
+// Bootstrap apply run 33291080180 died on exactly that setIamPolicy with
+// "Role roles/iam.denyAdmin is not supported for this resource".
+//
+// The Actions-disabled checks and the run listings stay, and stay strict, as
+// corroborating defence in depth. They no longer authorize anything.
 function freezeProofFromJson(value: unknown, expectedDrainSeconds: number): ConsumerFreezeProof {
   const proof = record(value, "freeze proof");
   exactKeys(
@@ -3425,7 +5748,14 @@ export async function runProtectedBootstrap(
   telemetry = bestEffortTelemetry(telemetry);
   const startedAtMs = dependencies.now();
   const wrapperDeadlineMs = startedAtMs + invocation.operationBudgetSeconds * 1_000;
-  const cleanupDeadlineMs = wrapperDeadlineMs - WRAPPER_CLEANUP_LEAD_SECONDS * 1_000;
+  const publicationDeadlineMs = wrapperDeadlineMs - WRAPPER_CLEANUP_LEAD_SECONDS * 1_000;
+  // Only a run that publishes an owner artifact needs the window. A plan writes
+  // its receipt inside the operation window and produces nothing afterwards, so
+  // reserving time it cannot use would shrink the reviewed plan envelope for no
+  // reason -- and would push the seven-minute floor below zero operation time.
+  const cleanupDeadlineMs = invocation.mode === "plan"
+    ? publicationDeadlineMs
+    : publicationDeadlineMs - OWNER_PUBLICATION_RESERVE_SECONDS * 1_000;
   const internalOperationMinutes = invocation.mode === "plan"
     ? PLAN_INTERNAL_OPERATION_MINUTES
     : APPLY_INTERNAL_OPERATION_MINUTES;
@@ -3433,8 +5763,16 @@ export async function runProtectedBootstrap(
     startedAtMs + internalOperationMinutes * 60_000,
     cleanupDeadlineMs - EXACT_CLEANUP_RESERVE_SECONDS * 1_000,
   );
-  if (operationDeadlineMs <= startedAtMs) {
-    throw new Error("Bridge operation budget cannot cover primary work plus exact cleanup.");
+  // Fail closed before anything mutates: if the envelope cannot cover primary
+  // work, exact cleanup AND the owner publication that makes a run countable,
+  // the run must not start rather than discover it at the last step.
+  if (
+    operationDeadlineMs <= startedAtMs ||
+    (invocation.mode !== "plan" && publicationDeadlineMs <= cleanupDeadlineMs)
+  ) {
+    throw new Error(
+      "Bridge operation budget cannot cover primary work, exact cleanup, and owner publication.",
+    );
   }
   const leaseExpiresAt = new Date(startedAtMs + LEASE_MINUTES * 60_000);
   const contract = REPOSITORIES[invocation.repository];
@@ -3452,7 +5790,32 @@ export async function runProtectedBootstrap(
   );
   let session: ExecutorSession | undefined;
   let primaryFailure: unknown;
+  let quarantinedFederation:
+    | { readonly generation: string; readonly record: FederationQuarantineRecord }
+    | undefined;
+  let federationRestored = false;
+  // Held in memory until every cleanup prerequisite has proven itself, so a
+  // crash anywhere before the publication phase leaves no success claim at all.
+  type OwnerPublication = {
+    readonly proof: FinalProtectedProof;
+    readonly review: ReviewManifestResult;
+  };
+  let rehearsalPublication: OwnerPublication | undefined;
+  let applyPublication: OwnerPublication | undefined;
+  let completedReleaseProof: ExecutorReleaseProof | undefined;
   try {
+    // Nothing starts until the fleet is known to be free of unrepaired
+    // quarantines, for any target, not just this one.
+    telemetry.phase("controller.federation-preflight");
+    const preflight = await dependencies.recoverFederationPreflight(
+      invocation,
+      operationDeadlineMs,
+    );
+    if (preflight.skippedUncontained.length > 0) {
+      throw new Error(
+        `A previous protected run left ${preflight.skippedUncontained.length} consumer federation quarantine(s) closed and its executor is not provably contained; recover before starting another run.`,
+      );
+    }
     telemetry.phase("controller.prepare");
     const preparation = await dependencies.prepare(invocation, operationDeadlineMs);
     const consumerTreeSha = preparation.consumerTreeSha;
@@ -3471,6 +5834,76 @@ export async function runProtectedBootstrap(
       freezeProof: await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds),
       markerProof: await dependencies.proveMarkers(invocation, session, false),
     };
+
+    // The rehearsal route. It exercises every federation boundary against live
+    // infrastructure -- arm the durable intent, disable all four pools and
+    // prove each converged, revoke mutation authority and prove its absence,
+    // hand the pools back and prove the restored fingerprints, then publish the
+    // one countable receipt -- while touching no business resource. No
+    // Terraform runs, no plan is read or consumed, and the executor is never
+    // elevated. This is what makes the first live exercise of the quarantine
+    // incapable of granting a production apply.
+    if (invocation.mode === "rehearsal") {
+      telemetry.phase("controller.quarantine");
+      quarantinedFederation = await dependencies.armFederationQuarantine(
+        invocation,
+        session,
+        operationDeadlineMs,
+      );
+      await dependencies.disableFederation(
+        invocation,
+        quarantinedFederation.record,
+        operationDeadlineMs,
+      );
+      telemetry.phase("controller.de-elevate");
+      const rehearsalDeElevation = await dependencies.deElevateExecutor(
+        invocation,
+        session,
+        operationDeadlineMs,
+      );
+      telemetry.phase("controller.federation-restore");
+      const rehearsalPools = await dependencies.restoreFederation(
+        invocation,
+        quarantinedFederation.record,
+        quarantinedFederation.generation,
+        operationDeadlineMs,
+      );
+      federationRestored = true;
+      // A rehearsal reviews no Terraform plan, so its manifest digest names the
+      // rehearsal identity rather than pretending to name a plan.
+      const rehearsalReview: ReviewManifestResult = {
+        canonical: "",
+        sha256: sha256Hex(canonicalJson(json({
+          consumerSha: invocation.consumerSha,
+          mode: "rehearsal",
+          platformSha: invocation.platformSha,
+          repository: invocation.repository,
+          runId: invocation.githubRunId,
+          terraformRoot: invocation.terraformRoot,
+        }, "rehearsal review identity"))),
+      };
+      // Nothing is published here. The entire cleanup -- Docker sandbox, exact
+      // executor release, and every private path -- has to succeed first, or a
+      // failure in `finally` would leave a terminal "rehearsal-complete" record
+      // behind for a run that did not complete. The payload waits in memory,
+      // and there is deliberately no early return: an early return would exit
+      // through `finally` and skip the publication phase entirely.
+      rehearsalPublication = {
+        proof: buildFinalProtectedProof({
+          deElevation: rehearsalDeElevation,
+          intent: quarantinedFederation.record,
+          intentDigest: sha256Hex(
+            canonicalJson(json(quarantinedFederation.record, "federation quarantine record")),
+          ),
+          intentGeneration: quarantinedFederation.generation,
+          invocation,
+          kind: "rehearsal",
+          observedPools: rehearsalPools,
+          review: rehearsalReview,
+        }),
+        review: rehearsalReview,
+      };
+    } else {
 
     const approved = invocation.mode === "apply"
       ? await dependencies.verifyApproval(invocation, session, proof, dependencies.now())
@@ -3514,6 +5947,12 @@ export async function runProtectedBootstrap(
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               `-var=active_workflow_sha=${invocation.platformSha}`,
+              // Both the plan and the apply carry this, so the reviewed plan is
+              // the one that keeps federation quarantined and the recomputed
+              // plan still matches its receipt. The bridge restores the pool
+              // after the post-apply audit, which is why every bootstrap plan
+              // legitimately contains this one disable.
+              `-var=federation_quarantined=true`,
               `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
               `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
             ]
@@ -3641,6 +6080,24 @@ export async function runProtectedBootstrap(
       leaseExpiresAt.getTime(),
       session.tokenExpiresAtMs,
     );
+    // Close consumer federation before any privilege exists. A disabled pool
+    // blocks token exchange AND stops already-issued tokens reaching resources,
+    // so this is what makes the privileged window unreachable rather than
+    // merely unobserved. The approved plan carries the same desired state, so
+    // the apply cannot undo it.
+    telemetry.phase("controller.quarantine");
+    // Armed before the first mutation. If disableFederation dies after the
+    // first PATCH, this run still owns the undo.
+    quarantinedFederation = await dependencies.armFederationQuarantine(
+      invocation,
+      session,
+      operationDeadlineMs,
+    );
+    await dependencies.disableFederation(
+      invocation,
+      quarantinedFederation.record,
+      operationDeadlineMs,
+    );
     await dependencies.elevateExecutor(
       invocation,
       session,
@@ -3653,7 +6110,27 @@ export async function runProtectedBootstrap(
       leaseExpiresAt.getTime(),
       session.tokenExpiresAtMs,
     );
-    await dependencies.proveFreeze(invocation, preparation.tokenDrainSeconds);
+    const finalPreApplyFreezeProof = await dependencies.proveFreeze(
+      invocation,
+      preparation.tokenDrainSeconds,
+    );
+    exact(
+      canonicalJson(json(
+        finalPreApplyFreezeProof.repositories,
+        "final pre-apply freeze repositories",
+      )),
+      canonicalJson(json(
+        preApplyProof.freezeProof.repositories,
+        "authorized pre-apply freeze repositories",
+      )),
+      "stable pre-apply freeze repository snapshot",
+    );
+    if (
+      Date.parse(finalPreApplyFreezeProof.observedAt) <
+        Date.parse(preApplyProof.freezeProof.observedAt)
+    ) {
+      throw new Error("The final pre-apply freeze snapshot predates its authorization snapshot.");
+    }
     const finalPreApplyExposureProof = await dependencies.proveExposure(
       invocation,
       session,
@@ -3692,6 +6169,12 @@ export async function runProtectedBootstrap(
         ...(invocation.terraformRoot === "bootstrap"
           ? [
               `-var=active_workflow_sha=${invocation.platformSha}`,
+              // Both the plan and the apply carry this, so the reviewed plan is
+              // the one that keeps federation quarantined and the recomputed
+              // plan still matches its receipt. The bridge restores the pool
+              // after the post-apply audit, which is why every bootstrap plan
+              // legitimately contains this one disable.
+              `-var=federation_quarantined=true`,
               `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
               `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
             ]
@@ -3719,14 +6202,65 @@ export async function runProtectedBootstrap(
     ) {
       throw new Error("The post-WIF freeze snapshot predates the required token-expiry barrier.");
     }
-    telemetry.phase("controller.apply-publish");
-    await dependencies.publishPostApplyReceipt(
+    // Nothing below this line may still be able to change anything. The
+    // executor hands back mutation authority first and proves, against the live
+    // control plane, that every mutation permission is gone -- so the identity
+    // that publishes the result is a reader.
+    telemetry.phase("controller.de-elevate");
+    const deElevationProof = await dependencies.deElevateExecutor(
       invocation,
       session,
-      review,
-      postApplyProof,
-      dependencies.now(),
+      operationDeadlineMs,
     );
+    // Federation comes back only once privilege is gone, and on the success
+    // path it happens here rather than in cleanup, so the audit and the receipt
+    // describe the world as it will actually be left.
+    telemetry.phase("controller.federation-restore");
+    const observedPools = await dependencies.restoreFederation(
+      invocation,
+      quarantinedFederation!.record,
+      quarantinedFederation!.generation,
+      operationDeadlineMs,
+    );
+    federationRestored = true;
+    // The post-apply audit ran with the pools quarantined, so it attests a
+    // state restoration immediately ends. This one attests the exact state the
+    // run actually leaves behind, including a target pool that was already
+    // disabled before this run, and its output digest is what the receipt binds.
+    telemetry.phase("controller.final-audit");
+    const restoredTargetPools = quarantinedFederation!.record.pools.filter(
+      (pool) => pool.repository === invocation.repository,
+    );
+    if (restoredTargetPools.length !== 1) {
+      throw new Error("The federation quarantine record does not contain one exact target pool.");
+    }
+    const restoredAudit = await dependencies.auditRestoredState(
+      invocation,
+      session,
+      terraformDirectory,
+      restoredTargetPools[0]!.disabled,
+      operationDeadlineMs,
+    );
+    // Nothing is published here either. The terminal receipt must not exist
+    // until the sandbox is torn down, the executor is provably gone, and every
+    // private path is removed. Only the payload is held.
+    applyPublication = {
+      review,
+      proof: buildFinalProtectedProof({
+        deElevation: deElevationProof,
+        intent: quarantinedFederation!.record,
+        intentDigest: sha256Hex(
+          canonicalJson(json(quarantinedFederation!.record, "federation quarantine record")),
+        ),
+        intentGeneration: quarantinedFederation!.generation,
+        invocation,
+        kind: "apply",
+        observedPools,
+        quarantinedApplyProof: postApplyProof,
+        restoredAudit,
+        review,
+      }),
+    };
     await dependencies.appendSummary(
       invocation,
       reviewSummary(invocation, review, {
@@ -3734,6 +6268,7 @@ export async function runProtectedBootstrap(
         planRunId: invocation.approvedPlanRunId,
       }),
     );
+    }
   } catch (error) {
     primaryFailure = error;
     throw error;
@@ -3743,7 +6278,7 @@ export async function runProtectedBootstrap(
     // private tree must not consume the cleanup window before the executor is
     // disabled, and a synchronous filesystem-cleanup throw must not prevent
     // the IAM attempt from starting.
-    const cleanupResults = await Promise.allSettled([
+    const [releaseResult, ...pathResults] = await Promise.allSettled([
       Promise.resolve().then(() =>
         dependencies.releaseExecutor(invocation, session, cleanupDeadlineMs)
       ),
@@ -3751,9 +6286,44 @@ export async function runProtectedBootstrap(
         Promise.resolve().then(() => dependencies.removePrivatePath(path))
       ),
     ]);
-    const cleanupErrors = cleanupResults.flatMap((result) =>
+    const cleanupErrors: unknown[] = [releaseResult, ...pathResults].flatMap((result) =>
       result.status === "rejected" ? [result.reason] : []
     );
+    // These two failures are not equivalent. A leftover private path is
+    // recoverable at leisure; an executor whose privilege was not provably
+    // revoked is the exact condition the quarantine exists for.
+    const executorContained = releaseResult!.status === "fulfilled";
+    // The exact release proof, available only when release actually succeeded.
+    const releaseProof = releaseResult!.status === "fulfilled"
+      ? releaseResult!.value
+      : undefined;
+    // Federation is restored only after the executor is gone, so no window
+    // exists in which consumer tokens work again while privilege still does.
+    completedReleaseProof = releaseProof;
+    if (quarantinedFederation !== undefined && !federationRestored) {
+      if (!executorContained) {
+        // Leave federation closed. Re-opening it while an executor may still
+        // hold privilege would hand back exactly the overlap this design
+        // removes. A human unblocks it with the durable intent.
+        cleanupErrors.push(
+          new Error(
+            "Consumer federation stays quarantined because executor containment was not proven; restore it from the durable quarantine intent after revoking the executor.",
+          ),
+        );
+      } else {
+        telemetry.phase("controller.federation-restore");
+        try {
+          await dependencies.restoreFederation(
+            invocation,
+            quarantinedFederation.record,
+            quarantinedFederation.generation,
+            cleanupDeadlineMs,
+          );
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
+    }
     if (cleanupErrors.length > 0) {
       const cleanupFailure = new AggregateError(
         cleanupErrors,
@@ -3766,6 +6336,45 @@ export async function runProtectedBootstrap(
       );
     }
   }
+  // The post-cleanup publication phase.
+  //
+  // Reached only when the try block completed AND the whole finally cleanup
+  // succeeded, so by construction the Docker sandbox is torn down, the executor
+  // is provably released, every private path is gone, and federation is back.
+  // A crash before this point therefore leaves no claim of any kind. The only
+  // terminal receipt is therefore a statement about a world already left
+  // clean, not a promise that cleanup will happen later. If the process dies
+  // before this phase, no success artifact exists and the run is safely retried
+  // under a new GitHub run identity.
+  //
+  // A plan reaches here with neither payload set and publishes nothing.
+  if (rehearsalPublication === undefined && applyPublication === undefined) return;
+  if (completedReleaseProof === undefined) {
+    throw new Error(
+      "The protected run produced no exact executor release proof, so no terminal receipt may be published.",
+    );
+  }
+  if (rehearsalPublication !== undefined) {
+    telemetry.phase("controller.apply-publish");
+    await dependencies.publishFinalReceipt(
+      invocation,
+      rehearsalPublication.review,
+      rehearsalPublication.proof,
+      completedReleaseProof,
+      dependencies.now(),
+      publicationDeadlineMs,
+    );
+    return;
+  }
+  telemetry.phase("controller.apply-publish");
+  await dependencies.publishFinalReceipt(
+    invocation,
+    applyPublication!.review,
+    applyPublication!.proof,
+    completedReleaseProof,
+    dependencies.now(),
+    publicationDeadlineMs,
+  );
 }
 
 export async function main(
@@ -3834,7 +6443,25 @@ export async function runProtectedRecovery(
   const recoveryDeadlineMs = sourceProofCompletedAtMs +
     RECOVERY_OPERATION_MINUTES * 60_000;
   telemetry.phase("recovery.inventory");
-  await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+  // One wall-clock horizon, established once and concurrently across every
+  // affected project. It always includes this failed run even if it died before
+  // writing a quarantine intent, plus every exact identity named by durable
+  // intents. Every phase below consumes that one fleet proof rather than
+  // starting another.
+  const horizon = await activeDependencies.recoverArtifacts(invocation, recoveryDeadlineMs);
+  // Executor containment is proven first, above, so federation is handed back
+  // only once nothing can still be holding privilege with it.
+  telemetry.phase("recovery.federation");
+  const federation = await activeDependencies.recoverFederation(
+    invocation,
+    horizon,
+    recoveryDeadlineMs,
+  );
+  if (federation.skippedUncontained.length > 0) {
+    throw new Error(
+      `Federation quarantine recovery left ${federation.skippedUncontained.length} intent(s) closed because their executors are not provably contained.`,
+    );
+  }
 }
 
 export async function recoveryMain(
@@ -3972,6 +6599,7 @@ export async function proveConsumerFreeze(
   }
   if (!Number.isFinite(nowMs)) throw new Error("The consumer freeze time is invalid.");
   const requiredDrainMs = (tokenDrainSeconds + TOKEN_DRAIN_SKEW_SECONDS) * 1_000;
+  const activeStatuses = new Set(["requested", "waiting", "pending", "queued", "in_progress"]);
   const repositories: Array<ConsumerFreezeProof["repositories"][number]> = [];
   for (const repository of REPOSITORY_NAMES) {
     const contract = REPOSITORIES[repository];
@@ -3997,6 +6625,19 @@ export async function proveConsumerFreeze(
     }
     if (activeRuns.length !== 0) {
       throw new Error(`${repository} still has an active GitHub Actions run.`);
+    }
+    // The status-filtered reads are the primary active-run proof, but the
+    // unfiltered history is an independent view of the same state. If it still
+    // names an active run, an incomplete filtered 200 must never be treated as
+    // evidence of absence merely because the run is old enough to pass the
+    // token-drain timestamp check.
+    for (const run of recentRuns) {
+      const recordValue = record(run, `${repository} workflow run`);
+      const status = requiredString(recordValue.status, "workflow run status");
+      if (activeStatuses.has(status)) {
+        throw new Error(`${repository} unfiltered history still contains an active GitHub Actions run.`);
+      }
+      exact(status, "completed", `${repository} terminal workflow run status`);
     }
     const latestPossibleTokenIssuance = recentRuns.reduce<number>((latest, run) => {
       const recordValue = record(run, `${repository} workflow run`);
@@ -4042,6 +6683,7 @@ async function githubAllRuns(
   retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
+  const runIds = new Set<string>();
   let page = 1;
   let expectedTotal: number | undefined;
   do {
@@ -4062,7 +6704,19 @@ async function githubAllRuns(
     }
     const pageRuns = array(value.workflow_runs, "GitHub workflow runs");
     if (pageRuns.length > 100) throw new Error("GitHub returned an oversized workflow-run page.");
-    results.push(...pageRuns.map((run) => json(run, "GitHub workflow run")));
+    const expectedPageLength = Math.min(100, (expectedTotal ?? 0) - results.length);
+    if (pageRuns.length !== expectedPageLength) {
+      throw new Error("GitHub returned a short or overfilled workflow-run page.");
+    }
+    for (const raw of pageRuns) {
+      const run = record(raw, "GitHub workflow run");
+      const runId = numeric(String(run.id), "workflow run ID");
+      if (runIds.has(runId)) {
+        throw new Error("GitHub workflow-run pagination repeated a run ID.");
+      }
+      runIds.add(runId);
+      results.push(json(run, "GitHub workflow run"));
+    }
     page += 1;
   } while ((page - 1) * 100 < (expectedTotal ?? 0));
   if (results.length !== expectedTotal) {
@@ -4078,7 +6732,9 @@ async function githubActiveRuns(
   retry?: GithubProofRetryPolicy,
 ): Promise<readonly JsonValue[]> {
   const results: JsonValue[] = [];
+  const runIds = new Set<string>();
   for (const status of ["requested", "waiting", "pending", "queued", "in_progress"] as const) {
+    let statusCount = 0;
     let page = 1;
     let expectedTotal: number | undefined;
     do {
@@ -4092,13 +6748,26 @@ async function githubActiveRuns(
       }
       const pageRuns = array(value.workflow_runs, `GitHub ${status} runs`);
       if (pageRuns.length > 100) throw new Error("GitHub returned an oversized run page.");
+      const expectedPageLength = Math.min(100, (expectedTotal ?? 0) - statusCount);
+      if (pageRuns.length !== expectedPageLength) {
+        throw new Error(`GitHub returned a short or overfilled ${status} run page.`);
+      }
       for (const raw of pageRuns) {
         const run = record(raw, `GitHub ${status} run`);
         exact(run.status, status, `GitHub ${status} run status`);
+        const runId = numeric(String(run.id), `GitHub ${status} run ID`);
+        if (runIds.has(runId)) {
+          throw new Error("GitHub active-run pagination repeated a run ID.");
+        }
+        runIds.add(runId);
         results.push(json(run, `GitHub ${status} run`));
+        statusCount += 1;
       }
       page += 1;
     } while ((page - 1) * 100 < (expectedTotal ?? 0));
+    if (statusCount !== expectedTotal) {
+      throw new Error(`GitHub ${status} run pagination was incomplete.`);
+    }
     if (results.length > REPOSITORY_NAMES.length * MAX_GITHUB_RUNS_PER_STATUS) {
       throw new Error("GitHub active-run proof exceeded its global bound.");
     }
@@ -4721,6 +7390,11 @@ function defaultBridgeDependencies(
   const sandbox = new TerraformSandboxExecutor(dockerTerraformSandboxDriver());
   let apiDeadlineMs = Date.now() + 5 * 60_000;
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
+  // Policy Analyzer commonly takes longer than the ordinary 20-second API
+  // envelope. It still shares the protected operation deadline and the global
+  // response bound, but one complete analysis may use the documented 120s
+  // execution window rather than being aborted into a false-negative proof.
+  const controllerAnalysisApi = deadlineFetcher(fetch, () => apiDeadlineMs, 125_000);
   return {
     acquireExecutor: (invocation, leaseExpiresAt, operationDeadlineMs) =>
       manager.acquire(invocation, leaseExpiresAt, operationDeadlineMs),
@@ -4734,6 +7408,8 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
+    deElevateExecutor: (invocation, session, operationDeadlineMs) =>
+      manager.deElevate(invocation, session, operationDeadlineMs),
     elevateExecutor: (invocation, session, leaseExpiresAt, operationDeadlineMs) =>
       manager.elevate(invocation, session, leaseExpiresAt, operationDeadlineMs),
     inspectPlan: inspectPlanFile,
@@ -4839,15 +7515,26 @@ function defaultBridgeDependencies(
         nowMs,
         api,
       ),
-    publishPostApplyReceipt: (invocation, session, review, proof, nowMs) =>
-      publishPostApplyReceipt(
+    publishFinalReceipt: async (
+      invocation,
+      review,
+      proof,
+      releaseProof,
+      nowMs,
+      publicationDeadlineMs,
+    ) => {
+      apiDeadlineMs = publicationDeadlineMs;
+      assertBeforeDeadline(nowMs, publicationDeadlineMs, "terminal owner receipt");
+      await publishFinalProtectedReceipt(
         invocation,
-        session.accessToken,
+        invocation.ownerAccessToken,
         review,
         proof,
+        releaseProof,
         nowMs,
         api,
-      ),
+      );
+    },
     readPlanJson: async (
       invocation,
       session,
@@ -4863,12 +7550,11 @@ function defaultBridgeDependencies(
         operationDeadlineMs,
         true,
     ),
-    releaseExecutor: async (invocation, _session, cleanupDeadlineMs) => {
+    releaseExecutor: async (invocation, _session, cleanupDeadlineMs) =>
       await releaseSandboxAndExecutor(
         () => sandbox.cleanupAll(cleanupDeadlineMs),
         () => manager.release(invocation, cleanupDeadlineMs),
-      );
-    },
+      ),
     removePrivatePath: (path) => rm(path, { force: true, recursive: true }),
     runTerraform: async (
       invocation,
@@ -4893,7 +7579,194 @@ function defaultBridgeDependencies(
         nowMs,
         api,
         githubProofRetryPolicy(() => apiDeadlineMs),
+    ),
+    armFederationQuarantine: async (invocation, session, operationDeadlineMs) => {
+      apiDeadlineMs = operationDeadlineMs;
+      // This is intentionally inside the arm operation and immediately before
+      // the live pool capture. Both rehearsal and apply therefore prove the
+      // current controller set; a clean plan after-state cannot hide an
+      // untrusted grant that remains live until Terraform applies its removal.
+      await proveNoUntrustedFederationControllers(
+        invocation.ownerAccessToken,
+        api,
+        controllerAnalysisApi,
+      );
+      assertBeforeDeadline(
+        Date.now(),
+        operationDeadlineMs,
+        "live federation controller proof",
+      );
+      // Every consumer pool, not just the target's. The freeze proof already
+      // spans the whole fleet because consumer principals are not provably
+      // confined to their own project, and quarantining a smaller set would
+      // need a transitive-reachability proof this bridge cannot make.
+      const pools = await Promise.all(REPOSITORY_NAMES.map(async (repository) => {
+        const projectId = REPOSITORIES[repository].projectId;
+        const [pool, provider] = await Promise.all([
+          readFederationPool(projectId, invocation.ownerAccessToken, api),
+          readFederationProvider(projectId, invocation.ownerAccessToken, api),
+        ]);
+        if (pool === undefined) {
+          // Fail closed. An absent pool on an established consumer is a missing
+          // precondition, not isolation.
+          throw new Error(
+            `The ${repository} workload identity pool is absent; protected elevation cannot prove federation is closed.`,
+          );
+        }
+        if (provider === undefined) {
+          throw new Error(
+            `The ${repository} GitHub workload identity provider is absent; protected elevation cannot prove its trust condition.`,
+          );
+        }
+        return {
+          disabled: pool.disabled,
+          fingerprint: federationPoolFingerprint(pool),
+          name: pool.name,
+          providerFingerprint: federationProviderFingerprint(provider),
+          providerName: provider.name,
+          repository,
+        } satisfies FederationQuarantineRecord["pools"][number];
+      }));
+      const record: FederationQuarantineRecord = {
+        approvedManifestSha256: invocation.approvedManifestSha256,
+        approvedPlanRunId: invocation.approvedPlanRunId,
+        capturedAt: new Date(Date.now()).toISOString(),
+        consumerSha: invocation.consumerSha,
+        executorEmail: session.executorEmail,
+        executorUniqueId: session.executorUniqueId,
+        platformSha: invocation.platformSha,
+        pools,
+        repository: invocation.repository,
+        root: invocation.terraformRoot,
+        runId: invocation.githubRunId,
+      };
+      // Durable, immutable, and written BEFORE any mutation, so a runner that
+      // dies at any later boundary still leaves a fresh runner enough to
+      // restore exactly these pools to exactly this state -- and nothing else.
+      // The generation it lands at is what a completion marker binds to.
+      const generation = await writeImmutableObject(
+        federationIntentBucket(invocation),
+        federationIntentObject(invocation),
+        canonicalJson(json(record, "federation quarantine record")),
+        invocation.ownerAccessToken,
+        api,
+      );
+      return { generation, record };
+    },
+    disableFederation: async (invocation, record, operationDeadlineMs) => {
+      await Promise.all(record.pools.map(async (pool) => {
+        const converged = await setFederationPoolDisabled(
+          REPOSITORIES[pool.repository].projectId,
+          true,
+          invocation.ownerAccessToken,
+          api,
+          operationDeadlineMs,
+        );
+        assertQuarantinedPool(converged, pool);
+        const provider = await readFederationProvider(
+          REPOSITORIES[pool.repository].projectId,
+          invocation.ownerAccessToken,
+          api,
+        );
+        if (provider === undefined) {
+          throw new Error(`The ${pool.repository} GitHub provider vanished during quarantine.`);
+        }
+        exact(provider.name, pool.providerName, "quarantined federation provider identity");
+        exact(
+          federationProviderFingerprint(provider),
+          pool.providerFingerprint,
+          `quarantined ${pool.repository} federation provider`,
+        );
+      }));
+    },
+    recoverFederationPreflight: async (invocation, operationDeadlineMs) =>
+      // Detection, not repair.
+      //
+      // The preflight runs inside the protected run's own operation window, and
+      // a containment horizon is ten minutes -- a third of an apply's entire
+      // budget for a single intent, and unbounded for several. It also has no
+      // need for one: its job is to refuse to START while an unrepaired
+      // quarantine exists, and refusing needs only to see that one exists.
+      // Repair belongs to --recover-only, whose envelope is sized for exactly
+      // one horizon.
+      await recoverFederationQuarantines(
+        invocation.ownerAccessToken,
+        api,
+        operationDeadlineMs,
+        // Never contained here, so nothing is ever restored here: every
+        // incomplete intent is reported and the run refuses to begin.
+        async () => undefined,
+        (milliseconds) => Bun.sleep(milliseconds),
+        () => Date.now(),
       ),
+    restoreFederation: async (invocation, record, generation, operationDeadlineMs) => {
+      const observed = await restoreQuarantinedFederation(
+        record,
+        invocation.ownerAccessToken,
+        api,
+        operationDeadlineMs,
+      );
+      // Exactly the marker the recovery path writes, through exactly the same
+      // idempotent writer, so one reader validates both and a lost response
+      // does not turn a completed restore into a conflict.
+      await writeFederationRestoreMarker(
+        federationIntentBucket(invocation),
+        federationIntentObject(invocation),
+        {
+          intentDigest: sha256Hex(canonicalJson(json(record, "federation quarantine record"))),
+          intentGeneration: generation,
+          repository: record.repository,
+          restoredAt: new Date(Date.now()).toISOString(),
+          root: record.root,
+          runId: record.runId,
+        },
+        invocation.ownerAccessToken,
+        api,
+        () => Date.now(),
+        Date.parse(record.capturedAt),
+      );
+      return observed;
+    },
+    auditRestoredState: async (
+      invocation,
+      session,
+      terraformDirectory,
+      federationQuarantined,
+      operationDeadlineMs,
+    ) => {
+      const contract = REPOSITORIES[invocation.repository];
+      const output = await sandbox.run(
+        invocation,
+        session,
+        terraformDirectory,
+        [
+          "plan",
+          "-json",
+          "-detailed-exitcode",
+          "-input=false",
+          "-lock=false",
+          "-no-color",
+          `-var=repository_id=${contract.repositoryId}`,
+          ...(invocation.terraformRoot === "bootstrap"
+            ? [
+              `-var=active_workflow_sha=${invocation.platformSha}`,
+              `-var=federation_quarantined=${federationQuarantined ? "true" : "false"}`,
+              `-var=legacy_compatibility_mode=${invocation.legacyCompatibilityMode}`,
+              `-var=transition_workflow_sha=${invocation.transitionWorkflowSha}`,
+            ]
+            : []),
+        ],
+        operationDeadlineMs,
+        true,
+      );
+      // The sandbox throws on a non-zero detailed exit code, so reaching here
+      // IS the zero-diff result; the digest is what makes it evidence.
+      return {
+        detailedExitCode: 0,
+        observedAt: new Date(Date.now()).toISOString(),
+        outputSha256: sha256Hex(output ?? ""),
+      };
+    },
     waitForPostMutationDrain: async (invocation, mutationCompletedAtMs, operationDeadlineMs) => {
       if (invocation.terraformRoot !== "bootstrap") return;
       const targetMs = mutationCompletedAtMs +
@@ -4908,10 +7781,10 @@ function defaultBridgeDependencies(
   };
 }
 
-export async function releaseSandboxAndExecutor(
+export async function releaseSandboxAndExecutor<T>(
   cleanupSandbox: () => Promise<void>,
-  cleanupExecutor: () => Promise<void>,
-): Promise<void> {
+  cleanupExecutor: () => Promise<T>,
+): Promise<T> {
   // Invoke IAM first and isolate both callbacks behind promises so a
   // synchronous Docker-cleanup failure cannot suppress executor containment.
   const results = await Promise.allSettled([
@@ -4924,6 +7797,9 @@ export async function releaseSandboxAndExecutor(
   if (errors.length > 0) {
     throw new AggregateError(errors, "Sandbox and executor cleanup did not both complete.");
   }
+  // The executor result is the exact release proof the countable owner object
+  // is written against; the sandbox has nothing to report.
+  return (results[0] as PromiseFulfilledResult<T>).value;
 }
 
 function defaultRecoveryDependencies(
@@ -4933,13 +7809,33 @@ function defaultRecoveryDependencies(
   const api = deadlineFetcher(fetch, () => apiDeadlineMs);
   return {
     now: () => Date.now(),
+    recoverFederation: async (invocation, horizon, recoveryDeadlineMs) => {
+      apiDeadlineMs = recoveryDeadlineMs;
+      return await recoverFederationQuarantines(
+        invocation.ownerAccessToken,
+        api,
+        recoveryDeadlineMs,
+        async (identity) => containmentProofForFederation(horizon, identity),
+        (milliseconds) => Bun.sleep(milliseconds),
+        () => Date.now(),
+      );
+    },
     recoverArtifacts: async (invocation, recoveryDeadlineMs) => {
       apiDeadlineMs = recoveryDeadlineMs;
-      await recoverBridgeArtifactsUntilStable(
+      const identities = await discoverFederationContainmentIdentities(
+        invocation.ownerAccessToken,
+        api,
+        () => Date.now(),
+      );
+      return await recoverFederationArtifactsUntilStable(
+        identities,
         invocation,
+        invocation.ownerAccessToken,
         api,
         (milliseconds) => Bun.sleep(milliseconds),
         recoveryDeadlineMs,
+        invocation.platformRoot,
+        invocation.runnerTemp,
         () => Date.now(),
         telemetry,
       );
@@ -5498,6 +8394,7 @@ export class ExecutorLeaseManager {
   // policy and must be able to tell its own read leases apart from authority
   // nobody granted.
   #projectMutation: PolicyMutationRecord | undefined;
+  readonly #elevationMutations: PolicyMutationRecord[] = [];
   #policyCleanupComplete = false;
   #roleIntents = new Map<string, EphemeralRoleIntent>();
   #roles: ProjectCustomRole[] = [];
@@ -5956,14 +8853,14 @@ export class ExecutorLeaseManager {
       mutationRole.name,
       this.#projectMutation?.leases ?? [],
     );
-    await this.#recordAndAdd(
+    this.#elevationMutations.push(await this.#recordAndAdd(
       `mutation project ${contract.projectId}`,
       elevation,
       () => getPolicy(contract.projectId, invocation.ownerAccessToken, this.#fetcher),
       (policy) => setPolicy(contract.projectId, invocation.ownerAccessToken, policy, this.#fetcher),
       this.#account.email,
       this.#projectMutation?.leases ?? [],
-    );
+    ));
     if (invocation.terraformRoot === "prod") {
       for (const [email, lease] of Object.entries(buildRuntimeActAsLeases(
         invocation.repository,
@@ -5971,29 +8868,87 @@ export class ExecutorLeaseManager {
         leaseExpiresAt,
         this.#account.email,
       ))) {
-        await this.#recordAndAdd(
+        this.#elevationMutations.push(await this.#recordAndAdd(
           `runtime service account ${email}`,
           { leases: [lease] },
           () => getServiceAccountPolicy(email, invocation.ownerAccessToken, this.#fetcher),
           (policy) =>
             setServiceAccountPolicy(email, invocation.ownerAccessToken, policy, this.#fetcher),
           this.#account.email,
-        );
+        ));
       }
     }
     await this.#waitForPermissionProjection(invocation, session.accessToken, "mutation");
     this.#elevated = true;
   }
 
-  async release(invocation: Invocation, cleanupDeadlineMs: number): Promise<void> {
-    if (this.#invocation === undefined) return;
+  // Hand back mutation authority while keeping exactly the receipt-scoped read
+  // authority the final receipt needs to be written with. This is what makes it
+  // possible for no countable success to exist until privilege is already gone:
+  // the identity that publishes the result can no longer change anything.
+  async deElevate(
+    invocation: Invocation,
+    session: ExecutorSession,
+    operationDeadlineMs: number,
+  ): Promise<ExecutorDeElevationProof> {
+    if (
+      this.#invocation !== invocation || this.#session !== session ||
+      this.#account === undefined
+    ) {
+      throw new Error("Executor de-elevation did not match the acquired single-run identity.");
+    }
+    this.#apiDeadlineMs = operationDeadlineMs;
+    // A rehearsal never elevates, so there is nothing to revoke; the proof
+    // below still runs, and states the absence positively rather than assuming
+    // it from the fact that no grant was made.
+    while (this.#elevationMutations.length > 0) {
+      await this.#removeRecordedMutation(this.#elevationMutations.pop()!, operationDeadlineMs);
+    }
+    this.#elevated = false;
+    // Positive proof against the live control plane: the mutation permission
+    // set must now be absent and only the acquire-time read authority may
+    // remain. This is the same probe elevation itself is validated with.
+    await this.#waitForPermissionProjection(invocation, session.accessToken, "read");
+    const mutation = executorControlPermissions(
+      invocation.repository,
+      invocation.terraformRoot,
+      "mutation",
+    );
+    const read = new Set(
+      executorControlPermissions(invocation.repository, invocation.terraformRoot, "read"),
+    );
+    return {
+      executorEmail: this.#account.email,
+      executorUniqueId: this.#account.uniqueId,
+      observedAt: new Date(Date.now()).toISOString(),
+      provenAbsent: mutation.filter((permission) => !read.has(permission)).toSorted(),
+    };
+  }
+
+  async release(
+    invocation: Invocation,
+    cleanupDeadlineMs: number,
+  ): Promise<ExecutorReleaseProof | undefined> {
+    if (this.#invocation === undefined) return undefined;
     if (this.#invocation !== invocation) throw new Error("Executor cleanup invocation drifted.");
     this.#apiDeadlineMs = cleanupDeadlineMs;
+    // Captured before #releaseAll clears them on success.
+    const released = this.#account;
     const errors = await this.#releaseAll(invocation, cleanupDeadlineMs);
     if (errors.length > 0) {
       throw new AggregateError(errors, "Exact executor lease cleanup failed.");
     }
     this.#invocation = undefined;
+    if (released === undefined) return undefined;
+    return {
+      artifactsDeleted: true,
+      executorEmail: released.email,
+      executorUniqueId: released.uniqueId,
+      observedAt: new Date(Date.now()).toISOString(),
+      permissionsProvenGone: true,
+      projectBindingsCleared: true,
+      provenBy: "exact-release",
+    };
   }
 
   // The grant arrives as one value. Leases and removals travelling together is
@@ -7178,6 +10133,34 @@ async function bridgeArtifactsRemain(
   };
 }
 
+// What one completed containment observation establishes.
+//
+// The inventory it is built from is PROJECT-WIDE: it enumerates every bridge
+// service account and custom role in the project, not just one run's. So a
+// stable-empty result is a statement about every run that project has ever
+// hosted, which is what makes a single horizon sufficient for many receipts
+// instead of one horizon per receipt -- an arrangement the twelve-minute
+// recovery envelope could never have funded.
+export interface ProjectContainmentHorizon {
+  readonly emptySinceAt: string;
+  readonly identities: readonly {
+    readonly platformSha: string;
+    readonly release: ExecutorReleaseProof;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  }[];
+  readonly observationStartedAt: string;
+  readonly observedAt: string;
+  readonly projectId: string;
+  readonly propagationMinutes: number;
+  readonly stableEmptyMinutes: number;
+}
+
+export interface FleetContainmentHorizon {
+  readonly projects: readonly ProjectContainmentHorizon[];
+}
+
 export async function recoverBridgeArtifactsUntilStable(
   invocation: RecoveryInvocation,
   fetcher: Fetcher,
@@ -7185,7 +10168,7 @@ export async function recoverBridgeArtifactsUntilStable(
   cleanupDeadlineMs: number,
   now: () => number = () => Date.now(),
   telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
-): Promise<void> {
+): Promise<ProjectContainmentHorizon> {
   telemetry = bestEffortTelemetry(telemetry);
   const projectId = REPOSITORIES[invocation.repository].projectId;
   const observationStartedAtMs = now();
@@ -7252,7 +10235,21 @@ export async function recoverBridgeArtifactsUntilStable(
         proofMs,
         scanMs: scanCompletedAtMs - scanStartedAtMs,
       });
-      if (proofComplete) return;
+      if (proofComplete) {
+        // The evidence this observation actually produced, returned rather than
+        // reconstructed by a caller afterwards. `inventoryBridgeArtifacts`
+        // scans the PROJECT, so an empty, stable inventory is a statement about
+        // every run in that project, not only this one.
+        return {
+          emptySinceAt: new Date(emptySinceMs!).toISOString(),
+          identities: [],
+          observedAt: new Date(scanCompletedAtMs).toISOString(),
+          observationStartedAt: new Date(observationStartedAtMs).toISOString(),
+          projectId,
+          propagationMinutes: RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+          stableEmptyMinutes: RECOVERY_STABLE_EMPTY_MINUTES,
+        };
+      }
     } catch (error) {
       if (!recursivelyRetryableCleanupError(error)) throw error;
       // A failed read is not negative proof. Retry the entire inventory while
@@ -7278,6 +10275,261 @@ export async function recoverBridgeArtifactsUntilStable(
   throw new Error(
     "Protected crash recovery did not observe the required stable-empty artifact inventory before its deadline.",
   );
+}
+
+// Contain this failed run even if it died before writing an intent, and every
+// executor named by durable federation intents, with one project-wide horizon
+// per affected project. Projects run concurrently because propagation is
+// elapsed wall time; identities within a project run in stable order so their
+// IAM CAS recovery cannot race itself.
+//
+// The returned proof contains the exact identity set that was probed on every
+// scan. A caller cannot use a clean project inventory to vouch for a later or
+// substituted run in that project: containmentProofForFederation requires exact
+// membership and returns the release evidence created here.
+export async function recoverFederationArtifactsUntilStable(
+  identities: readonly FederationContainmentIdentity[],
+  currentRecovery: RecoveryInvocation,
+  ownerToken: string,
+  fetcher: Fetcher,
+  sleep: (milliseconds: number) => Promise<void>,
+  cleanupDeadlineMs: number,
+  platformRoot: string,
+  runnerTemp: string,
+  now: () => number = () => Date.now(),
+  telemetry: BridgeTelemetry = NOOP_BRIDGE_TELEMETRY,
+): Promise<FleetContainmentHorizon> {
+  telemetry = bestEffortTelemetry(telemetry);
+  if (identities.length > MAX_FEDERATION_CONTAINMENT_IDENTITIES) {
+    throw new Error("Federation recovery identity count escaped its reviewed bound.");
+  }
+  exact(currentRecovery.ownerAccessToken, ownerToken, "current recovery owner credential");
+  exact(currentRecovery.platformRoot, platformRoot, "current recovery platform root");
+  exact(currentRecovery.runnerTemp, runnerTemp, "current recovery runner temp");
+  fortyHex(currentRecovery.platformSha, "current recovery platform SHA");
+  numeric(currentRecovery.githubRunId, "current recovery run ID");
+
+  interface RecoveryScanTarget {
+    readonly identity?: FederationContainmentIdentity;
+    readonly recovery: RecoveryInvocation;
+  }
+
+  const targets: RecoveryScanTarget[] = [];
+  const repositoriesByProject = new Map<string, RepositoryName>();
+  const keys = new Set<string>();
+  for (const identity of identities) {
+    const projectId = REPOSITORIES[identity.repository].projectId;
+    const key = `${identity.repository}/${identity.root}/${identity.runId}`;
+    if (keys.has(key)) throw new Error(`Federation recovery repeated identity ${key}.`);
+    keys.add(key);
+    fortyHex(identity.platformSha, "federation recovery platform SHA");
+    numeric(identity.runId, "federation recovery run ID");
+    if (!/^[1-9][0-9]{5,30}$/.test(identity.executorUniqueId)) {
+      throw new Error("Federation recovery executor unique ID is malformed.");
+    }
+    exact(
+      identity.executorEmail,
+      deterministicExecutorEmail({
+        githubRunId: identity.runId,
+        ownerAccessToken: ownerToken,
+        platformRoot,
+        platformSha: identity.platformSha,
+        repository: identity.repository,
+        runnerTemp,
+      }),
+      "federation recovery executor email",
+    );
+    targets.push({
+      identity,
+      recovery: {
+        githubRunId: identity.runId,
+        ownerAccessToken: ownerToken,
+        platformRoot,
+        platformSha: identity.platformSha,
+        repository: identity.repository,
+        runnerTemp,
+      },
+    });
+  }
+
+  const currentMatch = targets.find((target) =>
+    target.recovery.repository === currentRecovery.repository &&
+    target.recovery.githubRunId === currentRecovery.githubRunId
+  );
+  if (currentMatch === undefined) {
+    targets.push({ recovery: currentRecovery });
+  } else {
+    exact(
+      currentMatch.recovery.platformSha,
+      currentRecovery.platformSha,
+      "current recovery intent platform SHA",
+    );
+  }
+
+  const groups = new Map<string, RecoveryScanTarget[]>();
+  for (const target of targets) {
+    const projectId = REPOSITORIES[target.recovery.repository].projectId;
+    const existingRepository = repositoriesByProject.get(projectId);
+    if (
+      existingRepository !== undefined &&
+      existingRepository !== target.recovery.repository
+    ) {
+      throw new Error(
+        `Federation recovery project ${projectId} is shared by multiple repository contracts.`,
+      );
+    }
+    repositoriesByProject.set(projectId, target.recovery.repository);
+    const group = groups.get(projectId) ?? [];
+    group.push(target);
+    groups.set(projectId, group);
+  }
+
+  const projects = await Promise.all([...groups.entries()].map(async ([projectId, rawGroup]) => {
+    const group = rawGroup.toSorted((left, right) => {
+      const leftKey = `${left.recovery.repository}/${left.recovery.githubRunId}/${left.recovery.platformSha}`;
+      const rightKey = `${right.recovery.repository}/${right.recovery.githubRunId}/${right.recovery.platformSha}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    const observationStartedAtMs = now();
+    let emptySinceMs: number | undefined;
+    while (now() < cleanupDeadlineMs) {
+      const scanStartedAtMs = now();
+      try {
+        let clean = true;
+        let observedOrContainedArtifact = false;
+        for (const target of group) {
+          const recovery = target.recovery;
+          const inventory = await inventoryBridgeArtifacts(
+            projectId,
+            ownerToken,
+            fetcher,
+            sleep,
+            cleanupDeadlineMs,
+            recovery,
+          );
+          const remaining = await bridgeArtifactsRemain(
+            projectId,
+            ownerToken,
+            fetcher,
+            recovery,
+          );
+          observedOrContainedArtifact ||= inventory.hadActiveArtifacts;
+          clean &&= !remaining.active &&
+            (inventory.exactAccountAbsentOrDenied || remaining.exactAccountAbsentOrDenied);
+        }
+        const scanCompletedAtMs = now();
+        const propagationComplete = scanCompletedAtMs - observationStartedAtMs >=
+          RECOVERY_DOCUMENTED_PROPAGATION_MINUTES * 60_000;
+        let outcome: RecoveryScanOutcome;
+        let proofMs = 0;
+        if (!clean) {
+          emptySinceMs = undefined;
+          outcome = "reset-active-artifact";
+        } else if (!propagationComplete) {
+          emptySinceMs = undefined;
+          outcome = "reset-propagation-horizon";
+        } else if (observedOrContainedArtifact) {
+          emptySinceMs = scanCompletedAtMs;
+          outcome = "reset-observed-artifact";
+        } else if (emptySinceMs === undefined) {
+          emptySinceMs = scanCompletedAtMs;
+          outcome = "proof-start";
+        } else {
+          proofMs = scanCompletedAtMs - emptySinceMs;
+          if (proofMs >= RECOVERY_STABLE_EMPTY_MS) {
+            const observedAt = new Date(scanCompletedAtMs).toISOString();
+            const horizon: ProjectContainmentHorizon = {
+              emptySinceAt: new Date(emptySinceMs).toISOString(),
+              identities: group.flatMap(({ identity }) => identity === undefined ? [] : [{
+                platformSha: identity.platformSha,
+                release: {
+                  artifactsDeleted: true,
+                  executorEmail: identity.executorEmail,
+                  executorUniqueId: identity.executorUniqueId,
+                  observedAt,
+                  permissionsProvenGone: true,
+                  projectBindingsCleared: true,
+                  provenBy: "propagation-horizon",
+                },
+                repository: identity.repository,
+                root: identity.root,
+                runId: identity.runId,
+              }]),
+              observationStartedAt: new Date(observationStartedAtMs).toISOString(),
+              observedAt,
+              projectId,
+              propagationMinutes: RECOVERY_DOCUMENTED_PROPAGATION_MINUTES,
+              stableEmptyMinutes: RECOVERY_STABLE_EMPTY_MINUTES,
+            };
+            telemetry.recoveryScan({
+              elapsedMs: scanCompletedAtMs - observationStartedAtMs,
+              outcome: "proof-complete",
+              proofMs,
+              scanMs: scanCompletedAtMs - scanStartedAtMs,
+            });
+            return horizon;
+          }
+          outcome = "proof-continue";
+        }
+        telemetry.recoveryScan({
+          elapsedMs: scanCompletedAtMs - observationStartedAtMs,
+          outcome,
+          proofMs,
+          scanMs: scanCompletedAtMs - scanStartedAtMs,
+        });
+      } catch (error) {
+        if (!recursivelyRetryableCleanupError(error)) throw error;
+        emptySinceMs = undefined;
+        const scanFailedAtMs = now();
+        telemetry.recoveryScan({
+          elapsedMs: scanFailedAtMs - observationStartedAtMs,
+          outcome: "reset-retryable-read",
+          proofMs: 0,
+          scanMs: scanFailedAtMs - scanStartedAtMs,
+        });
+        const retryRemainingMs = cleanupDeadlineMs - now();
+        if (retryRemainingMs <= 0) break;
+        await sleep(Math.min(CLEANUP_RETRY_INTERVAL_MS, retryRemainingMs));
+        continue;
+      }
+      const remainingMs = cleanupDeadlineMs - now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(RECOVERY_STABLE_EMPTY_INTERVAL_MS, remainingMs));
+    }
+    throw new Error(
+      `Federation containment horizon for ${projectId} did not complete before its deadline.`,
+    );
+  }));
+  return {
+    projects: projects.toSorted((left, right) =>
+      left.projectId < right.projectId ? -1 : left.projectId > right.projectId ? 1 : 0
+    ),
+  };
+}
+
+export function containmentProofForFederation(
+  horizon: FleetContainmentHorizon,
+  identity: {
+    readonly executorEmail: string;
+    readonly executorUniqueId: string;
+    readonly platformSha: string;
+    readonly repository: RepositoryName;
+    readonly root: TerraformRoot;
+    readonly runId: string;
+  },
+): ExecutorReleaseProof | undefined {
+  const projectId = REPOSITORIES[identity.repository].projectId;
+  const project = horizon.projects.find((candidate) => candidate.projectId === projectId);
+  if (project === undefined) return undefined;
+  const contained = project.identities.find((candidate) =>
+    candidate.repository === identity.repository &&
+    candidate.root === identity.root &&
+    candidate.runId === identity.runId &&
+    candidate.platformSha === identity.platformSha &&
+    candidate.release.executorEmail === identity.executorEmail &&
+    candidate.release.executorUniqueId === identity.executorUniqueId
+  );
+  return contained === undefined ? undefined : { ...contained.release };
 }
 
 interface OrphanPolicySurface {
@@ -8721,7 +11973,7 @@ export function executorDescription(provenance: ExecutorProvenance): string {
   } else if (
     provenance.approvedPlanRunId !== "" || provenance.approvedManifestSha256 !== ""
   ) {
-    throw new Error("Plan executor provenance cannot name an approved run.");
+    throw new Error("Only apply executor provenance may name an approved run.");
   }
   const adoptionRequired = provenance.repository === "runsetta" && provenance.root === "prod";
   if ((provenance.exposureAdoptionRunId !== "") !== adoptionRequired) {
@@ -8771,7 +12023,7 @@ function parseCurrentExecutorProvenance(
 ): ExecutorProvenance {
   const match = new RegExp(
     `^${EXECUTOR_DESCRIPTION_VERSION};repository=(${REPOSITORY_NAMES.join("|")});` +
-      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply);" +
+      "run=([1-9][0-9]{0,19});root=(bootstrap|prod|exposure);mode=(plan|apply|rehearsal);" +
       "approved=(none|[1-9][0-9]{0,19});manifest=(none|[0-9a-f]{64});" +
       "adoption=(none|[1-9][0-9]{0,19});expires=([^;]+)$",
   ).exec(description);
@@ -8782,7 +12034,11 @@ function parseCurrentExecutorProvenance(
   exact(REPOSITORIES[repository].projectId, projectId, "executor provenance project");
   const runId = executorProvenanceNumeric(match[2]!, "executor provenance run ID");
   const root = rootName(match[3]!);
-  const mode = match[4] === "plan" ? "plan" : "apply";
+  // Exact, never a fallback. Collapsing every non-plan mode to "apply"
+  // would make crash recovery treat an abruptly lost REHEARSAL executor as
+  // an apply executor -- a different lease shape, a different receipt
+  // inventory, and a different idea of what the run was allowed to do.
+  const mode = executionMode(match[4]!);
   const approvedPlanRunId = match[5] === "none"
     ? ""
     : executorProvenanceNumeric(match[5]!, "executor provenance approved plan run ID");
@@ -10379,7 +13635,12 @@ export async function waitForStatePermissions(
       name: `${state.prefix}/default.tflock`,
       required: expected === "mutation" ? readWrite : noAccess,
     },
-    {
+    // Plan and apply only. A rehearsal reviews no plan and consumes no approved
+    // run, so there is no plan or adoption object for it to name -- and naming
+    // one would derive an object from an approved run id that is empty, which
+    // is a numeric() failure long before the live lifecycle this projection is
+    // supposed to be checking.
+    ...(invocation.mode === "rehearsal" ? [] : [{
       bucket: state.bucket,
       name: receiptObjectName(
         state,
@@ -10389,7 +13650,7 @@ export async function waitForStatePermissions(
       required: expected === "none"
         ? noAccess
         : invocation.mode === "plan" ? createRead : readOnly,
-    },
+    }]),
     ...(invocation.mode === "apply"
       ? [{
           bucket: state.bucket,
@@ -10421,14 +13682,9 @@ export async function waitForStatePermissions(
             : expected === "mutation"
             ? readOnly
             : createRead,
-        }, {
-          bucket: state.bucket,
-          // Still absent at elevation, so create remains both provable and
-          // necessary: this run publishes it.
-          name: receiptObjectName(state, "results", invocation.githubRunId),
-          required: expected === "none" ? noAccess : createRead,
-        }]
+        }, ...ownerWrittenReceiptProbes(state, invocation)]
       : []),
+    ...(invocation.mode === "rehearsal" ? ownerWrittenReceiptProbes(state, invocation) : []),
     ...(invocation.terraformRoot === "exposure"
       ? (() => {
           const contract = REPOSITORIES[invocation.repository];
@@ -10631,6 +13887,35 @@ export async function waitForStatePermissions(
       unconverged.length === 0
         ? ""
         : `Unconverged after the final scan: ${unconverged.join(", ")}.`);
+}
+
+// Owner-written artifacts, probed in EVERY phase and required to return zero
+// executor permissions.
+//
+// Removing the lease is not the same statement as proving the absence. A
+// bucket-level binding, an inherited grant, or anything issued out of band
+// would be invisible if these keys simply stopped being probed -- so they are
+// probed precisely because nothing grants them. The negative result is the
+// evidence; the missing lease is only the intent.
+//
+// `results/*` is included even though no current run writes it: a stale grant
+// from a build that predates its removal is exactly the thing worth catching.
+function ownerWrittenReceiptProbes(
+  state: { readonly bucket: string; readonly prefix: string },
+  invocation: Invocation,
+): readonly {
+  readonly bucket: string;
+  readonly name: string;
+  readonly required: ReadonlySet<string>;
+}[] {
+  const noAccess: ReadonlySet<string> = new Set<string>();
+  return [
+    receiptObjectName(state, "results", invocation.githubRunId),
+    receiptObjectName(state, "final", invocation.githubRunId),
+    ...(invocation.mode === "rehearsal"
+      ? [receiptObjectName(state, "rehearsals", invocation.githubRunId)]
+      : []),
+  ].map((name) => ({ bucket: state.bucket, name, required: noAccess }));
 }
 
 export async function waitForControlPermissions(
@@ -12141,59 +15426,140 @@ export async function consumePlanReceipt(
   );
 }
 
-export async function publishPostApplyReceipt(
+// The one terminal owner receipt, written only after every cleanup prerequisite
+// has succeeded. An apply is immediately countable because the same immutable
+// object carries the exact release proof; a rehearsal remains non-countable.
+// Every field is a claim already true when written: mutation authority was
+// gone, all four pools were restored, and the restored world audited to zero
+// diff.
+export async function publishFinalProtectedReceipt(
   invocation: Invocation,
-  executorToken: string,
+  ownerToken: string,
   review: ReviewManifestResult,
-  proof: ExecutionProof,
+  proof: FinalProtectedProof,
+  releaseProof: ExecutorReleaseProof,
   nowMs: number,
   fetcher: Fetcher,
 ): Promise<void> {
-  if (invocation.mode !== "apply") {
-    throw new Error("Only apply mode may publish a post-apply receipt.");
+  if (invocation.mode === "plan") {
+    throw new Error("Plan mode produces no final protected receipt.");
   }
   if (invocation.terraformRoot === "exposure") {
-    throw new Error("Exposure adoption has no post-apply receipt.");
+    throw new Error("Exposure adoption has no final protected receipt.");
+  }
+  // The kind must match the run. A rehearsal receipt claiming an apply, or an
+  // apply receipt written by a rehearsal, would each be a lie about whether any
+  // Terraform ran.
+  exact(
+    proof.kind,
+    invocation.mode === "rehearsal" ? "rehearsal" : "apply",
+    "final receipt kind",
+  );
+  exact(proof.reviewSha256, review.sha256, "final receipt manifest digest");
+  exact(proof.repository, invocation.repository, "final receipt repository");
+  exact(proof.root, invocation.terraformRoot, "final receipt root");
+  exact(proof.runId, invocation.githubRunId, "final receipt run ID");
+  exact(proof.platformSha, invocation.platformSha, "final receipt platform SHA");
+  exact(proof.consumerSha, invocation.consumerSha, "final receipt consumer SHA");
+  exact(releaseProof.provenBy, "exact-release", "terminal receipt release provenance");
+  exact(
+    releaseProof.executorEmail,
+    proof.deElevation.executorEmail,
+    "terminal receipt executor email",
+  );
+  exact(
+    releaseProof.executorUniqueId,
+    proof.deElevation.executorUniqueId,
+    "terminal receipt executor unique ID",
+  );
+  const deElevationAtMs = Date.parse(
+    canonicalInstant(proof.deElevation.observedAt, "terminal receipt de-elevation time"),
+  );
+  const releaseAtMs = Date.parse(
+    canonicalInstant(releaseProof.observedAt, "terminal receipt release time"),
+  );
+  if (!(deElevationAtMs <= releaseAtMs && releaseAtMs <= nowMs)) {
+    throw new Error("Terminal receipt requires de-elevation, exact release, and publication in order.");
+  }
+  if (proof.observedPools.length !== REPOSITORY_NAMES.length) {
+    throw new Error("Final receipt does not account for every consumer pool.");
   }
   const contract = REPOSITORIES[invocation.repository];
   const state = contract.state[invocation.terraformRoot];
-  const receipt: JsonValue = {
-    applyRunId: invocation.githubRunId,
-    consumerSha: invocation.consumerSha,
-    consumerTreeSha: proof.consumerTreeSha,
-    dhiParityId: proof.dhiParityId,
-    exposureProof: json(
-      exposureProofForReceipt(proof.exposureProof, invocation),
-      "post-apply exposure proof",
-    ),
-    freezeProof: json(
-      normalizedFreezeProof(proof.freezeProof, proof.tokenDrainSeconds),
-      "post-apply freeze proof",
-    ),
-    manifestSha256: review.sha256,
-    markerProof: json(
-      markerProofForReceipt(proof.markerProof, invocation),
-      "post-apply marker proof",
-    ),
-    mode: "post-apply",
-    planRunId: invocation.approvedPlanRunId,
-    platformSha: invocation.platformSha,
-    projectId: contract.projectId,
-    publishedAt: new Date(nowMs).toISOString(),
-    repository: invocation.repository,
-    repositoryId: contract.repositoryId,
-    schemaVersion: 4,
-    terraformRoot: invocation.terraformRoot,
-    tokenDrainSeconds: proof.tokenDrainSeconds,
-    transitionWorkflowSha: invocation.transitionWorkflowSha,
-  };
-  await writeImmutableObject(
+  const receipt: JsonValue = json(
+    {
+      // Names the independently approved plan whose manifest digest this run
+      // consumed.
+      approvedPlanRunId: invocation.approvedPlanRunId,
+      consumerSha: proof.consumerSha,
+      // This is the one terminal owner object. It is reached only after the
+      // whole finally cleanup succeeded, and it carries the exact release proof
+      // from that cleanup. A crash before here leaves no success claim; a crash
+      // after the immutable write leaves a statement that was already true.
+      countable: proof.countable,
+      status: invocation.mode === "rehearsal" ? "rehearsal-complete" : "complete",
+      deElevation: {
+        executorEmail: proof.deElevation.executorEmail,
+        executorUniqueId: proof.deElevation.executorUniqueId,
+        observedAt: proof.deElevation.observedAt,
+        provenAbsent: [...proof.deElevation.provenAbsent],
+      },
+      intentDigest: proof.intentDigest,
+      intentGeneration: proof.intentGeneration,
+      kind: proof.kind,
+      manifestSha256: proof.reviewSha256,
+      executorRelease: {
+        artifactsDeleted: releaseProof.artifactsDeleted,
+        executorEmail: releaseProof.executorEmail,
+        executorUniqueId: releaseProof.executorUniqueId,
+        observedAt: releaseProof.observedAt,
+        permissionsProvenGone: releaseProof.permissionsProvenGone,
+        projectBindingsCleared: releaseProof.projectBindingsCleared,
+        provenBy: releaseProof.provenBy,
+      },
+      observedPools: proof.observedPools.map((pool) => ({ ...pool })),
+      platformSha: proof.platformSha,
+      projectId: contract.projectId,
+      publishedAt: new Date(nowMs).toISOString(),
+      repository: proof.repository,
+      repositoryId: contract.repositoryId,
+      runId: proof.runId,
+      schemaVersion: 1,
+      terraformRoot: proof.root,
+      ...(proof.kind === "apply"
+        ? {
+          quarantinedApplyProofDigest: proof.quarantinedApplyProofDigest,
+          restoredAudit: { ...proof.restoredAudit },
+        }
+        : {}),
+    },
+    "final protected receipt",
+  );
+  const body = `${canonicalJson(receipt)}\n`;
+  const object = receiptObjectName(
+    state,
+    invocation.mode === "rehearsal" ? "rehearsals" : "final",
+    invocation.githubRunId,
+  );
+  // Reconciled like every other immutable write: a terminal rehearsal receipt
+  // whose response was lost must not turn a finished rehearsal into a failure.
+  // The committed generation comes back from the write itself.
+  await writeImmutableObjectIdempotent(
     state.bucket,
-    receiptObjectName(state, "results", invocation.githubRunId),
-    `${canonicalJson(receipt)}\n`,
-    executorToken,
+    object,
+    body,
+    ownerToken,
     fetcher,
   );
+}
+
+// Canonical timestamps are part of every immutable terminal receipt contract.
+function canonicalInstant(value: string, label: string): string {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    throw new Error(`${label} is not a canonical instant.`);
+  }
+  return value;
 }
 
 function planReceipt(value: unknown): PlanReceipt {
@@ -12364,13 +15730,13 @@ async function verifyPlanRun(
   }
 }
 
-async function writeImmutableObject(
+export async function writeImmutableObject(
   bucket: string,
   object: string,
   body: string,
   token: string,
   fetcher: Fetcher,
-): Promise<void> {
+): Promise<string> {
   if (Buffer.byteLength(body) > 32 * 1024) throw new Error("Receipt exceeded its size bound.");
   const url = new URL(`https://storage.googleapis.com/upload/storage/v1/b/${bucket}/o`);
   url.searchParams.set("uploadType", "media");
@@ -12389,9 +15755,101 @@ async function writeImmutableObject(
     throw new Error("The immutable protected receipt was already published or consumed.");
   }
   if (!response.ok) throw new Error(`Receipt upload failed with HTTP ${response.status}.`);
-  await boundedJson(response, 256 * 1024);
-  const observed = await readObject(bucket, object, token, fetcher);
+  // The write must identify itself completely, and the readback must be bound
+  // to the generation it reports. A readback by name alone verifies whatever
+  // happens to be at that key now, which is not the same statement.
+  const created = assertStorageObjectMetadata(
+    await boundedJson(response, 256 * 1024),
+    bucket,
+    object,
+    Buffer.byteLength(body),
+    "immutable object write",
+  );
+  const observed = await readObjectGeneration(bucket, object, created.generation, token, fetcher);
   if (observed !== body) throw new Error("Immutable receipt readback was not byte-equivalent.");
+  return created.generation;
+}
+
+// Exact identity for one storage object: the bucket and key it claims, the size
+// it claims, a well-formed generation, and a metageneration proving nothing has
+// rewritten its metadata since creation.
+function assertStorageObjectMetadata(
+  value: unknown,
+  bucket: string,
+  object: string,
+  expectedSize: number,
+  label: string,
+): { readonly generation: string; readonly metageneration: string } {
+  const metadata = record(value, label);
+  exact(requiredString(metadata.name, `${label} name`), object, `${label} name`);
+  // Required, not optional: a response that declines to say which bucket it
+  // wrote to cannot establish that it wrote to this one.
+  exact(requiredString(metadata.bucket, `${label} bucket`), bucket, `${label} bucket`);
+  const size = Number(requiredString(metadata.size, `${label} size`));
+  if (!Number.isSafeInteger(size) || size !== expectedSize) {
+    throw new Error(`${label} size did not match the bytes written.`);
+  }
+  const generation = requiredString(metadata.generation, `${label} generation`);
+  if (!/^[1-9][0-9]*$/.test(generation)) throw new Error(`${label} generation is malformed.`);
+  const metageneration = requiredString(metadata.metageneration, `${label} metageneration`);
+  exact(metageneration, "1", `${label} metageneration`);
+  return { generation, metageneration };
+}
+
+// Exact metadata for one object, without reading its bytes.
+async function readObjectMetadata(
+  bucket: string,
+  object: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<{ readonly generation: string; readonly metageneration: string; readonly size: number }> {
+  // Exact key, exact bucket, a positive generation, an unrewritten
+  // metageneration, and a size inside the reviewed bound. Anything looser and
+  // the reconciliation below is validating an object nobody named.
+  const url = new URL(
+    `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(object)}`,
+  );
+  url.searchParams.set("fields", "name,bucket,size,generation,metageneration");
+  const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+  if (!response.ok) {
+    throw new Error(`Object metadata read failed with HTTP ${response.status}.`);
+  }
+  const metadata = record(await boundedJson(response, 256 * 1024), "object metadata");
+  exact(requiredString(metadata.name, "object metadata name"), object, "object metadata name");
+  exact(requiredString(metadata.bucket, "object metadata bucket"), bucket, "object metadata bucket");
+  const generation = requiredString(metadata.generation, "object metadata generation");
+  if (!/^[1-9][0-9]*$/.test(generation)) {
+    throw new Error("Object metadata generation is malformed.");
+  }
+  const metageneration = requiredString(metadata.metageneration, "object metadata metageneration");
+  exact(metageneration, "1", "object metadata metageneration");
+  const size = Number(requiredString(metadata.size, "object metadata size"));
+  if (!Number.isSafeInteger(size) || size < 1 || size > 32 * 1024) {
+    throw new Error("Object metadata size escaped its bound.");
+  }
+  return { generation, metageneration, size };
+}
+
+// Reads exactly the bytes a listing named. Without the generation an object can
+// be replaced between the listing and the read, and every check below would
+// then be validating something other than what was discovered.
+async function readObjectGeneration(
+  bucket: string,
+  object: string,
+  generation: string,
+  token: string,
+  fetcher: Fetcher,
+): Promise<string> {
+  const url = new URL(
+    `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(object)}`,
+  );
+  url.searchParams.set("alt", "media");
+  url.searchParams.set("generation", generation);
+  const response = await fetcher(url, { headers: executorHeaders(token), redirect: "error" });
+  if (!response.ok) {
+    throw new Error(`Generation-bound read failed with HTTP ${response.status}.`);
+  }
+  return await boundedText(response, 32 * 1024);
 }
 
 async function readObject(
@@ -12414,7 +15872,13 @@ async function readObject(
 
 function receiptObjectName(
   state: { readonly prefix: string },
-  kind: "adoptions" | "consumed" | "plans" | "results",
+  kind:
+    | "adoptions"
+    | "consumed"
+    | "final"
+    | "plans"
+    | "rehearsals"
+    | "results",
   runId: string,
 ): string {
   numeric(runId, "receipt run ID");
@@ -13095,7 +16559,12 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
       const forgetOnly = root === "prod" && PROD_FORGET_ONLY_ADDRESSES.some((pattern) =>
         pattern.test(address)
       );
-      const moduleAddress = requiredString(change.module_address, `${label} module address`);
+      const moduleAddress = change.module_address === undefined
+        ? null
+        : requiredString(change.module_address, `${label} module address`);
+      const reviewedProdRootType = root === "prod" && identity.repository === "healthmcp"
+        ? HEALTHMCP_PROD_ROOT_RESOURCES.get(address)
+        : undefined;
       if (root === "exposure") {
         const expected = exposureAddresses.get(address);
         if (
@@ -13109,6 +16578,16 @@ function normalizeChanges(value: unknown, identity: PlanIdentity, label: string)
         }
         if (label === "resource drift") {
           throw new Error("Exposure Terraform reported remote drift; state-only adoption is blocked.");
+        }
+      } else if (reviewedProdRootType !== undefined) {
+        if (
+          moduleAddress !== null ||
+          mode !== "managed" ||
+          type !== reviewedProdRootType
+        ) {
+          throw new Error(
+            `Terraform ${label} ${address} escaped the exact HealthMCP prod root resource map.`,
+          );
         }
       } else if (moduleAddress !== modulePrefix.slice(0, -1)) {
         throw new Error(`Terraform ${label} escaped the exact root module.`);
@@ -13818,10 +17297,22 @@ function rootName(value: string): TerraformRoot {
 }
 
 function executionMode(value: string): ExecutionMode {
-  if (value !== "plan" && value !== "apply") {
+  if (value !== "plan" && value !== "apply" && value !== "rehearsal") {
     throw new Error("Execution mode escaped the closed allowlist.");
   }
   return value;
+}
+
+// Only a run that is about to start is gated. Parsing the mode recorded in an
+// already-published receipt must keep working, or stage one would be unable to
+// read the history stage two depends on.
+function assertModeIsPermitted(mode: ExecutionMode, productionApplyEnabled: boolean): void {
+  if (mode === "apply" && !productionApplyEnabled) {
+    // Fail closed by construction, not by configuration.
+    throw new Error(
+      "Production protected apply is disabled in this build: the federation-quarantine rollout enables it only after the rehearsal canary and recovery drills succeed.",
+    );
+  }
 }
 
 function booleanString(value: string, label: string): boolean {

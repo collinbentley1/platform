@@ -21,11 +21,12 @@ on:
           - prod
           - exposure
       mode:
-        description: Plan emits a digest; exposure plan is terminal adoption, while apply is bootstrap/prod only.
+        description: Plan emits a digest; rehearsal exercises the federation quarantine only; apply is disabled in this build.
         required: true
         type: choice
         options:
           - plan
+          - rehearsal
           - apply
       consumer_sha:
         description: Full reviewed consumer commit SHA to fetch without a branch or tag.
@@ -60,7 +61,13 @@ on:
 permissions: {}
 
 concurrency:
-  group: protected-owner-terraform-${{ inputs.target_repository }}
+  # One group for the whole fleet, not one per target. The protected apply now
+  # quarantines every consumer workload identity pool for the duration of its
+  # window, so two runs against different targets would capture and restore each
+  # other's pool state -- the second run would record "already disabled" and the
+  # first would re-enable federation while the second still held privilege.
+  # Serialising every protected run removes that interleaving outright.
+  group: protected-owner-terraform-federation
   cancel-in-progress: false
 
 jobs:
@@ -68,7 +75,7 @@ jobs:
     name: ${{ inputs.target_repository }} ${{ inputs.terraform_root }} ${{ inputs.mode }}
     if: ${{ always() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 41
+    timeout-minutes: 42
     environment: protected-bootstrap-owner-token
     permissions:
       actions: read
@@ -169,6 +176,12 @@ jobs:
             *) exit 1 ;;
           esac
           case "$TERRAFORM_ROOT" in bootstrap|prod|exposure) ;; *) exit 1 ;; esac
+          # A rehearsal runs no Terraform and adopts nothing, so it has no
+          # exposure route and no adoption identity of any kind.
+          if [ "$EXECUTION_MODE" = "rehearsal" ]; then
+            test "$TERRAFORM_ROOT" != "exposure"
+            test -z "$EXPOSURE_ADOPTION_RUN_ID"
+          fi
           if [ "$TERRAFORM_ROOT" = "exposure" ]; then
             test "$TARGET_REPOSITORY" = "runsetta"
             test "$EXECUTION_MODE" = "plan"
@@ -176,12 +189,13 @@ jobs:
           else
             test -z "$EXPOSURE_ADOPTION_CONFIRMATION"
           fi
-          if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ]; then
+          if [ "$TARGET_REPOSITORY" = "runsetta" ] && [ "$TERRAFORM_ROOT" = "prod" ] \
+            && [ "$EXECUTION_MODE" != "rehearsal" ]; then
             [[ "$EXPOSURE_ADOPTION_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           else
             test -z "$EXPOSURE_ADOPTION_RUN_ID"
           fi
-          case "$EXECUTION_MODE" in plan|apply) ;; *) exit 1 ;; esac
+          case "$EXECUTION_MODE" in plan|apply|rehearsal) ;; *) exit 1 ;; esac
           [[ "$CONSUMER_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_SHA_EXACT" =~ ^[0-9a-f]{40}$ ]]
           case "$LEGACY_COMPATIBILITY_MODE" in true|false) ;; *) exit 1 ;; esac
@@ -196,12 +210,14 @@ jobs:
           elif [ "$LEGACY_COMPATIBILITY_MODE" = "true" ]; then
             test -z "$TRANSITION_WORKFLOW_SHA"
           fi
-          if [ "$EXECUTION_MODE" = "plan" ]; then
-            test -z "$APPROVED_MANIFEST_SHA256"
-            test -z "$APPROVED_PLAN_RUN_ID"
-          else
+          if [ "$EXECUTION_MODE" = "apply" ]; then
             [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
             [[ "$APPROVED_PLAN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          else
+            # Plan AND rehearsal. Treating every non-plan mode as an apply here
+            # would demand approval fields a rehearsal can never have.
+            test -z "$APPROVED_MANIFEST_SHA256"
+            test -z "$APPROVED_PLAN_RUN_ID"
           fi
 
       - name: Fetch the exact public platform, consumer, and transition commits
@@ -420,9 +436,11 @@ jobs:
           [[ "$current_epoch" =~ ^[1-9][0-9]*$ ]]
           elapsed_seconds=$((current_epoch - job_start_epoch))
           test "$elapsed_seconds" -ge 0
-          # Plan keeps its complete sixteen-minute same-job recovery tail.
-          # Apply keeps two minutes for opportunistic same-job containment and
-          # relies on the independently authenticated eighteen-minute fresh
+          # Plan and rehearsal keep a complete seventeen-minute same-job recovery
+          # tail: one minute of Docker cleanup, a fifteen-minute recovery
+          # step, and one transition minute. Apply is capped at thirty-nine
+          # minutes, keeps a two-minute bounded cleanup/transition tail, and
+          # relies on the independently authenticated seventeen-minute fresh
           # recovery job after a late failure.
           #
           # The apply budget shortens by one second per second of setup, and
@@ -433,8 +451,10 @@ jobs:
           # this check and failed twelve minutes later having already acquired
           # and elevated an executor. Setup measures 6 to 9 seconds here.
           case "$EXECUTION_MODE" in
-            plan)
-              bridge_reserve_seconds=$((16 * 60))
+            # A rehearsal runs the federation lifecycle and no Terraform, so it
+            # takes the plan envelope rather than the apply one.
+            plan|rehearsal)
+              bridge_reserve_seconds=$((17 * 60))
               bridge_minimum_seconds=$((7 * 60))
               bridge_maximum_seconds=$((25 * 60))
               ;;
@@ -445,7 +465,11 @@ jobs:
               ;;
             *) exit 1 ;;
           esac
-          bridge_budget_seconds=$((41 * 60 - elapsed_seconds - bridge_reserve_seconds))
+          available_bridge_seconds=$((42 * 60 - elapsed_seconds - bridge_reserve_seconds))
+          bridge_budget_seconds="$available_bridge_seconds"
+          if [ "$bridge_budget_seconds" -gt "$bridge_maximum_seconds" ]; then
+            bridge_budget_seconds="$bridge_maximum_seconds"
+          fi
           test "$bridge_budget_seconds" -ge "$bridge_minimum_seconds"
           test "$bridge_budget_seconds" -le "$bridge_maximum_seconds"
           shopt -s lastpipe
@@ -675,8 +699,8 @@ jobs:
           test "$cleanup_failed" = "0"
 
       - name: Recover exact IAM artifacts after bridge failure
-        if: ${{ always() && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}
-        timeout-minutes: 14
+        if: ${{ always() && inputs.mode != 'apply' && (steps.protected-bridge.outcome == 'failure' || steps.protected-bridge.outcome == 'cancelled') }}
+        timeout-minutes: 15
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
@@ -710,7 +734,7 @@ jobs:
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \
             /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \
@@ -738,17 +762,18 @@ jobs:
     needs: owner-terraform
     if: ${{ always() && needs.owner-terraform.result != 'success' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 17
     environment: protected-bootstrap-owner-token
     permissions: {}
 
     steps:
-      - name: Reject every recovery route except the failed owner dispatch
-        id: recovery-route
+      - name: Prepare the exact fail-closed recovery runtime
+        id: recovery-runtime
         if: ${{ always() }}
         timeout-minutes: 1
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
           GITHUB_EVENT_NAME_EXACT: ${{ github.event_name }}
           GITHUB_REF_EXACT: ${{ github.ref }}
@@ -759,9 +784,11 @@ jobs:
           GITHUB_SHA_EXACT: ${{ github.sha }}
           GITHUB_WORKFLOW_REF_EXACT: ${{ github.workflow_ref }}
           OWNER_TERRAFORM_RESULT: ${{ needs.owner-terraform.result }}
+          PLATFORM_SHA: ${{ github.sha }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
         run: |
           set -euo pipefail
+          umask 077
           test "$GITHUB_EVENT_NAME_EXACT" = "workflow_dispatch"
           test "$GITHUB_REF_EXACT" = "refs/heads/main"
           test "$GITHUB_REPOSITORY_EXACT" = "collinbentley1/platform"
@@ -780,61 +807,56 @@ jobs:
             failure|cancelled|skipped) ;;
             *) exit 1 ;;
           esac
-
-      - name: Fetch the exact public platform commit for recovery
-        id: recovery-source
-        if: ${{ always() && steps.recovery-route.outcome == 'success' }}
-        timeout-minutes: 1
-        shell: /bin/bash --noprofile --norc -euo pipefail {0}
-        env:
-          PLATFORM_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
           [[ "$PLATFORM_SHA" =~ ^[0-9a-f]{40}$ ]]
           platform_root="$RUNNER_TEMP/platform"
-          test ! -e "$platform_root" && test ! -L "$platform_root"
-          mkdir -m 0700 "$platform_root"
-          git_command=(/usr/bin/env -i HOME="$RUNNER_TEMP" PATH=/usr/bin:/bin
-            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
-            /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null
-            -c core.fsmonitor=false -c diff.external= -c protocol.file.allow=never
-            -c protocol.version=2)
-          "${git_command[@]}" -C "$platform_root" init --quiet
-          "${git_command[@]}" -C "$platform_root" remote add origin \
-            https://github.com/collinbentley1/platform.git
-          /usr/bin/timeout --signal=TERM --kill-after=5s 30s \
-            "${git_command[@]}" -C "$platform_root" fetch --quiet --depth=1 --no-tags \
-              origin "$PLATFORM_SHA"
-          test "$("${git_command[@]}" -C "$platform_root" rev-parse FETCH_HEAD)" = \
-            "$PLATFORM_SHA"
-          "${git_command[@]}" -C "$platform_root" checkout --quiet --detach "$PLATFORM_SHA"
-          test "$("${git_command[@]}" -C "$platform_root" rev-parse HEAD)" = \
-            "$PLATFORM_SHA"
-          test -z "$("${git_command[@]}" -C "$platform_root" status \
-            --porcelain=v1 --untracked-files=all)"
-
-      - name: Install checksum-pinned Bun 1.4.0 for recovery
-        id: recovery-bun
-        if: ${{ always() && steps.recovery-source.outcome == 'success' }}
-        timeout-minutes: 1
-        shell: /bin/bash --noprofile --norc -euo pipefail {0}
-        env:
-          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
-        run: |
-          set -euo pipefail
           archive="$RUNNER_TEMP/bun.zip"
           destination="$RUNNER_TEMP/bun-bin"
-          curl --connect-timeout 10 --max-time 30 --fail --show-error --silent --location \
-            --output "$archive" \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
-          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
-          mkdir -m 0700 "$destination"
-          unzip -q "$archive" -d "$destination"
-          test "$("$destination/bun-linux-x64/bun" --revision | cut -d+ -f1)" = "1.4.0"
+          test ! -e "$platform_root" && test ! -L "$platform_root"
+          test ! -e "$archive" && test ! -L "$archive"
+          test ! -e "$destination" && test ! -L "$destination"
+
+          (
+            mkdir -m 0700 "$platform_root"
+            git_command=(/usr/bin/env -i HOME="$RUNNER_TEMP" PATH=/usr/bin:/bin
+              GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null
+              -c core.fsmonitor=false -c diff.external= -c protocol.file.allow=never
+              -c protocol.version=2)
+            "${git_command[@]}" -C "$platform_root" init --quiet
+            "${git_command[@]}" -C "$platform_root" remote add origin \
+              https://github.com/collinbentley1/platform.git
+            /usr/bin/timeout --signal=TERM --kill-after=5s 30s \
+              "${git_command[@]}" -C "$platform_root" fetch --quiet --depth=1 --no-tags \
+                origin "$PLATFORM_SHA"
+            test "$("${git_command[@]}" -C "$platform_root" rev-parse FETCH_HEAD)" = \
+              "$PLATFORM_SHA"
+            "${git_command[@]}" -C "$platform_root" checkout --quiet --detach "$PLATFORM_SHA"
+            test "$("${git_command[@]}" -C "$platform_root" rev-parse HEAD)" = \
+              "$PLATFORM_SHA"
+            test -z "$("${git_command[@]}" -C "$platform_root" status \
+              --porcelain=v1 --untracked-files=all)"
+          ) &
+          source_pid=$!
+
+          (
+            curl --connect-timeout 10 --max-time 30 --fail --show-error --silent --location \
+              --output "$archive" \
+              https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+            echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+            mkdir -m 0700 "$destination"
+            unzip -q "$archive" -d "$destination"
+            test "$("$destination/bun-linux-x64/bun" --revision | cut -d+ -f1)" = "1.4.0"
+          ) &
+          bun_pid=$!
+
+          setup_failed=0
+          wait "$source_pid" || setup_failed=1
+          wait "$bun_pid" || setup_failed=1
+          test "$setup_failed" = "0"
 
       - name: Recover exact IAM artifacts on a fresh runner
-        if: ${{ always() && steps.recovery-bun.outcome == 'success' }}
-        timeout-minutes: 14
+        if: ${{ always() && steps.recovery-runtime.outcome == 'success' }}
+        timeout-minutes: 15
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
@@ -868,7 +890,7 @@ jobs:
             owner_token=
             unset owner_token
           } | \
-          exec /usr/bin/timeout --signal=TERM --kill-after=15s 795s \
+          exec /usr/bin/timeout --signal=TERM --kill-after=15s 855s \
             /usr/bin/env -i \
             GITHUB_ACTOR_ID_EXACT="$GITHUB_ACTOR_ID_EXACT" \
             GITHUB_EVENT_NAME_EXACT="$GITHUB_EVENT_NAME_EXACT" \

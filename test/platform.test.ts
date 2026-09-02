@@ -62,8 +62,13 @@ describe("platform scaffold and doctor", () => {
     }
 
     expect(runnerJobs.length).toBeGreaterThan(0);
-    expect(protectedOwnerTimeout).toBe(41);
-    expect(protectedRecoveryTimeout).toBe(18);
+    // These mirror JOB_TIMEOUT_MINUTES and the recovery job budget in
+    // tools/ci/protected-bootstrap-bridge.ts, which is the source of truth --
+    // the bridge computes the envelope and the workflow is written from it.
+    // They are asserted here as well so a change to the envelope has to be made
+    // deliberately in both places rather than drifting silently.
+    expect(protectedOwnerTimeout).toBe(42);
+    expect(protectedRecoveryTimeout).toBe(17);
     expect(protectedRecoveryTimeout).toBeLessThanOrEqual(35);
   });
 
@@ -525,6 +530,35 @@ describe("platform scaffold and doctor", () => {
       expect(result.stderr).toContain(
         "runtime_secret_version_adder_ids must match the reviewed repository-specific set and subset validation",
       );
+    }
+  });
+
+  test("doctor binds the Medlock reCAPTCHA site key to the reviewed resource", async () => {
+    const env = { TRUSTED_GITHUB_REPOSITORY_ID: "1025243085" };
+    for (const replacement of [
+      '"copied-public-site-key"',
+      "google_recaptcha_enterprise_key.attacker.name",
+    ]) {
+      const app = await scaffold("medlock");
+      await configureReviewedMedlock(app);
+      const path = join(app, "infra/terraform/prod/main.tf");
+      await writeFile(
+        path,
+        (await readFile(path, "utf8")).replace(
+          "RECAPTCHA_SITE_KEY             = google_recaptcha_enterprise_key.waitlist.name",
+          `RECAPTCHA_SITE_KEY             = ${replacement}`,
+        ),
+      );
+
+      for (const result of [
+        await run(["doctor", app], env),
+        await runContract(app, "1025243085"),
+      ]) {
+        expect(result.exitCode).not.toBe(0);
+        expect(result.stderr).toContain(
+          "infra/terraform/prod/main.tf module site must exactly match the reviewed repository-specific platform contract",
+        );
+      }
     }
   });
 
@@ -2831,7 +2865,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "defddc6143cd084cdf025ecafb8d7e8eb412ecf2d5e64500a50ff2d39a789270",
+      "912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2864,7 +2898,9 @@ describe("platform scaffold and doctor", () => {
       [
         "google_project_iam_binding.editor_absent",
         "google_project_iam_member.preview_iam_auditors",
+        "google_project_iam_member.prod_deploy_waitlist_recaptcha_key_reader",
         "google_project_iam_member.runtime_project_roles",
+        "google_project_iam_member.runtime_waitlist_challenge_sender",
         "google_project_iam_member.terraform_convergence_reader",
         "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
         "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
@@ -3563,6 +3599,20 @@ describe("platform scaffold and doctor", () => {
     expect(preview).toContain('WAITLIST_BACKEND: "memory"');
     expect(production).toContain('WAITLIST_BACKEND: "firestore"');
     expect(production).toContain('FIRESTORE_PROJECT_ID: "medlock-1025243085"');
+    expect(production).toContain('MEDLOCK_OWNERSHIP_REQUIRED: "false"');
+    expect(production).toContain(
+      "The staged Medlock deploy may not clear an existing ownership boundary.",
+    );
+    expect(production).toContain('gcloud recaptcha keys describe "$recaptcha_site_key"');
+    expect(production).toContain('IDENTITY_PLATFORM_AUDIENCE: "medlock-1025243085"');
+    expect(production).toContain(
+      'IDENTITY_PLATFORM_CONTINUE_URL: "https://medlock.ai/api/waitlist/confirm"',
+    );
+    expect(production).toContain('RECAPTCHA_PROJECT_ID: "medlock-1025243085"');
+    expect(production).toContain("RECAPTCHA_SITE_KEY: $recaptcha_site_key");
+    expect(production).toContain(
+      "The served Medlock revision did not preserve the verified ownership configuration.",
+    );
     expect(production).toContain('PLATFORM_DEPLOY_ENVIRONMENT: "production"');
     expect(production).toContain("--clear-secrets");
     expect(production).not.toContain("GCP_PROD_ENV_VARS");
@@ -3629,6 +3679,27 @@ describe("platform scaffold and doctor", () => {
     expect(medlockProduction).toContain(
       'runtime_secret_version_adder_ids = [\n        "waitlist-identity-keyset",\n      ]',
     );
+    expect(deployment).toContain(
+      "container_env                                  = merge(local.deployment.container_env, local.medlock_ownership_env)",
+    );
+    expect(deployment).toContain(
+      'medlock_ownership_enabled = var.repository_id == "1025243085"',
+    );
+    expect(deployment).toContain(
+      "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].name)",
+    );
+    expect(deployment).not.toContain(
+      "RECAPTCHA_SITE_KEY = one(google_recaptcha_enterprise_key.waitlist[*].id)",
+    );
+    for (const header of [
+      'resource "google_firestore_field" "waitlist_entry_ttl"',
+      'resource "google_firestore_field" "waitlist_quota_ttl"',
+      'resource "google_identity_platform_config" "default"',
+      'resource "google_recaptcha_enterprise_key" "waitlist"',
+    ]) {
+      expect(deployment).toContain(header);
+    }
+    expect(deployment).not.toContain('resource "google_project_service"');
     const medlockBootstrap = bootstrapDeployment.slice(
       bootstrapDeployment.indexOf('    "1025243085" = {'),
       bootstrapDeployment.indexOf('    "280932482" = {'),
@@ -3647,10 +3718,13 @@ describe("platform scaffold and doctor", () => {
       mirrorContract.indexOf('  "280932482": {'),
       mirrorContract.indexOf("\n};", mirrorContract.indexOf('  "280932482": {')),
     );
+    // Required API ownership remains entirely in bootstrap state. The consumer
+    // mirror names the same service set as a contract, but never declares a
+    // second google_project_service owner in production state.
     const serviceSet = (source: string) =>
-      [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)]
-        .map((match) => match[1]!)
-        .toSorted();
+      [...new Set(
+        [...source.matchAll(/"([a-z]+(?:[a-z0-9-]*\.)*googleapis\.com)"/g)].map((match) => match[1]!),
+      )].toSorted();
     expect(serviceSet(medlockMirror)).toEqual(serviceSet(medlockBootstrap));
     expect(serviceSet(criticalMirror)).toEqual(serviceSet(criticalBootstrap));
     expect(criticalMirror).toContain('"certificatemanager.googleapis.com"');
@@ -3703,6 +3777,67 @@ async function setPlatformIdentity(
   await writeFile(path, JSON.stringify(config, null, 2) + "\n");
 }
 
+// Byte-identical to additionalProductionResources in the reviewed Terraform
+// mirror contract. Comment-free, because the contract compares parsed documents
+// and those strip comments.
+const MEDLOCK_REVIEWED_RESOURCES = `resource "google_firestore_field" "waitlist_entry_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_firestore_field" "waitlist_quota_ttl" {
+  project    = var.project_id
+  database   = "(default)"
+  collection = "waitlist_quota"
+  field      = "expiresAt"
+
+  ttl_config {}
+
+  index_config {}
+
+  depends_on = [module.site]
+}
+
+resource "google_identity_platform_config" "default" {
+  project = var.project_id
+
+  sign_in {
+    allow_duplicate_emails = false
+
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+
+  authorized_domains = [
+    "medlock.ai",
+    "www.medlock.ai",
+  ]
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  project      = var.project_id
+  display_name = "Medlock waitlist ownership"
+
+  deletion_policy = "PREVENT"
+
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+}`;
+
 async function configureReviewedMedlock(app: string): Promise<void> {
   await setPlatformIdentity(app, {
     githubRepositoryId: "1025243085",
@@ -3725,7 +3860,11 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    CANONICAL_HOST   = "medlock.ai"',
         '    LEGACY_HOSTS     = "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app"',
         '    MEDLOCK_VERSION  = "0.2.0"',
-        '    WAITLIST_BACKEND = "firestore"',
+        '    WAITLIST_BACKEND               = "firestore"',
+        '    IDENTITY_PLATFORM_AUDIENCE     = "medlock-1025243085"',
+        '    IDENTITY_PLATFORM_CONTINUE_URL = "https://medlock.ai/api/waitlist/confirm"',
+        '    RECAPTCHA_PROJECT_ID           = "medlock-1025243085"',
+        "    RECAPTCHA_SITE_KEY             = google_recaptcha_enterprise_key.waitlist.name",
         "  }",
       ].join("\n"),
     )
@@ -3741,6 +3880,9 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         "  }",
       ].join("\n"),
     );
+  // The reviewed contract now pins additional project resources alongside the
+  // module, so the fixture has to carry them too or `doctor` correctly refuses.
+  productionMain = `${productionMain.trimEnd()}\n\n${MEDLOCK_REVIEWED_RESOURCES}\n`;
   await writeFile(productionMainPath, productionMain);
 
   const productionVariablesPath = join(app, "infra/terraform/prod/variables.tf");
@@ -3782,6 +3924,8 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         '    "firestore.googleapis.com",',
         '    "iam.googleapis.com",',
         '    "iamcredentials.googleapis.com",',
+        '    "identitytoolkit.googleapis.com",',
+        '    "recaptchaenterprise.googleapis.com",',
         '    "run.googleapis.com",',
         '    "secretmanager.googleapis.com",',
         '    "serviceusage.googleapis.com",',
