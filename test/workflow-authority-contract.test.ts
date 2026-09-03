@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
   type WorkflowCapabilities,
   classifyWorkflowAuthority,
+  conditionStructure,
   declaredWorkflowAuthority,
   terraformUniverse,
   trustedWorkflowsFromTerraform,
@@ -136,6 +137,39 @@ describe("the live inventory agrees with the declaration", () => {
       "terraform/modules/bootstrap/main.tf: google_iam_workload_identity_pool_provider.github",
     ]);
     expect([...trust.workflows].sort()).toEqual([...declaredWorkflowAuthority.cloudAuthority].sort());
+  });
+
+  // The structural gate passes the live condition for reasons that can be
+  // checked here: each rendering is a conjunction whose guard -- the owner
+  // and repository IDs, the presence checks, the run attempt, the runner, the
+  // SHA disjunction -- binds nothing on its own, and whose last conjunct is a
+  // disjunction bounded by whole-operand trust forms naming exactly the
+  // cloud-authority workflows.
+  test("the live condition renders as two conjunctions, each bounded by its workflow disjunction", async () => {
+    const trust = trustedWorkflowsFromTerraform((await liveSources()).terraform);
+    expect(trust.kind).toBe("trusted");
+    if (trust.kind !== "trusted") return;
+    expect(trust.conditions.map((condition) => condition.choices)).toEqual([
+      ["var.legacy_compatibility_mode is true"],
+      ["var.legacy_compatibility_mode is false"],
+    ]);
+    const guard =
+      "assertion.repository_owner_id == 'var.github_owner_id' && assertion.repository_id == 'var.github_repository_id' && " +
+      "has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && has(assertion.run_attempt) && " +
+      "assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted' && (assertion.job_workflow_sha == 'sha')";
+    expect(conditionStructure(guard).kind).toBe("unbounded");
+    for (const condition of trust.conditions) {
+      expect(condition.text.startsWith(`${guard} && (`)).toBe(true);
+      expect(condition.text.endsWith(")")).toBe(true);
+      const disjunction = condition.text.slice(guard.length + " && (".length, -1);
+      const structure = conditionStructure(disjunction);
+      expect(structure.kind).toBe("bounded");
+      if (structure.kind !== "bounded") return;
+      expect([...structure.names].sort()).toEqual([...declaredWorkflowAuthority.cloudAuthority].sort());
+    }
+    const [legacy, exact] = trust.conditions;
+    expect(legacy?.text).toContain(".startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@')");
+    expect(exact?.text).not.toContain("startsWith");
   });
 
   test("each declared set matches the independent flags of its members", async () => {
@@ -579,10 +613,11 @@ describe("Terraform trust is read from provider conditions only", () => {
     expect(trusted(singleFile(source))).toEqual(["c.yml"]);
   });
 
+  // `local.decoy` inside a CEL string is prose Terraform never evaluates.
   test("a decoy inside an unrelated local is not followed", () => {
     const source =
       `locals {\n  real  = "${trustLine("c.yml")}"\n  decoy = "${trustLine("deploy-prod.yml")}"\n}\n` +
-      provider(`"${"${local.real}"}" == "local.decoy"`);
+      provider(`"${"${local.real}"} && assertion.ref == 'local.decoy'"`);
     expect(trusted(singleFile(source))).toEqual(["c.yml"]);
   });
 
@@ -792,9 +827,22 @@ describe("the effective condition must be read in full", () => {
     const source =
       pinnedVariables +
       `locals {\n  a = "${trustLine("c.yml")}"\n  b = "${trustLine("d.yml")}"\n  chosen = var.flag ? local.a : local.b\n` +
-      `  counted = length(var.shas) == 0 ? "false" : local.chosen\n}\n` +
+      `  counted = length(var.shas) == 0 ? local.a : local.chosen\n}\n` +
       provider("local.counted");
     expect(trusted(singleFile(source))).toEqual(["c.yml", "d.yml"]);
+  });
+
+  // The live module chooses `"false"` when a transition set is empty. Wired
+  // into the provider, that branch is a bare literal and is refused, and the
+  // message names the choice that led to it.
+  test("a conditional branch that is a boolean literal is refused, and the choice is named", () => {
+    const source =
+      pinnedVariables +
+      `locals {\n  a = "${trustLine("c.yml")}"\n  counted = length(var.shas) == 0 ? "false" : local.a\n}\n` +
+      provider("local.counted");
+    expect(trustFailures(singleFile(source))).toContain(
+      "when length(var.shas) == 0 is true, the condition uses the boolean literal false as an operand",
+    );
   });
 
   test.each([
@@ -847,6 +895,151 @@ describe("the effective condition must be read in full", () => {
     expect(
       trustFailures(singleFile(conditionOf(`locals {\n  list = []\n  shas = join(" || ", [for sha in local.list : ${shaLiteral}])\n}\n`))),
     ).toContain('iterates over "local.list", which is not one variable inside list-shaping calls');
+  });
+});
+
+describe("the effective condition is bounded by its boolean structure", () => {
+  const hole = (body: string) => "${" + body + "}";
+  const exact = trustLine("deploy-prod.yml");
+  const widened = (clause: string) => trustFailures(singleFile(provider(`"${exact} || ${clause}"`)));
+
+  // The demonstrated fail-open: a clause that mentions nothing the fragment
+  // scan refuses, joined with || to a reviewed clause, admits every token the
+  // issuer signs, and the lint used to exit 0 for it.
+  test.each([
+    ["true", "true"],
+    ["false", "false"],
+    ["another claim", "assertion.repository == 'x'"],
+    ["a tautology", "(1 == 1)"],
+    ["a presence check", "has(assertion.job_workflow_ref)"],
+    ["a negation", "!has(assertion.environment)"],
+  ])("|| %s beside a reviewed clause is refused", (_label, clause) => {
+    expect(widened(clause)).toContain(
+      `admits a token from any workflow through the || operand ${JSON.stringify(clause.replace(/^\((.*)\)$/, "$1"))}`,
+    );
+  });
+
+  test.each(["true", "false"])("the literal %s is refused wherever it stands", (literal) => {
+    expect(widened(literal)).toContain(`uses the boolean literal ${literal} as an operand`);
+    // Beside a conjunct that binds, the disjunction admits nothing extra,
+    // and the literal is refused all the same.
+    expect(trustFailures(singleFile(provider(`"${exact} && (${trustLine("c.yml")} || ${literal})"`)))).toContain(
+      `uses the boolean literal ${literal} as an operand`,
+    );
+    expect(trustFailures(singleFile(provider(`"${exact} && assertion.ref == 'x' == ${literal}"`)))).toContain(
+      `uses the boolean literal ${literal} inside the operand`,
+    );
+  });
+
+  test("a || true nested inside parentheses is refused where no conjunct beside it binds", () => {
+    expect(trustFailures(singleFile(provider(`"has(assertion.job_workflow_ref) && (${exact} || true)"`)))).toContain(
+      'admits a token from any workflow through the || operand "true"',
+    );
+  });
+
+  // CEL reads `T == false` as `(T) == false`: the reviewed clause, negated,
+  // with every token it names satisfying the fragment scan.
+  test("a trust form inside a larger comparison is a negation in disguise", () => {
+    expect(trustFailures(singleFile(provider(`"${exact} == false"`)))).toContain(
+      "is not a recognised trust form read as a whole operand",
+    );
+  });
+
+  test("a name mentioned only inside a larger operand is not a trust, even beside a conjunct that binds", () => {
+    const out = trustFailures(singleFile(provider(`"${exact} && (${trustLine("c.yml")}) == has(assertion.environment)"`)));
+    expect(out).toContain("compares job_workflow_ref to c.yml only inside a larger operand");
+  });
+
+  test("a disjunction of whole trust forms is bounded", () => {
+    expect(trusted(singleFile(provider(`"${exact} || ${trustLine("c.yml")} || ${legacyTrustLine("d.yml")}"`)))).toEqual([
+      "c.yml",
+      "d.yml",
+      "deploy-prod.yml",
+    ]);
+  });
+
+  test("each || operand may be a conjunction that opens with a trust form", () => {
+    const source = provider(
+      `"(${exact} && assertion.event_name == 'push') || (${trustLine("c.yml")} && (assertion.ref == 'a' || assertion.ref == 'b'))"`,
+    );
+    expect(trusted(singleFile(source))).toEqual(["c.yml", "deploy-prod.yml"]);
+  });
+
+  // The live SHA disjunction names no workflow. It is admitted because it is
+  // a conjunct, and refused the moment it becomes an alternative.
+  test("a disjunction naming no workflow is admitted as a conjunct and refused as an alternative", () => {
+    const shas = "(assertion.job_workflow_sha == 'a' || assertion.job_workflow_sha == 'b')";
+    expect(trusted(singleFile(provider(`"${shas} && ${exact}"`)))).toEqual(["deploy-prod.yml"]);
+    expect(trustFailures(singleFile(provider(`"${shas} || ${exact}"`)))).toContain(
+      `admits a token from any workflow through the || operand "assertion.job_workflow_sha == 'a' || assertion.job_workflow_sha == 'b'"`,
+    );
+  });
+
+  test("a negation is admitted as a conjunct", () => {
+    const source = provider(`"${exact} && !has(assertion.environment) && (!has(assertion.ref) || assertion.ref == 'x')"`);
+    expect(trusted(singleFile(source))).toEqual(["deploy-prod.yml"]);
+  });
+
+  test("a conditional binds only when both branches do", () => {
+    const chosen = (otherwise: string) => provider(`"assertion.event_name == 'push' ? ${exact} : ${otherwise}"`);
+    expect(trusted(singleFile(chosen(trustLine("c.yml"))))).toEqual(["c.yml", "deploy-prod.yml"]);
+    expect(trustFailures(singleFile(chosen("has(assertion.job_workflow_ref)")))).toContain(
+      'admits a token from any workflow through the conditional branch "has(assertion.job_workflow_ref)"',
+    );
+  });
+
+  test("the structure names the workflows of its whole-operand trust forms", () => {
+    const out = conditionStructure(
+      `has(assertion.job_workflow_ref) && ((${exact} && assertion.ref == 'x') || ${legacyTrustLine("c.yml")})`,
+    );
+    expect(out.kind).toBe("bounded");
+    if (out.kind !== "bounded") return;
+    expect([...out.names].sort()).toEqual(["c.yml", "deploy-prod.yml"]);
+  });
+
+  // A CEL comment hides the rest of the line from CEL but not from a split
+  // on operators: `T || x // && T2` is `T || x` to CEL. Every lexical form the
+  // reader does not follow refuses the condition rather than being split.
+  test.each([
+    ["a CEL comment", `${exact} || assertion.repository == 'x' // && ${trustLine("c.yml")}`, "hides the rest of the line from CEL"],
+    ["a prefixed string literal", `${exact} && assertion.ref == r'x'`, "the prefixed string literal"],
+    ["a triple-quoted string literal", `${exact} && assertion.ref == '''x'''`, "the triple-quoted string literal"],
+    ["an unterminated string literal", `${exact} && assertion.ref == 'x`, "is unterminated"],
+    ["adjacent string literals", `${exact} && assertion.ref == 'x''y'`, "is followed directly by another"],
+    ["a single |", `${exact} | true`, "a single | in"],
+    ["unbalanced brackets", `(${exact}`, "do not balance"],
+    ["a ? without :", `assertion.ref == 'x' ? ${exact}`, "has no matching :"],
+    ["a : without ?", `${exact} : true`, "has no ?"],
+    ["an empty operand", `${exact} && ()`, "an operand is empty"],
+  ])("%s cannot be decomposed and is refused", (_label, condition, message) => {
+    const out = conditionStructure(condition);
+    expect(out.kind).toBe("unbounded");
+    if (out.kind !== "unbounded") return;
+    expect(out.failures.join(" ")).toContain("cannot be decomposed");
+    expect(out.failures.join(" ")).toContain(message);
+  });
+
+  // The HCL that builds the condition is rendered only in the shapes the
+  // bootstrap module uses; a shape the renderer does not know refuses the
+  // provider even when every fragment read clean.
+  test.each([
+    ["an HCL comparison around a string", `"${exact}" == "x"`, "is an expression around a string"],
+    ["a join over a computed list", `join(" || ", concat(["${exact}"], ["x"]))`, "joins something other than a list literal"],
+    ["a join with a chosen separator", `join(local.sep, ["${exact}"])`, "separator that is not one literal string"],
+  ])("%s is not rendered", (_label, condition, message) => {
+    const locals = `locals {\n  sep = var.flag ? " || " : " && "\n}\n`;
+    expect(trustFailures(singleFile(locals + provider(condition)))).toContain(message);
+  });
+
+  test("a for over a collection that may be empty is rendered empty as well", () => {
+    const regexOnly =
+      `variable "shas" {\n  type = set(string)\n\n  validation {\n` +
+      `    condition     = alltrue([for sha in var.shas : can(regex("^[0-9a-f]{40}$", sha))])\n    error_message = "x"\n  }\n}\n`;
+    const shas =
+      `locals {\n  shas = join(" || ", [\n    for sha in sort(tolist(var.shas)) : "assertion.job_workflow_sha == '${hole("sha")}'"\n  ])\n}\n`;
+    expect(trustFailures(singleFile(regexOnly + shas + provider(`"(${hole("local.shas")}) && ${exact}"`)))).toContain(
+      "when var.shas is empty, the condition cannot be decomposed: an operand is empty",
+    );
   });
 });
 
@@ -1042,11 +1235,22 @@ describe("the lint entrypoint refuses hostile workflow entries", () => {
     for (const line of lines) expect(line).toContain(subject);
   }
 
-  // The demonstrated fail-open: each of these providers carries the reviewed
-  // exact clause beside a clause the inventory could not read, and the lint
-  // used to exit 0 for every one of them.
+  // The demonstrated fail-opens: each of these providers carries the reviewed
+  // exact clause beside a clause the inventory could not read, or beside one
+  // that widens the trust without mentioning job_workflow_ref at all, and the
+  // lint used to exit 0 for every one of them.
   const platformPath = "collinbentley1/platform/.github/workflows/";
   test.each([
+    [
+      "a widening clause with no job_workflow_ref",
+      extraProvider(`"${trustLine("deploy-prod.yml")} || true"`),
+      'admits a token from any workflow through the || operand "true"',
+    ],
+    [
+      "a widening clause on another claim",
+      extraProvider(`"${trustLine("deploy-prod.yml")} || assertion.repository == 'x'"`),
+      "admits a token from any workflow through the || operand \"assertion.repository == 'x'\"",
+    ],
     [
       "a prefix that stops short of a file name",
       extraProvider(`"${trustLine("deploy-prod.yml")} || assertion.job_workflow_ref.startsWith('${platformPath}')"`),

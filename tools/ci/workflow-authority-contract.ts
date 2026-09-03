@@ -752,11 +752,26 @@ function describeCapabilities(capabilities: WorkflowCapabilities): string {
 // every mention of job_workflow_ref, every startsWith, every template
 // interpolation and directive, and every reference or call outside a string
 // must be one of the shapes listed below, or the provider is refused.
+//
+// Reading every token is still not reading the condition: `T || true` has
+// no token to refuse and admits everything. So once the fragments are read,
+// the condition they build is rendered into its CEL text and its boolean
+// structure must bind job_workflow_ref on every path -- the two sections
+// after the fragment scan.
 // ---------------------------------------------------------------------------
+
+// One rendering of a provider's condition: the CEL text Terraform would
+// produce, with every conditional it passed through recorded as a choice.
+export interface EffectiveCondition {
+  readonly choices: readonly string[];
+  readonly provider: string;
+  readonly text: string;
+}
 
 export type TerraformTrust =
   | {
     readonly kind: "trusted";
+    readonly conditions: readonly EffectiveCondition[];
     readonly providers: readonly string[];
     readonly workflows: ReadonlySet<string>;
   }
@@ -1088,8 +1103,11 @@ interface LocalDefinition {
 // a negation elsewhere in the formula cannot loosen it.
 // ---------------------------------------------------------------------------
 
+// A pinned collection is also `nonempty` when a validation conjunct requires
+// at least one element, which is what lets a `for` over it be rendered as a
+// single representative element rather than as possibly nothing at all.
 type VariablePin =
-  | { readonly kind: "pinned"; readonly pattern: string }
+  | { readonly kind: "pinned"; readonly nonempty: boolean; readonly pattern: string }
   | { readonly kind: "unpinned"; readonly reason: string };
 
 // The regex grammar the scan can vouch for: anchored at both ends and built
@@ -1103,6 +1121,9 @@ const pinnedPattern =
 const directPin = /^can\(\s*regex\(\s*"([^"]*)"\s*,\s*var\.([A-Za-z_][A-Za-z0-9_-]*)\s*\)\s*\)$/;
 const elementPin =
   /^alltrue\(\s*\[\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+var\.([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*can\(\s*regex\(\s*"([^"]*)"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\)\s*\]\s*\)$/;
+// `length(var.NAME) > 0` as a conjunct of the same validation proves the
+// collection is never empty.
+const nonemptyPin = /^length\(\s*var\.([A-Za-z_][A-Za-z0-9_-]*)\s*\)\s*(?:>\s*0|>=\s*1)$/;
 
 interface ParsedFile {
   readonly body: HclBody;
@@ -1154,6 +1175,8 @@ function variablePin(file: HclFile, block: HclBlock, name: string): VariablePin 
   if (inner.kind === "invalid") {
     return { kind: "unpinned", reason: `var.${name} could not be read (${inner.failure})` };
   }
+  let pattern: string | undefined;
+  let nonempty = false;
   for (const validation of inner.body.blocks) {
     if (validation.type !== "validation") continue;
     const rules = parseBody(file, validation.bodyStart, validation.bodyEnd);
@@ -1168,14 +1191,16 @@ function variablePin(file: HclFile, block: HclBlock, name: string): VariablePin 
       const term = visibleText(file, from, to).trim();
       const direct = directPin.exec(term);
       const element = elementPin.exec(term);
-      const pattern = direct !== null && direct[2] === name
+      const candidate = direct !== null && direct[2] === name
         ? direct[1]
         : element !== null && element[2] === name && element[1] === element[4]
         ? element[3]
         : undefined;
-      if (pattern !== undefined && pinnedPattern.test(pattern)) return { kind: "pinned", pattern };
+      if (pattern === undefined && candidate !== undefined && pinnedPattern.test(candidate)) pattern = candidate;
+      if (nonemptyPin.exec(term)?.[1] === name) nonempty = true;
     }
   }
+  if (pattern !== undefined) return { kind: "pinned", nonempty, pattern };
   return {
     kind: "unpinned",
     reason: `var.${name} has no validation that pins it to an anchored alphanumeric regex`,
@@ -1405,6 +1430,792 @@ function scanFragment(fragment: ConditionFragment, pins: ReadonlyMap<string, Var
   return { names, residue };
 }
 
+// ---------------------------------------------------------------------------
+// The effective condition as text
+//
+// The fragment scan above reads every piece of the condition for a token it
+// cannot account for. It does not say how the pieces fit together, and a
+// clause that mentions nothing it refuses -- `|| true`, `|| assertion.
+// repository == 'x'` -- fits beside a reviewed clause into a condition that
+// admits every token the issuer signs. So the HCL that builds the condition
+// is rendered into the CEL text Terraform would produce, and that text is
+// read for its boolean structure in the section after this one.
+//
+// Only the shapes the bootstrap module uses are rendered: a string template
+// or heredoc, join(SEPARATOR, [...]) over literal items or over a `for` whose
+// collection is a pinned variable, a conditional with both branches followed,
+// and a local.* reference. A pinned value spliced into a literal is rendered
+// as the reference itself, so `'${var.github_owner_id}'` becomes
+// `'var.github_owner_id'`: the pin bounds what it can hold, and a string's
+// content is never read as structure. A `for` yields one representative
+// element, since every element renders alike and joining more of them adds no
+// operand of a new shape; over a collection that may be empty it yields the
+// empty text as well, because an empty join leaves a hole in the condition.
+// Anything else refuses the provider.
+// ---------------------------------------------------------------------------
+
+interface RenderedBranch {
+  readonly choices: readonly string[];
+  readonly text: string;
+}
+
+// A rendering is text interleaved with choices, each choice a set of labelled
+// alternatives, expanded into one branch per combination at the end.
+type Piece = string | Choice;
+
+interface Choice {
+  readonly options: readonly { readonly label: string; readonly pieces: readonly Piece[] }[];
+}
+
+type PieceRender =
+  | { readonly kind: "pieces"; readonly pieces: readonly Piece[] }
+  | { readonly kind: "unreadable"; readonly reason: string };
+
+type Expansion =
+  | { readonly kind: "branches"; readonly branches: readonly RenderedBranch[] }
+  | { readonly kind: "unreadable"; readonly reason: string };
+
+interface RenderContext {
+  readonly locals: ReadonlyMap<string, LocalDefinition>;
+  readonly pins: ReadonlyMap<string, VariablePin>;
+  // Locals already rendered, and those being rendered, so a local that
+  // interpolates itself is refused rather than followed forever.
+  readonly rendered: Map<string, PieceRender>;
+  readonly rendering: Set<string>;
+}
+
+const noIterators: ReadonlySet<string> = new Set();
+const joinCall = /^join\s*\(/;
+const forExpression = /^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^:]*?)\s*:/;
+const branchLimit = 64;
+
+function unreadable(reason: string): PieceRender {
+  return { kind: "unreadable", reason };
+}
+
+// The first code character equal to `wanted` at bracket depth zero.
+function codeIndexOf(file: HclFile, from: number, to: number, wanted: string): number | undefined {
+  let depth = 0;
+  for (let index = from; index < to; index += 1) {
+    if (!isCode(file, index)) continue;
+    const character = file.text.charAt(index);
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") depth -= 1;
+    else if (depth === 0 && character === wanted) return index;
+  }
+  return undefined;
+}
+
+// The `:` matching the `?` just before `from`, skipping nested conditionals.
+function conditionalColon(file: HclFile, from: number, to: number): number | undefined {
+  let depth = 0;
+  let nested = 0;
+  for (let index = from; index < to; index += 1) {
+    if (!isCode(file, index)) continue;
+    const character = file.text.charAt(index);
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") depth -= 1;
+    else if (depth === 0 && character === "?") nested += 1;
+    else if (depth === 0 && character === ":") {
+      if (nested === 0) return index;
+      nested -= 1;
+    }
+  }
+  return undefined;
+}
+
+// The ranges between code commas at bracket depth zero, blank ones dropped so
+// a trailing comma is not an argument.
+function splitAtCommas(file: HclFile, from: number, to: number): Array<[number, number]> {
+  const parts: Array<[number, number]> = [];
+  let depth = 0;
+  let start = from;
+  for (let index = from; index < to; index += 1) {
+    if (!isCode(file, index)) continue;
+    const character = file.text.charAt(index);
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") depth -= 1;
+    else if (depth === 0 && character === ",") {
+      parts.push([start, index]);
+      start = index + 1;
+    }
+  }
+  parts.push([start, to]);
+  return parts.filter(([partFrom, partTo]) => {
+    const [trimmedFrom, trimmedTo] = trimmedRange(file, partFrom, partTo);
+    return trimmedFrom < trimmedTo;
+  });
+}
+
+// The closing quote of the string opening at `open`. An interpolation inside
+// the string may hold strings of its own, so its span is stepped over.
+function stringClose(file: HclFile, open: number, to: number): number | undefined {
+  let index = open + 1;
+  while (index < to) {
+    const span = file.templates.find((candidate) => candidate.open === index);
+    if (span !== undefined) {
+      index = span.close + 1;
+      continue;
+    }
+    if (file.mask[index] === quote) return index;
+    index += 1;
+  }
+  return undefined;
+}
+
+// The literal text between interpolations, with backslash escapes resolved
+// in a quoted string; a heredoc has none. An escape outside the few this
+// module could plausibly use is refused rather than guessed at.
+function literalText(
+  file: HclFile,
+  from: number,
+  to: number,
+  escapes: boolean,
+): { readonly kind: "text"; readonly text: string } | { readonly kind: "unreadable"; readonly reason: string } {
+  const raw = file.text.slice(from, to);
+  if (!escapes) return { kind: "text", text: raw };
+  let out = "";
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw.charAt(index);
+    if (character !== "\\") {
+      out += character;
+      continue;
+    }
+    const escaped = raw.charAt(index + 1);
+    const resolved = escaped === '"'
+      ? '"'
+      : escaped === "\\"
+      ? "\\"
+      : escaped === "n"
+      ? "\n"
+      : escaped === "r"
+      ? "\r"
+      : escaped === "t"
+      ? "\t"
+      : undefined;
+    if (resolved === undefined) return { kind: "unreadable", reason: `the escape sequence \\${escaped}` };
+    out += resolved;
+    index += 1;
+  }
+  return { kind: "text", text: out };
+}
+
+function renderTemplate(
+  context: RenderContext,
+  file: HclFile,
+  from: number,
+  to: number,
+  escapes: boolean,
+  iterators: ReadonlySet<string>,
+  where: string,
+): PieceRender {
+  const pieces: Piece[] = [];
+  let buffer = "";
+  let cursor = from;
+  const spans = file.templates
+    .filter((span) => span.open >= from && span.open < to)
+    .sort((left, right) => left.open - right.open);
+  for (const span of spans) {
+    // A span inside one already rendered belongs to that interpolation.
+    if (span.open < cursor) continue;
+    const literal = literalText(file, cursor, span.open, escapes);
+    if (literal.kind === "unreadable") return unreadable(`${where} uses ${literal.reason}, which the inventory does not resolve.`);
+    buffer += literal.text;
+    cursor = span.close + 1;
+    if (span.directive) {
+      return unreadable(
+        `${where} contains the template directive ${excerpt(file.text, span.open)}, which the inventory cannot expand.`,
+      );
+    }
+    const body = file.text.slice(span.open + 2, span.close).trim();
+    if (localHole.test(body)) {
+      const inner = renderLocal(context, body.slice("local.".length));
+      if (inner.kind === "unreadable") return inner;
+      pieces.push(buffer, ...inner.pieces);
+      buffer = "";
+      continue;
+    }
+    const variable = variableHole.exec(body)?.[1];
+    if (variable !== undefined) {
+      if (context.pins.get(variable)?.kind !== "pinned") {
+        return unreadable(`${where} interpolates \${${body}}, which no validation pins.`);
+      }
+    } else if (!iterators.has(body)) {
+      return unreadable(`${where} interpolates \${${body}}, which the inventory cannot render.`);
+    }
+    // A pinned value is admitted only as the whole of one single-quoted CEL
+    // literal, where the pin bounds its content; the reference stands in.
+    if (file.text.charAt(span.open - 1) !== "'" || file.text.charAt(span.close + 1) !== "'") {
+      return unreadable(`${where} interpolates \${${body}} outside a single-quoted CEL literal.`);
+    }
+    buffer += body;
+  }
+  const tail = literalText(file, cursor, to, escapes);
+  if (tail.kind === "unreadable") return unreadable(`${where} uses ${tail.reason}, which the inventory does not resolve.`);
+  pieces.push(buffer + tail.text);
+  return { kind: "pieces", pieces };
+}
+
+function renderLocal(context: RenderContext, name: string): PieceRender {
+  const memo = context.rendered.get(name);
+  if (memo !== undefined) return memo;
+  if (context.rendering.has(name)) {
+    return unreadable(`local.${name} interpolates itself, so the effective condition has no finite text.`);
+  }
+  const definition = context.locals.get(name);
+  if (definition === undefined) {
+    return unreadable(`local.${name} is not defined beside the provider, so the effective condition cannot be rendered.`);
+  }
+  context.rendering.add(name);
+  const result = renderExpression(
+    context,
+    definition.file,
+    definition.attribute.start,
+    definition.attribute.end,
+    noIterators,
+    `local.${name} (${definition.file.path} line ${definition.attribute.line})`,
+  );
+  context.rendering.delete(name);
+  context.rendered.set(name, result);
+  return result;
+}
+
+function renderFor(
+  context: RenderContext,
+  file: HclFile,
+  from: number,
+  to: number,
+  iterators: ReadonlySet<string>,
+  where: string,
+): PieceRender {
+  const match = forExpression.exec(codeText(file, from, to));
+  const iterator = match?.[1];
+  const collection = match?.[2]?.trim();
+  if (match === null || iterator === undefined || collection === undefined) {
+    return unreadable(`${where} has a for expression the inventory cannot read.`);
+  }
+  const source = readableCollection.exec(collection)?.[1];
+  if (source === undefined) {
+    return unreadable(
+      `${where} iterates over ${JSON.stringify(collection)}, which is not one variable inside list-shaping calls.`,
+    );
+  }
+  const pin = context.pins.get(source);
+  if (pin?.kind !== "pinned") return unreadable(`${where} iterates over var.${source}, which no validation pins.`);
+  const body = renderExpression(context, file, from + match[0].length, to, new Set([...iterators, iterator]), where);
+  if (body.kind === "unreadable") return body;
+  if (pin.nonempty) return body;
+  return {
+    kind: "pieces",
+    pieces: [{
+      options: [
+        { label: `var.${source} is nonempty`, pieces: body.pieces },
+        { label: `var.${source} is empty`, pieces: [] },
+      ],
+    }],
+  };
+}
+
+function renderJoin(
+  context: RenderContext,
+  file: HclFile,
+  from: number,
+  to: number,
+  iterators: ReadonlySet<string>,
+  where: string,
+): PieceRender {
+  const visible = visibleText(file, from, to);
+  const open = from + (joinCall.exec(codeText(file, from, to))?.[0].length ?? 1) - 1;
+  if (closingBracket(file, open, to) !== to) {
+    return unreadable(`${where} continues after join(...) (${excerpt(visible, 0)}), which the inventory does not render.`);
+  }
+  const [separatorArgument, listArgument, ...extra] = splitAtCommas(file, open + 1, to - 1);
+  if (separatorArgument === undefined || listArgument === undefined || extra.length > 0) {
+    return unreadable(`${where} calls join without exactly a separator and a list (${excerpt(visible, 0)}).`);
+  }
+  const separator = renderExpression(context, file, separatorArgument[0], separatorArgument[1], iterators, where);
+  if (separator.kind === "unreadable") return separator;
+  const separatorText = separator.pieces.length === 1 ? separator.pieces[0] : undefined;
+  if (typeof separatorText !== "string") {
+    return unreadable(`${where} joins with a separator that is not one literal string (${excerpt(visible, 0)}).`);
+  }
+  const [listFrom, listTo] = trimmedRange(file, listArgument[0], listArgument[1]);
+  if (file.text.charAt(listFrom) !== "[" || !isCode(file, listFrom) || closingBracket(file, listFrom, listTo) !== listTo) {
+    return unreadable(
+      `${where} joins something other than a list literal (${excerpt(visible, 0)}); only [...] and [for ...] are rendered.`,
+    );
+  }
+  if (forExpression.test(codeText(file, listFrom + 1, listTo - 1))) {
+    return renderFor(context, file, listFrom + 1, listTo - 1, iterators, where);
+  }
+  const items = splitAtCommas(file, listFrom + 1, listTo - 1);
+  if (items.length === 0) return unreadable(`${where} joins an empty list, which renders as no condition at all.`);
+  const pieces: Piece[] = [];
+  for (const [index, [itemFrom, itemTo]] of items.entries()) {
+    if (index > 0) pieces.push(separatorText);
+    const item = renderExpression(context, file, itemFrom, itemTo, iterators, where);
+    if (item.kind === "unreadable") return item;
+    pieces.push(...item.pieces);
+  }
+  return { kind: "pieces", pieces };
+}
+
+function renderExpression(
+  context: RenderContext,
+  file: HclFile,
+  start: number,
+  end: number,
+  iterators: ReadonlySet<string>,
+  where: string,
+): PieceRender {
+  const [from, to] = trimmedRange(file, start, end);
+  if (from >= to) return unreadable(`${where} is empty where a condition was expected.`);
+  if (file.text.charAt(from) === "(" && isCode(file, from) && closingBracket(file, from, to) === to) {
+    return renderExpression(context, file, from + 1, to - 1, iterators, where);
+  }
+  const question = codeIndexOf(file, from, to, "?");
+  if (question !== undefined) {
+    const colon = conditionalColon(file, question + 1, to);
+    if (colon === undefined) {
+      return unreadable(`${where} has a ? with no matching : (${excerpt(visibleText(file, from, to), 0)}).`);
+    }
+    const chooser = visibleText(file, from, question).replace(/\s+/g, " ").trim();
+    const yes = renderExpression(context, file, question + 1, colon, iterators, where);
+    if (yes.kind === "unreadable") return yes;
+    const no = renderExpression(context, file, colon + 1, to, iterators, where);
+    if (no.kind === "unreadable") return no;
+    return {
+      kind: "pieces",
+      pieces: [{
+        options: [
+          { label: `${chooser} is true`, pieces: yes.pieces },
+          { label: `${chooser} is false`, pieces: no.pieces },
+        ],
+      }],
+    };
+  }
+  if (file.mask[from] === quote) {
+    const close = stringClose(file, from, to);
+    if (close !== to - 1) {
+      return unreadable(
+        `${where} is an expression around a string (${excerpt(visibleText(file, from, to), 0)}), not a string; only a whole string is rendered.`,
+      );
+    }
+    return renderTemplate(context, file, from + 1, close, true, iterators, where);
+  }
+  if (file.text.startsWith("<<", from)) {
+    heredocMarker.lastIndex = from;
+    const marker = heredocMarker.exec(file.text);
+    const terminator = file.text.lastIndexOf("\n", to - 1) + 1;
+    if (marker === null || marker[1] === undefined || file.text.slice(terminator, to).trim() !== marker[1]) {
+      return unreadable(`${where} is a heredoc the inventory cannot delimit.`);
+    }
+    return renderTemplate(context, file, from + marker[0].length, terminator, false, iterators, where);
+  }
+  const code = codeText(file, from, to).trim();
+  if (localHole.test(code)) return renderLocal(context, code.slice("local.".length));
+  if (joinCall.test(code)) return renderJoin(context, file, from, to, iterators, where);
+  return unreadable(
+    `${where} is not an expression the inventory can render into a condition (${excerpt(visibleText(file, from, to), 0)}); ` +
+      `only a string, a heredoc, join(SEPARATOR, [...]), a conditional and a local.* reference are followed.`,
+  );
+}
+
+// Every combination of choices, as one text each. A choice interpolated twice
+// is expanded independently each time, which over-approximates: a branch
+// that Terraform could not produce is still read, and reading more never
+// admits more.
+function expandPieces(pieces: readonly Piece[]): Expansion {
+  let branches: RenderedBranch[] = [{ choices: [], text: "" }];
+  for (const piece of pieces) {
+    if (typeof piece === "string") {
+      branches = branches.map((branch) => ({ choices: branch.choices, text: branch.text + piece }));
+      continue;
+    }
+    const next: RenderedBranch[] = [];
+    for (const option of piece.options) {
+      const inner = expandPieces(option.pieces);
+      if (inner.kind === "unreadable") return inner;
+      for (const branch of branches) {
+        for (const tail of inner.branches) {
+          next.push({ choices: [...branch.choices, option.label, ...tail.choices], text: branch.text + tail.text });
+        }
+      }
+    }
+    if (next.length > branchLimit) {
+      return {
+        kind: "unreadable",
+        reason: `the condition has more than ${branchLimit} conditional renderings, which the inventory does not read.`,
+      };
+    }
+    branches = next;
+  }
+  return { branches, kind: "branches" };
+}
+
+function renderCondition(
+  condition: HclAttribute,
+  file: HclFile,
+  locals: ReadonlyMap<string, LocalDefinition>,
+  pins: ReadonlyMap<string, VariablePin>,
+): Expansion {
+  const context: RenderContext = { locals, pins, rendered: new Map(), rendering: new Set() };
+  const pieces = renderExpression(
+    context,
+    file,
+    condition.start,
+    condition.end,
+    noIterators,
+    `attribute_condition (${file.path} line ${condition.line})`,
+  );
+  if (pieces.kind === "unreadable") return pieces;
+  return expandPieces(pieces.pieces);
+}
+
+// ---------------------------------------------------------------------------
+// The boolean structure of the effective condition
+//
+// A provider admits a token when its condition evaluates true, so the
+// question is whether the condition can be true for a token whose
+// job_workflow_ref is not a platform workflow. That is answered from the
+// structure alone. A recognised trust form, read as the whole of one operand,
+// binds job_workflow_ref; `A && B` binds it when either side does; `A || B`
+// and `c ? A : B` bind it only when both sides do; a negation, a literal and
+// any operand that is not a whole trust form bind nothing. The condition is
+// refused unless the whole of it binds. `|| true` is refused because `true`
+// binds nothing, and so is `T == false`, which CEL reads as `(T) == false`
+// and which no whole-operand form matches. The live SHA disjunction passes
+// because it stands as a conjunct beside a disjunction of trust forms, and a
+// conjunct is never asked to bind on its own.
+//
+// Two further refusals keep the reading honest. A bare boolean literal is
+// refused wherever it stands, since a condition is read only as comparisons
+// of claims. And an operand the reader cannot decompose refuses the condition
+// outright: a CEL comment, which hides the rest of the line from CEL but not
+// from a naive split; a prefixed or triple-quoted string, which CEL delimits
+// by other rules; an unbalanced bracket; a stray ? or :.
+// ---------------------------------------------------------------------------
+
+export type ConditionStructure =
+  | { readonly kind: "bounded"; readonly names: ReadonlySet<string> }
+  | { readonly kind: "unbounded"; readonly failures: readonly string[] };
+
+type CelNode =
+  | { readonly kind: "or"; readonly operands: readonly CelNode[]; readonly text: string }
+  | { readonly kind: "and"; readonly operands: readonly CelNode[]; readonly text: string }
+  | { readonly kind: "not"; readonly operand: CelNode; readonly text: string }
+  | {
+    readonly kind: "conditional";
+    readonly condition: CelNode;
+    readonly branches: readonly CelNode[];
+    readonly text: string;
+  }
+  | { readonly kind: "trust"; readonly name: string; readonly text: string }
+  | { readonly kind: "literal"; readonly text: string }
+  | { readonly kind: "other"; readonly blanked: string; readonly text: string };
+
+type CelParse =
+  | { readonly kind: "node"; readonly node: CelNode }
+  | { readonly kind: "problem"; readonly problem: string };
+
+// The two trust forms as whole operands: nothing before, nothing after.
+const exactTrustOperand =
+  /^assertion\.job_workflow_ref\s*==\s*'collinbentley1\/platform\/\.github\/workflows\/([\w.-]+\.ya?ml)@'\s*\+\s*assertion\.job_workflow_sha$/;
+const legacyTrustOperand =
+  /^assertion\.job_workflow_ref\.startsWith\(\s*'collinbentley1\/platform\/\.github\/workflows\/([\w.-]+\.ya?ml)@'\s*\)$/;
+// The fragment scan's pattern without its global flag, for a stateless test
+// of whether a node mentions a trust form at all.
+const trustMention = new RegExp(workflowTrustPattern.source);
+const booleanLiteral = /\b(?:true|false)\b/g;
+const identifierCharacter = /[A-Za-z0-9_]/;
+
+function quoteOperand(text: string): string {
+  const shown = text.replace(/\s+/g, " ").trim();
+  return JSON.stringify(shown.length > 90 ? `${shown.slice(0, 87)}...` : shown);
+}
+
+// The text with every string literal's content replaced by spaces, so that
+// operators and brackets are found only where CEL would find them.
+function blankStrings(
+  text: string,
+): { readonly kind: "blanked"; readonly blanked: string } | { readonly kind: "problem"; readonly problem: string } {
+  let out = "";
+  let index = 0;
+  while (index < text.length) {
+    const character = text.charAt(index);
+    if (character === "/" && text.charAt(index + 1) === "/") {
+      return { kind: "problem", problem: `the CEL comment at ${excerpt(text, index)} hides the rest of the line from CEL` };
+    }
+    if (character !== "'" && character !== '"') {
+      out += character;
+      index += 1;
+      continue;
+    }
+    if (identifierCharacter.test(text.charAt(index - 1))) {
+      return { kind: "problem", problem: `the prefixed string literal at ${excerpt(text, index)} is not a plain string` };
+    }
+    if (text.charAt(index + 1) === character && text.charAt(index + 2) === character) {
+      return { kind: "problem", problem: `the triple-quoted string literal at ${excerpt(text, index)} is not a plain string` };
+    }
+    out += character;
+    let cursor = index + 1;
+    while (cursor < text.length && text.charAt(cursor) !== character) {
+      const width = text.charAt(cursor) === "\\" ? 2 : 1;
+      out += " ".repeat(width);
+      cursor += width;
+    }
+    if (cursor >= text.length) {
+      return { kind: "problem", problem: `the string literal at ${excerpt(text, index)} is unterminated` };
+    }
+    out += character;
+    const following = text.charAt(cursor + 1);
+    if (following === "'" || following === '"') {
+      return { kind: "problem", problem: `the string literal at ${excerpt(text, index)} is followed directly by another` };
+    }
+    index = cursor + 1;
+  }
+  return { blanked: out, kind: "blanked" };
+}
+
+// The index of the bracket closing the one at `open`, or undefined.
+function matchingClose(blanked: string, open: number, to: number): number | undefined {
+  let depth = 0;
+  for (let index = open; index < to; index += 1) {
+    const character = blanked.charAt(index);
+    if (character === "(" || character === "[" || character === "{") depth += 1;
+    else if (character === ")" || character === "]" || character === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return undefined;
+}
+
+// CEL binds `?:` loosest, then `||`, then `&&`, then everything else, so the
+// operators are looked for in that order at bracket depth zero. Whatever is
+// left is one operand: a whole trust form, a literal, or something else.
+function parseCel(text: string, blanked: string, start: number, end: number): CelParse {
+  let from = start;
+  let to = end;
+  while (from < to && /\s/.test(blanked.charAt(from))) from += 1;
+  while (to > from && /\s/.test(blanked.charAt(to - 1))) to -= 1;
+  if (from >= to) return { kind: "problem", problem: "an operand is empty" };
+  if (blanked.charAt(from) === "(" && matchingClose(blanked, from, to) === to - 1) {
+    return parseCel(text, blanked, from + 1, to - 1);
+  }
+  const node = text.slice(from, to);
+  const cuts: Array<{ readonly index: number; readonly operator: "||" | "&&" | "?" | ":" }> = [];
+  let depth = 0;
+  for (let index = from; index < to; index += 1) {
+    const character = blanked.charAt(index);
+    if (character === "(" || character === "[" || character === "{") {
+      depth += 1;
+    } else if (character === ")" || character === "]" || character === "}") {
+      depth -= 1;
+      if (depth < 0) return { kind: "problem", problem: `the brackets of ${quoteOperand(node)} do not balance` };
+    } else if (depth > 0) {
+      continue;
+    } else if (character === "|" || character === "&") {
+      if (blanked.charAt(index + 1) !== character) {
+        return { kind: "problem", problem: `a single ${character} in ${quoteOperand(node)} is not a CEL operator` };
+      }
+      cuts.push({ index, operator: character === "|" ? "||" : "&&" });
+      index += 1;
+    } else if (character === "?" || character === ":") {
+      cuts.push({ index, operator: character });
+    }
+  }
+  if (depth !== 0) return { kind: "problem", problem: `the brackets of ${quoteOperand(node)} do not balance` };
+
+  const question = cuts.find((cut) => cut.operator === "?");
+  if (question !== undefined) {
+    let nested = 0;
+    let colon: number | undefined;
+    for (const cut of cuts) {
+      if (cut.index <= question.index) continue;
+      if (cut.operator === "?") nested += 1;
+      else if (cut.operator === ":") {
+        if (nested === 0) {
+          colon = cut.index;
+          break;
+        }
+        nested -= 1;
+      }
+    }
+    if (colon === undefined) return { kind: "problem", problem: `the ? in ${quoteOperand(node)} has no matching :` };
+    const condition = parseCel(text, blanked, from, question.index);
+    if (condition.kind === "problem") return condition;
+    const yes = parseCel(text, blanked, question.index + 1, colon);
+    if (yes.kind === "problem") return yes;
+    const no = parseCel(text, blanked, colon + 1, to);
+    if (no.kind === "problem") return no;
+    return {
+      kind: "node",
+      node: { branches: [yes.node, no.node], condition: condition.node, kind: "conditional", text: node },
+    };
+  }
+  if (cuts.some((cut) => cut.operator === ":")) {
+    return { kind: "problem", problem: `the : in ${quoteOperand(node)} has no ?` };
+  }
+  for (const operator of ["||", "&&"] as const) {
+    const positions = cuts.filter((cut) => cut.operator === operator).map((cut) => cut.index);
+    if (positions.length === 0) continue;
+    const operands: CelNode[] = [];
+    let cursor = from;
+    for (const position of [...positions, to]) {
+      const operand = parseCel(text, blanked, cursor, position);
+      if (operand.kind === "problem") return operand;
+      operands.push(operand.node);
+      cursor = position + 2;
+    }
+    return { kind: "node", node: { kind: operator === "||" ? "or" : "and", operands, text: node } };
+  }
+  if (blanked.charAt(from) === "!") {
+    const operand = parseCel(text, blanked, from + 1, to);
+    if (operand.kind === "problem") return operand;
+    return { kind: "node", node: { kind: "not", operand: operand.node, text: node } };
+  }
+  if (node === "true" || node === "false") return { kind: "node", node: { kind: "literal", text: node } };
+  const name = exactTrustOperand.exec(node)?.[1] ?? legacyTrustOperand.exec(node)?.[1];
+  if (name !== undefined) return { kind: "node", node: { kind: "trust", name, text: node } };
+  return { kind: "node", node: { blanked: blanked.slice(from, to), kind: "other", text: node } };
+}
+
+// Whether every token the node admits has job_workflow_ref bound to a
+// platform workflow.
+function binds(node: CelNode): boolean {
+  switch (node.kind) {
+    case "trust":
+      return true;
+    case "and":
+      return node.operands.some(binds);
+    case "or":
+      return node.operands.every(binds);
+    case "conditional":
+      return node.branches.every(binds);
+    case "not":
+    case "literal":
+    case "other":
+      return false;
+  }
+}
+
+function trustNames(node: CelNode, out: Set<string>): void {
+  switch (node.kind) {
+    case "trust":
+      out.add(node.name);
+      return;
+    case "and":
+    case "or":
+      for (const operand of node.operands) trustNames(operand, out);
+      return;
+    case "conditional":
+      for (const branch of node.branches) trustNames(branch, out);
+      return;
+    case "not":
+    case "literal":
+    case "other":
+      return;
+  }
+}
+
+function refuseLiterals(node: CelNode, out: string[]): void {
+  switch (node.kind) {
+    case "literal":
+      out.push(
+        `the condition uses the boolean literal ${node.text} as an operand; a condition is read only as comparisons of assertion claims, ` +
+          `and a bare literal can admit every token (|| true) or none (&& false).`,
+      );
+      return;
+    case "other":
+      for (const match of node.blanked.matchAll(booleanLiteral)) {
+        out.push(
+          `the condition uses the boolean literal ${match[0]} inside the operand ${quoteOperand(node.text)}, which the inventory does not decompose further.`,
+        );
+      }
+      return;
+    case "and":
+    case "or":
+      for (const operand of node.operands) refuseLiterals(operand, out);
+      return;
+    case "not":
+      refuseLiterals(node.operand, out);
+      return;
+    case "conditional":
+      refuseLiterals(node.condition, out);
+      for (const branch of node.branches) refuseLiterals(branch, out);
+      return;
+    case "trust":
+      return;
+  }
+}
+
+// Why a node that does not bind does not: the operands that were relied on
+// and failed, named as precisely as the structure allows.
+function explainUnbound(node: CelNode, out: string[]): void {
+  switch (node.kind) {
+    case "or":
+    case "conditional": {
+      const parts = node.kind === "or" ? node.operands : node.branches;
+      const role = node.kind === "or" ? "the || operand" : "the conditional branch";
+      for (const part of parts) {
+        if (binds(part)) continue;
+        if ((part.kind === "and" || part.kind === "or" || part.kind === "conditional") && trustMention.test(part.text)) {
+          explainUnbound(part, out);
+          continue;
+        }
+        out.push(
+          `the condition admits a token from any workflow through ${role} ${quoteOperand(part.text)}, which is not a recognised job_workflow_ref trust form; ` +
+            `every operand of a || and every branch of a ?: must bind job_workflow_ref to a platform workflow.`,
+        );
+      }
+      return;
+    }
+    case "and": {
+      const candidates = node.operands.filter((operand) => trustMention.test(operand.text));
+      if (candidates.length === 0) {
+        out.push(`the condition binds job_workflow_ref to no platform workflow in any conjunct of ${quoteOperand(node.text)}.`);
+        return;
+      }
+      for (const candidate of candidates) explainUnbound(candidate, out);
+      return;
+    }
+    case "not":
+      out.push(
+        `the condition admits a token from any workflow through the negation ${quoteOperand(node.text)}; a negation binds job_workflow_ref to nothing.`,
+      );
+      return;
+    case "literal":
+    case "other":
+      out.push(
+        `the condition binds job_workflow_ref to no platform workflow: ${quoteOperand(node.text)} is not a recognised trust form read as a whole operand.`,
+      );
+      return;
+    case "trust":
+      return;
+  }
+}
+
+// The structural reading of one effective condition: bounded, with the
+// workflows its whole-operand trust forms name, or the reasons it is not.
+export function conditionStructure(text: string): ConditionStructure {
+  const blanked = blankStrings(text);
+  if (blanked.kind === "problem") {
+    return { failures: [`the condition cannot be decomposed: ${blanked.problem}.`], kind: "unbounded" };
+  }
+  const parsed = parseCel(text, blanked.blanked, 0, text.length);
+  if (parsed.kind === "problem") {
+    return { failures: [`the condition cannot be decomposed: ${parsed.problem}.`], kind: "unbounded" };
+  }
+  const failures: string[] = [];
+  refuseLiterals(parsed.node, failures);
+  if (!binds(parsed.node)) explainUnbound(parsed.node, failures);
+  if (failures.length > 0) return { failures: [...new Set(failures)], kind: "unbounded" };
+  const names = new Set<string>();
+  trustNames(parsed.node, names);
+  return { kind: "bounded", names };
+}
+
 export function trustedWorkflowsFromTerraform(files: ReadonlyMap<string, string>): TerraformTrust {
   const failures: string[] = [];
   const parsed: ParsedFile[] = [];
@@ -1460,6 +2271,7 @@ export function trustedWorkflowsFromTerraform(files: ReadonlyMap<string, string>
   const pinsByDirectory = new Map<string, Map<string, VariablePin>>();
 
   const providers: string[] = [];
+  const conditions: EffectiveCondition[] = [];
   const workflows = new Set<string>();
   for (const { body, file } of parsed) {
     for (const block of body.blocks) {
@@ -1530,6 +2342,39 @@ export function trustedWorkflowsFromTerraform(files: ReadonlyMap<string, string>
         continue;
       }
       if (!readable) continue;
+
+      // Every fragment was read; now the condition they build is rendered
+      // and its structure must bind job_workflow_ref on every path. A name
+      // the fragment scan collected must also stand as a whole operand of
+      // that structure, so that `T == false` -- the trust form inside a
+      // larger comparison -- is refused even where another conjunct binds.
+      const rendering = renderCondition(condition, file, locals, pins);
+      if (rendering.kind === "unreadable") {
+        failures.push(`${display}: ${rendering.reason}`);
+        continue;
+      }
+      const anchored = new Set<string>();
+      let bounded = true;
+      for (const branch of rendering.branches) {
+        const when = branch.choices.length > 0 ? `when ${branch.choices.join(" and ")}, ` : "";
+        const structure = conditionStructure(branch.text);
+        if (structure.kind === "unbounded") {
+          bounded = false;
+          for (const failure of structure.failures) failures.push(`${display}: ${when}${failure}`);
+          continue;
+        }
+        for (const name of structure.names) anchored.add(name);
+        conditions.push({ choices: branch.choices, provider: display, text: branch.text });
+      }
+      if (!bounded) continue;
+      for (const name of sorted(names)) {
+        if (anchored.has(name)) continue;
+        bounded = false;
+        failures.push(
+          `${display} compares job_workflow_ref to ${name} only inside a larger operand; a trust form counts only as the whole of one || operand or && conjunct.`,
+        );
+      }
+      if (!bounded) continue;
       for (const name of names) workflows.add(name);
     }
   }
@@ -1539,7 +2384,9 @@ export function trustedWorkflowsFromTerraform(files: ReadonlyMap<string, string>
       "no google_iam_workload_identity_pool_provider block was found in any Terraform file; the authority inventory cannot be cross-checked.",
     );
   }
-  return failures.length > 0 ? { failures, kind: "invalid" } : { kind: "trusted", providers, workflows };
+  return failures.length > 0
+    ? { failures, kind: "invalid" }
+    : { conditions, kind: "trusted", providers, workflows };
 }
 
 // ---------------------------------------------------------------------------
