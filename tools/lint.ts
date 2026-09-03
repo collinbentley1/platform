@@ -10,6 +10,7 @@ import {
   type SecretContextReference,
   semanticSecretContextReferences,
 } from "./ci/workflow-secret-contract";
+import { validateWorkflowAuthorityInventory } from "./ci/workflow-authority-contract";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -27,7 +28,34 @@ const platformWorkflows = [
   ...reusableWorkflows,
   "platform.yml",
   "protected-bootstrap-implementation.yml",
+  "refresh-grype-db.yml",
 ];
+
+// Derived, not listed. `platformWorkflows` above is a hand-maintained set that
+// has drifted before -- refresh-grype-db.yml existed for weeks without any rule
+// keyed on that list ever seeing it. Everything below enumerates the directory
+// instead, so a new workflow is classified or the lint fails.
+const workflowDirectory = join(root, ".github/workflows");
+const derivedPlatformWorkflows = (await readdir(workflowDirectory))
+  .filter((name) => name.endsWith(".yml"))
+  .sort();
+for (const name of derivedPlatformWorkflows) {
+  if (!platformWorkflows.includes(name)) {
+    failures.push(
+      `.github/workflows/${name} is not covered by the platform workflow lint set.`,
+    );
+  }
+}
+const workflowSources = new Map<string, string>();
+for (const name of derivedPlatformWorkflows) {
+  workflowSources.set(name, await readFile(join(workflowDirectory, name), "utf8"));
+}
+failures.push(
+  ...validateWorkflowAuthorityInventory({
+    bootstrapTerraform: await readFile(join(root, "terraform/modules/bootstrap/main.tf"), "utf8"),
+    workflows: workflowSources,
+  }),
+);
 const declaredEnvironmentSecrets = [
   "DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3",
 ];
