@@ -46,9 +46,11 @@ const workflowFiles = await workflowUniverse(root);
 const terraformFiles = await terraformUniverse(root);
 if (workflowFiles.kind === "rejected") failures.push(...workflowFiles.failures);
 if (terraformFiles.kind === "rejected") failures.push(...terraformFiles.failures);
-const derivedPlatformWorkflows = workflowFiles.kind === "resolved"
-  ? [...workflowFiles.sources.keys()].sort()
-  : [];
+// A rejected universe is a failure of its own, never a reason to skip what
+// follows: the entries that did resolve are classified regardless, so a stray
+// file in .github/workflows cannot make the findings about its neighbours
+// disappear from the very run it fails.
+const derivedPlatformWorkflows = [...workflowFiles.sources.keys()].sort();
 for (const name of derivedPlatformWorkflows) {
   if (!platformWorkflows.includes(name)) {
     failures.push(
@@ -56,14 +58,12 @@ for (const name of derivedPlatformWorkflows) {
     );
   }
 }
-if (workflowFiles.kind === "resolved" && terraformFiles.kind === "resolved") {
-  failures.push(
-    ...validateWorkflowAuthorityInventory({
-      terraform: terraformFiles.sources,
-      workflows: workflowFiles.sources,
-    }),
-  );
-}
+failures.push(
+  ...validateWorkflowAuthorityInventory({
+    terraform: terraformFiles.sources,
+    workflows: workflowFiles.sources,
+  }),
+);
 const declaredEnvironmentSecrets = [
   "DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3",
 ];

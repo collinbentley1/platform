@@ -80,6 +80,20 @@ const provider = (condition: string, extra = "") =>
 const terraformTrusting = (...names: string[]) =>
   `locals {\n  condition = "${names.map(trustLine).join(" || ")}"\n}\n\n${provider("local.condition")}`;
 const singleFile = (source: string) => new Map([["terraform/modules/bootstrap/main.tf", source]]);
+// A provider with no condition at all trusts every token the issuer signs.
+const openProvider =
+  `resource "google_iam_workload_identity_pool_provider" "extra" {\n` +
+  `  workload_identity_pool_provider_id = "github-extra"\n` +
+  `  oidc { issuer_uri = "https://token.actions.githubusercontent.com/" }\n}\n`;
+// A second provider as an attacker or a hurried operator would add it.
+const extraProvider = (condition: string, locals = "") =>
+  `${locals}resource "google_iam_workload_identity_pool_provider" "extra" {\n` +
+  `  workload_identity_pool_provider_id = "github-extra"\n` +
+  `  attribute_condition = ${condition}\n` +
+  `  oidc { issuer_uri = "https://token.actions.githubusercontent.com/" }\n}\n`;
+const foreign = "assertion.job_workflow_ref.startsWith('attacker-org/backdoor/.github/workflows/pwn.yml@')";
+// The reviewed exact clause beside a prefix that admits another repository.
+const foreignProvider = extraProvider(`"${trustLine("deploy-prod.yml")} || ${foreign}"`);
 
 function trusted(files: ReadonlyMap<string, string>): string[] {
   const trust = trustedWorkflowsFromTerraform(files);
@@ -98,7 +112,7 @@ describe("the live inventory agrees with the declaration", () => {
     expect(validateWorkflowAuthorityInventory(await liveSources())).toEqual([]);
   });
 
-  test("the universe covers every workflow and every Terraform module", async () => {
+  test("the universe covers every workflow and every Terraform source in the repository", async () => {
     const { terraform, workflows } = await liveSources();
     const declared = [
       ...declaredWorkflowAuthority.ownerCredential,
@@ -106,9 +120,12 @@ describe("the live inventory agrees with the declaration", () => {
       ...declaredWorkflowAuthority.neither,
     ].sort();
     expect([...workflows.keys()].sort()).toEqual(declared);
-    expect(terraform.size).toBeGreaterThanOrEqual(28);
+    expect(terraform.size).toBeGreaterThanOrEqual(36);
     expect(terraform.has("terraform/modules/bootstrap/main.tf")).toBe(true);
-    for (const path of terraform.keys()) expect(path).toMatch(/^terraform\/.+\.tf$/);
+    // The app template ships Terraform outside terraform/; a walk rooted
+    // there would never have seen a provider added beside it.
+    expect(terraform.has("templates/app/infra/terraform/bootstrap/main.tf")).toBe(true);
+    for (const path of terraform.keys()) expect(path).toMatch(/\.tf$/);
   });
 
   test("Terraform trusts exactly the cloud-authority workflows through one provider", async () => {
@@ -302,6 +319,18 @@ describe("cloud authority is detected by several independent signals", () => {
     expect(derived.writesGitHub).toBe(true);
     expect(derived.gitHubWriteEvidence).toEqual(["jobs.a effective permissions grant write-all"]);
   });
+
+  // Scopes are compared in lower case: whether or not GitHub would honour
+  // `ID-TOKEN: write`, the inventory must never file it under the benign
+  // GitHub writes, which a case-sensitive comparison used to do.
+  test("a scope spelt in upper case is read as the grant it is", () => {
+    const derived = capabilities(withJob("    permissions:\n      ID-TOKEN: write\n    steps:\n      - run: echo x\n"));
+    expect(derived.mintsCloudCredentials).toBe(true);
+    expect(derived.cloudCredentialEvidence).toEqual(["jobs.a effective permissions grant id-token: write"]);
+    const writes = capabilities(withJob("    permissions:\n      Contents: write\n    steps:\n      - run: echo x\n"));
+    expect(writes.mintsCloudCredentials).toBe(false);
+    expect(writes.gitHubWriteEvidence).toEqual(["jobs.a effective permissions grant contents: write"]);
+  });
 });
 
 describe("the two authorities are independent flags", () => {
@@ -388,8 +417,24 @@ describe("a workflow that cannot be analysed is invalid, not classified", () => 
     ["a list", "    permissions: [contents]\n"],
     ["an unknown level", "    permissions:\n      contents: 1\n"],
     ["an unknown word", "    permissions: everything\n"],
+    ["an unknown scope", "    permissions:\n      id_token: write\n"],
   ])("permissions given as %s are invalid", (_label, permissions) => {
     expect(invalidReasons(withJob(`${permissions}    steps:\n      - run: echo x\n`))).toContain("jobs.a.permissions");
+  });
+
+  test("a scope GitHub does not define is refused, not recorded as a write", () => {
+    expect(invalidReasons(withJob("    permissions:\n      id_token: write\n    steps:\n      - run: echo x\n"))).toContain(
+      'jobs.a.permissions grants "id_token", which is not a GitHub permission scope',
+    );
+  });
+
+  // A mapping under `steps` used to be scanned as an empty list, which read
+  // as "no Google action" for a job GitHub would not even run.
+  test("steps that are not a list fail rather than scanning as empty", () => {
+    const reasons = invalidReasons(withJob(
+      "    permissions:\n      contents: read\n    steps:\n      auth:\n        uses: google-github-actions/auth@abc\n",
+    ));
+    expect(reasons).toContain("jobs.a.steps is not a list, so its actions cannot be scanned");
   });
 });
 
@@ -423,6 +468,9 @@ describe("the file universe refuses what it cannot classify", () => {
       ".github/workflows/e.yml is a FIFO; the workflow directory may hold only regular *.yml or *.yaml files.",
       ".github/workflows/notes.txt is not a workflow (*.yml or *.yaml); the workflow directory may hold nothing else.",
     ]);
+    // The entry that did resolve travels with the rejection, so the lint can
+    // still classify it rather than skip the authority check.
+    expect([...universe.sources.keys()]).toEqual(["a.yml"]);
   });
 
   test("a missing workflow directory is a failure, not an empty set", async () => {
@@ -467,6 +515,51 @@ describe("the file universe refuses what it cannot classify", () => {
       "terraform/modules/x/linked.tf is a symbolic link; Terraform sources must be regular files.",
       "terraform/modules/x/pipe.tf is a FIFO; Terraform sources must be regular files.",
     ]);
+  });
+
+  // A provider with no condition placed at infra/wif.tf used to lint clean,
+  // because the walk started at terraform/ and never looked anywhere else.
+  test("Terraform outside terraform/ is found, and unscanned directories are skipped", async () => {
+    const temporary = await temporaryRoot("platform-authority-terraform-root-");
+    for (const directory of ["infra/.terraform/modules/z", "terraform/modules/x", ".git/hooks", "node_modules/pkg"]) {
+      await mkdir(join(temporary, directory), { recursive: true });
+    }
+    await writeFile(join(temporary, "infra/wif.tf"), openProvider);
+    await writeFile(join(temporary, "infra/.terraform/modules/z/main.tf"), "locals {}\n");
+    await writeFile(join(temporary, "terraform/modules/x/main.tf"), "locals {}\n");
+    await writeFile(join(temporary, ".git/hooks/decoy.tf"), "locals {}\n");
+    await writeFile(join(temporary, "node_modules/pkg/decoy.tf"), "locals {}\n");
+    await writeFile(join(temporary, "README.md"), "not terraform\n");
+    const universe = await terraformUniverse(temporary);
+    expect(universe.kind).toBe("resolved");
+    if (universe.kind !== "resolved") return;
+    expect([...universe.sources.keys()].sort()).toEqual(["infra/wif.tf", "terraform/modules/x/main.tf"]);
+    expect(trustFailures(universe.sources)).toContain(
+      "infra/wif.tf: google_iam_workload_identity_pool_provider.extra has no attribute_condition",
+    );
+  });
+
+  test("JSON configuration and a symbolic link outside terraform/ are refused", async () => {
+    const temporary = await temporaryRoot("platform-authority-terraform-root-hostile-");
+    await mkdir(join(temporary, "infra"), { recursive: true });
+    await writeFile(join(temporary, "infra/main.tf"), "locals {}\n");
+    await writeFile(join(temporary, "infra/extra.tf.json"), "{}\n");
+    await symlink("main.tf", join(temporary, "infra/linked.tf"));
+    const universe = await terraformUniverse(temporary);
+    expect(universe.kind).toBe("rejected");
+    if (universe.kind !== "rejected") return;
+    expect(universe.failures).toEqual([
+      "infra/extra.tf.json is JSON Terraform configuration, which the authority scan cannot read; express it in HCL.",
+      "infra/linked.tf is a symbolic link; Terraform sources must be regular files.",
+    ]);
+    expect([...universe.sources.keys()]).toEqual(["infra/main.tf"]);
+  });
+
+  test("a missing repository root is a failure, not an empty set", async () => {
+    const universe = await terraformUniverse(join(await temporaryRoot("platform-authority-absent-"), "absent"));
+    expect(universe.kind).toBe("rejected");
+    if (universe.kind !== "rejected") return;
+    expect(universe.failures.join(" ")).toContain("the repository root could not be listed");
   });
 });
 
@@ -558,6 +651,9 @@ describe("Terraform trust is read from provider conditions only", () => {
       "names no workflow through assertion.job_workflow_ref",
     );
     expect(trustFailures(singleFile(provider("var.condition")))).toContain("names no workflow");
+    expect(trustFailures(singleFile(provider("var.condition")))).toContain(
+      "uses var.condition where its value could reach the condition text",
+    );
   });
 
   test("an ambiguous local fails", () => {
@@ -572,6 +668,185 @@ describe("Terraform trust is read from provider conditions only", () => {
       "terraform/modules/bootstrap/main.tf: unterminated string",
     );
     expect(trustFailures(singleFile("resource \"x\" \"y\" {\n  a = 1\n"))).toContain("unclosed block resource at line 1");
+  });
+});
+
+describe("the effective condition must be read in full", () => {
+  const hole = (body: string) => "${" + body + "}";
+
+  // One recognisable clause used to satisfy the cross-check for the whole
+  // condition; every clause beside it must now be read, or the provider fails.
+  test.each([
+    ["a prefix that stops short of a file name", "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/')"],
+    ["another repository", foreign],
+    ["a membership test", "assertion.job_workflow_ref in ['collinbentley1/platform/.github/workflows/deploy-prod.yml@x']"],
+    ["an indexed spelling", "assertion['job_workflow_ref'] == 'x'"],
+    ["a reversed comparison", "'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha == assertion.job_workflow_ref"],
+  ])("a reviewed clause does not vouch for %s beside it", (_label, clause) => {
+    const out = trustFailures(singleFile(provider(`"${trustLine("deploy-prod.yml")} || ${clause}"`)));
+    expect(out).toContain(
+      "attribute_condition (terraform/modules/bootstrap/main.tf line 3) uses job_workflow_ref in a form the inventory does not read",
+    );
+  });
+
+  test.each([
+    ["a prefix that stops short of a file name", "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/')"],
+    ["another repository", foreign],
+    ["another attribute", "assertion.sub.startsWith('repo:collinbentley1/platform:')"],
+  ])("startsWith on %s is refused", (_label, call) => {
+    expect(trustFailures(singleFile(provider(`"${trustLine("c.yml")} || ${call}"`)))).toContain(
+      "calls startsWith outside the legacy trust form",
+    );
+  });
+
+  test("the message quotes the clause that could not be read", () => {
+    const out = trustFailures(singleFile(provider(`"${trustLine("deploy-prod.yml")} || ${foreign}"`)));
+    expect(out).toContain("attacker-org/backdoor/.github/workflows/pwn.yml@");
+  });
+
+  test("a presence check on job_workflow_ref is read, not refused", () => {
+    expect(trusted(singleFile(provider(`"has(assertion.job_workflow_ref) && ${trustLine("c.yml")}"`)))).toEqual(["c.yml"]);
+  });
+
+  test("an interpolated workflow name is not a name the inventory can read", () => {
+    const source =
+      `locals {\n  n = "deploy-prod"\n}\n` +
+      provider(
+        `"assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/${hole("local.n")}.yml@' + assertion.job_workflow_sha"`,
+      );
+    expect(trustFailures(singleFile(source))).toContain("uses job_workflow_ref in a form the inventory does not read");
+  });
+
+  test("a template directive is refused whatever it would expand to", () => {
+    const source =
+      `locals {\n  names = ["deploy-prod"]\n}\n` +
+      provider(
+        `"${trustLine("c.yml")}%{ for w in local.names } || assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/${hole("w")}.yml@')%{ endfor }"`,
+      );
+    const out = trustFailures(singleFile(source));
+    expect(out).toContain("contains the template directive");
+    expect(out).toContain(`interpolates ${hole("w")} where it cannot be bounded`);
+  });
+
+  test("a variable spliced as a clause is refused", () => {
+    const out = trustFailures(singleFile(provider(`"${trustLine("c.yml")} || (${hole("var.extra_condition")})"`)));
+    expect(out).toContain(
+      `interpolates ${hole("var.extra_condition")} where it cannot be bounded: a value from outside the module is admitted only as the whole of a single-quoted CEL literal`,
+    );
+  });
+
+  test("an escaped template sequence is refused", () => {
+    const escaped = "$" + hole("true");
+    expect(trustFailures(singleFile(provider(`"${trustLine("c.yml")} || ${escaped}"`)))).toContain(
+      "contains the escaped template sequence",
+    );
+  });
+
+  test("a bare variable, an unreadable reference and a rewriting call are each refused", () => {
+    const locals = `locals {\n  real = "${trustLine("c.yml")}"\n}\n`;
+    expect(trustFailures(singleFile(locals + provider(`join(" || ", ["${hole("local.real")}", var.extra])`)))).toContain(
+      "uses var.extra where its value could reach the condition text",
+    );
+    expect(
+      trustFailures(singleFile(
+        locals + provider(`join(" || ", ["${hole("local.real")}", data.google_secret_manager_secret_version.extra.secret_data])`),
+      )),
+    ).toContain("references data.google_secret_manager_secret_version.extra.secret_data, which the inventory cannot follow");
+    expect(trustFailures(singleFile(locals + provider(`replace(local.real, "platform", "backdoor")`)))).toContain(
+      "calls replace(...), which can change the condition after it was read",
+    );
+  });
+
+  test("residue inside a followed local names the local, its file and its line", () => {
+    const files = new Map([
+      ["terraform/modules/bootstrap/main.tf", provider("local.condition")],
+      ["terraform/modules/bootstrap/conditions.tf", `locals {\n  condition = "${trustLine("c.yml")} || ${foreign}"\n}\n`],
+    ]);
+    expect(trustFailures(files)).toContain(
+      "terraform/modules/bootstrap/main.tf: google_iam_workload_identity_pool_provider.github: local.condition (terraform/modules/bootstrap/conditions.tf line 2) uses job_workflow_ref",
+    );
+  });
+
+  // The live module splices the numeric owner and repository IDs and the
+  // trusted commit SHAs from variables. Each is admitted only because its
+  // validation pins it to an alphanumeric alphabet, and only as the whole of
+  // one single-quoted literal.
+  const pinnedVariables =
+    `variable "owner" {\n  type = string\n\n  validation {\n    condition     = can(regex("^[1-9][0-9]*$", var.owner))\n    error_message = "x"\n  }\n}\n` +
+    `variable "shas" {\n  type = set(string)\n\n  validation {\n    condition = (\n      length(var.shas) > 0 &&\n` +
+    `      alltrue([for sha in var.shas : can(regex("^[0-9a-f]{40}$", sha))])\n    )\n    error_message = "x"\n  }\n}\n`;
+  const shaLoop = (result: string) => `  shas = join(" || ", [\n    for sha in sort(tolist(var.shas)) : ${result}\n  ])\n`;
+  const shaLiteral = `"assertion.job_workflow_sha == '${hole("sha")}'"`;
+  const pinnedCondition =
+    `locals {\n${shaLoop(shaLiteral)}` +
+    `  condition = "assertion.repository_owner_id == '${hole("var.owner")}' && (${hole("local.shas")}) && (${trustLine("c.yml")})"\n}\n`;
+
+  test("a pinned variable spliced as one literal is admitted, from its own file", () => {
+    expect(trusted(new Map([
+      ["terraform/modules/bootstrap/main.tf", pinnedCondition + provider("local.condition")],
+      ["terraform/modules/bootstrap/variables.tf", pinnedVariables],
+    ]))).toEqual(["c.yml"]);
+  });
+
+  test("a variable that chooses a branch or is counted contributes no text", () => {
+    const source =
+      pinnedVariables +
+      `locals {\n  a = "${trustLine("c.yml")}"\n  b = "${trustLine("d.yml")}"\n  chosen = var.flag ? local.a : local.b\n` +
+      `  counted = length(var.shas) == 0 ? "false" : local.chosen\n}\n` +
+      provider("local.counted");
+    expect(trusted(singleFile(source))).toEqual(["c.yml", "d.yml"]);
+  });
+
+  test.each([
+    ["no validation", `variable "owner" {\n  type = string\n}\n`, "var.owner has no validation that pins it"],
+    [
+      "a regex that could admit a quote",
+      `variable "owner" {\n  type = string\n  validation {\n    condition     = can(regex("^.*$", var.owner))\n    error_message = "x"\n  }\n}\n`,
+      "var.owner has no validation that pins it",
+    ],
+    [
+      "a pin weakened by ||",
+      `variable "owner" {\n  type = string\n  validation {\n    condition     = can(regex("^[0-9]+$", var.owner)) || true\n    error_message = "x"\n  }\n}\n`,
+      "var.owner has no validation that pins it",
+    ],
+    [
+      "a negated pin",
+      `variable "owner" {\n  type = string\n  validation {\n    condition     = !can(regex("^[0-9]+$", var.owner))\n    error_message = "x"\n  }\n}\n`,
+      "var.owner has no validation that pins it",
+    ],
+    [
+      "a pin on a different variable",
+      `variable "owner" {\n  type = string\n  validation {\n    condition     = can(regex("^[0-9]+$", var.other))\n    error_message = "x"\n  }\n}\n`,
+      "var.owner has no validation that pins it",
+    ],
+    ["no declaration at all", "", "var.owner is not declared in this module"],
+    [
+      "two declarations",
+      `variable "owner" {\n  type = string\n}\nvariable "owner" {\n  type = string\n}\n`,
+      "var.owner is declared more than once",
+    ],
+  ])("a spliced variable with %s is refused", (_label, declaration, message) => {
+    const source = declaration + provider(`"assertion.repository_owner_id == '${hole("var.owner")}' && ${trustLine("c.yml")}"`);
+    expect(trustFailures(singleFile(source))).toContain(message);
+  });
+
+  test("a pinned value is admitted only as the whole of one literal", () => {
+    const source = pinnedVariables +
+      provider(`"assertion.repository_owner_id == 'id-${hole("var.owner")}' && ${trustLine("c.yml")}"`);
+    expect(trustFailures(singleFile(source))).toContain("admitted only as the whole of a single-quoted CEL literal");
+  });
+
+  test("an iterator is read only over a pinned collection and only inside a literal", () => {
+    const conditionOf = (locals: string) => locals + provider(`"(${hole("local.shas")}) && ${trustLine("c.yml")}"`);
+    expect(
+      trustFailures(singleFile(conditionOf(`variable "shas" {\n  type = set(string)\n}\nlocals {\n${shaLoop(shaLiteral)}}\n`))),
+    ).toContain("sha iterates over var.shas, and var.shas has no validation that pins it");
+    expect(trustFailures(singleFile(conditionOf(pinnedVariables + `locals {\n${shaLoop("sha")}}\n`)))).toContain(
+      "uses the iterator sha outside a single-quoted CEL literal",
+    );
+    expect(
+      trustFailures(singleFile(conditionOf(`locals {\n  list = []\n  shas = join(" || ", [for sha in local.list : ${shaLiteral}])\n}\n`))),
+    ).toContain('iterates over "local.list", which is not one variable inside list-shaping calls');
   });
 });
 
@@ -757,5 +1032,82 @@ describe("the lint entrypoint refuses hostile workflow entries", () => {
     });
     expect(result.exitCode).not.toBe(0);
     expect(result.output).toContain("terraform/deployments/prod/linked.tf is a symbolic link");
+  }, 30_000);
+
+  // The fixture, and nothing else, must be what fails the copy: every line
+  // of output has to be about the provider the fixture added.
+  function expectOnlyFindingsAbout(output: string, subject: string): void {
+    const lines = output.split("\n").filter((line) => line.trim() !== "");
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(line).toContain(subject);
+  }
+
+  // The demonstrated fail-open: each of these providers carries the reviewed
+  // exact clause beside a clause the inventory could not read, and the lint
+  // used to exit 0 for every one of them.
+  const platformPath = "collinbentley1/platform/.github/workflows/";
+  test.each([
+    [
+      "a prefix that stops short of a file name",
+      extraProvider(`"${trustLine("deploy-prod.yml")} || assertion.job_workflow_ref.startsWith('${platformPath}')"`),
+      "calls startsWith outside the legacy trust form",
+    ],
+    ["another repository", foreignProvider, "attacker-org/backdoor/.github/workflows/pwn.yml@"],
+    [
+      "an interpolated workflow name",
+      extraProvider(
+        `"assertion.job_workflow_ref == '${platformPath}$` + `{local.extra_name}.yml@' + assertion.job_workflow_sha"`,
+        `locals {\n  extra_name = "deploy-prod"\n}\n`,
+      ),
+      "uses job_workflow_ref in a form the inventory does not read",
+    ],
+    [
+      "a template directive",
+      extraProvider(
+        `"${trustLine("deploy-prod.yml")}%{ for w in local.extra_names } || assertion.job_workflow_ref.startsWith('${platformPath}$` +
+          `{w}.yml@')%{ endfor }"`,
+        `locals {\n  extra_names = ["deploy-prod"]\n}\n`,
+      ),
+      "contains the template directive",
+    ],
+    [
+      "a variable spliced as a clause",
+      extraProvider(`"${trustLine("deploy-prod.yml")} || ($` + `{var.extra_condition})"`),
+      "interpolates ${var.extra_condition} where it cannot be bounded",
+    ],
+  ])("a second provider admitting %s beside a reviewed clause fails", async (_label, source, message) => {
+    const result = await lintCopy(async (copy) => {
+      await writeFile(join(copy, "terraform/deployments/prod/extra.tf"), source);
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain(message);
+    expectOnlyFindingsAbout(result.output, "terraform/deployments/prod/extra.tf: google_iam_workload_identity_pool_provider.extra");
+  }, 30_000);
+
+  // A provider with no condition trusts every token the issuer signs, and
+  // outside terraform/ it used to be invisible.
+  test("a provider outside terraform/ is found", async () => {
+    const result = await lintCopy(async (copy) => {
+      await mkdir(join(copy, "infra"), { recursive: true });
+      await writeFile(join(copy, "infra/wif.tf"), openProvider);
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain(
+      "infra/wif.tf: google_iam_workload_identity_pool_provider.extra has no attribute_condition",
+    );
+    expectOnlyFindingsAbout(result.output, "infra/wif.tf: google_iam_workload_identity_pool_provider.extra");
+  }, 30_000);
+
+  // A stray entry used to suppress the authority check outright: the run
+  // failed for the stray file and said nothing about the workflow beside it.
+  test("a stray entry does not hide an authority finding about its neighbour", async () => {
+    const result = await lintCopy(async (copy) => {
+      await writeFile(join(copy, ".github/workflows/notes.txt"), "not a workflow\n");
+      await writeFile(join(copy, ".github/workflows/hostile.yaml"), owner);
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain(".github/workflows/notes.txt is not a workflow");
+    expect(result.output).toContain(".github/workflows/hostile.yaml is not declared in the workflow authority inventory");
+    expect(result.output).toContain("its source shows owner-credential");
   }, 30_000);
 });

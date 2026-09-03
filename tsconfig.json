@@ -13,5 +13,5 @@
     "target": "ES2024",
     "types": ["bun-types"]
   },
-  "include": ["tools/**/*.ts", "test/integration/**/*.ts"]
+  "include": ["tools/**/*.ts", "test/integration/**/*.ts", "test/workflow-authority-contract.test.ts"]
 }
