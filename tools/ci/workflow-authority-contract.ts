@@ -164,6 +164,17 @@ async function entryNames(path: string, display: string, failures: string[]): Pr
   }
 }
 
+// A file that cannot be read is a failure naming the file, never an uncaught
+// error: the run must say which authority it could not bound.
+async function readSource(path: string, display: string, failures: string[]): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (error) {
+    failures.push(`${display} could not be read: ${errorMessage(error)}.`);
+    return undefined;
+  }
+}
+
 // Every workflow GitHub would run: each entry of .github/workflows named *.yml
 // or *.yaml. Anything else in the directory is refused with a message rather
 // than skipped, because an entry the inventory did not read is authority it
@@ -188,7 +199,8 @@ export async function workflowUniverse(root: string): Promise<FileUniverse> {
       );
       continue;
     }
-    sources.set(name, await readFile(join(directory, name), "utf8"));
+    const source = await readSource(join(directory, name), display, failures);
+    if (source !== undefined) sources.set(name, source);
   }
   return failures.length > 0 ? { failures, kind: "rejected", sources } : { kind: "resolved", sources };
 }
@@ -233,7 +245,8 @@ async function collectTerraform(
       continue;
     }
     if (terraformFileName.test(name)) {
-      sources.set(display, await readFile(join(root, display), "utf8"));
+      const source = await readSource(join(root, display), display, failures);
+      if (source !== undefined) sources.set(display, source);
     }
   }
 }
@@ -798,6 +811,9 @@ const text = 1;
 const comment = 2;
 const quote = 3;
 
+// The opener each closing bracket pairs with.
+const openerOf: Readonly<Record<string, string>> = { ")": "(", "]": "[", "}": "{" };
+
 interface TemplateSpan {
   readonly close: number;
   readonly directive: boolean;
@@ -928,7 +944,36 @@ function lexHcl(
   if (open !== undefined) {
     return { failure: `${path}: unterminated ${open.kind} at end of file.`, kind: "invalid" };
   }
+  const mismatch = bracketMismatch(path, source, mask);
+  if (mismatch !== undefined) return { failure: mismatch, kind: "invalid" };
   return { file: { mask, path, templates, text: source }, kind: "lexed" };
+}
+
+// Every closing bracket that is code must close the bracket opened last. The
+// scans below count depth over the three pairs as one, which is exact only
+// once this holds; without it `(1]` read as balanced. An opener still open
+// at the end of the file is left to the parse that runs into it, which names
+// the block or expression it could not close.
+function bracketMismatch(path: string, source: string, mask: Uint8Array): string | undefined {
+  const open: Array<{ readonly bracket: string; readonly index: number }> = [];
+  for (let index = 0; index < source.length; index += 1) {
+    if (mask[index] !== code) continue;
+    const character = source.charAt(index);
+    if (character === "(" || character === "[" || character === "{") {
+      open.push({ bracket: character, index });
+      continue;
+    }
+    const opener = openerOf[character];
+    if (opener === undefined) continue;
+    const last = open.pop();
+    if (last === undefined) {
+      return `${path}: the ${character} at line ${lineOf(source, index)} closes nothing.`;
+    }
+    if (last.bracket !== opener) {
+      return `${path}: the ${character} at line ${lineOf(source, index)} closes the ${last.bracket} opened at line ${lineOf(source, last.index)}.`;
+    }
+  }
+  return undefined;
 }
 
 interface HclAttribute {
@@ -968,7 +1013,9 @@ function skipInlineBlank(file: HclFile, from: number, end: number): number {
 }
 
 // The index just past the bracket matching the one at `open`, counting only
-// brackets of that pair that are code.
+// brackets of that pair that are code. This and every depth count after it
+// rely on lexHcl having refused any closer that does not match the bracket
+// opened last.
 function closingBracket(file: HclFile, open: number, end: number): number | undefined {
   const opener = file.text.charAt(open);
   const closer = opener === "(" ? ")" : opener === "[" ? "]" : "}";
@@ -1104,8 +1151,8 @@ interface LocalDefinition {
 // ---------------------------------------------------------------------------
 
 // A pinned collection is also `nonempty` when a validation conjunct requires
-// at least one element, which is what lets a `for` over it be rendered as a
-// single representative element rather than as possibly nothing at all.
+// at least one element, which is what spares a `for` over it the rendering
+// in which it contributes nothing at all.
 type VariablePin =
   | { readonly kind: "pinned"; readonly nonempty: boolean; readonly pattern: string }
   | { readonly kind: "unpinned"; readonly reason: string };
@@ -1447,11 +1494,15 @@ function scanFragment(fragment: ConditionFragment, pins: ReadonlyMap<string, Var
 // and a local.* reference. A pinned value spliced into a literal is rendered
 // as the reference itself, so `'${var.github_owner_id}'` becomes
 // `'var.github_owner_id'`: the pin bounds what it can hold, and a string's
-// content is never read as structure. A `for` yields one representative
-// element, since every element renders alike and joining more of them adds no
-// operand of a new shape; over a collection that may be empty it yields the
-// empty text as well, because an empty join leaves a hole in the condition.
-// Anything else refuses the provider.
+// content is never read as structure. A `for` is rendered twice: as one
+// element, and as two elements with the separator between them. Every
+// element renders alike, so a third would add no operand of a new shape; the
+// separator is text of the maintainer's choosing and the one place a join
+// can introduce an operator, and it used to be dropped from the rendering,
+// so `join(") || (assertion.repository_owner == 'x') || (", [for ...])` read
+// as a single comparison. Over a collection that may be empty the `for`
+// yields the empty text as well, because an empty join leaves a hole in the
+// condition. Anything else refuses the provider.
 // ---------------------------------------------------------------------------
 
 interface RenderedBranch {
@@ -1463,8 +1514,13 @@ interface RenderedBranch {
 // alternatives, expanded into one branch per combination at the end.
 type Piece = string | Choice;
 
+interface ChoiceOption {
+  readonly label: string;
+  readonly pieces: readonly Piece[];
+}
+
 interface Choice {
-  readonly options: readonly { readonly label: string; readonly pieces: readonly Piece[] }[];
+  readonly options: readonly ChoiceOption[];
 }
 
 type PieceRender =
@@ -1687,6 +1743,7 @@ function renderFor(
   to: number,
   iterators: ReadonlySet<string>,
   where: string,
+  separator: string,
 ): PieceRender {
   const match = forExpression.exec(codeText(file, from, to));
   const iterator = match?.[1];
@@ -1704,16 +1761,12 @@ function renderFor(
   if (pin?.kind !== "pinned") return unreadable(`${where} iterates over var.${source}, which no validation pins.`);
   const body = renderExpression(context, file, from + match[0].length, to, new Set([...iterators, iterator]), where);
   if (body.kind === "unreadable") return body;
-  if (pin.nonempty) return body;
-  return {
-    kind: "pieces",
-    pieces: [{
-      options: [
-        { label: `var.${source} is nonempty`, pieces: body.pieces },
-        { label: `var.${source} is empty`, pieces: [] },
-      ],
-    }],
-  };
+  const options: ChoiceOption[] = [
+    { label: `var.${source} has one element`, pieces: body.pieces },
+    { label: `var.${source} has more than one element`, pieces: [...body.pieces, separator, ...body.pieces] },
+  ];
+  if (!pin.nonempty) options.push({ label: `var.${source} is empty`, pieces: [] });
+  return { kind: "pieces", pieces: [{ options }] };
 }
 
 function renderJoin(
@@ -1746,7 +1799,7 @@ function renderJoin(
     );
   }
   if (forExpression.test(codeText(file, listFrom + 1, listTo - 1))) {
-    return renderFor(context, file, listFrom + 1, listTo - 1, iterators, where);
+    return renderFor(context, file, listFrom + 1, listTo - 1, iterators, where, separatorText);
   }
   const items = splitAtCommas(file, listFrom + 1, listTo - 1);
   if (items.length === 0) return unreadable(`${where} joins an empty list, which renders as no condition at all.`);
@@ -1893,7 +1946,8 @@ function renderCondition(
 // of claims. And an operand the reader cannot decompose refuses the condition
 // outright: a CEL comment, which hides the rest of the line from CEL but not
 // from a naive split; a prefixed or triple-quoted string, which CEL delimits
-// by other rules; an unbalanced bracket; a stray ? or :.
+// by other rules; a bracket unbalanced or closed by the wrong kind; a stray
+// ? or :.
 // ---------------------------------------------------------------------------
 
 export type ConditionStructure =
@@ -1977,7 +2031,28 @@ function blankStrings(
   return { blanked: out, kind: "blanked" };
 }
 
-// The index of the bracket closing the one at `open`, or undefined.
+// Every closing bracket must close the bracket opened last, or the depth
+// counts that follow -- which treat the three pairs as one -- read `(T]` as
+// a parenthesised trust form.
+function bracketProblem(text: string, blanked: string): string | undefined {
+  const open: string[] = [];
+  for (let index = 0; index < blanked.length; index += 1) {
+    const character = blanked.charAt(index);
+    if (character === "(" || character === "[" || character === "{") {
+      open.push(character);
+      continue;
+    }
+    const opener = openerOf[character];
+    if (opener === undefined) continue;
+    const last = open.pop();
+    if (last === undefined) return `the ${character} at ${excerpt(text, index)} closes nothing`;
+    if (last !== opener) return `the ${character} at ${excerpt(text, index)} closes a ${last}, not a ${opener}`;
+  }
+  return open.length === 0 ? undefined : `the brackets of ${quoteOperand(text)} do not balance`;
+}
+
+// The index of the bracket closing the one at `open`; the brackets were
+// checked to pair before the first call.
 function matchingClose(blanked: string, open: number, to: number): number | undefined {
   let depth = 0;
   for (let index = open; index < to; index += 1) {
@@ -1993,7 +2068,9 @@ function matchingClose(blanked: string, open: number, to: number): number | unde
 
 // CEL binds `?:` loosest, then `||`, then `&&`, then everything else, so the
 // operators are looked for in that order at bracket depth zero. Whatever is
-// left is one operand: a whole trust form, a literal, or something else.
+// left is one operand: a whole trust form, a literal, or something else. The
+// brackets were checked to pair before the first call, so depth is counted
+// over the three pairs as one.
 function parseCel(text: string, blanked: string, start: number, end: number): CelParse {
   let from = start;
   let to = end;
@@ -2012,7 +2089,6 @@ function parseCel(text: string, blanked: string, start: number, end: number): Ce
       depth += 1;
     } else if (character === ")" || character === "]" || character === "}") {
       depth -= 1;
-      if (depth < 0) return { kind: "problem", problem: `the brackets of ${quoteOperand(node)} do not balance` };
     } else if (depth > 0) {
       continue;
     } else if (character === "|" || character === "&") {
@@ -2025,7 +2101,6 @@ function parseCel(text: string, blanked: string, start: number, end: number): Ce
       cuts.push({ index, operator: character });
     }
   }
-  if (depth !== 0) return { kind: "problem", problem: `the brackets of ${quoteOperand(node)} do not balance` };
 
   const question = cuts.find((cut) => cut.operator === "?");
   if (question !== undefined) {
@@ -2202,6 +2277,10 @@ export function conditionStructure(text: string): ConditionStructure {
   const blanked = blankStrings(text);
   if (blanked.kind === "problem") {
     return { failures: [`the condition cannot be decomposed: ${blanked.problem}.`], kind: "unbounded" };
+  }
+  const brackets = bracketProblem(text, blanked.blanked);
+  if (brackets !== undefined) {
+    return { failures: [`the condition cannot be decomposed: ${brackets}.`], kind: "unbounded" };
   }
   const parsed = parseCel(text, blanked.blanked, 0, text.length);
   if (parsed.kind === "problem") {
