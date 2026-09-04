@@ -28,6 +28,7 @@ const platformWorkflows = [
   ...reusableWorkflows,
   "platform.yml",
   "protected-bootstrap-implementation.yml",
+  "protected-recovery-invoke.yml",
   "refresh-grype-db.yml",
 ];
 
@@ -2605,7 +2606,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "fcda60e0df635275e8d21f2c1c1d03ec474dc9be6b399ffafaf485edb88d7906"
+  "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",

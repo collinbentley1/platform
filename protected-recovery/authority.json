@@ -1,0 +1,50 @@
+{
+  "broker": {
+    "projectId": null,
+    "projectNumber": null,
+    "region": "us-east4",
+    "serviceName": "protected-recovery",
+    "firestoreDatabase": "protected-recovery",
+    "reconcilerServiceAccount": "recovery-reconciler",
+    "workloadIdentityPoolId": "github-actions",
+    "workloadIdentityProviderId": "github"
+  },
+  "githubOwner": "collinbentley1",
+  "githubOwnerId": "16823277",
+  "platformRepository": "collinbentley1/platform",
+  "platformRepositoryId": "1255856466",
+  "consumers": [
+    {
+      "repository": "cdbentley",
+      "repositoryId": "1255553151",
+      "projectId": "cdbentley",
+      "projectNumber": "882468538648",
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "critical-history",
+      "repositoryId": "280932482",
+      "projectId": "critical-history-16823277",
+      "projectNumber": "422714632513",
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "healthmcp",
+      "repositoryId": "1025243085",
+      "projectId": "medlock-1025243085",
+      "projectNumber": "229383559510",
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "runsetta",
+      "repositoryId": "711292980",
+      "projectId": "runsetta",
+      "projectNumber": "601124730704",
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    }
+  ]
+}

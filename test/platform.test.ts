@@ -2876,7 +2876,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "fcda60e0df635275e8d21f2c1c1d03ec474dc9be6b399ffafaf485edb88d7906",
+      "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -3020,6 +3020,10 @@ describe("platform scaffold and doctor", () => {
     expect(attestations.map((entry) => entry.serviceAccounts)).toEqual([[], []]);
     expect(manifest.filter((entry) => entry.transitionEligible).map(jobKey)).toEqual([
       ".github/workflows/cleanup-preview.yml#cleanup",
+      ".github/workflows/protected-recovery-invoke.yml#cdbentley",
+      ".github/workflows/protected-recovery-invoke.yml#critical-history",
+      ".github/workflows/protected-recovery-invoke.yml#healthmcp",
+      ".github/workflows/protected-recovery-invoke.yml#runsetta",
       ".github/workflows/reconcile-previews.yml#reconcile",
     ]);
     expect(manifest.filter((entry) => entry.job.endsWith("canary")).map((entry) => entry.serviceAccounts)).toEqual([
