@@ -2876,7 +2876,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf",
+      "fcda60e0df635275e8d21f2c1c1d03ec474dc9be6b399ffafaf485edb88d7906",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -3045,7 +3045,7 @@ describe("platform scaffold and doctor", () => {
     );
     expect(bootstrap.match(/principalSet:\/\//g)).toHaveLength(1);
     expect(bootstrap).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+      'attribute_condition = "google.subject.startsWith(\'${local.github_owner_id}:${var.github_repository_id}:github-hosted:\')"',
     );
     expect(bootstrap).toContain('authority_delimiter = ":"');
     expect(bootstrap).toContain(
@@ -3073,7 +3073,6 @@ describe("platform scaffold and doctor", () => {
     for (const retired of [
       "'denied'",
       "run_attempt",
-      ".startsWith(",
       "has(assertion.",
       "attribute.legacy_",
       "_workflow_sha/",
@@ -3083,6 +3082,7 @@ describe("platform scaffold and doctor", () => {
     ]) {
       expect(bootstrap).not.toContain(retired);
     }
+    expect(bootstrap.match(/\.startsWith\(/g)).toHaveLength(1);
     expect(bootstrap).not.toContain(
       'member             = "serviceAccount:${google_service_account.prod_publisher.email}"',
     );
@@ -3552,10 +3552,11 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     // Rerun defence lives in the workflows' own attempt guards above; the WIF
-    // provider condition is the literal owner, repository, and GitHub-hosted
-    // conjunction only, so both attempts of a run carry identical authority.
+    // provider condition is only a delimiter-terminated prefix of the mapped
+    // subject, pinning the owner, the repository, and a runner environment of
+    // exactly github-hosted, so both attempts of a run carry identical authority.
     expect(bootstrap).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+      'attribute_condition = "google.subject.startsWith(\'${local.github_owner_id}:${var.github_repository_id}:github-hosted:\')"',
     );
     expect(bootstrap).not.toContain("run_attempt");
   });

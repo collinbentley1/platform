@@ -304,11 +304,11 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   # The attempt counter is deliberately absent, so both attempts of a run carry
   # the same authority and the workflows' own attempt guards decide reruns.
   attribute_mapping = {
-    "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
+    "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.runner_environment + ':' + assertion.run_id"
     "attribute.authority" = "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name"
   }
 
-  attribute_condition = "assertion.repository_owner_id == '${local.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && assertion.runner_environment == 'github-hosted'"
+  attribute_condition = "google.subject.startsWith('${local.github_owner_id}:${var.github_repository_id}:github-hosted:')"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com/"

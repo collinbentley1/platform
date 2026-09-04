@@ -32,13 +32,13 @@ run "provider_admits_only_github_hosted_jobs_of_the_exact_repository" {
   command = plan
 
   assert {
-    condition     = google_iam_workload_identity_pool_provider.github.attribute_condition == "assertion.repository_owner_id == '16823277' && assertion.repository_id == '123456789' && assertion.runner_environment == 'github-hosted'"
-    error_message = "The provider condition must be exactly the owner-ID, repository-ID, and GitHub-hosted conjunction, so a wrong owner, a wrong repository, or a self-hosted runner is refused before any mapping."
+    condition     = google_iam_workload_identity_pool_provider.github.attribute_condition == "google.subject.startsWith('16823277:123456789:github-hosted:')"
+    error_message = "The provider condition must be exactly the owner-ID, repository-ID, and GitHub-hosted prefix of the mapped subject, so a wrong owner, a wrong repository, or a self-hosted runner is refused."
   }
 
   assert {
     condition = google_iam_workload_identity_pool_provider.github.attribute_mapping == tomap({
-      "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
+      "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.runner_environment + ':' + assertion.run_id"
       "attribute.authority" = "assertion.workflow_ref + ':' + assertion.job_workflow_ref + ':' + assertion.job_workflow_sha + ':' + assertion.environment + ':' + assertion.event_name"
     })
     error_message = "The mapping must be the subject plus the one job-level authority composite in tuple order, with no per-job decision logic."
@@ -260,7 +260,7 @@ run "each_module_instance_binds_only_its_own_consumer_repository" {
   }
 
   assert {
-    condition     = google_iam_workload_identity_pool_provider.github.attribute_condition == "assertion.repository_owner_id == '16823277' && assertion.repository_id == '987654321' && assertion.runner_environment == 'github-hosted'"
+    condition     = google_iam_workload_identity_pool_provider.github.attribute_condition == "google.subject.startsWith('16823277:987654321:github-hosted:')"
     error_message = "The provider condition must track the exact consumer repository ID of the module instance."
   }
 
