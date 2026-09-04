@@ -1857,10 +1857,13 @@ describe("platform scaffold and doctor", () => {
     for (const environment of [
       "`dhi-base-prefetch-20260822-098dca9280b3`",
       "`preview-publish`",
+      "`preview-publish-canary`",
       "`preview-cloud`",
+      "`preview-cloud-canary`",
       "`preview-operations`",
       "`supply-chain`",
       "`production`",
+      "`production-canary`",
       "`production-publish`",
     ]) {
       expect(rollout).toContain(environment);
@@ -2289,7 +2292,7 @@ describe("platform scaffold and doctor", () => {
       deploy.indexOf("  publish-canary:\n"),
       deploy.indexOf("\n  publish:\n"),
     );
-    expect(publishCanary).toContain("environment: preview-publish");
+    expect(publishCanary).toContain("environment: preview-publish-canary");
     expect(publishCanary).not.toContain("GCP_CLOUD_PREVIEW_ENABLED");
     expect(deploy.slice(deploy.indexOf("  publish:\n"), deploy.indexOf("\n  attest:\n"))).toContain(
       "needs.publish-canary.result == 'success'",
@@ -2504,9 +2507,14 @@ describe("platform scaffold and doctor", () => {
       join(repoRoot, "terraform/modules/bootstrap/tests/workflow_authority.tftest.hcl"),
       "utf8",
     );
-    expect(workflowAuthorityTest).toContain(
-      'run "transition_sha_binds_only_transition_eligible_workflows"',
-    );
+    for (const run of [
+      "active_sha_binds_the_exact_job_tuple_matrix",
+      "transition_sha_extends_only_the_preview_operations_tuples",
+      "neighbouring_tuples_and_unauthorized_accounts_bind_nothing",
+      "federated_principals_reach_only_bound_service_accounts",
+    ]) {
+      expect(workflowAuthorityTest).toContain(`run "${run}"`);
+    }
     expect(workflowAuthorityTest).toContain("expect_failures = [var.transition_workflow_sha]");
     for (const [workflowName, publishEnvironment, publisher, operator] of [
       ["deploy-prod.yml", "production-publish", "gha-prod-publish@", "gha-prod-deploy@"],
@@ -2868,7 +2876,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "7ac5098e213a80b1047fd7f96f0bf85954adbcc270ddcf415e30ba090c7f7974",
+      "d10c8b379aa9f2a0acab24fa19273c31a500bd980da013b1558d88780096c80b",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2986,7 +2994,7 @@ describe("platform scaffold and doctor", () => {
       "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants.",
     );
     expect(await readFile(join(repoRoot, "README.md"), "utf8")).toContain(
-      "exact `job_workflow_ref` of its reviewed reusable workflow",
+      "one job-level `attribute.authority` tuple",
     );
     expect(bootstrap).not.toMatch(/^\s*module\s+"/m);
     for (const outputPath of [
@@ -3002,34 +3010,23 @@ describe("platform scaffold and doctor", () => {
     }
     const manifest = JSON.parse(
       await readFile(join(repoRoot, "terraform/modules/bootstrap/workflow-authority.json"), "utf8"),
-    ) as Array<{ authority: string; path: string; serviceAccounts: string[]; transitionEligible: boolean }>;
-    const cloud = manifest.filter((entry) => entry.authority === "cloud");
-    expect(cloud.map((entry) => entry.path)).toEqual([
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/deploy-preview.yml",
-      ".github/workflows/deploy-prod.yml",
-      ".github/workflows/infrastructure.yml",
-      ".github/workflows/reconcile-previews.yml",
+    ) as Array<{ job: string; purpose: string; serviceAccounts: string[]; transitionEligible: boolean; workflow: string }>;
+    const jobKey = (entry: { job: string; workflow: string }) => `${entry.workflow}#${entry.job}`;
+    const attestations = manifest.filter((entry) => entry.purpose === "attestation");
+    expect(attestations.map(jobKey)).toEqual([
+      ".github/workflows/deploy-preview.yml#attest",
+      ".github/workflows/deploy-prod.yml#attest",
     ]);
-    expect(cloud.filter((entry) => entry.transitionEligible).map((entry) => entry.path)).toEqual([
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/reconcile-previews.yml",
+    expect(attestations.map((entry) => entry.serviceAccounts)).toEqual([[], []]);
+    expect(manifest.filter((entry) => entry.transitionEligible).map(jobKey)).toEqual([
+      ".github/workflows/cleanup-preview.yml#cleanup",
+      ".github/workflows/reconcile-previews.yml#reconcile",
     ]);
-    for (const [path, accounts] of [
-      [".github/workflows/cleanup-preview.yml", ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]],
-      [
-        ".github/workflows/deploy-preview.yml",
-        ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-preview-operator", "gha-preview-publish", "gha-wif-canary"],
-      ],
-      [
-        ".github/workflows/deploy-prod.yml",
-        ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-prod-deploy", "gha-prod-publish", "gha-wif-canary"],
-      ],
-      [".github/workflows/infrastructure.yml", ["gha-terraform", "gha-wif-canary"]],
-      [".github/workflows/reconcile-previews.yml", ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]],
-    ] as const) {
-      expect(cloud.find((entry) => entry.path === path)?.serviceAccounts, path).toEqual([...accounts]);
-    }
+    expect(manifest.filter((entry) => entry.job.endsWith("canary")).map((entry) => entry.serviceAccounts)).toEqual([
+      ["gha-wif-canary"],
+      ["gha-wif-canary"],
+      ["gha-wif-canary"],
+    ]);
     const workflowAuthorityBindingStart = bootstrap.indexOf(
       'resource "google_service_account_iam_member" "workflow_authority"',
     );
@@ -3044,14 +3041,16 @@ describe("platform scaffold and doctor", () => {
     expect(workflowAuthorityBinding).toContain('role               = "roles/iam.workloadIdentityUser"');
     expect(workflowAuthorityBinding).toContain("member             = each.value.member");
     expect(bootstrap).toContain(
-      "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null])",
+      "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [",
     );
     expect(bootstrap.match(/principalSet:\/\//g)).toHaveLength(1);
     expect(bootstrap).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\'"',
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
-    expect(bootstrap).toContain('"attribute.repository_id"    = "assertion.repository_id"');
-    expect(bootstrap).toContain('"attribute.job_workflow_ref" = "assertion.job_workflow_ref"');
+    expect(bootstrap).toContain('authority_delimiter = ":"');
+    expect(bootstrap).toContain(
+      '"attribute.authority" = "assertion.workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_sha + \'${local.authority_delimiter}\' + assertion.environment + \'${local.authority_delimiter}\' + assertion.event_name"',
+    );
     const bootstrapVariables = await readFile(
       join(repoRoot, "terraform/modules/bootstrap/variables.tf"),
       "utf8",
@@ -3073,12 +3072,14 @@ describe("platform scaffold and doctor", () => {
     }
     for (const retired of [
       "'denied'",
-      "assertion.job_workflow_sha",
-      "assertion.event_name",
+      "run_attempt",
       ".startsWith(",
+      "has(assertion.",
       "attribute.legacy_",
       "_workflow_sha/",
       '"attribute.environment"',
+      '"attribute.job_workflow_ref"',
+      '"attribute.repository_id"',
     ]) {
       expect(bootstrap).not.toContain(retired);
     }
@@ -3551,11 +3552,12 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     // Rerun defence lives in the workflows' own attempt guards above; the WIF
-    // provider condition is the literal owner/repository conjunction only.
+    // provider condition is the literal owner, repository, and GitHub-hosted
+    // conjunction only, so both attempts of a run carry identical authority.
     expect(bootstrap).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\'"',
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
-    expect(bootstrap).not.toContain("assertion.run_attempt");
+    expect(bootstrap).not.toContain("run_attempt");
   });
 
   test("runtime configuration is immutable per repository and Runsetta stays offline", async () => {

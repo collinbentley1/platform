@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cp, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  authorityDelimiter,
   checkWorkflowAuthority,
-  expectedWorkloadIdentityBindings,
   manifestPath,
   parseWorkflowAuthority,
   type WorkflowAuthorityEntry,
@@ -12,8 +12,6 @@ import {
 
 const repoRoot = resolve(import.meta.dir, "..");
 const temporaryRoots: string[] = [];
-const activeSha = "a".repeat(40);
-const transitionSha = "b".repeat(40);
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { force: true, recursive: true })));
@@ -22,8 +20,10 @@ afterEach(async () => {
 async function fixtureRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "workflow-authority-"));
   temporaryRoots.push(root);
-  await mkdir(join(root, ".github"), { recursive: true });
-  await cp(join(repoRoot, ".github/workflows"), join(root, ".github/workflows"), { recursive: true });
+  for (const directory of [".github/workflows", "templates/app/.github/workflows"]) {
+    await mkdir(join(root, directory, ".."), { recursive: true });
+    await cp(join(repoRoot, directory), join(root, directory), { recursive: true });
+  }
   await mkdir(join(root, "terraform/modules/bootstrap"), { recursive: true });
   await cp(join(repoRoot, manifestPath), join(root, manifestPath));
   return root;
@@ -37,100 +37,240 @@ async function writeManifest(root: string, manifest: unknown): Promise<void> {
   await writeFile(join(root, manifestPath), `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-async function editWorkflow(root: string, name: string, edit: (text: string) => string): Promise<void> {
-  const path = join(root, ".github/workflows", name);
-  const original = await readFile(path, "utf8");
+async function editEntry(root: string, workflow: string, job: string, edit: (entry: Record<string, unknown>) => void): Promise<void> {
+  const manifest = await readManifest(root);
+  const entry = manifest.find((candidate) => candidate.workflow === `.github/workflows/${workflow}` && candidate.job === job);
+  expect(entry, `${workflow} ${job} must be declared`).toBeDefined();
+  edit(entry!);
+  await writeManifest(root, manifest);
+}
+
+async function editFile(root: string, path: string, edit: (text: string) => string): Promise<void> {
+  const original = await readFile(join(root, path), "utf8");
   const edited = edit(original);
-  expect(edited, `${name} edit must change the file`).not.toBe(original);
-  await writeFile(path, edited);
+  expect(edited, `${path} edit must change the file`).not.toBe(original);
+  await writeFile(join(root, path), edited);
 }
 
 async function failuresOf(root: string): Promise<string[]> {
   return [...(await checkWorkflowAuthority(root)).failures];
 }
 
-const minimalWorkflow = [
-  "name: Rogue",
-  "on:",
-  "  workflow_call:",
-  "permissions: {}",
-  "jobs:",
-  "  build:",
-  "    runs-on: ubuntu-latest",
-  "    permissions:",
-  "      contents: read",
-  "    steps:",
-  `      - uses: actions/checkout@${"c".repeat(40)}`,
-  "",
-].join("\n");
+const caller = (workflow: string, ...events: string[]) => ({ events, ref: "refs/heads/main", workflow: `.github/workflows/${workflow}` });
+const previewCaller = [caller("deploy-preview.yml", "pull_request_target")];
+const productionCaller = [caller("deploy-prod.yml", "push")];
+const entry = (
+  workflow: string,
+  job: string,
+  environment: string,
+  purpose: "attestation" | "gcp",
+  callers: ReturnType<typeof caller>[],
+  serviceAccounts: string[],
+  transitionEligible = false,
+): WorkflowAuthorityEntry => ({ callers, environment, job, purpose, serviceAccounts, transitionEligible, workflow: `.github/workflows/${workflow}` });
+
+// The complete job-level inventory. Every id-token job of every platform
+// reusable workflow appears exactly once with the accounts it exchanges for.
+const expectedEntries: WorkflowAuthorityEntry[] = [
+  entry("cleanup-preview.yml", "cleanup", "preview-operations", "gcp", [caller("cleanup-preview.yml", "pull_request_target"), ...previewCaller], ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"], true),
+  entry("deploy-preview.yml", "attest", "supply-chain", "attestation", previewCaller, []),
+  entry("deploy-preview.yml", "canary", "preview-cloud-canary", "gcp", previewCaller, ["gha-wif-canary"]),
+  entry("deploy-preview.yml", "deploy", "preview-cloud", "gcp", previewCaller, ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-preview-operator"]),
+  entry("deploy-preview.yml", "invalidate", "preview-operations", "gcp", previewCaller, ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]),
+  entry("deploy-preview.yml", "publish", "preview-publish", "gcp", previewCaller, ["gha-preview-publish", "gha-wif-canary"]),
+  entry("deploy-preview.yml", "publish-canary", "preview-publish-canary", "gcp", previewCaller, ["gha-wif-canary"]),
+  entry("deploy-prod.yml", "attest", "supply-chain", "attestation", productionCaller, []),
+  entry("deploy-prod.yml", "canary", "production-canary", "gcp", productionCaller, ["gha-wif-canary"]),
+  entry("deploy-prod.yml", "deploy", "production", "gcp", productionCaller, ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-prod-deploy"]),
+  entry("deploy-prod.yml", "publish", "production-publish", "gcp", productionCaller, ["gha-prod-publish", "gha-wif-canary"]),
+  entry("infrastructure.yml", "terraform-convergence", "production", "gcp", productionCaller, ["gha-terraform", "gha-wif-canary"]),
+  entry("reconcile-previews.yml", "reconcile", "preview-operations", "gcp", [caller("reconcile-previews.yml", "push", "schedule", "workflow_dispatch")], ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"], true),
+];
 
 describe("workflow authority manifest", () => {
-  test("the live repository declares every workflow and every declaration matches its workflow", async () => {
+  test("the live repository declares every id-token job as exactly its job-level tuple", async () => {
     const result = await checkWorkflowAuthority(repoRoot);
     expect(result.failures).toEqual([]);
-    expect(result.entries.map((entry) => entry.path)).toEqual([
-      ".github/workflows/application.yml",
-      ".github/workflows/bun-dependency-update.yml",
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/deploy-preview.yml",
-      ".github/workflows/deploy-prod.yml",
-      ".github/workflows/infrastructure.yml",
-      ".github/workflows/platform.yml",
-      ".github/workflows/protected-bootstrap-implementation.yml",
-      ".github/workflows/reconcile-previews.yml",
-      ".github/workflows/refresh-grype-db.yml",
-      ".github/workflows/socket-firewall.yml",
-    ]);
-    const byAuthority = (authority: string) =>
-      result.entries.filter((entry) => entry.authority === authority).map((entry) => entry.path.slice(".github/workflows/".length));
-    expect(byAuthority("cloud")).toEqual([
+    expect(result.entries).toEqual(expectedEntries);
+    expect(result.workflows).toEqual([
+      "application.yml",
+      "bun-dependency-update.yml",
       "cleanup-preview.yml",
       "deploy-preview.yml",
       "deploy-prod.yml",
       "infrastructure.yml",
-      "reconcile-previews.yml",
-    ]);
-    expect(byAuthority("owner-secret")).toEqual(["protected-bootstrap-implementation.yml"]);
-    expect(byAuthority("none")).toEqual([
-      "application.yml",
-      "bun-dependency-update.yml",
       "platform.yml",
+      "protected-bootstrap-implementation.yml",
+      "reconcile-previews.yml",
       "refresh-grype-db.yml",
       "socket-firewall.yml",
     ]);
-    expect(result.entries.filter((entry) => entry.transitionEligible).map((entry) => entry.path)).toEqual([
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/reconcile-previews.yml",
+    for (const attestation of result.entries.filter((candidate) => candidate.purpose === "attestation")) {
+      expect(attestation.serviceAccounts).toEqual([]);
+      expect(attestation.environment).toBe("supply-chain");
+    }
+    for (const canary of result.entries.filter((candidate) => candidate.job.endsWith("canary"))) {
+      expect(canary.serviceAccounts).toEqual(["gha-wif-canary"]);
+      expect(canary.environment).toEndWith("-canary");
+    }
+    const environments = new Set(result.entries.map((candidate) => `${candidate.workflow} ${candidate.environment}`));
+    expect(environments.size).toBe(result.entries.length);
+  });
+
+  test("an id-token job the manifest does not declare fails closed", async () => {
+    const root = await fixtureRoot();
+    await editFile(root, ".github/workflows/refresh-grype-db.yml", (text) =>
+      text.replace("      contents: write\n", "      contents: write\n      id-token: write\n"),
+    );
+    expect(await failuresOf(root)).toEqual([
+      `.github/workflows/refresh-grype-db.yml: job refresh requests id-token: write but ${manifestPath} declares no authority for it.`,
     ]);
   });
 
-  test("an undeclared workflow on disk fails closed", async () => {
+  test("a declared job that is not an id-token job on disk fails closed", async () => {
     const root = await fixtureRoot();
-    await writeFile(join(root, ".github/workflows/rogue.yml"), minimalWorkflow);
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.job = "canary-smoke";
+    });
     expect(await failuresOf(root)).toEqual([
-      `.github/workflows/rogue.yml: not declared in ${manifestPath}.`,
+      `.github/workflows/deploy-prod.yml: job canary requests id-token: write but ${manifestPath} declares no authority for it.`,
+      `.github/workflows/deploy-prod.yml: job canary-smoke is declared in ${manifestPath} but is not an id-token: write job on disk.`,
     ]);
   });
 
-  test("a declared workflow that is absent from disk fails closed", async () => {
+  test("an environment must be one literal name that matches the manifest", async () => {
     const root = await fixtureRoot();
-    await rm(join(root, ".github/workflows/application.yml"));
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("    environment: production-canary\n", "    environment: ${{ vars.CANARY_ENVIRONMENT }}\n"),
+    );
     expect(await failuresOf(root)).toEqual([
-      `.github/workflows/application.yml: declared in ${manifestPath} but is not a regular workflow file on disk.`,
+      ".github/workflows/deploy-prod.yml: job canary environment must be one literal environment name.",
     ]);
-  });
-
-  test("a .yaml workflow is enumerated and must be declared under its exact name", async () => {
-    const root = await fixtureRoot();
-    await rename(join(root, ".github/workflows/application.yml"), join(root, ".github/workflows/application.yaml"));
-    expect(await failuresOf(root)).toEqual([
-      `.github/workflows/application.yaml: not declared in ${manifestPath}.`,
-      `.github/workflows/application.yml: declared in ${manifestPath} but is not a regular workflow file on disk.`,
-    ]);
-    const manifest = await readManifest(root);
-    manifest[0]!.path = ".github/workflows/application.yaml";
-    await writeManifest(root, manifest);
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("    environment: ${{ vars.CANARY_ENVIRONMENT }}\n", "    environment:\n      name: production-canary\n"),
+    );
     expect(await failuresOf(root)).toEqual([]);
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.environment = "production-smoke";
+    });
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary environment production-canary does not match the manifest environment production-smoke.",
+    ]);
+  });
+
+  test("two id-token jobs of one reusable workflow may not share an environment", async () => {
+    const root = await fixtureRoot();
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.environment = "production";
+    });
+    expect(await failuresOf(root)).toEqual([
+      `${manifestPath}[9]: .github/workflows/deploy-prod.yml job deploy shares environment production with another id-token job, so their authority tuples would collide.`,
+      ".github/workflows/deploy-prod.yml: job canary environment production-canary does not match the manifest environment production.",
+    ]);
+  });
+
+  test("an attestation tuple must attest and must exchange for nothing", async () => {
+    const root = await fixtureRoot();
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.purpose = "attestation";
+      canary.serviceAccounts = [];
+    });
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary is declared attestation but never runs actions/attest.",
+      ".github/workflows/deploy-prod.yml: job canary is declared attestation but exchanges for [gha-wif-canary].",
+    ]);
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.purpose = "gcp";
+      canary.serviceAccounts = ["gha-wif-canary"];
+    });
+    await editEntry(root, "deploy-prod.yml", "attest", (attest) => {
+      attest.purpose = "gcp";
+      attest.serviceAccounts = ["gha-wif-canary"];
+    });
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job attest exchanges for [] but the manifest binds [gha-wif-canary].",
+    ]);
+  });
+
+  test("a gcp tuple binds exactly the accounts its job exchanges for", async () => {
+    const root = await fixtureRoot();
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.serviceAccounts = ["gha-prod-deploy", "gha-wif-canary"];
+    });
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary exchanges for [gha-wif-canary] but the manifest binds [gha-prod-deploy, gha-wif-canary].",
+    ]);
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.serviceAccounts = ["gha-wif-canary"];
+    });
+    await editEntry(root, "cleanup-preview.yml", "cleanup", (cleanup) => {
+      cleanup.serviceAccounts = ["gha-preview-commit", "gha-wif-canary"];
+    });
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/cleanup-preview.yml: job cleanup exchanges for [gha-preview-commit, gha-preview-operator, gha-wif-canary] but the manifest binds [gha-preview-commit, gha-wif-canary].",
+    ]);
+  });
+
+  test("an exchange whose account is not a literal same-job output fails closed", async () => {
+    const root = await fixtureRoot();
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("          service_account: ${{ steps.app.outputs.canary_service_account }}\n", "          service_account: ${{ vars.CANARY_SERVICE_ACCOUNT }}\n"),
+    );
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary step 2 service_account must resolve to one known gha-* account through a same-job step output.",
+      ".github/workflows/deploy-prod.yml: job canary exchanges for [] but the manifest binds [gha-wif-canary].",
+    ]);
+  });
+
+  test("every action of a declared job must be pinned to a full commit SHA", async () => {
+    const root = await fixtureRoot();
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093", "uses: google-github-actions/auth@v3"),
+    );
+    expect(await failuresOf(root)).toEqual([
+      '.github/workflows/deploy-prod.yml: job canary step 2 uses "google-github-actions/auth@v3", which is not pinned to a full 40-hex commit SHA or sha256 image digest.',
+    ]);
+  });
+
+  test("write-all permissions are refused on a declared job", async () => {
+    const root = await fixtureRoot();
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("    permissions:\n      id-token: write # Exchange only for the no-role exact-WIF canary identity.\n", "    permissions: write-all\n"),
+    );
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary must declare an explicit permissions mapping, not write-all.",
+    ]);
+  });
+
+  test("the reserved composite delimiter is refused in every manifest value", async () => {
+    const root = await fixtureRoot();
+    await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
+      canary.environment = `production${authorityDelimiter}canary`;
+    });
+    expect(await failuresOf(root)).toEqual([
+      `${manifestPath}: "production:canary" contains the reserved delimiter ":".`,
+      `${manifestPath}[8]: environment must be one literal environment name.`,
+      `.github/workflows/deploy-prod.yml: job canary requests id-token: write but ${manifestPath} declares no authority for it.`,
+    ]);
+  });
+
+  test("a caller must be a real trigger of the consumer caller template", async () => {
+    const root = await fixtureRoot();
+    const template = "templates/app/.github/workflows/cleanup-preview.yml";
+    await editFile(root, template, (text) => text.replace("on:\n  pull_request_target:\n", "on:\n  workflow_dispatch:\n  pull_request_target:\n"));
+    expect(await failuresOf(root)).toEqual([
+      `${template}: triggers [pull_request_target, workflow_dispatch] do not match the manifest caller events [pull_request_target] of .github/workflows/cleanup-preview.yml job cleanup.`,
+    ]);
+    await editFile(root, template, (text) => text.replace("  workflow_dispatch:\n", "").replace("      - main\n", "      - '**'\n"));
+    expect(await failuresOf(root)).toEqual([
+      `${template}: pull_request_target must select only the main branch named by the manifest caller ref refs/heads/main.`,
+    ]);
+    await editFile(root, template, (text) =>
+      text.replace("      - '**'\n", "      - main\n").replace("      id-token: write # Exchange only for the exact-SHA preview traffic operator.\n", ""),
+    );
+    expect(await failuresOf(root)).toEqual([
+      `${template}: exactly one job must call collinbentley1/platform/.github/workflows/cleanup-preview.yml@__PLATFORM_SHA__ with id-token: write; found 0.`,
+    ]);
   });
 
   test("symbolic links and non-workflow entries in the workflow directory fail closed", async () => {
@@ -144,164 +284,51 @@ describe("workflow authority manifest", () => {
   });
 
   test("the manifest schema is strict", () => {
-    const entry = (overrides: Record<string, unknown>) => ({
-      authority: "none",
-      environments: [],
-      events: ["workflow_call"],
-      path: ".github/workflows/application.yml",
-      serviceAccounts: [],
+    const base = {
+      callers: [productionCaller[0]],
+      environment: "production-canary",
+      job: "canary",
+      purpose: "gcp",
+      serviceAccounts: ["gha-wif-canary"],
       transitionEligible: false,
-      ...overrides,
-    });
+      workflow: ".github/workflows/deploy-prod.yml",
+    };
+    const manifestEntry = (overrides: Record<string, unknown>) => ({ ...base, ...overrides });
+    const withCaller = (overrides: Record<string, unknown>) => manifestEntry({ callers: [{ ...productionCaller[0], ...overrides }] });
     const failure = (manifest: unknown) => parseWorkflowAuthority(JSON.stringify(manifest)).failures;
-    expect(failure([entry({})])).toEqual([]);
+    expect(failure([manifestEntry({})])).toEqual([]);
     expect(failure("{")).toHaveLength(1);
-    expect(failure({})).toEqual([`${manifestPath}: must be a non-empty array of workflow entries.`]);
-    expect(failure([])).toEqual([`${manifestPath}: must be a non-empty array of workflow entries.`]);
-    expect(failure([entry({ extra: true })])[0]).toContain("keys must be exactly");
-    expect(failure([entry({ authority: "cloudy" })])[0]).toContain("authority must be one of");
-    expect(failure([entry({ path: "workflows/application.yml" })])[0]).toContain("path must name");
-    expect(failure([entry({ path: ".github/workflows/../secrets.yml" })])[0]).toContain("path must name");
-    expect(failure([entry({ transitionEligible: "no" })])[0]).toContain("transitionEligible must be a boolean");
-    expect(failure([entry({ transitionEligible: true })])[0]).toContain("transitionEligible requires authority cloud");
-    expect(failure([entry({ serviceAccounts: ["gha-wif-canary"] })])[0]).toContain("non-empty exactly when authority is cloud");
-    expect(failure([entry({ authority: "cloud" })])[0]).toContain("non-empty exactly when authority is cloud");
-    expect(failure([entry({ authority: "cloud", serviceAccounts: ["gha-owner"] })])[0]).toContain("known service account IDs");
-    expect(failure([entry({ authority: "cloud", serviceAccounts: ["gha-wif-canary", "gha-terraform"] })])[0]).toContain("sorted, unique");
-    expect(failure([entry({ authority: "cloud", serviceAccounts: ["gha-terraform", "gha-terraform"] })])[0]).toContain("sorted, unique");
-    expect(failure([entry({ environments: "production" })])[0]).toContain("environments must be");
-    expect(failure([entry({ events: [] })])[0]).toContain("events must be");
-    expect(failure([entry({ events: ["push", 1] })])[0]).toContain("events must be");
-    expect(failure([entry({}), entry({})])).toEqual([`${manifestPath}[1]: duplicate path .github/workflows/application.yml.`]);
-  });
-
-  test("a job without explicit permissions fails when the workflow declares none", async () => {
-    const root = await fixtureRoot();
-    await writeFile(
-      join(root, ".github/workflows/rogue.yml"),
-      minimalWorkflow.replace("permissions: {}\n", "").replace("    permissions:\n      contents: read\n", ""),
-    );
-    const manifest = await readManifest(root);
-    manifest.push({
-      authority: "none",
-      environments: [],
-      events: ["workflow_call"],
-      path: ".github/workflows/rogue.yml",
-      serviceAccounts: [],
-      transitionEligible: false,
-    });
-    await writeManifest(root, manifest);
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/rogue.yml: job build declares no permissions and the workflow declares none.",
+    expect(failure({})).toEqual([`${manifestPath}: must be a non-empty array of id-token job entries.`]);
+    expect(failure([])).toEqual([`${manifestPath}: must be a non-empty array of id-token job entries.`]);
+    expect(failure([manifestEntry({ extra: true })])[0]).toContain("keys must be exactly");
+    expect(failure([manifestEntry({ purpose: "cloud" })])[0]).toContain("purpose must be one of");
+    expect(failure([manifestEntry({ workflow: "workflows/deploy-prod.yml" })])[0]).toContain("workflow must name");
+    expect(failure([manifestEntry({ workflow: ".github/workflows/../deploy-prod.yml" })])[0]).toContain("workflow must name");
+    expect(failure([manifestEntry({ job: "${{ matrix.job }}" })])[0]).toContain("job must be");
+    expect(failure([manifestEntry({ environment: "${{ vars.ENVIRONMENT }}" })])[0]).toContain("environment must be one literal");
+    expect(failure([manifestEntry({ transitionEligible: "no" })])[0]).toContain("transitionEligible must be a boolean");
+    expect(failure([manifestEntry({ purpose: "attestation", serviceAccounts: [], transitionEligible: true })])[0]).toContain("transitionEligible requires purpose gcp");
+    expect(failure([manifestEntry({ serviceAccounts: [] })])[0]).toContain("non-empty exactly when purpose is gcp");
+    expect(failure([manifestEntry({ purpose: "attestation" })])[0]).toContain("non-empty exactly when purpose is gcp");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-owner"] })])[0]).toContain("known service account IDs");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-wif-canary", "gha-terraform"] })])[0]).toContain("sorted, unique");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-terraform", "gha-terraform"] })])[0]).toContain("sorted, unique");
+    expect(failure([manifestEntry({ callers: [] })])[0]).toContain("callers must be a non-empty list");
+    expect(failure([manifestEntry({ callers: [{ events: ["push"], workflow: ".github/workflows/deploy-prod.yml" }] })])[0]).toContain("exactly the keys");
+    expect(failure([withCaller({ workflow: "deploy-prod.yml" })])[0]).toContain("caller workflow must name");
+    expect(failure([withCaller({ ref: "refs/tags/v1" })])[0]).toContain("caller ref must be");
+    expect(failure([withCaller({ events: ["pull_request"] })])[0]).toContain("caller events must be");
+    expect(failure([withCaller({ events: [] })])[0]).toContain("caller events must be");
+    expect(failure([withCaller({ events: ["workflow_dispatch", "push"] })])[0]).toContain("caller events must be");
+    expect(failure([manifestEntry({ callers: [productionCaller[0], productionCaller[0]] })])[0]).toContain("callers must be unique and sorted");
+    expect(failure([manifestEntry({ job: "deploy" }), manifestEntry({})])).toEqual([
+      `${manifestPath}[1]: entries must be unique and sorted by workflow, then job.`,
+      `${manifestPath}[1]: .github/workflows/deploy-prod.yml job canary shares environment production-canary with another id-token job, so their authority tuples would collide.`,
     ]);
-  });
-
-  test("id-token: write outside a cloud workflow fails", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "refresh-grype-db.yml", (text) =>
-      text.replace("      contents: write\n", "      contents: write\n      id-token: write\n"),
-    );
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/refresh-grype-db.yml: id-token: write must appear exactly in workflows the manifest marks cloud; this one is none.",
+    expect(failure([manifestEntry({}), manifestEntry({ environment: "production", job: "deploy", serviceAccounts: ["gha-prod-deploy"] })])).toEqual([]);
+    expect(failure([manifestEntry({ callers: [{ events: ["push"], ref: `refs/heads/main${authorityDelimiter}x`, workflow: ".github/workflows/deploy-prod.yml" }] })])).toEqual([
+      `${manifestPath}: "refs/heads/main:x" contains the reserved delimiter ":".`,
+      `${manifestPath}[0]: caller ref must be a refs/heads/ branch reference.`,
     ]);
-  });
-
-  test("a cloud workflow that never requests id-token: write is misclassified", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "infrastructure.yml", (text) => text.replaceAll("id-token: write", "id-token: none"));
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/infrastructure.yml: id-token: write must appear exactly in workflows the manifest marks cloud; this one is cloud.",
-    ]);
-  });
-
-  test("environment drift between the manifest and the workflow fails", async () => {
-    const root = await fixtureRoot();
-    const manifest = await readManifest(root);
-    const infrastructure = manifest.find((entry) => entry.path === ".github/workflows/infrastructure.yml")!;
-    infrastructure.environments = ["preview-cloud"];
-    await writeManifest(root, manifest);
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/infrastructure.yml: environments [production] do not match the manifest [preview-cloud].",
-    ]);
-  });
-
-  test("an environment declared as a mapping is read by name", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "infrastructure.yml", (text) =>
-      text.replace("    environment: production\n", "    environment:\n      name: production\n"),
-    );
-    expect(await failuresOf(root)).toEqual([]);
-  });
-
-  test("trigger drift between the manifest and the workflow fails", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "application.yml", (text) => text.replace("on:\n  workflow_call:\n", "on:\n  workflow_call:\n  push:\n    branches:\n      - main\n"));
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/application.yml: triggers [push:main, workflow_call] do not match the manifest events [workflow_call].",
-    ]);
-  });
-
-  test("a uses reference that is not pinned to a full commit SHA fails", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "application.yml", (text) =>
-      text.replace(/uses: actions\/checkout@[0-9a-f]{40} # v7\.0\.1/, "uses: actions/checkout@v7"),
-    );
-    expect(await failuresOf(root)).toEqual([
-      '.github/workflows/application.yml: job verify step 2 uses "actions/checkout@v7", which is not pinned to a full 40-hex commit SHA or sha256 image digest.',
-    ]);
-  });
-
-  test("the owner OAuth secret is referenced only by the owner-secret workflow", async () => {
-    const root = await fixtureRoot();
-    await editWorkflow(root, "application.yml", (text) =>
-      text.replace("    permissions:\n      contents: read\n", "    permissions:\n      contents: read\n    env:\n      OWNER: ${{ secrets.OWNER_OAUTH_ACCESS_TOKEN }}\n"),
-    );
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/application.yml: OWNER_OAUTH_ACCESS_TOKEN must be referenced exactly by workflows the manifest marks owner-secret; this one is none.",
-    ]);
-    await editWorkflow(root, "application.yml", (text) => text.replace("      OWNER: ${{ secrets.OWNER_OAUTH_ACCESS_TOKEN }}\n", "      OWNER: none\n"));
-    await editWorkflow(root, "protected-bootstrap-implementation.yml", (text) => text.replaceAll("OWNER_OAUTH_ACCESS_TOKEN", "OWNER_TOKEN"));
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/protected-bootstrap-implementation.yml: OWNER_OAUTH_ACCESS_TOKEN must be referenced exactly by workflows the manifest marks owner-secret; this one is owner-secret.",
-    ]);
-  });
-
-  test("granting a service account the workflow never names fails", async () => {
-    const root = await fixtureRoot();
-    const manifest = await readManifest(root);
-    const infrastructure = manifest.find((entry) => entry.path === ".github/workflows/infrastructure.yml")!;
-    infrastructure.serviceAccounts = ["gha-prod-deploy", "gha-terraform", "gha-wif-canary"];
-    await writeManifest(root, manifest);
-    expect(await failuresOf(root)).toEqual([
-      ".github/workflows/infrastructure.yml: the manifest grants gha-prod-deploy, which the workflow never names.",
-    ]);
-  });
-
-  test("the expected binding set is the manifest times the active SHA plus transition-eligible paths", async () => {
-    const { entries } = await checkWorkflowAuthority(repoRoot);
-    const active = expectedWorkloadIdentityBindings(entries, activeSha, null, "123456789012");
-    expect(active.size).toBe(20);
-    const both = expectedWorkloadIdentityBindings(entries, activeSha, transitionSha, "123456789012");
-    expect(both.size).toBe(26);
-    const transitionKeys = [...both.keys()].filter((key) => key.endsWith(`@${transitionSha}`)).sort();
-    expect(transitionKeys.map((key) => key.split("/").slice(1).join("/").split("@")[0])).toEqual([
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/reconcile-previews.yml",
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/reconcile-previews.yml",
-      ".github/workflows/cleanup-preview.yml",
-      ".github/workflows/reconcile-previews.yml",
-    ]);
-    expect(both.get(`gha-prod-deploy/.github/workflows/deploy-prod.yml@${activeSha}`)).toEqual({
-      account: "gha-prod-deploy",
-      member: `principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.job_workflow_ref/collinbentley1/platform/.github/workflows/deploy-prod.yml@${activeSha}`,
-      path: ".github/workflows/deploy-prod.yml",
-      sha: activeSha,
-    });
-    expect(both.has(`gha-prod-deploy/.github/workflows/deploy-prod.yml@${transitionSha}`)).toBe(false);
-    expect(() => expectedWorkloadIdentityBindings(entries, "abc", null, "1")).toThrow("not a full lowercase commit SHA");
-    expect(() => expectedWorkloadIdentityBindings(entries, activeSha, activeSha, "1")).toThrow("distinct full lowercase commit SHA");
-    const none: WorkflowAuthorityEntry[] = entries.filter((entry) => entry.authority !== "cloud");
-    expect(expectedWorkloadIdentityBindings(none, activeSha, transitionSha, "1").size).toBe(0);
   });
 });

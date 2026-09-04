@@ -31,16 +31,17 @@ const platformWorkflows = [
   "refresh-grype-db.yml",
 ];
 
-// The manifest is the one inventory of workflow authority. It must name every
-// workflow on disk -- .yml or .yaml, never a symbolic link -- and each entry is
-// checked against its workflow, so a new workflow is classified there or the
-// lint fails. The hand-maintained set above has drifted before, so it is
-// cross-checked against the same enumeration.
+// The manifest is the one inventory of federated authority: every id-token job
+// on disk -- in .yml or .yaml files, never a symbolic link -- must be declared
+// there as one exact job-level tuple, and each declaration is checked against
+// its job and its consumer caller template, so a new privileged job is
+// classified there or the lint fails. The hand-maintained set above has drifted
+// before, so it is cross-checked against the same workflow enumeration.
 const workflowAuthority = await checkWorkflowAuthority(root);
 failures.push(...workflowAuthority.failures);
-for (const entry of workflowAuthority.entries) {
-  if (!platformWorkflows.includes(entry.path.slice(".github/workflows/".length))) {
-    failures.push(`${entry.path} is not covered by the platform workflow lint set.`);
+for (const workflow of workflowAuthority.workflows) {
+  if (!platformWorkflows.includes(workflow)) {
+    failures.push(`.github/workflows/${workflow} is not covered by the platform workflow lint set.`);
   }
 }
 const declaredEnvironmentSecrets = [
@@ -819,12 +820,18 @@ rejectContains(
   'gh pr comment "$PR_NUMBER" --body',
   "Preview comments must not rely on a local Git repository.",
 );
+for (const [path, workflow, end, environment] of [
+  [".github/workflows/deploy-prod.yml", deployProduction, "\n  publish:\n", "environment: production-canary"],
+  [".github/workflows/deploy-preview.yml", deployPreview, "\n  publish-canary:\n", "environment: preview-cloud-canary"],
+] as const) {
+  requireContains(path, sectionBetween(workflow, "  canary:\n", end), environment, "Each no-role canary must enter its own environment, so its authority tuple binds only gha-wif-canary.");
+}
 const previewPublishCanary = sectionBetween(deployPreview, "  publish-canary:\n", "\n  publish:\n");
 requireContains(
   ".github/workflows/deploy-preview.yml",
   previewPublishCanary,
-  "environment: preview-publish",
-  "Preview publisher trust must have an independent publish-environment canary.",
+  "environment: preview-publish-canary",
+  "Preview publisher trust must have an independent canary in its own environment, so the canary tuple never shares the publisher's authority.",
 );
 rejectContains(
   ".github/workflows/deploy-preview.yml",
@@ -1977,12 +1984,15 @@ const workflowAuthorityTest = await readFile(
   "utf8",
 );
 for (const boundary of [
-  'run "provider_trusts_only_the_owner_and_repository_ids"',
-  'run "active_sha_binds_every_cloud_workflow_authority"',
-  'run "transition_sha_binds_only_transition_eligible_workflows"',
+  'run "provider_admits_only_github_hosted_jobs_of_the_exact_repository"',
+  'run "active_sha_binds_the_exact_job_tuple_matrix"',
+  'run "transition_sha_extends_only_the_preview_operations_tuples"',
+  'run "neighbouring_tuples_and_unauthorized_accounts_bind_nothing"',
+  'run "each_module_instance_binds_only_its_own_consumer_repository"',
+  'run "federated_principals_reach_only_bound_service_accounts"',
   "expect_failures = [var.active_workflow_sha]",
   "expect_failures = [var.transition_workflow_sha]",
-  "assertion.repository_owner_id == '16823277' && assertion.repository_id == '123456789'",
+  "assertion.repository_owner_id == '16823277' && assertion.repository_id == '123456789' && assertion.runner_environment == 'github-hosted'",
 ]) {
   if (!workflowAuthorityTest.includes(boundary)) {
     failures.push(`terraform/modules/bootstrap/tests/workflow_authority.tftest.hcl: missing ${boundary}`);
@@ -2595,7 +2605,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "7ac5098e213a80b1047fd7f96f0bf85954adbcc270ddcf415e30ba090c7f7974"
+  "d10c8b379aa9f2a0acab24fa19273c31a500bd980da013b1558d88780096c80b"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2759,14 +2769,14 @@ requireContains(
 requireContains(
   "README.md",
   readme,
-  "exact `job_workflow_ref` of its reviewed reusable workflow",
-  "The identity overview must disclose the exact reusable-workflow trust and the transition-eligible split.",
+  "one job-level `attribute.authority` tuple",
+  "The identity overview must disclose the job-level authority tuple and the transition-eligible split.",
 );
 requireContains(
   "docs/security-rollout.md",
   securityRollout,
-  "only the transition-eligible preview-operations workflows",
-  "The rollout guide must disclose which workflow authorities the transition SHA may keep exchanging.",
+  "only the transition-eligible `cleanup` and `reconcile` tuples",
+  "The rollout guide must disclose which authority tuples the transition SHA may keep exchanging.",
 );
 for (const outputPath of [
   "terraform/modules/bootstrap/outputs.tf",
@@ -2883,31 +2893,33 @@ for (const boundary of [
   'github_owner_id     = "16823277"',
   'platform_repository = "collinbentley1/platform"',
   'workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))',
-  'cloud_workflows    = { for entry in local.workflow_authority : entry.path => entry if entry.authority == "cloud" }',
-  'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\'"',
-  '"attribute.repository_id"    = "assertion.repository_id"',
-  '"attribute.job_workflow_ref" = "assertion.job_workflow_ref"',
+  'authority_delimiter = ":"',
+  'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+  '"google.subject"      = "assertion.repository_owner_id + \':\' + assertion.repository_id + \':\' + assertion.run_id"',
+  '"attribute.authority" = "assertion.workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_sha + \'${local.authority_delimiter}\' + assertion.environment + \'${local.authority_delimiter}\' + assertion.event_name"',
 ]) {
   requireContains(
     "terraform/modules/bootstrap/main.tf",
     bootstrapMain,
     boundary,
-    `The WIF provider must trust only the literal owner and repository IDs and map the reusable-workflow reference verbatim: ${boundary}`,
+    `The WIF provider must admit only GitHub-hosted jobs of the literal owner and repository IDs and map exactly the one job-level authority composite: ${boundary}`,
   );
 }
 for (const forbidden of [
   '"attribute.environment"',
+  '"attribute.job_workflow_ref"',
+  '"attribute.repository_id"',
   "'denied'",
-  "assertion.job_workflow_sha",
-  "assertion.event_name",
+  "run_attempt",
   ".startsWith(",
   "has(assertion.",
+  " ? assertion",
 ]) {
   rejectContains(
     "terraform/modules/bootstrap/main.tf",
     bootstrapMain,
     forbidden,
-    `The WIF provider must carry no workflow logic: ${forbidden}`,
+    `The WIF provider must carry no per-job decision logic and no second federated attribute: ${forbidden}`,
   );
 }
 const workflowAuthorityBinding = sectionBetween(
@@ -2920,6 +2932,9 @@ for (const boundary of [
   "service_account_id = local.workflow_authority_service_accounts[each.value.account]",
   'role               = "roles/iam.workloadIdentityUser"',
   "member             = each.value.member",
+  'contains(["attestation", "gcp"], entry.purpose)',
+  "(entry.purpose == \"gcp\") == (length(entry.serviceAccounts) > 0)",
+  "local.authority_delimiter)",
 ]) {
   requireContains(
     "terraform/modules/bootstrap/main.tf",
@@ -2933,14 +2948,19 @@ for (const boundary of [
   'account_id   = "gha-preview-publish"',
   'account_id   = "gha-preview-operator"',
   'account_id   = "gha-preview-commit"',
-  "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null])",
-  'member  = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.job_workflow_ref/${local.platform_repository}/${path}@${sha}"',
+  "for caller in entry.callers : [",
+  "for event in caller.events : [",
+  "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [",
+  "for account in entry.serviceAccounts : {",
+  '"${local.github_repo_full_name}/${caller.workflow}@${caller.ref}",',
+  '"${local.platform_repository}/${entry.workflow}@${sha}",',
+  'member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"',
 ]) {
   requireContains(
     "terraform/modules/bootstrap/main.tf",
     bootstrapMain,
     boundary,
-    `Exact workflow-authority binding is missing boundary: ${boundary}`,
+    `Exact job-level authority binding is missing boundary: ${boundary}`,
   );
 }
 if ([...bootstrapMain.matchAll(/principalSet:\/\//g)].length !== 1) {

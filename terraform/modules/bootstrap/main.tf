@@ -7,16 +7,22 @@ locals {
   workload_identity_pool = "projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
 
   # The provider admits exactly this owner's consumer repository, by immutable
-  # numeric IDs. Which reusable workflow may mint which service account is
-  # decided only by the per-workflow bindings derived from the manifest below;
-  # the provider condition carries no workflow logic.
+  # numeric IDs, on GitHub-hosted runners. Which job may mint which service
+  # account is decided only by the job-level bindings derived from the manifest
+  # below; the provider carries no other logic.
   github_owner_id     = "16823277"
   platform_repository = "collinbentley1/platform"
 
-  # The one inventory of workflow authority. tools/ci/workflow-authority.ts
-  # validates the same file against every workflow on disk.
+  # The one inventory of federated authority: one entry per id-token job of a
+  # platform reusable workflow. tools/ci/workflow-authority.ts validates the
+  # same file against every workflow and caller template on disk.
   workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))
-  cloud_workflows    = { for entry in local.workflow_authority : entry.path => entry if entry.authority == "cloud" }
+
+  # Reserved delimiter of the attribute.authority composite. Git refuses ':' in
+  # ref names and GitHub refuses it in owner and repository names, so no
+  # caller-controlled workflow_ref or job_workflow_ref can carry one; the
+  # manifest is refused if any of its values does.
+  authority_delimiter = ":"
 
   labels = {
     app        = var.app
@@ -291,15 +297,18 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   description                        = "OIDC provider restricted to ${local.github_repo_full_name}."
 
   # Numeric IDs survive renames. run_id makes the subject non-reusable across
-  # runs. The reusable-workflow reference is mapped verbatim so each service
-  # account binding can name the exact path@SHA it trusts.
+  # runs. attribute.authority is the one job-level tuple every binding names:
+  # the consumer caller's workflow_ref, the reusable job_workflow_ref and its
+  # job_workflow_sha, the job's environment, and the triggering event. A token
+  # without an environment claim cannot complete the mapping and is refused.
+  # The attempt counter is deliberately absent, so both attempts of a run carry
+  # the same authority and the workflows' own attempt guards decide reruns.
   attribute_mapping = {
-    "google.subject"             = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
-    "attribute.repository_id"    = "assertion.repository_id"
-    "attribute.job_workflow_ref" = "assertion.job_workflow_ref"
+    "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
+    "attribute.authority" = "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name"
   }
 
-  attribute_condition = "assertion.repository_owner_id == '${local.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}'"
+  attribute_condition = "assertion.repository_owner_id == '${local.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && assertion.runner_environment == 'github-hosted'"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com/"
@@ -849,11 +858,16 @@ resource "google_service_account_iam_member" "preview_deploy_uses_preview_runtim
   member             = "serviceAccount:${google_service_account.preview_deploy.email}"
 }
 
-# Every cloud workflow authority is one exact reusable-workflow reference. The
-# manifest names the workflow path, the service accounts that path may mint, and
-# whether the immediately previous reviewed platform commit keeps minting them
-# while consumers repin. Deploy paths are never transition-eligible, so a
-# predecessor token cannot deploy or roll a completed DHI epoch backward.
+# Every federated grant is one exact job-level tuple. For each manifest entry,
+# each declared consumer caller and event, the active SHA (plus the transition
+# SHA only for the transition-eligible preview-operations jobs), and each
+# permitted account, the member is the attribute.authority value that only that
+# job can present: the consumer caller at its branch, the platform reusable
+# workflow at the SHA whose job_workflow_sha is that same SHA, the job's literal
+# environment, and the event. Attestation entries carry no accounts and so
+# produce no binding. Deploy, publish, canary, and infrastructure jobs are never
+# transition-eligible, so a predecessor token cannot deploy or roll a completed
+# DHI epoch backward.
 locals {
   workflow_authority_service_accounts = {
     "gha-deploy-parity"    = google_service_account.deployment_parity_reader.name
@@ -869,16 +883,28 @@ locals {
 
   workflow_authority_bindings = {
     for binding in flatten([
-      for path, entry in local.cloud_workflows : [
-        for account in entry.serviceAccounts : [
-          for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : {
-            account = account
-            key     = "${account}/${path}@${sha}"
-            member  = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.job_workflow_ref/${local.platform_repository}/${path}@${sha}"
-          }
+      for entry in local.workflow_authority : [
+        for caller in entry.callers : [
+          for event in caller.events : [
+            for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [
+              for account in entry.serviceAccounts : {
+                account = account
+                key     = "${account}/${trimprefix(entry.workflow, ".github/workflows/")}:${entry.job}/${trimprefix(caller.workflow, ".github/workflows/")}:${event}@${sha}"
+                authority = join(local.authority_delimiter, [
+                  "${local.github_repo_full_name}/${caller.workflow}@${caller.ref}",
+                  "${local.platform_repository}/${entry.workflow}@${sha}",
+                  sha,
+                  entry.environment,
+                  event,
+                ])
+              }
+            ]
+          ]
         ]
       ]
-    ]) : binding.key => binding
+      ]) : binding.key => merge(binding, {
+      member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"
+    })
   }
 }
 
@@ -891,8 +917,14 @@ resource "google_service_account_iam_member" "workflow_authority" {
 
   lifecycle {
     precondition {
-      condition     = alltrue([for entry in local.workflow_authority : contains(["cloud", "none", "owner-secret"], entry.authority)])
-      error_message = "workflow-authority.json declares an authority other than cloud, none, or owner-secret."
+      condition = alltrue([
+        for entry in local.workflow_authority : (
+          contains(["attestation", "gcp"], entry.purpose) &&
+          (entry.purpose == "gcp") == (length(entry.serviceAccounts) > 0) &&
+          !strcontains(join("", concat([entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
+        )
+      ])
+      error_message = "workflow-authority.json must declare only attestation or gcp purposes, accounts only for gcp jobs, and no reserved delimiter in any tuple value."
     }
   }
 }

@@ -660,19 +660,21 @@ describe("protected container and preview lifecycle contracts", () => {
     );
   });
 
-  test("the WIF provider trusts only literal owner and repository IDs and maps the reusable-workflow reference verbatim", async () => {
+  test("the WIF provider admits only GitHub-hosted jobs of the literal owner and repository IDs and maps one job-level authority composite", async () => {
     const source = await readFile(
       join(repoRoot, "terraform/modules/bootstrap/main.tf"),
       "utf8",
     );
     expect(source).toContain('github_owner_id     = "16823277"');
+    expect(source).toContain('authority_delimiter = ":"');
     expect(source).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\'"',
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
     for (const repositoryId of ["1255553151", "711292980", "1025243085", "280932482"]) {
-      const condition = `assertion.repository_owner_id == '16823277' && assertion.repository_id == '${repositoryId}'`;
+      const condition = `assertion.repository_owner_id == '16823277' && assertion.repository_id == '${repositoryId}' && assertion.runner_environment == 'github-hosted'`;
       expect(condition.length).toBeLessThanOrEqual(4096);
-      expect(condition).not.toMatch(/job_workflow|event_name|environment|has\(|startsWith|\?/);
+      expect(condition.split(" && ")).toHaveLength(3);
+      expect(condition).not.toMatch(/job_workflow|event_name|run_attempt|has\(|startsWith|\?/);
     }
     const mappingBlock = source.slice(
       source.indexOf("attribute_mapping = {"),
@@ -681,15 +683,16 @@ describe("protected container and preview lifecycle contracts", () => {
     const mappings = [...mappingBlock.matchAll(/^\s*"([^"]+)"\s*=\s*"([^"]*)"\s*$/gm)].map((match) => [match[1], match[2]]);
     expect(mappings).toEqual([
       ["google.subject", "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"],
-      ["attribute.repository_id", "assertion.repository_id"],
-      ["attribute.job_workflow_ref", "assertion.job_workflow_ref"],
+      [
+        "attribute.authority",
+        "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name",
+      ],
     ]);
     for (const [, expression] of mappings) {
       expect(expression!.length).toBeLessThanOrEqual(2048);
-      expect(expression).not.toContain("?");
+      expect(expression).not.toMatch(/\?|has\(|run_attempt/);
     }
     expect(source).not.toContain("'denied'");
-    expect(source).not.toContain("assertion.job_workflow_sha");
     expect(source).not.toContain("reconcile-previews.yml@");
   });
 

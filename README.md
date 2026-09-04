@@ -163,26 +163,32 @@ and Reader on only the matching image repository, as Cloud Run requires; they
 cannot upload or delete artifacts. Medlock's production deploy identity alone
 also has Secret Version Adder on exactly `waitlist-identity-keyset`; it cannot
 read, list, disable, or destroy versions, and every other deploy identity has no
-secret grant. Every cloud workflow authenticates through one Workload Identity
-Federation provider that admits only this owner's immutable numeric repository
-ID; the provider carries no workflow logic. Which reusable workflow may mint
-which service account is decided entirely by per-workflow Workload Identity
-User bindings on the exact `job_workflow_ref` of its reviewed reusable workflow
-at the active platform commit, derived from
+secret grant. Every cloud job authenticates through one Workload Identity
+Federation provider that admits only GitHub-hosted jobs of this owner's
+immutable numeric repository ID and maps exactly
+one job-level `attribute.authority` tuple: the consumer caller's `workflow_ref`
+on `main`, the reviewed reusable workflow's `job_workflow_ref` at the active
+platform commit, its `job_workflow_sha`, the job's literal environment, and
+the triggering event. Each service account is bound only to the exact tuples
+of the jobs that exchange for it, as enumerated per id-token job in
 `terraform/modules/bootstrap/workflow-authority.json`, the one inventory that
-lint also checks against every workflow on disk. `preview-operations` runs
-authenticate only the read-only `gha-preview-operator` IAM auditor and the
-service-scoped `gha-preview-commit` transaction committer. Cloud Run
-revalidates the service identity and image during `gcloud run services
-update-traffic`, so the API-minimum traffic operation is contained by the exact
-reviewed workflow reference, the immutable numeric-repository-ID
+lint also checks against every workflow and caller template on disk. The
+`supply-chain` attestation jobs keep `id-token: write` for GitHub attestations
+but bind no Google identity, and each no-role canary enters its own
+`production-canary`, `preview-cloud-canary`, or `preview-publish-canary`
+environment so its tuple can mint nothing but `gha-wif-canary`.
+`preview-operations` tuples authenticate only the read-only
+`gha-preview-operator` IAM auditor and the service-scoped `gha-preview-commit`
+transaction committer. Cloud Run revalidates the service identity and image
+during `gcloud run services update-traffic`, so the API-minimum traffic
+operation is contained by that exact tuple, the immutable numeric-repository-ID
 project/service map, fixed CLI arguments, and the absence of PR checkout or
 PR-controlled code after authentication. No credential reaches the untrusted PR
-build. Only `cleanup-preview.yml` and `reconcile-previews.yml` are
-transition-eligible: during a repin the immediately previous reviewed commit
-may keep exchanging for them, while deploy, publish, and infrastructure paths
-bind the active commit only, and the transition SHA is null at steady state.
-Protect both publish environments before pinning a consumer to this workflow.
+build. Only the `cleanup` and `reconcile` tuples are transition-eligible:
+during a repin the immediately previous reviewed commit may keep exchanging for
+them, while deploy, publish, canary, and infrastructure tuples bind the active
+commit only, and the transition SHA is null at steady state. Protect both
+publish environments before pinning a consumer to this workflow.
 
 ## Runtime Configuration
 

@@ -154,28 +154,34 @@ deploy identities can update only the pre-created matching Cloud Run service,
 they cannot upload or delete registry artifacts. Medlock's production deployer
 alone may add a version to exactly `waitlist-identity-keyset`; it cannot read,
 list, disable, or destroy versions, and all other deployers have zero Secret
-Manager grants. Every cloud workflow exchanges through one provider that admits
-only this owner's immutable numeric repository ID; each service account is
-bound to the exact `job_workflow_ref` of its reviewed reusable workflow at the
-active platform commit, as declared in
-`terraform/modules/bootstrap/workflow-authority.json`. The `preview-operations`
-workflows authenticate only the read-only `gha-preview-operator` IAM auditor and
-the service-scoped `gha-preview-commit` committer. Cloud Run revalidates the
-attached service identity and image during `update-traffic`, so that coarse
-capability is contained by the exact reviewed workflow reference, the immutable
-numeric-repository-ID project/service map, fixed CLI arguments, and no PR
-checkout or PR-controlled code after authentication. No credential reaches the
-untrusted PR build. Only `cleanup-preview.yml` and `reconcile-previews.yml` are
-transition-eligible: the immediately previous reviewed commit may keep
-exchanging for them during a repin, deploy and publish paths bind the active
-commit only, and the transition SHA is null at steady state. A stale-deploy invalidation rechecks
+Manager grants. Every cloud job exchanges through one provider that admits only
+GitHub-hosted jobs of this owner's immutable numeric repository ID and maps one
+job-level `attribute.authority` tuple (caller `workflow_ref` on `main`,
+reusable `job_workflow_ref` at the active platform commit, `job_workflow_sha`,
+literal environment, event); each service account is bound only to the exact
+tuples of the jobs that exchange for it, as enumerated per id-token job in
+`terraform/modules/bootstrap/workflow-authority.json`. The `supply-chain`
+attestation jobs bind no Google identity, each no-role canary has its own
+`production-canary`, `preview-cloud-canary`, or `preview-publish-canary`
+environment, and the `preview-operations` tuples authenticate only the
+read-only `gha-preview-operator` IAM auditor and the service-scoped
+`gha-preview-commit` committer. Cloud Run revalidates the attached service
+identity and image during `update-traffic`, so that coarse capability is
+contained by the exact tuple, the immutable numeric-repository-ID
+project/service map, fixed CLI arguments, and no PR checkout or PR-controlled
+code after authentication. No credential reaches the untrusted PR build. Only
+the `cleanup` and `reconcile` tuples are transition-eligible: the immediately
+previous reviewed commit may keep exchanging for them during a repin, every
+other tuple binds the active commit only, and the transition SHA is null at
+steady state. A stale-deploy invalidation rechecks
 the current traffic tag under the shared cloud lock and removes it only when it
 still points to the exact full-SHA/repository-ID-labelled revision created by
 that stale run.
 
 `dhi-base-prefetch-20260822-098dca9280b3`, `preview-publish`,
-`preview-cloud`, `preview-operations`, and `supply-chain` select only `main`,
-have zero reviewers, and disable administrator bypass. `production` and
+`preview-publish-canary`, `preview-cloud`, `preview-cloud-canary`,
+`preview-operations`, `production-canary`, and `supply-chain` select only
+`main`, have zero reviewers, and disable administrator bypass. `production` and
 `production-publish` select only `main`, require the owner reviewer, and disable
 administrator bypass. The DHI environment must be explicitly created empty,
 REST-verified, entered by a credentialless exact-SHA trusted-base canary, and
