@@ -1992,7 +1992,7 @@ for (const boundary of [
   'run "federated_principals_reach_only_bound_service_accounts"',
   "expect_failures = [var.active_workflow_sha]",
   "expect_failures = [var.transition_workflow_sha]",
-  "assertion.repository_owner_id == '16823277' && assertion.repository_id == '123456789' && assertion.runner_environment == 'github-hosted'",
+  "google.subject.startsWith('16823277:123456789:github-hosted:')",
 ]) {
   if (!workflowAuthorityTest.includes(boundary)) {
     failures.push(`terraform/modules/bootstrap/tests/workflow_authority.tftest.hcl: missing ${boundary}`);
@@ -2605,7 +2605,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf"
+  "fcda60e0df635275e8d21f2c1c1d03ec474dc9be6b399ffafaf485edb88d7906"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2894,8 +2894,8 @@ for (const boundary of [
   'platform_repository = "collinbentley1/platform"',
   'workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))',
   'authority_delimiter = ":"',
-  'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
-  '"google.subject"      = "assertion.repository_owner_id + \':\' + assertion.repository_id + \':\' + assertion.run_id"',
+  'attribute_condition = "google.subject.startsWith(\'${local.github_owner_id}:${var.github_repository_id}:github-hosted:\')"',
+  '"google.subject"      = "assertion.repository_owner_id + \':\' + assertion.repository_id + \':\' + assertion.runner_environment + \':\' + assertion.run_id"',
   '"attribute.authority" = "assertion.workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_sha + \'${local.authority_delimiter}\' + assertion.environment + \'${local.authority_delimiter}\' + assertion.event_name"',
 ]) {
   requireContains(
@@ -2911,7 +2911,6 @@ for (const forbidden of [
   '"attribute.repository_id"',
   "'denied'",
   "run_attempt",
-  ".startsWith(",
   "has(assertion.",
   " ? assertion",
 ]) {
@@ -2920,6 +2919,11 @@ for (const forbidden of [
     bootstrapMain,
     forbidden,
     `The WIF provider must carry no per-job decision logic and no second federated attribute: ${forbidden}`,
+  );
+}
+if (bootstrapMain.split(".startsWith(").length - 1 !== 1) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: .startsWith( must occur exactly once, as the sanctioned mapped-subject prefix condition and nowhere else.",
   );
 }
 const workflowAuthorityBinding = sectionBetween(

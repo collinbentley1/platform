@@ -668,7 +668,7 @@ describe("protected container and preview lifecycle contracts", () => {
     expect(source).toContain('github_owner_id     = "16823277"');
     expect(source).toContain('authority_delimiter = ":"');
     expect(source).toContain(
-      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+      'attribute_condition = "google.subject.startsWith(\'${local.github_owner_id}:${var.github_repository_id}:github-hosted:\')"',
     );
     const mappingBlock = source.slice(
       source.indexOf("attribute_mapping = {"),
@@ -676,7 +676,7 @@ describe("protected container and preview lifecycle contracts", () => {
     );
     const mappings = [...mappingBlock.matchAll(/^\s*"([^"]+)"\s*=\s*"([^"]*)"\s*$/gm)].map((match) => [match[1], match[2]]);
     expect(mappings).toEqual([
-      ["google.subject", "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"],
+      ["google.subject", "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.runner_environment + ':' + assertion.run_id"],
       [
         "attribute.authority",
         "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name",
