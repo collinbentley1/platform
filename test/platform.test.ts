@@ -3082,6 +3082,7 @@ describe("platform scaffold and doctor", () => {
     ]) {
       expect(bootstrap).not.toContain(retired);
     }
+    expect(bootstrap.match(/\.startsWith\(/g)).toHaveLength(1);
     expect(bootstrap).not.toContain(
       'member             = "serviceAccount:${google_service_account.prod_publisher.email}"',
     );
@@ -3551,8 +3552,9 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     // Rerun defence lives in the workflows' own attempt guards above; the WIF
-    // provider condition is the literal owner, repository, and GitHub-hosted
-    // conjunction only, so both attempts of a run carry identical authority.
+    // provider condition is only a delimiter-terminated prefix of the mapped
+    // subject, pinning the owner, the repository, and a runner environment of
+    // exactly github-hosted, so both attempts of a run carry identical authority.
     expect(bootstrap).toContain(
       'attribute_condition = "google.subject.startsWith(\'${local.github_owner_id}:${var.github_repository_id}:github-hosted:\')"',
     );
