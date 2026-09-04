@@ -555,7 +555,7 @@ jobs:
       github.event.pull_request.user.type == 'User' &&
       github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false
-    environment: preview-cloud
+    environment: preview-cloud-canary
     permissions:
       id-token: write # Exchange only for the no-role exact-WIF canary identity.
 
@@ -610,7 +610,7 @@ jobs:
       github.event.pull_request.user.type == 'User' &&
       github.actor != 'dependabot[bot]' &&
       github.event.pull_request.draft == false
-    environment: preview-publish
+    environment: preview-publish-canary
     permissions:
       id-token: write # Exchange only for the no-role exact-WIF canary identity.
 

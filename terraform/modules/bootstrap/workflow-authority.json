@@ -1,0 +1,146 @@
+[
+  {
+    "workflow": ".github/workflows/cleanup-preview.yml",
+    "job": "cleanup",
+    "environment": "preview-operations",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/cleanup-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] },
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "attest",
+    "environment": "supply-chain",
+    "purpose": "attestation",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": []
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "canary",
+    "environment": "preview-cloud-canary",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "deploy",
+    "environment": "preview-cloud",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-preview-operator"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "invalidate",
+    "environment": "preview-operations",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "publish",
+    "environment": "preview-publish",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-preview-publish", "gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-preview.yml",
+    "job": "publish-canary",
+    "environment": "preview-publish-canary",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-prod.yml",
+    "job": "attest",
+    "environment": "supply-chain",
+    "purpose": "attestation",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": []
+  },
+  {
+    "workflow": ".github/workflows/deploy-prod.yml",
+    "job": "canary",
+    "environment": "production-canary",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-prod.yml",
+    "job": "deploy",
+    "environment": "production",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-prod-deploy"]
+  },
+  {
+    "workflow": ".github/workflows/deploy-prod.yml",
+    "job": "publish",
+    "environment": "production-publish",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-prod-publish", "gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/infrastructure.yml",
+    "job": "terraform-convergence",
+    "environment": "production",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-terraform", "gha-wif-canary"]
+  },
+  {
+    "workflow": ".github/workflows/reconcile-previews.yml",
+    "job": "reconcile",
+    "environment": "preview-operations",
+    "purpose": "gcp",
+    "callers": [
+      { "workflow": ".github/workflows/reconcile-previews.yml", "ref": "refs/heads/main", "events": ["push", "schedule", "workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"]
+  }
+]

@@ -45,17 +45,6 @@ variable "github_repo" {
   default     = "__APP_NAME__"
 }
 
-variable "github_owner_id" {
-  description = "Immutable numeric GitHub owner ID."
-  type        = string
-  default     = "__GITHUB_OWNER_ID__"
-
-  validation {
-    condition     = can(regex("^[1-9][0-9]*$", var.github_owner_id))
-    error_message = "github_owner_id must be a positive decimal ID."
-  }
-}
-
 variable "github_repository_id" {
   description = "Immutable numeric GitHub repository ID."
   type        = string

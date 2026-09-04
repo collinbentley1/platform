@@ -10,6 +10,7 @@ import {
   type SecretContextReference,
   semanticSecretContextReferences,
 } from "./ci/workflow-secret-contract";
+import { checkWorkflowAuthority } from "./ci/workflow-authority";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -27,7 +28,22 @@ const platformWorkflows = [
   ...reusableWorkflows,
   "platform.yml",
   "protected-bootstrap-implementation.yml",
+  "refresh-grype-db.yml",
 ];
+
+// The manifest is the one inventory of federated authority: every id-token job
+// on disk -- in .yml or .yaml files, never a symbolic link -- must be declared
+// there as one exact job-level tuple, and each declaration is checked against
+// its job and its consumer caller template, so a new privileged job is
+// classified there or the lint fails. The hand-maintained set above has drifted
+// before, so it is cross-checked against the same workflow enumeration.
+const workflowAuthority = await checkWorkflowAuthority(root);
+failures.push(...workflowAuthority.failures);
+for (const workflow of workflowAuthority.workflows) {
+  if (!platformWorkflows.includes(workflow)) {
+    failures.push(`.github/workflows/${workflow} is not covered by the platform workflow lint set.`);
+  }
+}
 const declaredEnvironmentSecrets = [
   "DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3",
 ];
@@ -804,12 +820,18 @@ rejectContains(
   'gh pr comment "$PR_NUMBER" --body',
   "Preview comments must not rely on a local Git repository.",
 );
+for (const [path, workflow, end, environment] of [
+  [".github/workflows/deploy-prod.yml", deployProduction, "\n  publish:\n", "environment: production-canary"],
+  [".github/workflows/deploy-preview.yml", deployPreview, "\n  publish-canary:\n", "environment: preview-cloud-canary"],
+] as const) {
+  requireContains(path, sectionBetween(workflow, "  canary:\n", end), environment, "Each no-role canary must enter its own environment, so its authority tuple binds only gha-wif-canary.");
+}
 const previewPublishCanary = sectionBetween(deployPreview, "  publish-canary:\n", "\n  publish:\n");
 requireContains(
   ".github/workflows/deploy-preview.yml",
   previewPublishCanary,
-  "environment: preview-publish",
-  "Preview publisher trust must have an independent publish-environment canary.",
+  "environment: preview-publish-canary",
+  "Preview publisher trust must have an independent canary in its own environment, so the canary tuple never shares the publisher's authority.",
 );
 rejectContains(
   ".github/workflows/deploy-preview.yml",
@@ -1935,7 +1957,7 @@ const approvedModuleFiles = ["main.tf", "outputs.tf", "variables.tf", "versions.
 for (const moduleName of ["cloud-run-service", "bootstrap"]) {
   const moduleDirectory = join(root, "terraform/modules", moduleName);
   const approvedEntries = moduleName === "bootstrap"
-    ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
+    ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests", "workflow-authority.json"].sort()
     : approvedModuleFiles;
   const moduleEntries = (await readdir(moduleDirectory)).sort();
   if (JSON.stringify(moduleEntries) !== JSON.stringify(approvedEntries)) {
@@ -1954,21 +1976,26 @@ for (const moduleName of ["cloud-run-service", "bootstrap"]) {
 }
 const bootstrapModuleTests = join(root, "terraform/modules/bootstrap/tests");
 const bootstrapTestFiles = (await readdir(bootstrapModuleTests)).sort();
-if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify(["transition_cardinality.tftest.hcl"])) {
-  failures.push("terraform/modules/bootstrap/tests: only the reviewed transition-cardinality test is allowed.");
+if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify(["workflow_authority.tftest.hcl"])) {
+  failures.push("terraform/modules/bootstrap/tests: only the reviewed workflow-authority test is allowed.");
 }
-const transitionCardinalityTest = await readFile(
-  join(bootstrapModuleTests, "transition_cardinality.tftest.hcl"),
+const workflowAuthorityTest = await readFile(
+  join(bootstrapModuleTests, "workflow_authority.tftest.hcl"),
   "utf8",
 );
 for (const boundary of [
-  'run "reject_multiple_preview_operator_transition_shas"',
-  "expect_failures = [var.preview_operator_transition_workflow_shas]",
-  '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
-  '"cccccccccccccccccccccccccccccccccccccccc"',
+  'run "provider_admits_only_github_hosted_jobs_of_the_exact_repository"',
+  'run "active_sha_binds_the_exact_job_tuple_matrix"',
+  'run "transition_sha_extends_only_the_preview_operations_tuples"',
+  'run "neighbouring_tuples_and_unauthorized_accounts_bind_nothing"',
+  'run "each_module_instance_binds_only_its_own_consumer_repository"',
+  'run "federated_principals_reach_only_bound_service_accounts"',
+  "expect_failures = [var.active_workflow_sha]",
+  "expect_failures = [var.transition_workflow_sha]",
+  "assertion.repository_owner_id == '16823277' && assertion.repository_id == '123456789' && assertion.runner_environment == 'github-hosted'",
 ]) {
-  if (!transitionCardinalityTest.includes(boundary)) {
-    failures.push(`terraform/modules/bootstrap/tests/transition_cardinality.tftest.hcl: missing ${boundary}`);
+  if (!workflowAuthorityTest.includes(boundary)) {
+    failures.push(`terraform/modules/bootstrap/tests/workflow_authority.tftest.hcl: missing ${boundary}`);
   }
 }
 const bootstrapModuleLock = await readFile(
@@ -2578,7 +2605,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801"
+  "e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -2598,32 +2625,9 @@ const approvedBootstrapIamResources = [
   "google_project_iam_member.runtime_project_roles",
   "google_project_iam_member.runtime_waitlist_challenge_sender",
   "google_project_iam_member.terraform_convergence_reader",
-  "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
-  "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
-  "google_service_account_iam_member.canary_wif_preview_publish_workflow_sha",
-  "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
-  "google_service_account_iam_member.canary_wif_prod_workflow_sha",
-  "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
-  "google_service_account_iam_member.deployment_parity_wif_preview_workflow_sha",
-  "google_service_account_iam_member.deployment_parity_wif_prod_workflow_sha",
-  "google_service_account_iam_member.preview_commit_wif_preview_operations_workflow_sha",
-  "google_service_account_iam_member.preview_commit_wif_prod_workflow_sha",
-  "google_service_account_iam_member.preview_commit_wif_workflow_sha",
   "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
-  "google_service_account_iam_member.preview_deploy_wif_repo",
-  "google_service_account_iam_member.preview_deploy_wif_prod_workflow_sha",
-  "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
-  "google_service_account_iam_member.preview_operator_wif_repo",
-  "google_service_account_iam_member.preview_operator_wif_workflow_sha",
-  "google_service_account_iam_member.preview_iam_audit_wif_preview_operations_workflow_sha",
-  "google_service_account_iam_member.preview_iam_audit_wif_workflow_sha",
-  "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
   "google_service_account_iam_member.prod_deploy_uses_runtime",
-  "google_service_account_iam_member.prod_deploy_wif_prod_env",
-  "google_service_account_iam_member.prod_deploy_wif_workflow_sha",
-  "google_service_account_iam_member.prod_publisher_wif_workflow_sha",
-  "google_service_account_iam_member.terraform_wif_prod_env",
-  "google_service_account_iam_member.terraform_wif_workflow_sha",
+  "google_service_account_iam_member.workflow_authority",
   "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
   "google_storage_bucket_iam_binding.deployment_parity_transition_no_legacy_access",
   "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
@@ -2765,14 +2769,14 @@ requireContains(
 requireContains(
   "README.md",
   readme,
-  "active SHA binds the distinct",
-  "The identity overview must disclose the active and transition preview-operations split.",
+  "one job-level `attribute.authority` tuple",
+  "The identity overview must disclose the job-level authority tuple and the transition-eligible split.",
 );
 requireContains(
   "docs/security-rollout.md",
   securityRollout,
-  "active/new SHA's distinct preview-operator workflow attribute",
-  "The rollout guide must disclose the active and transition preview-operations split.",
+  "only the transition-eligible `cleanup` and `reconcile` tuples",
+  "The rollout guide must disclose which authority tuples the transition SHA may keep exchanging.",
 );
 for (const outputPath of [
   "terraform/modules/bootstrap/outputs.tf",
@@ -2793,38 +2797,52 @@ for (const outputPath of [
     "The production deploy output must disclose its exact-secret version-add boundary.",
   );
 }
-const activePreviewOperationsShas = sectionBetween(
+const activeWorkflowSha = sectionBetween(
   bootstrapVariables,
-  'variable "preview_operations_active_workflow_shas"',
+  'variable "active_workflow_sha"',
+  "\n}\n",
+);
+requireContains(
+  "terraform/modules/bootstrap/variables.tf",
+  activeWorkflowSha,
+  'condition     = can(regex("^[0-9a-f]{40}$", var.active_workflow_sha))',
+  "The active workflow SHA must be validated as one full lowercase commit SHA.",
+);
+rejectContains(
+  "terraform/modules/bootstrap/variables.tf",
+  activeWorkflowSha,
+  "default",
+  "The active workflow SHA must be an explicit input at every protected module call.",
+);
+const transitionWorkflowSha = sectionBetween(
+  bootstrapVariables,
+  'variable "transition_workflow_sha"',
   "\n}\n",
 );
 for (const boundary of [
-  "length(var.preview_operations_active_workflow_shas) > 0",
-  "setintersection(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas)",
-  "setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas",
+  "default     = null",
+  'condition     = var.transition_workflow_sha == null || can(regex("^[0-9a-f]{40}$", var.transition_workflow_sha))',
+  "condition     = var.transition_workflow_sha != var.active_workflow_sha",
 ]) {
   requireContains(
     "terraform/modules/bootstrap/variables.tf",
-    activePreviewOperationsShas,
+    transitionWorkflowSha,
     boundary,
-    `Active preview-operations SHA partition validation is missing: ${boundary}`,
+    `Transition workflow SHA validation is missing: ${boundary}`,
   );
 }
-const transitionPreviewOperatorShas = sectionBetween(
-  bootstrapVariables,
+for (const retired of [
+  'variable "trusted_platform_workflow_shas"',
+  'variable "preview_operations_active_workflow_shas"',
   'variable "preview_operator_transition_workflow_shas"',
-  "\n}\n",
-);
-for (const boundary of [
-  "default     = []",
-  "length(var.preview_operator_transition_workflow_shas) <= 1",
-  "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
+  'variable "legacy_compatibility_mode"',
+  'variable "github_owner_id"',
 ]) {
-  requireContains(
+  rejectContains(
     "terraform/modules/bootstrap/variables.tf",
-    transitionPreviewOperatorShas,
-    boundary,
-    `Transition preview-operator SHA validation is missing: ${boundary}`,
+    bootstrapVariables,
+    retired,
+    `The module takes exactly one active SHA and one optional transition SHA; ${retired} must not return.`,
   );
 }
 requireContains(
@@ -2871,22 +2889,58 @@ requireContains(
   "to   = google_org_policy_policy.disable_automatic_default_service_account_grants[0]",
   "Existing organization-backed state must migrate to the counted policy address without replacement.",
 );
-requireContains(
-  "terraform/modules/bootstrap/main.tf",
-  bootstrapMain,
-  '"(${local.trusted_workflow_sha_condition})",',
-  "The WIF provider itself must reject unapproved workflow SHAs.",
-);
-for (const attemptGuard of [
-  '"has(assertion.run_attempt)",',
-  '"assertion.run_attempt == \'1\'",',
-  "has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted'",
+for (const boundary of [
+  'github_owner_id     = "16823277"',
+  'platform_repository = "collinbentley1/platform"',
+  'workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))',
+  'authority_delimiter = ":"',
+  'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+  '"google.subject"      = "assertion.repository_owner_id + \':\' + assertion.repository_id + \':\' + assertion.run_id"',
+  '"attribute.authority" = "assertion.workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_sha + \'${local.authority_delimiter}\' + assertion.environment + \'${local.authority_delimiter}\' + assertion.event_name"',
 ]) {
   requireContains(
     "terraform/modules/bootstrap/main.tf",
     bootstrapMain,
-    attemptGuard,
-    "Both exact and legacy WIF provider paths must reject workflow reruns.",
+    boundary,
+    `The WIF provider must admit only GitHub-hosted jobs of the literal owner and repository IDs and map exactly the one job-level authority composite: ${boundary}`,
+  );
+}
+for (const forbidden of [
+  '"attribute.environment"',
+  '"attribute.job_workflow_ref"',
+  '"attribute.repository_id"',
+  "'denied'",
+  "run_attempt",
+  ".startsWith(",
+  "has(assertion.",
+  " ? assertion",
+]) {
+  rejectContains(
+    "terraform/modules/bootstrap/main.tf",
+    bootstrapMain,
+    forbidden,
+    `The WIF provider must carry no per-job decision logic and no second federated attribute: ${forbidden}`,
+  );
+}
+const workflowAuthorityBinding = sectionBetween(
+  bootstrapMain,
+  'resource "google_service_account_iam_member" "workflow_authority"',
+  "\n}\n",
+);
+for (const boundary of [
+  "for_each = local.workflow_authority_bindings",
+  "service_account_id = local.workflow_authority_service_accounts[each.value.account]",
+  'role               = "roles/iam.workloadIdentityUser"',
+  "member             = each.value.member",
+  'contains(["attestation", "gcp"], entry.purpose)',
+  "(entry.purpose == \"gcp\") == (length(entry.serviceAccounts) > 0)",
+  "local.authority_delimiter)",
+]) {
+  requireContains(
+    "terraform/modules/bootstrap/main.tf",
+    workflowAuthorityBinding,
+    boundary,
+    `The manifest-derived Workload Identity User binding is missing boundary: ${boundary}`,
   );
 }
 for (const boundary of [
@@ -2894,127 +2948,24 @@ for (const boundary of [
   'account_id   = "gha-preview-publish"',
   'account_id   = "gha-preview-operator"',
   'account_id   = "gha-preview-commit"',
-  '"attribute.preview_deploy_workflow_sha"',
-  '"attribute.preview_operator_workflow_sha"',
-  '"attribute.prod_publish_workflow_sha"',
-  '"attribute.preview_publish_workflow_sha"',
-  '"attribute.legacy_preview_deploy"',
-  '"attribute.legacy_preview_operator"',
-  '"attribute.legacy_prod_deploy"',
-  '"attribute.legacy_terraform"',
-  'resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha"',
-  'resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha"',
-  'resource "google_service_account_iam_member" "preview_commit_wif_workflow_sha"',
-  'resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha"',
-  'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
-  'resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha"',
-  'resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha"',
-  'resource "google_service_account_iam_member" "canary_wif_prod_publish_workflow_sha"',
-  'resource "google_service_account_iam_member" "canary_wif_preview_publish_workflow_sha"',
+  "for caller in entry.callers : [",
+  "for event in caller.events : [",
+  "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [",
+  "for account in entry.serviceAccounts : {",
+  '"${local.github_repo_full_name}/${caller.workflow}@${caller.ref}",',
+  '"${local.platform_repository}/${entry.workflow}@${sha}",',
+  'member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"',
 ]) {
   requireContains(
     "terraform/modules/bootstrap/main.tf",
     bootstrapMain,
     boundary,
-    `Publisher/deployer WIF isolation is missing boundary: ${boundary}`,
+    `Exact job-level authority binding is missing boundary: ${boundary}`,
   );
 }
-for (const forbiddenMapping of ['"attribute.environment"', '"attribute.repository_id"']) {
-  rejectContains(
-    "terraform/modules/bootstrap/main.tf",
-    bootstrapMain,
-    forbiddenMapping,
-    `Compatibility WIF must not expose aggregate cross-identity mapping ${forbiddenMapping}.`,
-  );
-}
-for (const boundary of [
-  'preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false"',
-  "for sha in sort(tolist(var.preview_operator_transition_workflow_shas))",
-  '"attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : \'denied\'"',
-]) {
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    bootstrapMain,
-    boundary,
-    `Retired preview-operator compatibility trust must be restricted to the declared transition SHA set: ${boundary}`,
-  );
-}
-for (const [binding, serviceAccount, attribute] of [
-  ["prod_deploy_wif_workflow_sha", "prod_deploy", "prod_workflow_sha"],
-  ["prod_publisher_wif_workflow_sha", "prod_publisher", "prod_publish_workflow_sha"],
-  ["preview_deploy_wif_workflow_sha", "preview_deploy", "preview_deploy_workflow_sha"],
-  [
-    "preview_commit_wif_workflow_sha",
-    "preview_commit",
-    "preview_deploy_workflow_sha",
-  ],
-  [
-    "preview_commit_wif_preview_operations_workflow_sha",
-    "preview_commit",
-    "preview_operator_workflow_sha",
-  ],
-  ["preview_operator_wif_workflow_sha", "preview_operator", "preview_operator_workflow_sha"],
-  ["preview_publisher_wif_workflow_sha", "preview_publisher", "preview_publish_workflow_sha"],
-  ["terraform_wif_workflow_sha", "terraform", "terraform_workflow_sha"],
-] as const) {
-  const block = sectionBetween(
-    bootstrapMain,
-    `resource "google_service_account_iam_member" "${binding}"`,
-    "\n}\n",
-  );
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    block,
-    `service_account_id = google_service_account.${serviceAccount}.name`,
-    `Exact WIF binding ${binding} must target only ${serviceAccount}.`,
-  );
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    block,
-    `/attribute.${attribute}/`,
-    `Exact WIF binding ${binding} must use only ${attribute}.`,
-  );
-}
-for (const [binding, forEach] of [
-  [
-    "preview_commit_wif_preview_operations_workflow_sha",
-    "var.preview_operations_active_workflow_shas",
-  ],
-  ["preview_operator_wif_workflow_sha", "var.preview_operator_transition_workflow_shas"],
-] as const) {
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    sectionBetween(
-      bootstrapMain,
-      `resource "google_service_account_iam_member" "${binding}"`,
-      "\n}\n",
-    ),
-    `for_each = ${forEach}`,
-    `Preview-operations WIF binding ${binding} must use only ${forEach}.`,
-  );
-}
-for (const [binding, serviceAccount, principal] of [
-  ["prod_deploy_wif_prod_env", "prod_deploy", "legacy_prod_deploy_principal_set"],
-  ["preview_deploy_wif_repo", "preview_deploy", "legacy_preview_deploy_principal_set"],
-  ["preview_operator_wif_repo", "preview_operator", "legacy_preview_operator_principal_set"],
-  ["terraform_wif_prod_env", "terraform", "legacy_terraform_principal_set"],
-] as const) {
-  const block = sectionBetween(
-    bootstrapMain,
-    `resource "google_service_account_iam_member" "${binding}"`,
-    "\n}\n",
-  );
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    block,
-    `service_account_id = google_service_account.${serviceAccount}.name`,
-    `Legacy WIF binding ${binding} must target only ${serviceAccount}.`,
-  );
-  requireContains(
-    "terraform/modules/bootstrap/main.tf",
-    block,
-    `member             = local.${principal}`,
-    `Legacy WIF binding ${binding} must use only ${principal}.`,
+if ([...bootstrapMain.matchAll(/principalSet:\/\//g)].length !== 1) {
+  failures.push(
+    "terraform/modules/bootstrap/main.tf: the manifest-derived binding must be the only federated principal set in the module.",
   );
 }
 for (const forbiddenPublisherFallback of ["legacy_prod_publish", "legacy_preview_publish"]) {
@@ -3065,14 +3016,15 @@ requireContains(
   "The four registered standalone projects must not request organization-only authority.",
 );
 for (const boundary of [
-  "preview_operations_active_workflow_shas   = local.preview_operations_active_workflow_shas",
-  "preview_operator_transition_workflow_shas = local.preview_operator_transition_workflow_shas",
+  "active_workflow_sha         = var.active_workflow_sha",
+  "transition_workflow_sha     = local.transition_workflow_sha",
+  'transition_workflow_sha = var.transition_workflow_sha == "" ? null : var.transition_workflow_sha',
 ]) {
   requireContains(
     "terraform/deployments/bootstrap/main.tf",
     bootstrapDeployment,
     boundary,
-    `The protected bootstrap root is missing the exact preview-operations transition partition: ${boundary}`,
+    `The protected bootstrap root must pass exactly one active SHA and one optional transition SHA: ${boundary}`,
   );
 }
 const templateBootstrapMain = await read("templates/app/infra/terraform/bootstrap/main.tf");
@@ -3083,17 +3035,18 @@ requireContains(
   "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
   "Generic scaffolds must require an explicit organization-policy capability decision.",
 );
-for (const boundary of [
-  "preview_operations_active_workflow_shas = [",
-  "preview_operator_transition_workflow_shas              = []",
-]) {
-  requireContains(
-    "templates/app/infra/terraform/bootstrap/main.tf",
-    templateBootstrapMain,
-    boundary,
-    `Generic scaffolds must render the steady-state preview-operations partition: ${boundary}`,
-  );
-}
+requireContains(
+  "templates/app/infra/terraform/bootstrap/main.tf",
+  templateBootstrapMain,
+  'active_workflow_sha         = "__PLATFORM_SHA__"',
+  "Generic scaffolds must pin the one active workflow SHA to the scaffolded platform SHA.",
+);
+rejectContains(
+  "templates/app/infra/terraform/bootstrap/main.tf",
+  templateBootstrapMain,
+  "transition_workflow_sha",
+  "Generic scaffolds must render the steady state, which has no transition SHA.",
+);
 requireContains(
   "templates/app/infra/terraform/bootstrap/variables.tf",
   templateBootstrapVariables,

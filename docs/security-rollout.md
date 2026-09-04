@@ -560,14 +560,16 @@ the recovery object and stop; never rerun from empty state.
    matrix for each consumer is:
 
    - `dhi-base-prefetch-20260822-098dca9280b3`, `preview-publish`,
-     `preview-cloud`, `preview-operations`, and `supply-chain`: selected branch
+     `preview-publish-canary`, `preview-cloud`, `preview-cloud-canary`,
+     `preview-operations`, `production-canary`, and `supply-chain`: selected branch
      `main` only, zero reviewers, and administrator bypass disabled.
    - `production` and `production-publish`: selected branch `main` only, the
      owner reviewer, and administrator bypass disabled.
 
    A missing selected-branch rule on any of these environments is a stop
    condition. In particular, do not enable Actions while `preview-operations`,
-   `preview-cloud`, `preview-publish`, or `supply-chain` remains unprotected in
+   `preview-cloud`, `preview-cloud-canary`, `preview-publish`,
+   `preview-publish-canary`, `production-canary`, or `supply-chain` remains unprotected in
    any consumer. Verify the exact environment inventory and policies through the
    REST API, including zero unwanted reviewers, secrets, variables, tag rules,
    and bypass actors. The DHI environment is intentionally shared by preview
@@ -696,15 +698,14 @@ the recovery object and stop; never rerun from empty state.
    This first apply must remove every project-wide routine/deployer role,
    all Token Creator grants, routine-Terraform runtime `actAs`, and preview
    `actAs` on the production runtime. It creates the two publisher identities;
-   neither publisher gets a generic fallback. The active/new SHA's distinct preview-operator workflow attribute
-   binds to `gha-preview-deploy`, while only an explicitly declared transition
-   SHA retains the old `gha-preview-operator` binding during repin. With the
-   empty initial transition set, the retired
-   operator has no workflow binding. Compatibility mode retains only
-   path-specific Workload Identity User fallbacks for Terraform,
-   production deploy, preview deploy, and preview traffic operations, so tokens
-   admitted on one path cannot impersonate another identity. Old workflows stop
-   authenticating at this point.
+   neither publisher gets a generic fallback. Every service account is bound
+   only to the exact job-level `attribute.authority` tuples (consumer caller
+   `workflow_ref` on `main`, reusable `job_workflow_ref` at the active SHA,
+   `job_workflow_sha`, literal environment, event) of the id-token jobs that
+   name it in `terraform/modules/bootstrap/workflow-authority.json`;
+   only the transition-eligible `cleanup` and `reconcile` tuples also bind an
+   explicitly declared transition SHA during repin, and the transition SHA is
+   empty at steady state. Old workflows stop authenticating at this point.
    Every later stable-preview follow-on starts by reading all four live
    bootstrap states and the prepared consumer heads. Call the exact workflow
    SHA that every consumer currently pins `P`; do not infer `P` from this
@@ -781,9 +782,9 @@ the recovery object and stop; never rerun from empty state.
    so the API-minimum traffic operation uses `gha-preview-deploy`'s existing
    exact-service update, preview-runtime `actAs`, and exact-preview-repository
    Reader grants. Those permissions are also sufficient to deploy a preview
-   revision; contain that irreducible API capability with the distinct
-   preview-operator workflow attribute, exact workflow-SHA WIF, protected
-   `preview-operations` environment/event claims, immutable project/service
+   revision; contain that irreducible API capability with the exact job-level
+   authority tuple (caller on `main`, reviewed workflow SHA, protected
+   `preview-operations` environment, event), immutable project/service
    selection, fixed CLI arguments, and no PR checkout or PR-controlled code
    after authentication. No credential may reach PR-controlled code.
    No subsequent exposure apply exists in v0.5.13. A fresh-app exposure create
@@ -887,19 +888,19 @@ the recovery object and stop; never rerun from empty state.
     an organization parent; see `docs/followup-organization-parent.md`.
 13. Inspect `gha-terraform`, `gha-prod-deploy`, `gha-preview-deploy`,
     `gha-preview-operator`, `gha-prod-publish`, and `gha-preview-publish`. Require
-    the expected identity-specific `attribute.*_workflow_sha/<new-sha>` Workload
-    Identity User binding on every active identity and no active-SHA binding on
-    the retired operator. Prove both publisher accounts have only one exact
+    the expected
+    `attribute.authority/collinbentley1/<consumer>/<caller>@refs/heads/main:collinbentley1/platform/<workflow>@<new-sha>:<new-sha>:<environment>:<event>`
+    Workload Identity User bindings enumerated for each identity's jobs in
+    `terraform/modules/bootstrap/workflow-authority.json` and nothing else. Prove both publisher accounts have only one exact
     repository-level Artifact Registry Writer grant, both deploy accounts have
     only Reader on their exact image repository, both publishers have zero Cloud
     Run and runtime `actAs` grants. For Medlock only, prove `gha-prod-deploy` has
     Secret Version Adder on exactly `waitlist-identity-keyset` and zero version
     access, get, list, disable, enable, or destroy permission; prove every other
-    deploy identity has zero Secret Manager grants. Prove the active/new SHA's
-    `attribute.preview_operator_workflow_sha` principalSet targets only
-    `gha-preview-deploy`; only the declared transition SHA may target
-    `gha-preview-operator`, and both the transition set and legacy fallback must
-    be empty at steady state. Prove the retired operator has zero Cloud Run,
+    deploy identity has zero Secret Manager grants. Prove that only the
+    `cleanup` and `reconcile` tuple bindings name the declared transition SHA,
+    that no deploy, publish, canary, attestation, or infrastructure binding does,
+    and that the transition SHA is empty at steady state. Prove the retired operator has zero Cloud Run,
     registry, runtime `actAs`, project, secret, state, data, and production
     grants. Audit the exact cleanup/reconcile workflow SHA, environment/event
     claims, immutable project/service map, fixed CLI arguments, and absence of PR
@@ -978,7 +979,7 @@ deployments.
 3. Do not activate any repository until four immutable successful phase-B result
    receipts exist and bind the four exact pre-activation consumer trees. Confirm
    each service-account policy contains only the expected
-   `attribute.*_workflow_sha/<approved-sha>` principal sets, with no legacy or
+   `attribute.authority/<caller-tuple>:collinbentley1/platform/<workflow>@<approved-sha>:<approved-sha>:<environment>:<event>` principal sets, with no legacy or
    transition fallback, and repeat the all-four clear-marker and disabled-run
    proof.
 4. Activate all four consumers serially, one complete repository proof at a

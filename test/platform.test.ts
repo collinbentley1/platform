@@ -91,8 +91,8 @@ describe("platform scaffold and doctor", () => {
     expect(bootstrap).toContain(
       "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
     );
-    expect(bootstrap).toContain("preview_operations_active_workflow_shas = [");
-    expect(bootstrap).toContain("preview_operator_transition_workflow_shas");
+    expect(bootstrap).toContain(`active_workflow_sha         = "${platformSha}"`);
+    expect(bootstrap).not.toContain("transition_workflow_sha");
     expect(await readFile(join(app, "infra/terraform/bootstrap/variables.tf"), "utf8")).toContain(
       'variable "manage_automatic_default_service_account_grants_policy"',
     );
@@ -1091,30 +1091,26 @@ describe("platform scaffold and doctor", () => {
     const path = join(app, "infra/terraform/bootstrap/main.tf");
     const original = await readFile(path, "utf8");
     const withTransition = (transition: string) =>
-      original
-        .replace(`    "${platformSha}",`, `    "${platformSha}",\n    "${transition}",`)
-        .replace(
-          /preview_operator_transition_workflow_shas\s*=\s*\[\]/,
-          `preview_operator_transition_workflow_shas = [\n    "${transition}",\n  ]`,
-        );
+      original.replace(
+        `  active_workflow_sha         = "${platformSha}"`,
+        `  active_workflow_sha         = "${platformSha}"\n  transition_workflow_sha     = "${transition}"`,
+      );
+    expect(withTransition("b".repeat(40))).not.toBe(original);
 
     await writeFile(path, withTransition("b".repeat(40)));
     const doctor = await run(["doctor", app]);
     expect(doctor.exitCode).not.toBe(0);
     expect(doctor.stderr).toContain(
-      "trusted_platform_workflow_shas must contain exactly one full commit SHA",
-    );
-    expect(doctor.stderr).toContain(
-      "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
+      "transition_workflow_sha must be absent in the consumer steady-state mirror",
     );
 
     const contract = await runContract(app);
     expect(contract.exitCode).not.toBe(0);
     expect(contract.stderr).toContain(
-      "consumer mirror trusted_platform_workflow_shas must contain only the module platform SHA",
+      "infra/terraform/bootstrap/main.tf transition_workflow_sha must be absent in the consumer steady-state mirror",
     );
     expect(contract.stderr).toContain(
-      "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
+      "module bootstrap must exactly match the reviewed repository-specific platform contract",
     );
 
     for (const vulnerable of [
@@ -1861,10 +1857,13 @@ describe("platform scaffold and doctor", () => {
     for (const environment of [
       "`dhi-base-prefetch-20260822-098dca9280b3`",
       "`preview-publish`",
+      "`preview-publish-canary`",
       "`preview-cloud`",
+      "`preview-cloud-canary`",
       "`preview-operations`",
       "`supply-chain`",
       "`production`",
+      "`production-canary`",
       "`production-publish`",
     ]) {
       expect(rollout).toContain(environment);
@@ -2293,7 +2292,7 @@ describe("platform scaffold and doctor", () => {
       deploy.indexOf("  publish-canary:\n"),
       deploy.indexOf("\n  publish:\n"),
     );
-    expect(publishCanary).toContain("environment: preview-publish");
+    expect(publishCanary).toContain("environment: preview-publish-canary");
     expect(publishCanary).not.toContain("GCP_CLOUD_PREVIEW_ENABLED");
     expect(deploy.slice(deploy.indexOf("  publish:\n"), deploy.indexOf("\n  attest:\n"))).toContain(
       "needs.publish-canary.result == 'success'",
@@ -2495,7 +2494,7 @@ describe("platform scaffold and doctor", () => {
     for (const moduleName of ["cloud-run-service", "bootstrap"]) {
       const moduleDirectory = join(repoRoot, "terraform/modules", moduleName);
       const approvedEntries = moduleName === "bootstrap"
-        ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests"].sort()
+        ? [...approvedModuleFiles, ".terraform.lock.hcl", "tests", "workflow-authority.json"].sort()
         : approvedModuleFiles;
       expect((await readdir(moduleDirectory)).sort()).toEqual(approvedEntries);
       for (const name of approvedModuleFiles.filter((file) => file !== "main.tf")) {
@@ -2504,13 +2503,19 @@ describe("platform scaffold and doctor", () => {
         );
       }
     }
-    const transitionCardinalityTest = await readFile(
-      join(repoRoot, "terraform/modules/bootstrap/tests/transition_cardinality.tftest.hcl"),
+    const workflowAuthorityTest = await readFile(
+      join(repoRoot, "terraform/modules/bootstrap/tests/workflow_authority.tftest.hcl"),
       "utf8",
     );
-    expect(transitionCardinalityTest).toContain(
-      "expect_failures = [var.preview_operator_transition_workflow_shas]",
-    );
+    for (const run of [
+      "active_sha_binds_the_exact_job_tuple_matrix",
+      "transition_sha_extends_only_the_preview_operations_tuples",
+      "neighbouring_tuples_and_unauthorized_accounts_bind_nothing",
+      "federated_principals_reach_only_bound_service_accounts",
+    ]) {
+      expect(workflowAuthorityTest).toContain(`run "${run}"`);
+    }
+    expect(workflowAuthorityTest).toContain("expect_failures = [var.transition_workflow_sha]");
     for (const [workflowName, publishEnvironment, publisher, operator] of [
       ["deploy-prod.yml", "production-publish", "gha-prod-publish@", "gha-prod-deploy@"],
       ["deploy-preview.yml", "preview-publish", "gha-preview-publish@", "gha-preview-deploy@"],
@@ -2871,7 +2876,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "912f75489dfd4e11bc645c706655d4d27d72f7d02838759435833855fc0d1801",
+      "e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -2908,32 +2913,9 @@ describe("platform scaffold and doctor", () => {
         "google_project_iam_member.runtime_project_roles",
         "google_project_iam_member.runtime_waitlist_challenge_sender",
         "google_project_iam_member.terraform_convergence_reader",
-        "google_service_account_iam_member.canary_wif_preview_deploy_workflow_sha",
-        "google_service_account_iam_member.canary_wif_preview_operator_workflow_sha",
-        "google_service_account_iam_member.canary_wif_preview_publish_workflow_sha",
-        "google_service_account_iam_member.canary_wif_prod_publish_workflow_sha",
-        "google_service_account_iam_member.canary_wif_prod_workflow_sha",
-        "google_service_account_iam_member.canary_wif_terraform_workflow_sha",
-        "google_service_account_iam_member.deployment_parity_wif_preview_workflow_sha",
-        "google_service_account_iam_member.deployment_parity_wif_prod_workflow_sha",
-        "google_service_account_iam_member.preview_commit_wif_preview_operations_workflow_sha",
-        "google_service_account_iam_member.preview_commit_wif_prod_workflow_sha",
-        "google_service_account_iam_member.preview_commit_wif_workflow_sha",
         "google_service_account_iam_member.preview_deploy_uses_preview_runtime",
-        "google_service_account_iam_member.preview_deploy_wif_prod_workflow_sha",
-        "google_service_account_iam_member.preview_deploy_wif_repo",
-        "google_service_account_iam_member.preview_deploy_wif_workflow_sha",
-        "google_service_account_iam_member.preview_iam_audit_wif_preview_operations_workflow_sha",
-        "google_service_account_iam_member.preview_iam_audit_wif_workflow_sha",
-        "google_service_account_iam_member.preview_operator_wif_repo",
-        "google_service_account_iam_member.preview_operator_wif_workflow_sha",
-        "google_service_account_iam_member.preview_publisher_wif_workflow_sha",
         "google_service_account_iam_member.prod_deploy_uses_runtime",
-        "google_service_account_iam_member.prod_deploy_wif_prod_env",
-        "google_service_account_iam_member.prod_deploy_wif_workflow_sha",
-        "google_service_account_iam_member.prod_publisher_wif_workflow_sha",
-        "google_service_account_iam_member.terraform_wif_prod_env",
-        "google_service_account_iam_member.terraform_wif_workflow_sha",
+        "google_service_account_iam_member.workflow_authority",
         "google_storage_bucket_iam_binding.bootstrap_state_no_legacy_access",
         "google_storage_bucket_iam_binding.deployment_parity_transition_no_legacy_access",
         "google_storage_bucket_iam_binding.terraform_state_logs_no_legacy_access",
@@ -3012,7 +2994,7 @@ describe("platform scaffold and doctor", () => {
       "Retired preview traffic identity retained only for an explicitly declared workflow-SHA transition; receives no steady-state operational grants.",
     );
     expect(await readFile(join(repoRoot, "README.md"), "utf8")).toContain(
-      "active SHA binds the distinct",
+      "one job-level `attribute.authority` tuple",
     );
     expect(bootstrap).not.toMatch(/^\s*module\s+"/m);
     for (const outputPath of [
@@ -3026,67 +3008,81 @@ describe("platform scaffold and doctor", () => {
       );
       expect(output).toContain("only declared exact-secret version-add grants.");
     }
-    const activeOperationsBindingStart = bootstrap.indexOf(
-      'resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha"',
+    const manifest = JSON.parse(
+      await readFile(join(repoRoot, "terraform/modules/bootstrap/workflow-authority.json"), "utf8"),
+    ) as Array<{ job: string; purpose: string; serviceAccounts: string[]; transitionEligible: boolean; workflow: string }>;
+    const jobKey = (entry: { job: string; workflow: string }) => `${entry.workflow}#${entry.job}`;
+    const attestations = manifest.filter((entry) => entry.purpose === "attestation");
+    expect(attestations.map(jobKey)).toEqual([
+      ".github/workflows/deploy-preview.yml#attest",
+      ".github/workflows/deploy-prod.yml#attest",
+    ]);
+    expect(attestations.map((entry) => entry.serviceAccounts)).toEqual([[], []]);
+    expect(manifest.filter((entry) => entry.transitionEligible).map(jobKey)).toEqual([
+      ".github/workflows/cleanup-preview.yml#cleanup",
+      ".github/workflows/reconcile-previews.yml#reconcile",
+    ]);
+    expect(manifest.filter((entry) => entry.job.endsWith("canary")).map((entry) => entry.serviceAccounts)).toEqual([
+      ["gha-wif-canary"],
+      ["gha-wif-canary"],
+      ["gha-wif-canary"],
+    ]);
+    const workflowAuthorityBindingStart = bootstrap.indexOf(
+      'resource "google_service_account_iam_member" "workflow_authority"',
     );
-    const activeOperationsBinding = bootstrap.slice(
-      activeOperationsBindingStart,
-      bootstrap.indexOf("\n}\n", activeOperationsBindingStart) + 3,
+    const workflowAuthorityBinding = bootstrap.slice(
+      workflowAuthorityBindingStart,
+      bootstrap.indexOf("\n}\n", workflowAuthorityBindingStart) + 3,
     );
-    expect(activeOperationsBinding).toContain(
-      "for_each = var.preview_operations_active_workflow_shas",
+    expect(workflowAuthorityBinding).toContain("for_each = local.workflow_authority_bindings");
+    expect(workflowAuthorityBinding).toContain(
+      "service_account_id = local.workflow_authority_service_accounts[each.value.account]",
     );
-    expect(activeOperationsBinding).toContain(
-      "service_account_id = google_service_account.preview_commit.name",
-    );
-    expect(activeOperationsBinding).toContain("/attribute.preview_operator_workflow_sha/");
-    const transitionOperatorBindingStart = bootstrap.indexOf(
-      'resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha"',
-    );
-    const transitionOperatorBinding = bootstrap.slice(
-      transitionOperatorBindingStart,
-      bootstrap.indexOf("\n}\n", transitionOperatorBindingStart) + 3,
-    );
-    expect(transitionOperatorBinding).toContain(
-      "for_each = var.preview_operator_transition_workflow_shas",
-    );
-    expect(transitionOperatorBinding).toContain(
-      "service_account_id = google_service_account.preview_operator.name",
-    );
-    expect(transitionOperatorBinding).toContain("/attribute.preview_operator_workflow_sha/");
+    expect(workflowAuthorityBinding).toContain('role               = "roles/iam.workloadIdentityUser"');
+    expect(workflowAuthorityBinding).toContain("member             = each.value.member");
     expect(bootstrap).toContain(
-      'preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false"',
+      "for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [",
     );
+    expect(bootstrap.match(/principalSet:\/\//g)).toHaveLength(1);
     expect(bootstrap).toContain(
-      '"attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : \'denied\'"',
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
+    );
+    expect(bootstrap).toContain('authority_delimiter = ":"');
+    expect(bootstrap).toContain(
+      '"attribute.authority" = "assertion.workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_ref + \'${local.authority_delimiter}\' + assertion.job_workflow_sha + \'${local.authority_delimiter}\' + assertion.environment + \'${local.authority_delimiter}\' + assertion.event_name"',
     );
     const bootstrapVariables = await readFile(
       join(repoRoot, "terraform/modules/bootstrap/variables.tf"),
       "utf8",
     );
     expect(bootstrapVariables).toContain(
-      "setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas",
+      'condition     = can(regex("^[0-9a-f]{40}$", var.active_workflow_sha))',
     );
     expect(bootstrapVariables).toContain(
-      "setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)",
+      "condition     = var.transition_workflow_sha != var.active_workflow_sha",
     );
-    expect(bootstrapVariables).toContain(
-      "length(var.preview_operator_transition_workflow_shas) <= 1",
-    );
-    for (const attribute of [
-      "attribute.prod_publish_workflow_sha",
-      "attribute.preview_publish_workflow_sha",
-      "attribute.preview_deploy_workflow_sha",
-      "attribute.preview_operator_workflow_sha",
-      "attribute.legacy_prod_deploy",
-      "attribute.legacy_preview_deploy",
-      "attribute.legacy_preview_operator",
-      "attribute.legacy_terraform",
+    for (const retired of [
+      "trusted_platform_workflow_shas",
+      "preview_operations_active_workflow_shas",
+      "preview_operator_transition_workflow_shas",
+      "legacy_compatibility_mode",
+      "github_owner_id",
     ]) {
-      expect(bootstrap).toContain(`"${attribute}"`);
+      expect(bootstrapVariables).not.toContain(`variable "${retired}"`);
     }
-    expect(bootstrap).not.toContain('"attribute.environment"');
-    expect(bootstrap).not.toContain('"attribute.repository_id"');
+    for (const retired of [
+      "'denied'",
+      "run_attempt",
+      ".startsWith(",
+      "has(assertion.",
+      "attribute.legacy_",
+      "_workflow_sha/",
+      '"attribute.environment"',
+      '"attribute.job_workflow_ref"',
+      '"attribute.repository_id"',
+    ]) {
+      expect(bootstrap).not.toContain(retired);
+    }
     expect(bootstrap).not.toContain(
       'member             = "serviceAccount:${google_service_account.prod_publisher.email}"',
     );
@@ -3555,11 +3551,13 @@ describe("platform scaffold and doctor", () => {
       join(repoRoot, "terraform/modules/bootstrap/main.tf"),
       "utf8",
     );
-    expect(bootstrap).toContain('"has(assertion.run_attempt)",');
-    expect(bootstrap).toContain('"assertion.run_attempt == \'1\'",');
+    // Rerun defence lives in the workflows' own attempt guards above; the WIF
+    // provider condition is the literal owner, repository, and GitHub-hosted
+    // conjunction only, so both attempts of a run carry identical authority.
     expect(bootstrap).toContain(
-      "has(assertion.job_workflow_sha) && has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted'",
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
+    expect(bootstrap).not.toContain("run_attempt");
   });
 
   test("runtime configuration is immutable per repository and Runsetta stays offline", async () => {
@@ -3921,7 +3919,7 @@ async function configureReviewedMedlock(app: string): Promise<void> {
   let bootstrapMain = await readFile(bootstrapMainPath, "utf8");
   bootstrapMain = bootstrapMain
     .replace(
-      "  legacy_compatibility_mode",
+      "  manage_automatic_default_service_account_grants_policy",
       [
         "  required_services = [",
         '    "artifactregistry.googleapis.com",',
@@ -3941,7 +3939,7 @@ async function configureReviewedMedlock(app: string): Promise<void> {
         "  runtime_project_roles = [",
         '    "roles/datastore.user",',
         "  ]",
-        "  legacy_compatibility_mode",
+        "  manage_automatic_default_service_account_grants_policy",
       ].join("\n"),
     )
     .replace(

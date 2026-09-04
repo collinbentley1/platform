@@ -52,12 +52,6 @@ type TerraformExpression = {
   readonly expression: string;
 };
 
-type WorkflowShaPartitions = {
-  readonly active: readonly string[];
-  readonly transition: readonly string[];
-  readonly trusted: readonly string[];
-};
-
 const defaultContract: ReviewedTerraformContract = {
   previewIngress: "INGRESS_TRAFFIC_ALL",
   requiredServicesOverride: null,
@@ -618,17 +612,11 @@ export function validateTerraformMirrorContract(
     }
 
     if (bootstrapPlatformSha && identity.name) {
-      const partitions = validateWorkflowShaPartitions(
-        bootstrapModule,
-        bootstrapPlatformSha,
-        failures,
-      );
-      if (partitions) {
+      if (validateActiveWorkflowSha(bootstrapModule, bootstrapPlatformSha, failures)) {
         const expectedBootstrapModule = renderBootstrapModule(
           identity,
           contract,
           bootstrapPlatformSha,
-          partitions,
         );
         if (compactHcl(bootstrapModule) !== compactHcl(expectedBootstrapModule)) {
           failures.push(
@@ -979,159 +967,54 @@ function requirePlatformModuleSource(
   return sha;
 }
 
-function validateWorkflowShaPartitions(
+function validateActiveWorkflowSha(
   block: string,
   platformSha: string,
   failures: string[],
-): WorkflowShaPartitions | undefined {
-  const trusted = requireStringListAttribute(
-    block,
-    "trusted_platform_workflow_shas",
-    failures,
-  );
-  const active = requireStringListAttribute(
-    block,
-    "preview_operations_active_workflow_shas",
-    failures,
-  );
-  const transition = requireStringListAttribute(
-    block,
-    "preview_operator_transition_workflow_shas",
-    failures,
-  );
-  if (!trusted || !active || !transition) return undefined;
-
-  for (const [name, values] of [
-    ["trusted_platform_workflow_shas", trusted],
-    ["preview_operations_active_workflow_shas", active],
-    ["preview_operator_transition_workflow_shas", transition],
-  ] as const) {
-    if (values.some((value) => !/^[0-9a-f]{40}$/.test(value))) {
-      failures.push(`infra/terraform/bootstrap/main.tf ${name} must contain only full lowercase commit SHAs`);
-    }
-    if (new Set(values).size !== values.length) {
-      failures.push(`infra/terraform/bootstrap/main.tf ${name} must not contain duplicate SHAs`);
-    }
-    if (values.some((value) => forbiddenPreMigrationWorkflowShas.has(value))) {
-      failures.push(`infra/terraform/bootstrap/main.tf ${name} must not restore a retired pre-migration SHA`);
-    }
-  }
-
-  if (trusted.length !== 1 || trusted[0] !== platformSha) {
-    failures.push(
-      "infra/terraform/bootstrap/main.tf consumer mirror trusted_platform_workflow_shas must contain only the module platform SHA",
-    );
-  }
-  if (active.length !== 1 || active[0] !== platformSha) {
-    failures.push(
-      "infra/terraform/bootstrap/main.tf preview_operations_active_workflow_shas must contain only the module platform SHA",
-    );
-  }
-  if (transition.length !== 0) {
-    failures.push(
-      "infra/terraform/bootstrap/main.tf preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
-    );
-  }
-
-  const partition = [...active, ...transition];
-  if (
-    new Set(partition).size !== partition.length ||
-    !sameStringSet(partition, trusted)
-  ) {
-    failures.push(
-      "infra/terraform/bootstrap/main.tf active and transition workflow SHAs must be disjoint and exactly partition trusted_platform_workflow_shas",
-    );
-  }
-
-  return { active, transition, trusted };
-}
-
-function requireStringListAttribute(
-  block: string,
-  name: string,
-  failures: string[],
-): string[] | undefined {
-  const values = topLevelAttributeValues(block, name);
+): boolean {
+  const values = topLevelAttributeValues(block, "active_workflow_sha");
   if (values.length !== 1) {
     failures.push(
-      `infra/terraform/bootstrap/main.tf module bootstrap must define ${name} exactly once at top level`,
+      "infra/terraform/bootstrap/main.tf module bootstrap must define active_workflow_sha exactly once at top level",
     );
-    return undefined;
+    return false;
   }
-  const parsed = parseStringListExpression(values[0] ?? "");
-  if (!parsed) {
+  const active = parseQuotedString(values[0] ?? "");
+  if (active === undefined || !/^[0-9a-f]{40}$/.test(active)) {
     failures.push(
-      `infra/terraform/bootstrap/main.tf ${name} must be a literal list of quoted strings`,
+      "infra/terraform/bootstrap/main.tf active_workflow_sha must be one quoted full lowercase commit SHA",
     );
+    return false;
+  }
+  if (forbiddenPreMigrationWorkflowShas.has(active)) {
+    failures.push("infra/terraform/bootstrap/main.tf active_workflow_sha must not restore a retired pre-migration SHA");
+  }
+  if (active !== platformSha) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf consumer mirror active_workflow_sha must be the module platform SHA",
+    );
+  }
+  for (const transition of topLevelAttributeValues(block, "transition_workflow_sha")) {
+    failures.push(
+      "infra/terraform/bootstrap/main.tf transition_workflow_sha must be absent in the consumer steady-state mirror",
+    );
+    const sha = parseQuotedString(transition);
+    if (sha !== undefined && forbiddenPreMigrationWorkflowShas.has(sha)) {
+      failures.push("infra/terraform/bootstrap/main.tf transition_workflow_sha must not restore a retired pre-migration SHA");
+    }
+  }
+  return true;
+}
+
+function parseQuotedString(expression: string): string | undefined {
+  const trimmed = expression.trim();
+  if (!/^"(?:[^"\\]|\\.)*"$/.test(trimmed)) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return typeof parsed === "string" ? parsed : undefined;
+  } catch {
     return undefined;
   }
-  return parsed;
-}
-
-function parseStringListExpression(expression: string): string[] | undefined {
-  const values: string[] = [];
-  let index = 0;
-  const skipWhitespace = (): void => {
-    while (/\s/.test(expression[index] ?? "")) index += 1;
-  };
-
-  skipWhitespace();
-  if (expression[index] !== "[") return undefined;
-  index += 1;
-  skipWhitespace();
-  if (expression[index] === "]") {
-    index += 1;
-    skipWhitespace();
-    return index === expression.length ? values : undefined;
-  }
-
-  while (index < expression.length) {
-    if (expression[index] !== '"') return undefined;
-    const start = index;
-    index += 1;
-    let escaped = false;
-    while (index < expression.length) {
-      const character = expression[index]!;
-      index += 1;
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === '"') {
-        break;
-      }
-    }
-    if (expression[index - 1] !== '"' || escaped) return undefined;
-    try {
-      const parsed = JSON.parse(expression.slice(start, index));
-      if (typeof parsed !== "string") return undefined;
-      values.push(parsed);
-    } catch {
-      return undefined;
-    }
-
-    skipWhitespace();
-    if (expression[index] === "]") {
-      index += 1;
-      skipWhitespace();
-      return index === expression.length ? values : undefined;
-    }
-    if (expression[index] !== ",") return undefined;
-    index += 1;
-    skipWhitespace();
-    if (expression[index] === "]") {
-      index += 1;
-      skipWhitespace();
-      return index === expression.length ? values : undefined;
-    }
-  }
-  return undefined;
-}
-
-function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
-  const leftSet = new Set(left);
-  const rightSet = new Set(right);
-  return leftSet.size === rightSet.size && [...leftSet].every((value) => rightSet.has(value));
 }
 
 function renderProductionModule(
@@ -1190,7 +1073,6 @@ function renderBootstrapModule(
   identity: TerraformMirrorIdentity,
   contract: ReviewedTerraformContract,
   platformSha: string,
-  partitions: WorkflowShaPartitions,
 ): string {
   const lines = [
     'module "bootstrap" {',
@@ -1203,11 +1085,8 @@ function renderBootstrapModule(
     "state_bucket_location = var.state_bucket_location",
     "github_owner = var.github_owner",
     "github_repo = var.github_repo",
-    "github_owner_id = var.github_owner_id",
     "github_repository_id = var.github_repository_id",
-    "trusted_platform_workflow_shas = " + renderStringList(partitions.trusted),
-    "preview_operations_active_workflow_shas = " + renderStringList(partitions.active),
-    "preview_operator_transition_workflow_shas = " + renderStringList(partitions.transition),
+    `active_workflow_sha = ${JSON.stringify(platformSha)}`,
   ];
   if (contract.requiredServicesOverride !== null) {
     lines.push("required_services = " + renderStringList(contract.requiredServicesOverride));
@@ -1216,7 +1095,6 @@ function renderBootstrapModule(
     lines.push("runtime_project_roles = " + renderStringList(contract.runtimeProjectRolesOverride));
   }
   lines.push(
-    "legacy_compatibility_mode = false",
     "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",
     `runtime_description = ${JSON.stringify(
       contract.runtimeDescription ??
@@ -1385,7 +1263,6 @@ function renderBootstrapVariables(
       "string",
       JSON.stringify(githubRepo),
     ),
-    numericIdVariable("github_owner_id", "Immutable numeric GitHub owner ID.", "16823277"),
     numericIdVariable(
       "github_repository_id",
       "Immutable numeric GitHub repository ID.",

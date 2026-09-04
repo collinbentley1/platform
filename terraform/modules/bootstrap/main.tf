@@ -6,83 +6,23 @@ locals {
   github_repo_full_name  = "${var.github_owner}/${var.github_repo}"
   workload_identity_pool = "projects/${data.google_project.current.number}/locations/global/workloadIdentityPools/${google_iam_workload_identity_pool.github.workload_identity_pool_id}"
 
-  legacy_preview_deploy_principal_set   = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_preview_deploy/${var.github_repository_id}"
-  legacy_preview_operator_principal_set = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_preview_operator/${var.github_repository_id}"
-  legacy_prod_deploy_principal_set      = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_prod_deploy/${var.github_repository_id}"
-  legacy_terraform_principal_set        = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.legacy_terraform/${var.github_repository_id}"
+  # The provider admits exactly this owner's consumer repository, by immutable
+  # numeric IDs, on GitHub-hosted runners. Which job may mint which service
+  # account is decided only by the job-level bindings derived from the manifest
+  # below; the provider carries no other logic.
+  github_owner_id     = "16823277"
+  platform_repository = "collinbentley1/platform"
 
-  preview_deploy_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-cloud'"
-  preview_operator_workflow_condition = join(" || ", [
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-operations'",
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/cleanup-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.environment == 'preview-operations'",
-    "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/reconcile-previews.yml@' + assertion.job_workflow_sha && (assertion.event_name == 'push' || assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && assertion.environment == 'preview-operations'",
-  ])
-  preview_publish_workflow_condition    = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-preview.yml@' + assertion.job_workflow_sha && assertion.event_name == 'pull_request_target' && assertion.ref == 'refs/heads/main' && assertion.base_ref == 'main' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-publish'"
-  production_workflow_condition         = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
-  production_publish_workflow_condition = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production-publish'"
-  terraform_workflow_condition          = "assertion.job_workflow_ref == 'collinbentley1/platform/.github/workflows/infrastructure.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
+  # The one inventory of federated authority: one entry per id-token job of a
+  # platform reusable workflow. tools/ci/workflow-authority.ts validates the
+  # same file against every workflow and caller template on disk.
+  workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))
 
-  # Compatibility accepts an immediately previous reviewed workflow ref for
-  # each old operational identity, but maps a distinct attribute per path. A
-  # token accepted for one legacy workflow therefore cannot impersonate a
-  # different service account through an aggregate repository/environment key.
-  legacy_preview_deploy_workflow_condition = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && assertion.actor != 'dependabot[bot]' && (!has(assertion.environment) || assertion.environment == 'preview-cloud')"
-  legacy_preview_operator_workflow_condition = join(" || ", [
-    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-preview.yml@') && assertion.event_name == 'pull_request' && assertion.actor != 'dependabot[bot]' && assertion.environment == 'preview-operations'",
-    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/cleanup-preview.yml@') && assertion.event_name == 'pull_request' && (!has(assertion.environment) || assertion.environment == 'preview-operations')",
-    "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/reconcile-previews.yml@') && (assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch') && assertion.ref == 'refs/heads/main' && has(assertion.environment) && assertion.environment == 'preview-operations'",
-  ])
-  preview_operator_transition_workflow_sha_condition = length(var.preview_operator_transition_workflow_shas) == 0 ? "false" : join(" || ", [
-    for sha in sort(tolist(var.preview_operator_transition_workflow_shas)) : "assertion.job_workflow_sha == '${sha}'"
-  ])
-  legacy_preview_operator_attribute_condition = "(${local.legacy_preview_operator_workflow_condition}) && (${local.preview_operator_transition_workflow_sha_condition})"
-  legacy_prod_deploy_workflow_condition       = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/deploy-prod.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
-  legacy_terraform_workflow_condition         = "assertion.job_workflow_ref.startsWith('collinbentley1/platform/.github/workflows/infrastructure.yml@') && assertion.event_name == 'push' && assertion.ref == 'refs/heads/main' && assertion.environment == 'production'"
-  legacy_workflow_condition = join(" || ", [
-    "(${local.legacy_preview_deploy_workflow_condition})",
-    "(${local.legacy_preview_operator_workflow_condition})",
-    "(${local.legacy_prod_deploy_workflow_condition})",
-    "(${local.legacy_terraform_workflow_condition})",
-    # Phase A must accept the new base-controlled pull_request_target paths as
-    # well as the immediately previous pull_request paths.
-    "(${local.preview_deploy_workflow_condition})",
-    "(${local.preview_operator_workflow_condition})",
-    # Publisher identities never receive a generic compatibility binding. Even
-    # in phase A, only a full-SHA caller can mint their exact mapped attribute.
-    "(${local.preview_publish_workflow_condition})",
-    "(${local.production_publish_workflow_condition})",
-  ])
-  trusted_workflow_sha_condition = join(" || ", [
-    for sha in sort(tolist(var.trusted_platform_workflow_shas)) : "assertion.job_workflow_sha == '${sha}'"
-  ])
-
-  exact_workflow_provider_condition = join(" && ", [
-    "assertion.repository_owner_id == '${var.github_owner_id}'",
-    "assertion.repository_id == '${var.github_repository_id}'",
-    "has(assertion.job_workflow_ref)",
-    "has(assertion.job_workflow_sha)",
-    "has(assertion.run_attempt)",
-    "assertion.run_attempt == '1'",
-    "assertion.runner_environment == 'github-hosted'",
-    "(${local.trusted_workflow_sha_condition})",
-    "((${local.preview_deploy_workflow_condition}) || (${local.preview_operator_workflow_condition}) || (${local.preview_publish_workflow_condition}) || (${local.production_workflow_condition}) || (${local.production_publish_workflow_condition}) || (${local.terraform_workflow_condition}))",
-  ])
-  legacy_provider_condition = "assertion.repository_owner_id == '${var.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && has(assertion.run_attempt) && assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted' && (${local.trusted_workflow_sha_condition}) && (${local.legacy_workflow_condition})"
-  provider_condition        = var.legacy_compatibility_mode ? local.legacy_provider_condition : local.exact_workflow_provider_condition
-
-  github_attribute_mapping = {
-    "attribute.preview_deploy_workflow_sha"   = "(${local.preview_deploy_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.preview_operator_workflow_sha" = "(${local.preview_operator_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.preview_publish_workflow_sha"  = "(${local.preview_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.prod_workflow_sha"             = "(${local.production_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.prod_publish_workflow_sha"     = "(${local.production_publish_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.terraform_workflow_sha"        = "(${local.terraform_workflow_condition}) ? assertion.job_workflow_sha : 'denied'"
-    "attribute.legacy_preview_deploy"         = "(${local.legacy_preview_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_preview_operator"       = "(${local.legacy_preview_operator_attribute_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_prod_deploy"            = "(${local.legacy_prod_deploy_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "attribute.legacy_terraform"              = "(${local.legacy_terraform_workflow_condition}) ? assertion.repository_id : 'denied'"
-    "google.subject"                          = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
-  }
+  # Reserved delimiter of the attribute.authority composite. Git refuses ':' in
+  # ref names and GitHub refuses it in owner and repository names, so no
+  # caller-controlled workflow_ref or job_workflow_ref can carry one; the
+  # manifest is refused if any of its values does.
+  authority_delimiter = ":"
 
   labels = {
     app        = var.app
@@ -111,18 +51,6 @@ locals {
     var.manage_automatic_default_service_account_grants_policy ? toset(["orgpolicy.googleapis.com"]) : toset([]),
   )
 
-}
-
-check "wif_expression_limits" {
-  assert {
-    condition     = length(local.provider_condition) <= 4096
-    error_message = "The rendered workload identity provider condition exceeds Google's 4096-character limit."
-  }
-
-  assert {
-    condition     = alltrue([for expression in values(local.github_attribute_mapping) : length(expression) <= 2048])
-    error_message = "A rendered workload identity attribute mapping expression exceeds Google's 2048-character limit."
-  }
 }
 
 resource "google_project_service" "required" {
@@ -368,10 +296,19 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   display_name                       = "GitHub"
   description                        = "OIDC provider restricted to ${local.github_repo_full_name}."
 
-  # Numeric IDs survive renames. run_id makes the subject non-reusable across runs.
-  attribute_mapping = local.github_attribute_mapping
+  # Numeric IDs survive renames. run_id makes the subject non-reusable across
+  # runs. attribute.authority is the one job-level tuple every binding names:
+  # the consumer caller's workflow_ref, the reusable job_workflow_ref and its
+  # job_workflow_sha, the job's environment, and the triggering event. A token
+  # without an environment claim cannot complete the mapping and is refused.
+  # The attempt counter is deliberately absent, so both attempts of a run carry
+  # the same authority and the workflows' own attempt guards decide reruns.
+  attribute_mapping = {
+    "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"
+    "attribute.authority" = "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name"
+  }
 
-  attribute_condition = local.provider_condition
+  attribute_condition = "assertion.repository_owner_id == '${local.github_owner_id}' && assertion.repository_id == '${var.github_repository_id}' && assertion.runner_environment == 'github-hosted'"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com/"
@@ -454,7 +391,7 @@ resource "google_service_account" "exact_wif_canary" {
   project      = var.project_id
   account_id   = "gha-wif-canary"
   display_name = "GitHub Actions Exact WIF Canary"
-  description  = "No-role identity that proves exact reusable-workflow SHA trust before legacy WIF bindings are removed."
+  description  = "No-role identity whose exchange proves the exact reusable-workflow binding of every cloud workflow authority."
 
   depends_on = [google_project_service.required]
 }
@@ -921,224 +858,73 @@ resource "google_service_account_iam_member" "preview_deploy_uses_preview_runtim
   member             = "serviceAccount:${google_service_account.preview_deploy.email}"
 }
 
-# Preserve only the addresses of the constrained legacy Workload Identity User
-# bindings while compatibility mode transitions them to count-based resources.
-moved {
-  from = google_service_account_iam_member.terraform_wif_prod_env
-  to   = google_service_account_iam_member.terraform_wif_prod_env[0]
+# Every federated grant is one exact job-level tuple. For each manifest entry,
+# each declared consumer caller and event, the active SHA (plus the transition
+# SHA only for the transition-eligible preview-operations jobs), and each
+# permitted account, the member is the attribute.authority value that only that
+# job can present: the consumer caller at its branch, the platform reusable
+# workflow at the SHA whose job_workflow_sha is that same SHA, the job's literal
+# environment, and the event. Attestation entries carry no accounts and so
+# produce no binding. Deploy, publish, canary, and infrastructure jobs are never
+# transition-eligible, so a predecessor token cannot deploy or roll a completed
+# DHI epoch backward.
+locals {
+  workflow_authority_service_accounts = {
+    "gha-deploy-parity"    = google_service_account.deployment_parity_reader.name
+    "gha-preview-commit"   = google_service_account.preview_commit.name
+    "gha-preview-deploy"   = google_service_account.preview_deploy.name
+    "gha-preview-operator" = google_service_account.preview_operator.name
+    "gha-preview-publish"  = google_service_account.preview_publisher.name
+    "gha-prod-deploy"      = google_service_account.prod_deploy.name
+    "gha-prod-publish"     = google_service_account.prod_publisher.name
+    "gha-terraform"        = google_service_account.terraform.name
+    "gha-wif-canary"       = google_service_account.exact_wif_canary.name
+  }
+
+  workflow_authority_bindings = {
+    for binding in flatten([
+      for entry in local.workflow_authority : [
+        for caller in entry.callers : [
+          for event in caller.events : [
+            for sha in compact([var.active_workflow_sha, entry.transitionEligible ? var.transition_workflow_sha : null]) : [
+              for account in entry.serviceAccounts : {
+                account = account
+                key     = "${account}/${trimprefix(entry.workflow, ".github/workflows/")}:${entry.job}/${trimprefix(caller.workflow, ".github/workflows/")}:${event}@${sha}"
+                authority = join(local.authority_delimiter, [
+                  "${local.github_repo_full_name}/${caller.workflow}@${caller.ref}",
+                  "${local.platform_repository}/${entry.workflow}@${sha}",
+                  sha,
+                  entry.environment,
+                  event,
+                ])
+              }
+            ]
+          ]
+        ]
+      ]
+      ]) : binding.key => merge(binding, {
+      member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"
+    })
+  }
 }
 
-moved {
-  from = google_service_account_iam_member.prod_deploy_wif_prod_env
-  to   = google_service_account_iam_member.prod_deploy_wif_prod_env[0]
-}
+resource "google_service_account_iam_member" "workflow_authority" {
+  for_each = local.workflow_authority_bindings
 
-moved {
-  from = google_service_account_iam_member.preview_deploy_wif_repo
-  to   = google_service_account_iam_member.preview_deploy_wif_repo[0]
-}
-
-# Each service account trusts only its reviewed reusable workflow, exact platform
-# commit, immutable caller repository IDs, and expected event/ref/environment.
-resource "google_service_account_iam_member" "terraform_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.terraform.name
+  service_account_id = local.workflow_authority_service_accounts[each.value.account]
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.terraform_workflow_sha/${each.value}"
-}
+  member             = each.value.member
 
-resource "google_service_account_iam_member" "prod_deploy_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "prod_publisher_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.prod_publisher.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_publish_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_deploy_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
-}
-
-# The active production workflow may stage only the sanitized preview baseline
-# through this existing preview deployer. A transition SHA has no binding, so a
-# predecessor token cannot roll a completed DHI epoch backward.
-resource "google_service_account_iam_member" "preview_deploy_wif_prod_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_commit_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_commit.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_commit.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_commit_wif_prod_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_commit.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_iam_audit_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_operator.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_iam_audit_wif_preview_operations_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_operator.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
-}
-
-# Keep the previous identity usable only for an explicitly declared transition
-# SHA. The steady-state transition set is empty and this binding disappears.
-resource "google_service_account_iam_member" "preview_operator_wif_workflow_sha" {
-  for_each = var.preview_operator_transition_workflow_shas
-
-  service_account_id = google_service_account.preview_operator.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "preview_publisher_wif_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.preview_publisher.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_publish_workflow_sha/${each.value}"
-}
-
-# This identity is deliberately read-only and has no legacy binding. Both
-# deployment paths may mint it only through their exact workflow-SHA attribute:
-# preview verifies the live production image, while production proves that all
-# still-routable preview tags carry the same DHI lineage identifier.
-resource "google_service_account_iam_member" "deployment_parity_wif_preview_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.deployment_parity_reader.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "deployment_parity_wif_prod_workflow_sha" {
-  for_each = var.preview_operations_active_workflow_shas
-
-  service_account_id = google_service_account.deployment_parity_reader.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
-}
-
-# The canary has no project permissions and no legacy WIF binding. A successful
-# access-token exchange against it proves the exact workflow attribute path.
-resource "google_service_account_iam_member" "canary_wif_terraform_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.terraform_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "canary_wif_prod_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "canary_wif_prod_publish_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.prod_publish_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "canary_wif_preview_deploy_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_deploy_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "canary_wif_preview_operator_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_operator_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "canary_wif_preview_publish_workflow_sha" {
-  for_each = var.trusted_platform_workflow_shas
-
-  service_account_id = google_service_account.exact_wif_canary.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.preview_publish_workflow_sha/${each.value}"
-}
-
-resource "google_service_account_iam_member" "terraform_wif_prod_env" {
-  count = var.legacy_compatibility_mode ? 1 : 0
-
-  service_account_id = google_service_account.terraform.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.legacy_terraform_principal_set
-}
-
-resource "google_service_account_iam_member" "prod_deploy_wif_prod_env" {
-  count = var.legacy_compatibility_mode ? 1 : 0
-
-  service_account_id = google_service_account.prod_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.legacy_prod_deploy_principal_set
-}
-
-resource "google_service_account_iam_member" "preview_deploy_wif_repo" {
-  count = var.legacy_compatibility_mode ? 1 : 0
-
-  service_account_id = google_service_account.preview_deploy.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.legacy_preview_deploy_principal_set
-}
-
-resource "google_service_account_iam_member" "preview_operator_wif_repo" {
-  count = var.legacy_compatibility_mode ? 1 : 0
-
-  service_account_id = google_service_account.preview_operator.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = local.legacy_preview_operator_principal_set
+  lifecycle {
+    precondition {
+      condition = alltrue([
+        for entry in local.workflow_authority : (
+          contains(["attestation", "gcp"], entry.purpose) &&
+          (entry.purpose == "gcp") == (length(entry.serviceAccounts) > 0) &&
+          !strcontains(join("", concat([local.github_repo_full_name, entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
+        )
+      ])
+      error_message = "workflow-authority.json must declare only attestation or gcp purposes, accounts only for gcp jobs, and no reserved delimiter in any tuple value."
+    }
+  }
 }

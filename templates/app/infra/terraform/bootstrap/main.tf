@@ -9,16 +9,9 @@ module "bootstrap" {
   state_bucket_location       = var.state_bucket_location
   github_owner                = var.github_owner
   github_repo                 = var.github_repo
-  github_owner_id             = var.github_owner_id
   github_repository_id        = var.github_repository_id
-  trusted_platform_workflow_shas = [
-    "__PLATFORM_SHA__",
-  ]
-  preview_operations_active_workflow_shas = [
-    "__PLATFORM_SHA__",
-  ]
-  preview_operator_transition_workflow_shas              = []
-  legacy_compatibility_mode                              = false
+  active_workflow_sha         = "__PLATFORM_SHA__"
+
   manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy
   runtime_description                                    = "Runtime identity for the __APP_NAME__ Cloud Run services."
 }

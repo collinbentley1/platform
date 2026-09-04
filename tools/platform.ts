@@ -527,110 +527,25 @@ async function doctor(repoArgs: string[]): Promise<void> {
 
     const bootstrapText = await readText(join(repoPath, "infra/terraform/bootstrap/main.tf"));
     if (bootstrapText !== undefined) {
-      let uniqueTrustedRefs: Set<string> | undefined;
-      const trustedBlock = bootstrapText.match(
-        /^\s*trusted_platform_workflow_shas\s*=\s*\[([^\]]*)\]/m,
-      );
-      if (!trustedBlock) {
-        messages.push("bootstrap main.tf is missing trusted_platform_workflow_shas");
+      const active = bootstrapText.match(/^\s*active_workflow_sha\s*=\s*"([^"]*)"\s*(?:#.*)?$/m);
+      if (!active) {
+        messages.push("bootstrap main.tf is missing active_workflow_sha");
       } else {
-        const lines = trustedBlock[1]!
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean);
-        const trustedRefs: string[] = [];
-        let invalidLine = false;
-        for (const line of lines) {
-          const match = line.match(/^"([0-9a-f]{40})",?(?:\s*#.*)?$/);
-          if (!match) {
-            invalidLine = true;
-          } else {
-            trustedRefs.push(match[1]!);
-          }
+        const ref = active[1]!;
+        if (!isFullCommitSha(ref)) {
+          messages.push("active_workflow_sha must be one full commit SHA");
+        } else if (platformRef !== "unknown" && ref !== platformRef) {
+          messages.push("active_workflow_sha must be the active platform SHA");
         }
-        uniqueTrustedRefs = new Set(trustedRefs);
-        if (invalidLine || trustedRefs.length !== 1 || uniqueTrustedRefs.size !== 1) {
-          messages.push(
-            "trusted_platform_workflow_shas must contain exactly one full commit SHA",
-          );
-        }
-        if (
-          platformRef !== "unknown" &&
-          (trustedRefs.length !== 1 || trustedRefs[0] !== platformRef)
-        ) {
-          messages.push("trusted_platform_workflow_shas must contain only the active platform SHA");
-        }
-        for (const ref of uniqueTrustedRefs) {
-          if (forbiddenPreMigrationWorkflowShas.has(ref)) {
-            messages.push(`trusted_platform_workflow_shas contains vulnerable pre-migration SHA ${ref}`);
-          }
+        if (forbiddenPreMigrationWorkflowShas.has(ref)) {
+          messages.push(`active_workflow_sha contains vulnerable pre-migration SHA ${ref}`);
         }
       }
-
-      const parseOperatorShaSet = (variable: string): Set<string> | undefined => {
-        const block = bootstrapText.match(
-          new RegExp(`^\\s*${variable}\\s*=\\s*\\[([^\\]]*)\\]`, "m"),
-        );
-        if (!block) {
-          messages.push(`bootstrap main.tf is missing ${variable}`);
-          return undefined;
-        }
-        const refs = new Set<string>();
-        let invalidLine = false;
-        for (const line of block[1]!.split("\n").map((value) => value.trim()).filter(Boolean)) {
-          const match = line.match(/^"([0-9a-f]{40})",?(?:\s*#.*)?$/);
-          if (!match || refs.has(match[1]!)) {
-            invalidLine = true;
-          } else {
-            refs.add(match[1]!);
-          }
-        }
-        if (invalidLine) {
-          messages.push(`${variable} must contain only unique full commit SHAs`);
-        }
-        return refs;
-      };
-
-      const activeOperatorRefs = parseOperatorShaSet(
-        "preview_operations_active_workflow_shas",
-      );
-      const transitionOperatorRefs = parseOperatorShaSet(
-        "preview_operator_transition_workflow_shas",
-      );
-      if (activeOperatorRefs && activeOperatorRefs.size !== 1) {
-        messages.push(
-          "preview_operations_active_workflow_shas must contain exactly the active platform SHA",
-        );
-      }
-      if (
-        activeOperatorRefs &&
-        platformRef !== "unknown" &&
-        !activeOperatorRefs.has(platformRef)
-      ) {
-        messages.push(
-          "preview_operations_active_workflow_shas must contain the active platform SHA",
-        );
-      }
-      if (transitionOperatorRefs && transitionOperatorRefs.size !== 0) {
-        messages.push(
-          "preview_operator_transition_workflow_shas must be empty in the consumer steady-state mirror",
-        );
-      }
-      if (activeOperatorRefs && transitionOperatorRefs) {
-        const overlap = [...activeOperatorRefs].filter((ref) => transitionOperatorRefs.has(ref));
-        if (overlap.length > 0) {
-          messages.push("preview operator active and transition workflow SHA sets must be disjoint");
-        }
-        if (uniqueTrustedRefs) {
-          const partition = new Set([...activeOperatorRefs, ...transitionOperatorRefs]);
-          if (
-            partition.size !== uniqueTrustedRefs.size ||
-            [...partition].some((ref) => !uniqueTrustedRefs!.has(ref))
-          ) {
-            messages.push(
-              "preview operator active and transition workflow SHA sets must exactly partition trusted_platform_workflow_shas",
-            );
-          }
+      for (const transition of bootstrapText.matchAll(/^[ \t]*transition_workflow_sha[ \t]*=[ \t]*(.*)$/gm)) {
+        messages.push("transition_workflow_sha must be absent in the consumer steady-state mirror");
+        const ref = transition[1]!.match(/^"([0-9a-f]{40})"/)?.[1];
+        if (ref !== undefined && forbiddenPreMigrationWorkflowShas.has(ref)) {
+          messages.push(`transition_workflow_sha contains vulnerable pre-migration SHA ${ref}`);
         }
       }
     }
@@ -695,7 +610,6 @@ async function scaffold(args: string[]): Promise<void> {
     __APP_NAME__: name,
     __PROJECT_ID__: name,
     __STATE_BUCKET__: `${name}-tfstate`,
-    __GITHUB_OWNER_ID__: "16823277",
     __GITHUB_REPOSITORY_ID__: githubRepositoryId,
     __PLATFORM_SHA__: platformSha,
   });

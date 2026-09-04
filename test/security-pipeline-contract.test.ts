@@ -660,48 +660,34 @@ describe("protected container and preview lifecycle contracts", () => {
     );
   });
 
-  test("rendered WIF conditions and mappings stay within Google limits", async () => {
+  test("the WIF provider admits only GitHub-hosted jobs of the literal owner and repository IDs and maps one job-level authority composite", async () => {
     const source = await readFile(
       join(repoRoot, "terraform/modules/bootstrap/main.tf"),
       "utf8",
     );
-    expect(source).toContain('condition     = length(local.provider_condition) <= 4096');
+    expect(source).toContain('github_owner_id     = "16823277"');
+    expect(source).toContain('authority_delimiter = ":"');
     expect(source).toContain(
-      'condition     = alltrue([for expression in values(local.github_attribute_mapping) : length(expression) <= 2048])',
+      'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
-    for (const repositoryId of ["1255553151", "711292980", "1025243085", "280932482"]) {
-      for (const shaCount of [1, 2]) {
-        const rendered = renderWifContract(
-          source,
-          repositoryId,
-          Array.from({ length: shaCount }, (_, index) => `${index + 1}`.repeat(40)),
-        );
-        expect(rendered.exact.length).toBeLessThanOrEqual(4096);
-        expect(rendered.legacy.length).toBeLessThanOrEqual(4096);
-        expect(Math.max(...Object.values(rendered.mappings).map((value) => value.length))).toBeLessThanOrEqual(2048);
-        expect(rendered.exact).toContain("assertion.event_name == 'pull_request_target'");
-        expect(rendered.exact).toContain("assertion.base_ref == 'main'");
-        expect(rendered.exact).toContain("assertion.run_attempt == '1'");
-      }
+    const mappingBlock = source.slice(
+      source.indexOf("attribute_mapping = {"),
+      source.indexOf("attribute_condition ="),
+    );
+    const mappings = [...mappingBlock.matchAll(/^\s*"([^"]+)"\s*=\s*"([^"]*)"\s*$/gm)].map((match) => [match[1], match[2]]);
+    expect(mappings).toEqual([
+      ["google.subject", "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.run_id"],
+      [
+        "attribute.authority",
+        "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name",
+      ],
+    ]);
+    for (const [, expression] of mappings) {
+      expect(expression!.length).toBeLessThanOrEqual(2048);
+      expect(expression).not.toMatch(/\?|has\(|run_attempt/);
     }
-    const reference = renderWifContract(source, "1255553151", ["1".repeat(40)]);
-    const reconcileEvents =
-      "(assertion.event_name == 'push' || assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch')";
-    const exactReconcile = extractHclJoin(source, "preview_operator_workflow_condition").items
-      .find((condition) => condition.includes("/reconcile-previews.yml@"));
-    const legacyReconcile = extractHclJoin(
-      source,
-      "legacy_preview_operator_workflow_condition",
-    ).items.find((condition) => condition.includes("/reconcile-previews.yml@"));
-    expect(exactReconcile).toContain(reconcileEvents);
-    expect(legacyReconcile).toContain(
-      "(assertion.event_name == 'schedule' || assertion.event_name == 'workflow_dispatch')",
-    );
-    expect(legacyReconcile).not.toContain("assertion.event_name == 'push'");
-    expect(reference.exact).toContain(reconcileEvents);
-    expect(reference.exact.length).toBe(2707);
-    expect(reference.legacy.length).toBe(3718);
-    expect(Math.max(...Object.values(reference.mappings).map((value) => value.length))).toBe(1005);
+    expect(source).not.toContain("'denied'");
+    expect(source).not.toContain("reconcile-previews.yml@");
   });
 
   test("a post-deploy API failure makes exact-revision invalidation mandatory", async () => {
@@ -1535,120 +1521,4 @@ async function executeReconcileStep(
     mutations: await readFile(mutations, "utf8"),
     stderr,
   };
-}
-
-function renderWifContract(
-  source: string,
-  repositoryId: string,
-  workflowShas: string[],
-): { exact: string; legacy: string; mappings: Record<string, string> } {
-  const locals: Record<string, string> = {};
-  const variables = {
-    github_owner_id: "16823277",
-    github_repository_id: repositoryId,
-  };
-  for (const name of [
-    "preview_deploy_workflow_condition",
-    "preview_publish_workflow_condition",
-    "production_workflow_condition",
-    "production_publish_workflow_condition",
-    "terraform_workflow_condition",
-    "legacy_preview_deploy_workflow_condition",
-    "legacy_prod_deploy_workflow_condition",
-    "legacy_terraform_workflow_condition",
-  ]) {
-    locals[name] = renderHcl(extractHclString(source, name), locals, variables);
-  }
-  for (const name of [
-    "preview_operator_workflow_condition",
-    "legacy_preview_operator_workflow_condition",
-  ]) {
-    const { items, separator } = extractHclJoin(source, name);
-    locals[name] = items.map((item) => renderHcl(item, locals, variables)).join(separator);
-  }
-  locals.preview_operator_transition_workflow_sha_condition = workflowShas
-    .toSorted()
-    .map((sha) => `assertion.job_workflow_sha == '${sha}'`)
-    .join(" || ");
-  locals.legacy_preview_operator_attribute_condition = renderHcl(
-    extractHclString(source, "legacy_preview_operator_attribute_condition"),
-    locals,
-    variables,
-  );
-  const legacyWorkflow = extractHclJoin(source, "legacy_workflow_condition");
-  locals.legacy_workflow_condition = legacyWorkflow.items
-    .map((item) => renderHcl(item, locals, variables))
-    .join(legacyWorkflow.separator);
-  locals.trusted_workflow_sha_condition = workflowShas
-    .toSorted()
-    .map((sha) => `assertion.job_workflow_sha == '${sha}'`)
-    .join(" || ");
-  const exact = extractHclJoin(source, "exact_workflow_provider_condition");
-  locals.exact_workflow_provider_condition = exact.items
-    .map((item) => renderHcl(item, locals, variables))
-    .join(exact.separator);
-  locals.legacy_provider_condition = renderHcl(
-    extractHclString(source, "legacy_provider_condition"),
-    locals,
-    variables,
-  );
-
-  const mappingBody = source.match(
-    /github_attribute_mapping\s*=\s*\{([\s\S]*?)\n\s*\}/,
-  )?.[1];
-  if (!mappingBody) throw new Error("github_attribute_mapping block is absent");
-  const mappings: Record<string, string> = {};
-  for (const match of mappingBody.matchAll(/^\s*"([^"]+)"\s*=\s*"([^"]*)"\s*$/gm)) {
-    mappings[match[1]] = renderHcl(match[2], locals, variables);
-  }
-  if (Object.keys(mappings).length !== 11) {
-    throw new Error(`expected 11 WIF mappings, found ${Object.keys(mappings).length}`);
-  }
-  return {
-    exact: locals.exact_workflow_provider_condition,
-    legacy: locals.legacy_provider_condition,
-    mappings,
-  };
-}
-
-function extractHclString(source: string, name: string): string {
-  const match = source.match(new RegExp(`^\\s*${name}\\s*=\\s*"([^"]*)"\\s*$`, "m"));
-  if (!match) throw new Error(`missing HCL string local ${name}`);
-  return match[1];
-}
-
-function extractHclJoin(
-  source: string,
-  name: string,
-): { items: string[]; separator: string } {
-  const match = source.match(
-    new RegExp(`${name}\\s*=\\s*join\\("([^"]*)",\\s*\\[([\\s\\S]*?)\\n\\s*\\]\\)`, "m"),
-  );
-  if (!match) throw new Error(`missing HCL join local ${name}`);
-  return {
-    items: [...match[2].matchAll(/^\s*"([^"]*)",?\s*$/gm)].map((item) => item[1]),
-    separator: match[1],
-  };
-}
-
-function renderHcl(
-  template: string,
-  locals: Record<string, string>,
-  variables: Record<string, string>,
-): string {
-  let rendered = template;
-  for (let pass = 0; pass < 20; pass += 1) {
-    const next = rendered
-      .replace(/\$\{local\.([A-Za-z0-9_]+)\}/g, (_match, name: string) => {
-        if (!(name in locals)) throw new Error(`unresolved local ${name}`);
-        return locals[name];
-      })
-      .replace(/\$\{var\.([A-Za-z0-9_]+)\}/g, (_match, name: string) => {
-        if (!(name in variables)) throw new Error(`unresolved variable ${name}`);
-        return variables[name];
-      });
-    if (next === rendered) return rendered;
-    rendered = next;
-  }
-  throw new Error("HCL interpolation did not converge");
 }

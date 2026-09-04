@@ -43,16 +43,6 @@ variable "github_repo" {
   type        = string
 }
 
-variable "github_owner_id" {
-  description = "Immutable numeric GitHub owner ID."
-  type        = string
-
-  validation {
-    condition     = can(regex("^[1-9][0-9]*$", var.github_owner_id))
-    error_message = "github_owner_id must be a positive decimal ID."
-  }
-}
-
 variable "github_repository_id" {
   description = "Immutable numeric GitHub repository ID."
   type        = string
@@ -63,57 +53,29 @@ variable "github_repository_id" {
   }
 }
 
-variable "trusted_platform_workflow_shas" {
-  description = "Reviewed platform commits whose reusable workflows may exchange GitHub OIDC tokens."
-  type        = set(string)
+variable "active_workflow_sha" {
+  description = "Exact reviewed platform commit whose reusable workflows exchange GitHub OIDC tokens for every cloud workflow authority."
+  type        = string
 
   validation {
-    condition = (
-      length(var.trusted_platform_workflow_shas) > 0 &&
-      alltrue([for sha in var.trusted_platform_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))])
-    )
-    error_message = "trusted_platform_workflow_shas must contain one or more full lowercase commit SHAs."
+    condition     = can(regex("^[0-9a-f]{40}$", var.active_workflow_sha))
+    error_message = "active_workflow_sha must be one full lowercase commit SHA."
   }
 }
 
-variable "preview_operations_active_workflow_shas" {
-  description = "Nonempty reviewed platform commit set whose preview-operations workflows exchange through the preview deploy service account. Must be disjoint from the transition set and together exactly partition trusted_platform_workflow_shas."
-  type        = set(string)
+variable "transition_workflow_sha" {
+  description = "Optional immediately previous reviewed platform commit that only transition-eligible workflow authorities may keep exchanging while consumers repin. Null at steady state."
+  type        = string
+  default     = null
 
   validation {
-    condition = (
-      length(var.preview_operations_active_workflow_shas) > 0 &&
-      alltrue([for sha in var.preview_operations_active_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))]) &&
-      length(setintersection(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas)) == 0 &&
-      setunion(var.preview_operations_active_workflow_shas, var.preview_operator_transition_workflow_shas) == var.trusted_platform_workflow_shas
-    )
-    error_message = "preview_operations_active_workflow_shas must be nonempty, contain full lowercase commit SHAs, be disjoint from the transition set, and together exactly partition trusted_platform_workflow_shas."
+    condition     = var.transition_workflow_sha == null || can(regex("^[0-9a-f]{40}$", var.transition_workflow_sha))
+    error_message = "transition_workflow_sha must be null or one full lowercase commit SHA."
   }
-}
-
-variable "preview_operator_transition_workflow_shas" {
-  description = "Immediately previous reviewed platform commit set temporarily allowed to exchange preview-operations tokens through the retired preview operator identity. Empty at steady state."
-  type        = set(string)
-  default     = []
 
   validation {
-    condition = (
-      length(var.preview_operator_transition_workflow_shas) <= 1 &&
-      alltrue([for sha in var.preview_operator_transition_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))]) &&
-      length(setsubtract(var.preview_operator_transition_workflow_shas, var.trusted_platform_workflow_shas)) == 0
-    )
-    error_message = "preview_operator_transition_workflow_shas must contain at most one trusted full lowercase commit SHA."
-  }
-}
-
-variable "legacy_compatibility_mode" {
-  description = "Temporarily retain only constrained repository/environment Workload Identity User bindings during a verified exact-SHA migration. Broad project roles, Token Creator, and cross-boundary actAs grants are always removed. Must be false at steady state."
-  type        = bool
-  default     = false
-
-  validation {
-    condition     = !(var.legacy_compatibility_mode && length(var.preview_operator_transition_workflow_shas) != 0)
-    error_message = "legacy_compatibility_mode is allowed only for the initial migration with an empty transition workflow set."
+    condition     = var.transition_workflow_sha != var.active_workflow_sha
+    error_message = "transition_workflow_sha must differ from active_workflow_sha."
   }
 }
 

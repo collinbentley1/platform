@@ -155,32 +155,42 @@ access are disabled across the complete PR-controlled build action.
 
 Cloud publication and Cloud Run mutation use different protected environments
 and identities. Secretless `production-publish` and `preview-publish` jobs can
-impersonate only `gha-prod-publish` and `gha-preview-publish`; each publisher has
-Writer on exactly one Artifact Registry repository and no Cloud Run or runtime
+impersonate only the matching `gha-prod-publish` or `gha-preview-publish`
+publisher and the no-role `gha-wif-canary`; each publisher has Writer on
+exactly one Artifact Registry repository and no Cloud Run or runtime
 `actAs` access. `production` and `preview-cloud` use separate deploy identities
 with the service-scoped Cloud Run role, `actAs` on only the matching runtime,
 and Reader on only the matching image repository, as Cloud Run requires; they
 cannot upload or delete artifacts. Medlock's production deploy identity alone
 also has Secret Version Adder on exactly `waitlist-identity-keyset`; it cannot
 read, list, disable, or destroy versions, and every other deploy identity has no
-secret grant. `preview-operations` uses
-the existing `gha-preview-deploy` identity through the distinct
-`attribute.preview_operator_workflow_sha` WIF path. Cloud Run revalidates the
-service identity and image during `gcloud run services update-traffic`, so the
-API-minimum traffic operation requires the same service-scoped update,
-preview-runtime `actAs`, and exact-preview-repository Reader permissions as a
-deployment. Those coarse permissions could deploy a preview revision, so their
-containment is the exact reviewed cleanup/reconcile workflow SHA,
-`preview-operations` environment/event claims, immutable numeric-repository-ID
+secret grant. Every cloud job authenticates through one Workload Identity
+Federation provider that admits only GitHub-hosted jobs of this owner's
+immutable numeric repository ID and maps exactly
+one job-level `attribute.authority` tuple: the consumer caller's `workflow_ref`
+on `main`, the reviewed reusable workflow's `job_workflow_ref` at the active
+platform commit, its `job_workflow_sha`, the job's literal environment, and
+the triggering event. Each service account is bound only to the exact tuples
+of the jobs that exchange for it, as enumerated per id-token job in
+`terraform/modules/bootstrap/workflow-authority.json`, the one inventory that
+lint also checks against every workflow and caller template on disk. The
+`supply-chain` attestation jobs keep `id-token: write` for GitHub attestations
+but bind no Google identity, and each no-role canary enters its own
+`production-canary`, `preview-cloud-canary`, or `preview-publish-canary`
+environment so its tuple can mint nothing but `gha-wif-canary`.
+`preview-operations` tuples authenticate only the read-only
+`gha-preview-operator` IAM auditor, the service-scoped `gha-preview-commit`
+transaction committer, and the no-role `gha-wif-canary`.
+Cloud Run revalidates the service identity and image
+during `gcloud run services update-traffic`, so the API-minimum traffic
+operation is contained by that exact tuple, the immutable numeric-repository-ID
 project/service map, fixed CLI arguments, and the absence of PR checkout or
 PR-controlled code after authentication. No credential reaches the untrusted PR
-build. `gha-preview-operator` is transition-only: the immediately previous SHA
-may retain its old binding during repin, while the active SHA binds the distinct
-operator-workflow attribute only to `gha-preview-deploy`; the transition set and
-legacy fallback are empty at steady state. The retired operator receives no
-steady-state Cloud Run, registry, runtime `actAs`, project, secret, state, data,
-or production access. Protect both publish environments before pinning a
-consumer to this workflow.
+build. Only the `cleanup` and `reconcile` tuples are transition-eligible:
+during a repin the immediately previous reviewed commit may keep exchanging for
+them, while deploy, publish, canary, and infrastructure tuples bind the active
+commit only, and the transition SHA is null at steady state. Protect both
+publish environments before pinning a consumer to this workflow.
 
 ## Runtime Configuration
 

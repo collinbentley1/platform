@@ -519,7 +519,7 @@ jobs:
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main'
-    environment: production
+    environment: production-canary
     permissions:
       id-token: write # Exchange only for the no-role exact-WIF canary identity.
 
