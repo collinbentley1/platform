@@ -7,6 +7,7 @@ import {
   checkWorkflowAuthority,
   manifestPath,
   parseWorkflowAuthority,
+  recoveryInvokerName,
   type WorkflowAuthorityEntry,
 } from "../tools/ci/workflow-authority";
 
@@ -69,14 +70,15 @@ const entry = (
   transitionEligible = false,
 ): WorkflowAuthorityEntry => ({ callers, environment, job, purpose, serviceAccounts, transitionEligible, trustDomain: "consumer", workflow: `.github/workflows/${workflow}` });
 const recoveryWorkflow = ".github/workflows/protected-recovery-invoke.yml";
-const recovery = (consumer: string): WorkflowAuthorityEntry => ({
+const directionWords = { QUARANTINE: "quarantine", RESTORE: "restore" } as const;
+const recovery = (consumer: string, intent: "QUARANTINE" | "RESTORE"): WorkflowAuthorityEntry => ({
   callers: [{ events: ["workflow_dispatch"], ref: "refs/heads/main", workflow: recoveryWorkflow }],
   consumer,
-  environment: `recovery-${consumer}`,
-  intents: ["QUARANTINE", "RESTORE"],
-  job: consumer,
+  environment: `recovery-${consumer}-${directionWords[intent]}`,
+  intent,
+  job: `${consumer}-${directionWords[intent]}`,
   purpose: "recovery",
-  serviceAccounts: [`gha-recovery-${consumer}`],
+  serviceAccounts: [recoveryInvokerName(consumer, intent)],
   transitionEligible: true,
   trustDomain: "recovery",
   workflow: recoveryWorkflow,
@@ -84,7 +86,7 @@ const recovery = (consumer: string): WorkflowAuthorityEntry => ({
 
 // The complete job-level inventory. Every id-token job of every platform
 // reusable workflow appears exactly once with the accounts it exchanges for,
-// and every consumer has exactly one recovery-domain invoker.
+// and every consumer has exactly one recovery-domain invoker per direction.
 const expectedEntries: WorkflowAuthorityEntry[] = [
   entry("cleanup-preview.yml", "cleanup", "preview-operations", "gcp", [caller("cleanup-preview.yml", "pull_request_target"), ...previewCaller], ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"], true),
   entry("deploy-preview.yml", "attest", "supply-chain", "attestation", previewCaller, []),
@@ -98,10 +100,14 @@ const expectedEntries: WorkflowAuthorityEntry[] = [
   entry("deploy-prod.yml", "deploy", "production", "gcp", productionCaller, ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-prod-deploy"]),
   entry("deploy-prod.yml", "publish", "production-publish", "gcp", productionCaller, ["gha-prod-publish", "gha-wif-canary"]),
   entry("infrastructure.yml", "terraform-convergence", "production", "gcp", productionCaller, ["gha-terraform", "gha-wif-canary"]),
-  recovery("cdbentley"),
-  recovery("critical-history"),
-  recovery("healthmcp"),
-  recovery("runsetta"),
+  recovery("cdbentley", "QUARANTINE"),
+  recovery("cdbentley", "RESTORE"),
+  recovery("critical-history", "QUARANTINE"),
+  recovery("critical-history", "RESTORE"),
+  recovery("healthmcp", "QUARANTINE"),
+  recovery("healthmcp", "RESTORE"),
+  recovery("runsetta", "QUARANTINE"),
+  recovery("runsetta", "RESTORE"),
   entry("reconcile-previews.yml", "reconcile", "preview-operations", "gcp", [caller("reconcile-previews.yml", "push", "schedule", "workflow_dispatch")], ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"], true),
 ];
 
@@ -373,14 +379,19 @@ describe("workflow authority manifest", () => {
     ]);
   });
 
-  test("a recovery job exchanges for exactly its purpose-level invoker", async () => {
+  test("a recovery job exchanges for exactly its direction-bound purpose-level invoker", async () => {
     const root = await fixtureRoot();
+    // The quarantine job of one consumer exchanging for another consumer's invoker, and the restore job exchanging for the quarantine invoker, both fail closed.
     await editFile(root, recoveryWorkflow, (text) =>
-      text.replace('echo "invoker=gha-recovery-cdbentley@${project_id}.iam.gserviceaccount.com"', 'echo "invoker=gha-recovery-runsetta@${project_id}.iam.gserviceaccount.com"'),
+      text
+        .replace('echo "invoker=gha-isolate-cdbentley@${project_id}.iam.gserviceaccount.com"', 'echo "invoker=gha-isolate-runsetta@${project_id}.iam.gserviceaccount.com"')
+        .replace('echo "invoker=gha-restore-cdbentley@${project_id}.iam.gserviceaccount.com"', 'echo "invoker=gha-isolate-cdbentley@${project_id}.iam.gserviceaccount.com"'),
     );
     expect(await failuresOf(root)).toEqual([
-      `${recoveryWorkflow}: job cdbentley step 2 service_account must resolve to one known gha-* account through a same-job step output.`,
-      `${recoveryWorkflow}: job cdbentley exchanges for [] but the manifest binds [gha-recovery-cdbentley].`,
+      `${recoveryWorkflow}: job cdbentley-quarantine step 2 service_account must resolve to one known gha-* account through a same-job step output.`,
+      `${recoveryWorkflow}: job cdbentley-quarantine exchanges for [] but the manifest binds [gha-isolate-cdbentley].`,
+      `${recoveryWorkflow}: job cdbentley-restore step 2 service_account must resolve to one known gha-* account through a same-job step output.`,
+      `${recoveryWorkflow}: job cdbentley-restore exchanges for [] but the manifest binds [gha-restore-cdbentley].`,
     ]);
   });
 
@@ -389,35 +400,44 @@ describe("workflow authority manifest", () => {
     await editFile(root, recoveryWorkflow, (text) => text.replace("on:\n  workflow_dispatch:\n", "on:\n  push:\n    branches:\n      - main\n  workflow_dispatch:\n"));
     const triggers = `${recoveryWorkflow}: triggers [push, workflow_dispatch] do not match the manifest caller events [workflow_dispatch] of ${recoveryWorkflow} job`;
     expect(await failuresOf(root)).toEqual([
-      `${triggers} cdbentley.`,
-      `${triggers} critical-history.`,
-      `${triggers} healthmcp.`,
-      `${triggers} runsetta.`,
+      `${triggers} cdbentley-quarantine.`,
+      `${triggers} cdbentley-restore.`,
+      `${triggers} critical-history-quarantine.`,
+      `${triggers} critical-history-restore.`,
+      `${triggers} healthmcp-quarantine.`,
+      `${triggers} healthmcp-restore.`,
+      `${triggers} runsetta-quarantine.`,
+      `${triggers} runsetta-restore.`,
     ]);
   });
 
-  test("the recovery entry schema is strict", () => {
-    const base = recovery("cdbentley") as unknown as Record<string, unknown>;
+  test("the recovery entry schema is strict and binds one direction per credential", () => {
+    const base = recovery("cdbentley", "QUARANTINE") as unknown as Record<string, unknown>;
+    const restoreEntry = recovery("cdbentley", "RESTORE") as unknown as Record<string, unknown>;
     const manifestEntry = (overrides: Record<string, unknown>) => ({ ...base, ...overrides });
     const failure = (manifest: unknown) => parseWorkflowAuthority(JSON.stringify(manifest)).failures;
     expect(failure([manifestEntry({})])).toEqual([]);
-    expect(failure([manifestEntry({ intents: ["QUARANTINE"] })])).toEqual([]);
+    expect(failure([manifestEntry({}), restoreEntry])).toEqual([]);
     expect(failure([manifestEntry({ purpose: "gcp" })])[0]).toContain("purpose recovery is exactly the recovery trust domain");
     expect(failure([manifestEntry({ consumer: "cdbentley/../runsetta" })])[0]).toContain("consumer must be one consumer repository name");
-    expect(failure([manifestEntry({ intents: [] })])[0]).toContain("intents must be a sorted, unique, non-empty list");
-    expect(failure([manifestEntry({ intents: ["RESTORE", "QUARANTINE"] })])[0]).toContain("intents must be a sorted, unique, non-empty list");
-    expect(failure([manifestEntry({ intents: ["DISABLE"] })])[0]).toContain("intents must be a sorted, unique, non-empty list");
-    expect(failure([manifestEntry({ serviceAccounts: ["gha-recovery-runsetta"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-recovery-cdbentley");
-    expect(failure([manifestEntry({ serviceAccounts: ["gha-recovery-cdbentley", "gha-terraform"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-recovery-cdbentley");
-    expect(failure([manifestEntry({ consumer: "a-consumer-whose-name-is-too-long", serviceAccounts: ["gha-recovery-a-consumer-whose-name-is-too-long"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker");
+    expect(failure([manifestEntry({ intent: ["QUARANTINE", "RESTORE"] })])[0]).toContain("intent must be one of QUARANTINE, RESTORE");
+    expect(failure([manifestEntry({ intent: "DISABLE" })])[0]).toContain("intent must be one of QUARANTINE, RESTORE");
+    expect(failure([manifestEntry({ intents: ["QUARANTINE"] })])[0]).toContain("keys must be exactly");
+    expect(failure([manifestEntry({ intent: "RESTORE" })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-restore-cdbentley");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-isolate-runsetta"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-isolate-cdbentley");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-recovery-cdbentley"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-isolate-cdbentley");
+    expect(failure([manifestEntry({ serviceAccounts: ["gha-isolate-cdbentley", "gha-terraform"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker gha-isolate-cdbentley");
+    expect(failure([manifestEntry({ consumer: "a-consumer-whose-name-is-too-long", serviceAccounts: ["gha-isolate-a-consumer-whose-name-is-too-long"] })])[0]).toContain("serviceAccounts must be exactly the purpose-level invoker");
     expect(failure([manifestEntry({ callers: [{ events: ["workflow_dispatch"], ref: "refs/heads/main", workflow: ".github/workflows/deploy-prod.yml" }] })])[0]).toContain("callers must name exactly this workflow");
     expect(failure([manifestEntry({ callers: [base.callers, { events: ["push"], ref: "refs/heads/main", workflow: ".github/workflows/reconcile-previews.yml" }].flat() })])[0]).toContain("callers must name exactly this workflow");
     expect(failure([manifestEntry({ transitionEligible: "yes" })])[0]).toContain("transitionEligible must be a boolean");
     const { consumer: _consumer, ...withoutConsumer } = base;
     expect(failure([withoutConsumer])[0]).toContain("keys must be exactly");
+    const { intent: _intent, ...withoutIntent } = base;
+    expect(failure([withoutIntent])[0]).toContain("keys must be exactly");
     expect(failure([manifestEntry({ environment: "recovery-a", job: "a" }), manifestEntry({ environment: "recovery-b", job: "b" })])).toEqual([
-      `${manifestPath}[1]: consumer cdbentley already has a recovery invoker.`,
+      `${manifestPath}[1]: consumer cdbentley already has a QUARANTINE invoker.`,
     ]);
-    expect(failure([manifestEntry({ consumer: `cdbentley${authorityDelimiter}x`, serviceAccounts: [`gha-recovery-cdbentley${authorityDelimiter}x`] })])[0]).toContain("contains the reserved delimiter");
+    expect(failure([manifestEntry({ consumer: `cdbentley${authorityDelimiter}x`, serviceAccounts: [`gha-isolate-cdbentley${authorityDelimiter}x`] })])[0]).toContain("contains the reserved delimiter");
   });
 });

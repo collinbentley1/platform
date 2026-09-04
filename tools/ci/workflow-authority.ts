@@ -11,10 +11,14 @@ import { join } from "node:path";
 // declared here can mint nothing. The consumer identity (owner/repository) is
 // the Terraform module instance's own; the caller facts recorded here are the
 // ones every consumer shares through its byte-identical rendered caller
-// template. A recovery-domain entry is a platform-local dispatch job that the
-// protected-recovery module binds, through the broker project's own pool, to
-// exactly one purpose-level invoker for one consumer and the effect directions
-// it may request.
+// template. A recovery-domain entry is a platform-local workflow_dispatch job
+// declared directly (not a reusable-workflow call), so its token carries the
+// direct-job claims workflow_ref and workflow_sha; GitHub documents
+// job_workflow_ref and job_workflow_sha only for jobs that call a reusable
+// workflow. The protected-recovery module binds that job, through the broker
+// project's own pool and its own workflow_ref:workflow_sha:environment:event
+// composite, to exactly one purpose-level invoker for one consumer and one
+// effect direction.
 export const manifestPath = "terraform/modules/bootstrap/workflow-authority.json";
 export const workflowDirectory = ".github/workflows";
 const callerTemplateDirectory = "templates/app";
@@ -32,9 +36,16 @@ export const trustDomains = ["consumer", "recovery"] as const;
 type TrustDomain = (typeof trustDomains)[number];
 export const recoveryIntents = ["QUARANTINE", "RESTORE"] as const;
 export type RecoveryIntent = (typeof recoveryIntents)[number];
-// Every recovery invoker is named by its consumer, so the manifest cannot bind
-// one invoker to two consumers or two invokers to one.
-export const recoveryInvokerPrefix = "gha-recovery-";
+// Every recovery invoker is named by its consumer and its one effect direction,
+// so the manifest cannot bind one invoker to two consumers, two invokers to one
+// direction, or both directions to one credential. Google limits a service
+// account ID to 30 characters, which "gha-quarantine-critical-history" exceeds,
+// so the QUARANTINE direction is named "isolate".
+const recoveryInvokerPrefixes: Readonly<Record<RecoveryIntent, string>> = { QUARANTINE: "gha-isolate-", RESTORE: "gha-restore-" };
+
+export function recoveryInvokerName(consumer: string, intent: RecoveryIntent): string {
+  return `${recoveryInvokerPrefixes[intent]}${consumer}`;
+}
 
 const serviceAccountIds = [
   "gha-deploy-parity",
@@ -70,7 +81,7 @@ export interface ConsumerAuthorityEntry extends AuthorityEntryBase {
 
 export interface RecoveryAuthorityEntry extends AuthorityEntryBase {
   readonly consumer: string;
-  readonly intents: readonly RecoveryIntent[];
+  readonly intent: RecoveryIntent;
   readonly purpose: "recovery";
   readonly trustDomain: "recovery";
 }
@@ -84,7 +95,7 @@ interface WorkflowAuthorityCheck {
 }
 
 const consumerEntryKeys = ["callers", "environment", "job", "purpose", "serviceAccounts", "transitionEligible", "trustDomain", "workflow"];
-const recoveryEntryKeys = ["callers", "consumer", "environment", "intents", "job", "purpose", "serviceAccounts", "transitionEligible", "trustDomain", "workflow"];
+const recoveryEntryKeys = ["callers", "consumer", "environment", "intent", "job", "purpose", "serviceAccounts", "transitionEligible", "trustDomain", "workflow"];
 const callerKeys = ["events", "ref", "workflow"];
 const workflowFile = /^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/;
 const workflowPath = /^\.github\/workflows\/[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$/;
@@ -128,8 +139,8 @@ export function parseWorkflowAuthority(text: string): WorkflowAuthorityCheck {
     if (entries.some((other) => other.workflow === entry.workflow && other.environment === entry.environment)) {
       failures.push(`${label}: ${entry.workflow} job ${entry.job} shares environment ${entry.environment} with another id-token job, so their authority tuples would collide.`);
     }
-    if (entry.trustDomain === "recovery" && entries.some((other) => other.trustDomain === "recovery" && other.consumer === entry.consumer)) {
-      failures.push(`${label}: consumer ${entry.consumer} already has a recovery invoker.`);
+    if (entry.trustDomain === "recovery" && entries.some((other) => other.trustDomain === "recovery" && other.consumer === entry.consumer && other.intent === entry.intent)) {
+      failures.push(`${label}: consumer ${entry.consumer} already has a ${entry.intent} invoker.`);
     }
     entries.push(entry);
   });
@@ -175,17 +186,18 @@ function parseEntry(value: unknown, label: string, failures: string[]): Workflow
     if ((purpose === "gcp") !== accounts.length > 0) return fail("serviceAccounts must be non-empty exactly when purpose is gcp");
     return { ...base, purpose, serviceAccounts: accounts, trustDomain };
   }
-  // A recovery job is its own caller: its workflow_ref and job_workflow_ref
-  // both name this platform workflow, so no consumer template is involved.
-  const { consumer, intents } = value;
+  // A recovery job is a direct workflow_dispatch job and therefore its own
+  // caller: its token's workflow_ref names this platform workflow and its
+  // workflow_sha is the dispatched platform commit, so no consumer template and
+  // no reusable-workflow claim is involved. One entry binds one direction.
+  const { consumer, intent } = value;
   if (typeof consumer !== "string" || !repositoryName.test(consumer)) return fail("consumer must be one consumer repository name");
-  const parsedIntents = stringList(intents, (intent) => (recoveryIntents as readonly string[]).includes(intent));
-  if (!parsedIntents || parsedIntents.length === 0) return fail(`intents must be a sorted, unique, non-empty list drawn from ${recoveryIntents.join(", ")}`);
-  const invoker = `${recoveryInvokerPrefix}${consumer}`;
+  if (!isRecoveryIntent(intent)) return fail(`intent must be one of ${recoveryIntents.join(", ")}`);
+  const invoker = recoveryInvokerName(consumer, intent);
   const accounts = stringList(serviceAccounts, (id) => id === invoker);
   if (!accounts || accounts.length !== 1 || invoker.length > maxServiceAccountId) return fail(`serviceAccounts must be exactly the purpose-level invoker ${invoker}`);
   if (parsedCallers.length !== 1 || parsedCallers[0]!.workflow !== workflow) return fail("callers must name exactly this workflow, because a recovery job is its own caller");
-  return { ...base, consumer, intents: parsedIntents as RecoveryIntent[], purpose: "recovery", serviceAccounts: accounts, trustDomain: "recovery" };
+  return { ...base, consumer, intent, purpose: "recovery", serviceAccounts: accounts, trustDomain: "recovery" };
 }
 
 // Every id-token job on disk must be declared, every declaration must be such
@@ -384,6 +396,10 @@ function isPurpose(value: unknown): value is Purpose {
 
 function isTrustDomain(value: unknown): value is TrustDomain {
   return (trustDomains as readonly unknown[]).includes(value);
+}
+
+function isRecoveryIntent(value: unknown): value is RecoveryIntent {
+  return (recoveryIntents as readonly unknown[]).includes(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

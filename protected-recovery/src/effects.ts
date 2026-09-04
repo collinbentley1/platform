@@ -4,20 +4,25 @@ import {
   type ExpectedSnapshot,
   type Intent,
   type ObservedSnapshot,
+  type ProbeOutcome,
   type Target,
   canonicalJson,
   isRecord,
   managedRole,
+  probePermission,
+  probePrerequisite,
   sha256Hex,
 } from "./model";
 
 // The one external effect: a compare-and-set of one target service account's
 // IAM allow policy that adds or removes exactly the managed members of the
-// managed role. The sequence is always PREPARE (Firestore) -> setIamPolicy
-// with the prepared etag (IAM) -> ACK (Firestore). Every ambiguous answer is
-// classified against the complete prepared before snapshot (bindings + etag)
-// and the complete expected after snapshot; the operation is never recomputed
-// against a newer policy.
+// managed role. The resource is addressed by the target's permanent unique
+// ID, and before every read or write the identity IAM returns for it must be
+// exactly the journaled email and unique ID. The sequence is always PREPARE
+// (Firestore) -> setIamPolicy with the prepared etag (IAM) -> ACK (Firestore).
+// Every ambiguous answer is classified against the complete prepared before
+// snapshot (bindings + etag) and the complete expected after snapshot; the
+// operation is never recomputed against a newer policy.
 
 export interface PolicyCondition {
   readonly description: string;
@@ -47,10 +52,42 @@ export type WriteOutcome =
   | { readonly kind: "lost"; readonly reason: string }
   | { readonly kind: "refused"; readonly status: number };
 
+export type IdentityOutcome =
+  | { readonly kind: "identity"; readonly email: string; readonly uniqueId: string }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
 export interface ServiceAccountIam {
+  getIdentity(resource: string): Promise<IdentityOutcome>;
   getPolicy(resource: string): Promise<ReadOutcome>;
   setPolicy(resource: string, policy: Policy): Promise<WriteOutcome>;
 }
+
+// A negative impersonation probe: an attempt of exactly the probe permission
+// as the managed member against the exact target identity, by a principal the
+// broker trusts, with the outcome observed by the broker. The result names
+// that principal and the observation time.
+export interface ProbeRequest {
+  readonly email: string;
+  readonly member: string;
+  readonly permission: typeof probePermission;
+  readonly resource: string;
+  readonly uniqueId: string;
+}
+
+export type ProbeResult =
+  | { readonly kind: "observed"; readonly observedAt: string; readonly outcome: ProbeOutcome; readonly principal: string }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
+export interface ImpersonationProbe {
+  probe(request: ProbeRequest): Promise<ProbeResult>;
+}
+
+// The production binding until an approved probe source exists: every probe
+// is unavailable, nothing is recorded, and readiness names the prerequisite.
+// This can never satisfy a gate; it only refuses.
+export const undeployedProbe: ImpersonationProbe = {
+  probe: async () => ({ kind: "unavailable", reason: probePrerequisite }),
+};
 
 export type DriveOutcome =
   | { readonly kind: "acked"; readonly entry: Entry }
@@ -117,6 +154,14 @@ export function expectedSnapshot(bindings: readonly PolicyBinding[]): ExpectedSn
   return { hash: sha256Hex(text), policy: text };
 }
 
+// The identity IAM returns for the addressed resource must be exactly the
+// journaled email and unique ID; anything else -- a recreated account at the
+// same address, a misrecorded ID -- refuses the read and the write.
+function identityMismatch(identity: IdentityOutcome & { readonly kind: "identity" }, target: Target): string | undefined {
+  if (identity.uniqueId === target.uniqueId && identity.email === target.email) return undefined;
+  return `the resource identity ${identity.email} (${identity.uniqueId}) is not the journaled target ${target.email} (${target.uniqueId})`;
+}
+
 // Drive one effect entry as far as the world allows. Nothing here runs inside
 // a Firestore transaction; each ledger call is its own committed step, and
 // each step is conditional on the recorded effect ID and actuator epoch.
@@ -124,16 +169,26 @@ export async function driveEffect(ledger: Ledger, iam: ServiceAccountIam, shard:
   let entry = initial;
   if (entry.body.kind !== "effect" || entry.progress === null) return { kind: "terminal", entry };
   if (entry.progress.state === "ACKED" || entry.progress.state === "DIVERGED") return { kind: "terminal", entry };
+  if (entry.body.uniqueId !== target.uniqueId || entry.body.email !== target.email || entry.body.resource !== target.resource) {
+    throw new Error(`${shard}/${entry.sequence}: the journaled identity does not match the driven target.`);
+  }
   const intent = entry.body.intent;
 
   if (entry.progress.state === "RECORDED") {
-    const reservation = await ledger.reserveActuator(shard, entry.sequence, target.email);
+    const reservation = await ledger.reserveActuator(shard, entry.sequence, target.uniqueId);
     if (reservation.kind === "held") return { kind: "pending", entry, reason: `actuator held by ${reservation.holder.shard}/${reservation.holder.sequence}` };
     if (reservation.kind === "unchanged") return { kind: "stale", entry: reservation.entry };
+    const facts = { effectId: reservation.effectId, epoch: reservation.epoch };
+    const identity = await iam.getIdentity(target.resource);
+    if (identity.kind === "unavailable") return { kind: "pending", entry, reason: identity.reason };
+    const mismatch = identityMismatch(identity, target);
+    if (mismatch !== undefined) {
+      const diverged = await ledger.divergeEffect(shard, entry.sequence, { ...facts, observed: null, reason: mismatch });
+      return diverged.kind === "transitioned" ? { kind: "diverged", entry: diverged.entry, reason: mismatch } : { kind: "stale", entry: diverged.entry };
+    }
     const read = await iam.getPolicy(target.resource);
     if (read.kind === "unavailable") return { kind: "pending", entry, reason: read.reason };
     const plan = planEffect(intent, read.policy, target);
-    const facts = { effectId: reservation.effectId, epoch: reservation.epoch };
     if ("divergence" in plan) {
       const diverged = await ledger.divergeEffect(shard, entry.sequence, { ...facts, observed: observedSnapshot(read.policy), reason: plan.divergence });
       return diverged.kind === "transitioned" ? { kind: "diverged", entry: diverged.entry, reason: plan.divergence } : { kind: "stale", entry: diverged.entry };
@@ -146,6 +201,14 @@ export async function driveEffect(ledger: Ledger, iam: ServiceAccountIam, shard:
   const progress = entry.progress;
   if (progress === null || progress.state !== "PREPARED") return { kind: "terminal", entry };
   const facts = { effectId: progress.effectId, epoch: progress.epoch };
+  // A takeover resumes here; the identity is verified again before the write.
+  const identity = await iam.getIdentity(target.resource);
+  if (identity.kind === "unavailable") return { kind: "pending", entry, reason: identity.reason };
+  const mismatch = identityMismatch(identity, target);
+  if (mismatch !== undefined) {
+    const diverged = await ledger.divergeEffect(shard, entry.sequence, { ...facts, observed: null, reason: mismatch });
+    return diverged.kind === "transitioned" ? { kind: "diverged", entry: diverged.entry, reason: mismatch } : { kind: "stale", entry: diverged.entry };
+  }
   const attempt = await ledger.recordAttempt(shard, entry.sequence, facts);
   if (attempt.kind === "unchanged") return { kind: "stale", entry: attempt.entry };
   entry = attempt.entry;
@@ -253,7 +316,8 @@ export interface GoogleIamDependencies {
 const maxResourceBytes = 256 * 1024;
 const conflictStatuses = [409, 412];
 
-// The IAM API client: getIamPolicy at requested policy version 3, and
+// The IAM API client: serviceAccounts.get for the identity of the resource
+// addressed by unique ID, getIamPolicy at requested policy version 3, and
 // setIamPolicy of the full version-3 policy with the prepared etag and the
 // explicit update mask. Anything unexpected is unavailable, never a snapshot.
 export class GoogleServiceAccountIam implements ServiceAccountIam {
@@ -263,6 +327,17 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
   constructor(deps: GoogleIamDependencies) {
     this.#deps = deps;
     this.#baseUrl = deps.baseUrl ?? "https://iam.googleapis.com";
+  }
+
+  async getIdentity(resource: string): Promise<IdentityOutcome> {
+    const response = await this.#send("GET", resource, undefined);
+    if (response.kind === "unreachable") return { kind: "unavailable", reason: response.reason };
+    if (!response.ok) return { kind: "unavailable", reason: `HTTP ${response.status}` };
+    const body = response.body;
+    if (!isRecord(body) || typeof body.email !== "string" || typeof body.uniqueId !== "string" || !/^[1-9][0-9]*$/.test(body.uniqueId)) {
+      return { kind: "unavailable", reason: "the service account response carries no email and unique ID" };
+    }
+    return { kind: "identity", email: body.email, uniqueId: body.uniqueId };
   }
 
   async getPolicy(resource: string): Promise<ReadOutcome> {
@@ -292,12 +367,16 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
   }
 
   async #post(path: string, body: unknown): Promise<{ readonly kind: "response"; readonly ok: boolean; readonly status: number; readonly body: unknown } | { readonly kind: "unreachable"; readonly reason: string }> {
+    return await this.#send("POST", path, body);
+  }
+
+  async #send(method: "GET" | "POST", path: string, body: unknown): Promise<{ readonly kind: "response"; readonly ok: boolean; readonly status: number; readonly body: unknown } | { readonly kind: "unreachable"; readonly reason: string }> {
     let response: Response;
     try {
       response = await this.#deps.fetch(`${this.#baseUrl}/v1/${path}`, {
-        body: JSON.stringify(body),
-        headers: { Authorization: `Bearer ${await this.#deps.token()}`, "Content-Type": "application/json" },
-        method: "POST",
+        ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
+        headers: { Authorization: `Bearer ${await this.#deps.token()}`, ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
+        method,
         redirect: "error",
       });
     } catch (error) {

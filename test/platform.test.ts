@@ -3021,10 +3021,14 @@ describe("platform scaffold and doctor", () => {
     expect(attestations.map((entry) => entry.serviceAccounts)).toEqual([[], []]);
     expect(manifest.filter((entry) => entry.transitionEligible).map(jobKey)).toEqual([
       ".github/workflows/cleanup-preview.yml#cleanup",
-      ".github/workflows/protected-recovery-invoke.yml#cdbentley",
-      ".github/workflows/protected-recovery-invoke.yml#critical-history",
-      ".github/workflows/protected-recovery-invoke.yml#healthmcp",
-      ".github/workflows/protected-recovery-invoke.yml#runsetta",
+      ".github/workflows/protected-recovery-invoke.yml#cdbentley-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#cdbentley-restore",
+      ".github/workflows/protected-recovery-invoke.yml#critical-history-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#critical-history-restore",
+      ".github/workflows/protected-recovery-invoke.yml#healthmcp-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#healthmcp-restore",
+      ".github/workflows/protected-recovery-invoke.yml#runsetta-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#runsetta-restore",
       ".github/workflows/reconcile-previews.yml#reconcile",
     ]);
     expect(manifest.filter((entry) => entry.job.endsWith("canary")).map((entry) => entry.serviceAccounts)).toEqual([

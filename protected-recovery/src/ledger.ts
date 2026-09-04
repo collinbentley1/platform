@@ -6,21 +6,28 @@ import {
   type Entry,
   type EntryBody,
   type ExpectedSnapshot,
+  type Intent,
   type KeyRecord,
   type ObservedSnapshot,
   type OutboxProgress,
   type PreparedFacts,
+  type ProbeRecord,
+  type ScanReadiness,
   type Shard,
   type Target,
   type TerminalOutbox,
   appendBodyJson,
-  canaryChecks,
   canonicalJson,
   entryObjectName,
   intentOf,
   intents,
   isRecord,
   maxEntriesPerShard,
+  probeKey,
+  probeOutcomes,
+  probePermission,
+  probePhases,
+  scanReadiness,
   sha256Hex,
   terminalObjectName,
 } from "./model";
@@ -28,9 +35,12 @@ import {
 // The ledger is Firestore, spoken through its REST API so the broker carries no
 // dependencies. Every state change is one transaction over the shard document
 // and the documents it orders; nothing here calls any other API. Effects are
-// additionally ordered per target service account by an actuator document:
-// PREPARE takes it, ACK or DIVERGED releases it, and every effect transition is
-// conditional on the recorded effect ID and actuator epoch.
+// additionally ordered per target identity by an actuator document: PREPARE
+// takes it, ACK or DIVERGED releases it, and every effect transition is
+// conditional on the recorded effect ID and actuator epoch. Scan readiness is
+// recomputed inside the transaction that begins a close, the one that
+// finishes it, and the one that journals a restore, from the committed
+// entries those transactions read.
 
 export class LedgerUnavailable extends Error {}
 export class LedgerError extends Error {}
@@ -50,7 +60,8 @@ export interface LedgerDependencies {
 
 export type Rejection =
   | { readonly reason: "SHARD_NOT_OPEN"; readonly phase: Shard["phase"] }
-  | { readonly reason: "CANARY_PREMATURE" | "NOT_FOUND" | "PINS_UNRECORDED" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
+  | { readonly reason: "NOT_READY"; readonly blockers: readonly string[] }
+  | { readonly reason: "NOT_FOUND" | "PINS_UNRECORDED" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
 
 export type AppendOutcome =
   | { readonly kind: "accepted"; readonly entries: readonly Entry[]; readonly result: string }
@@ -64,6 +75,10 @@ export type CloseOutcome =
   | { readonly kind: "conflict" }
   | { readonly kind: "rejected"; readonly rejection: Rejection };
 
+export type ProbeOutcomeRecord =
+  | { readonly kind: "recorded"; readonly entry: Entry }
+  | { readonly kind: "refused"; readonly reason: string };
+
 export type TransitionOutcome =
   | { readonly kind: "transitioned"; readonly entry: Entry }
   | { readonly kind: "unchanged"; readonly entry: Entry };
@@ -75,7 +90,7 @@ export type ReservationOutcome =
 
 export type FinishCloseOutcome =
   | { readonly kind: "finalizing"; readonly shard: Shard }
-  | { readonly kind: "not-ready"; readonly shard: Shard | undefined };
+  | { readonly kind: "not-ready"; readonly shard: Shard | undefined; readonly reason: string };
 
 interface EffectFacts {
   readonly effectId: string;
@@ -121,8 +136,8 @@ export class Ledger {
   // the same transaction as the entry and key documents, so every concurrent
   // append is ordered before a close or refused after it. A QUARANTINE request
   // journals one effect per inventory target; a RESTORE request journals one
-  // effect per acknowledged effect of its CLOSED source shard; a canary
-  // request journals evidence for one acknowledged target.
+  // effect per acknowledged effect of its source shard, which must be CLOSED
+  // with a projected receipt and scan-ready on its committed entries.
   async append(request: AppendRequest, targets: readonly Target[] | undefined): Promise<AppendOutcome> {
     return await this.#transact(request.shard, async (tx) => {
       const shardName = this.#shardName(request.shard);
@@ -133,7 +148,8 @@ export class Ledger {
         if (recorded.operation !== "append" || recorded.bodyHash !== request.bodyHash) return { kind: "conflict" };
         return { kind: "replayed", result: recorded.result };
       }
-      const now = this.#deps.now().toISOString();
+      const now = this.#deps.now();
+      const nowText = now.toISOString();
       const intent = intentOf(request.body);
       const reject = (rejection: Rejection): AppendOutcome => ({ kind: "rejected", rejection });
       let shard: Shard;
@@ -142,69 +158,57 @@ export class Ledger {
         if (shard.consumer !== request.consumer || shard.intent !== intent) return reject({ reason: "SHARD_MISMATCH", detail: `shard is ${shard.consumer} ${shard.intent}` });
         if (shard.phase !== "OPEN") return reject({ reason: "SHARD_NOT_OPEN", phase: shard.phase });
       } else {
-        if (request.body.kind === "canary") return reject({ reason: "CANARY_PREMATURE", detail: "no quarantine shard exists" });
-        shard = { phase: "OPEN", consumer: request.consumer, createdAt: now, intent, nextSequence: 1, pendingEffects: 0, pendingOutbox: 0, source: request.body.kind === "restore" ? request.body.source : null, targets: {} };
+        shard = { phase: "OPEN", consumer: request.consumer, createdAt: nowText, intent, nextSequence: 1, pendingEffects: 0, pendingOutbox: 0, source: request.body.kind === "restore" ? request.body.source : null, targets: {} };
       }
+      if (Object.keys(shard.targets).length > 0) return reject({ reason: "SHARD_MISMATCH", detail: "targets are already journaled in this shard" });
       let bodies: EntryBody[];
       if (request.body.kind === "quarantine") {
-        if (!targets) return reject({ reason: "PINS_UNRECORDED", detail: "the consumer's workflow SHA pins are not recorded" });
-        if (Object.keys(shard.targets).length > 0) return reject({ reason: "SHARD_MISMATCH", detail: "targets are already journaled in this shard" });
-        bodies = targets.map((target) => ({ kind: "effect", account: target.account, intent: "QUARANTINE", members: target.members, resource: target.resource }));
-      } else if (request.body.kind === "restore") {
-        if (Object.keys(shard.targets).length > 0) return reject({ reason: "SHARD_MISMATCH", detail: "targets are already journaled in this shard" });
-        if (shard.source !== request.body.source) return reject({ reason: "SHARD_MISMATCH", detail: `shard restores ${shard.source}` });
-        const [sourceDoc] = await tx.get([this.#shardName(request.body.source)]);
+        if (!targets) return reject({ reason: "PINS_UNRECORDED", detail: "the consumer's workflow SHA pins or target identities are not recorded" });
+        bodies = targets.map((target) => ({ kind: "effect", account: target.account, email: target.email, intent: "QUARANTINE", members: target.members, resource: target.resource, uniqueId: target.uniqueId }));
+      } else {
+        const sourceId = request.body.source;
+        if (shard.source !== sourceId) return reject({ reason: "SHARD_MISMATCH", detail: `shard restores ${shard.source}` });
+        const [sourceDoc] = await tx.get([this.#shardName(sourceId)]);
         if (!sourceDoc) return reject({ reason: "SOURCE_NOT_COMPLETE", detail: "the source shard does not exist" });
         const source = shardFromDocument(sourceDoc);
         if (source.consumer !== request.consumer || source.intent !== "QUARANTINE") return reject({ reason: "SOURCE_NOT_COMPLETE", detail: `the source shard is ${source.consumer} ${source.intent}` });
         if (source.phase !== "CLOSED" || source.terminal.progress.state !== "PROJECTED") return reject({ reason: "SOURCE_NOT_COMPLETE", detail: `the source shard is ${source.phase} without a projected completeness receipt` });
+        const sourceEntries = await this.#entriesIn(tx, sourceId, source.closeHighWater);
+        const readiness = scanReadiness(source, sourceEntries, now);
+        if (!readiness.ready) return reject({ reason: "SOURCE_NOT_COMPLETE", detail: `the source shard is not scan-ready: ${readiness.blockers.join("; ")}` });
         const sequences = Object.values(source.targets).sort((left, right) => left - right);
-        const docs = sequences.length === 0 ? [] : await tx.get(sequences.map((sequence) => this.#entryName(request.body.kind === "restore" ? request.body.source : "", sequence)));
-        bodies = docs.map((doc, index) => {
-          if (!doc) throw new LedgerError(`${source.consumer}: source entry ${sequences[index]} is missing.`);
-          const entry = entryFromDocument(doc);
+        bodies = sequences.map((sequence) => {
+          const entry = sourceEntries.find((candidate) => candidate.sequence === sequence);
+          if (!entry) throw new LedgerError(`${source.consumer}: source entry ${sequence} is missing.`);
           if (entry.body.kind !== "effect" || entry.progress?.state !== "ACKED") throw new LedgerError(`${request.body.kind}: source entry ${entry.sequence} is not an acknowledged effect.`);
-          return { kind: "effect", account: entry.body.account, intent: "RESTORE", members: entry.body.members, resource: entry.body.resource };
+          return { kind: "effect", account: entry.body.account, email: entry.body.email, intent: "RESTORE", members: entry.body.members, resource: entry.body.resource, uniqueId: entry.body.uniqueId };
         });
-      } else {
-        const canary = request.body;
-        const sequence = shard.targets[canary.account];
-        if (sequence === undefined) return reject({ reason: "CANARY_PREMATURE", detail: `${canary.account} is not a journaled target` });
-        const [effectDoc] = await tx.get([this.#entryName(request.shard, sequence)]);
-        if (!effectDoc) throw new LedgerError(`${request.shard}: target entry ${sequence} is missing.`);
-        const effect = entryFromDocument(effectDoc);
-        if (effect.body.kind !== "effect" || effect.progress === null) throw new LedgerError(`${request.shard}: entry ${sequence} is not an effect.`);
-        if (effect.progress.state !== "ACKED") return reject({ reason: "CANARY_PREMATURE", detail: `${canary.account} quarantine is ${effect.progress.state}` });
-        if (!effect.body.members.includes(canary.member)) return reject({ reason: "CANARY_PREMATURE", detail: "member is not a managed member of the target" });
-        if (Date.parse(canary.observedAt) < Date.parse(effect.progress.ackedAt)) return reject({ reason: "CANARY_PREMATURE", detail: "observedAt precedes the quarantine acknowledgement" });
-        bodies = [{ kind: "canary", account: canary.account, checks: canary.checks, member: canary.member, observedAt: canary.observedAt }];
       }
       if (bodies.length === 0) return reject({ reason: "SHARD_MISMATCH", detail: "the request journals no target" });
       if (shard.nextSequence + bodies.length - 1 > maxEntriesPerShard) return reject({ reason: "SHARD_FULL", detail: `${maxEntriesPerShard} entries` });
-      const targetsJournaled: Record<string, number> = { ...shard.targets };
+      const targetsJournaled: Record<string, number> = {};
       const entries: Entry[] = bodies.map((body, index) => {
         const sequence = shard.nextSequence + index;
         if (body.kind === "effect") targetsJournaled[body.account] = sequence;
         return {
-          acceptedAt: now,
+          acceptedAt: nowText,
           body,
           bodyHash: request.bodyHash,
           key: request.key,
           objectName: entryObjectName(request.shard, sequence),
           outbox: { state: "PENDING" },
-          progress: body.kind === "effect" ? { state: "RECORDED" } : null,
+          progress: { state: "RECORDED" },
           sequence,
         };
       });
-      const effects = entries.filter((entry) => entry.progress !== null).length;
       const next: Shard = {
         ...shard,
         nextSequence: shard.nextSequence + entries.length,
-        pendingEffects: shard.pendingEffects + effects,
+        pendingEffects: shard.pendingEffects + entries.length,
         pendingOutbox: shard.pendingOutbox + entries.length,
         targets: targetsJournaled,
       };
-      const result = canonicalJson({ acceptedAt: now, bodyHash: request.bodyHash, key: request.key, sequences: entries.map((entry) => entry.sequence), shard: request.shard });
+      const result = canonicalJson({ acceptedAt: nowText, bodyHash: request.bodyHash, key: request.key, sequences: entries.map((entry) => entry.sequence), shard: request.shard });
       tx.put(shardName, shardToJson(next), shardDoc);
       for (const entry of entries) tx.put(this.#entryName(request.shard, entry.sequence), entryToJson(entry), null);
       tx.put(keyName, keyToJson({ bodyHash: request.bodyHash, key: request.key, operation: "append", result }), null);
@@ -212,41 +216,101 @@ export class Ledger {
     });
   }
 
+  // A probe is recorded by the broker from its own probe source, never from a
+  // caller. It is admitted only into an OPEN QUARANTINE shard, for a journaled
+  // target whose quarantine is acknowledged, naming that target's exact
+  // identity, one of its managed members, the probe permission, a non-empty
+  // probe principal, and an observation no earlier than the acknowledgement
+  // and no later than the ledger's own clock. Redundant probes are evidence
+  // too; they can only restart or repeat a chain, never shorten it.
+  async recordProbe(shardId: string, probe: ProbeRecord): Promise<ProbeOutcomeRecord> {
+    return await this.#transact(shardId, async (tx) => {
+      const shardName = this.#shardName(shardId);
+      const [shardDoc] = await tx.get([shardName]);
+      const refuse = (reason: string): ProbeOutcomeRecord => ({ kind: "refused", reason });
+      if (!shardDoc) return refuse("the shard does not exist");
+      const shard = shardFromDocument(shardDoc);
+      if (shard.intent !== "QUARANTINE") return refuse("probes belong to QUARANTINE shards only");
+      if (shard.phase !== "OPEN") return refuse(`the shard is ${shard.phase}`);
+      const sequence = shard.targets[probe.account];
+      if (sequence === undefined) return refuse(`${probe.account} is not a journaled target`);
+      const [effectDoc] = await tx.get([this.#entryName(shardId, sequence)]);
+      if (!effectDoc) throw new LedgerError(`${shardId}: target entry ${sequence} is missing.`);
+      const effect = entryFromDocument(effectDoc);
+      if (effect.body.kind !== "effect" || effect.progress === null) throw new LedgerError(`${shardId}: entry ${sequence} is not an effect.`);
+      if (effect.progress.state !== "ACKED") return refuse(`${probe.account} quarantine is ${effect.progress.state}`);
+      if (effect.body.uniqueId !== probe.uniqueId || effect.body.email !== probe.email) return refuse("the probe names a different identity than the journaled target");
+      if (!effect.body.members.includes(probe.member)) return refuse("the probed member is not a managed member of the target");
+      if (probe.permission !== probePermission) return refuse(`the probed permission is not ${probePermission}`);
+      if (!(probePhases as readonly string[]).includes(probe.phase) || !(probeOutcomes as readonly string[]).includes(probe.outcome)) return refuse("unknown probe phase or outcome");
+      if (probe.principal.length === 0) return refuse("the probe names no principal");
+      const observedAt = Date.parse(probe.observedAt);
+      const now = this.#deps.now();
+      if (Number.isNaN(observedAt) || new Date(observedAt).toISOString() !== probe.observedAt) return refuse("observedAt must be an ISO-8601 UTC instant");
+      if (observedAt < Date.parse(effect.progress.ackedAt)) return refuse("the observation precedes the quarantine acknowledgement");
+      if (observedAt > now.getTime()) return refuse("the observation is in the ledger's future");
+      if (shard.nextSequence > maxEntriesPerShard) return refuse(`the shard is full at ${maxEntriesPerShard} entries`);
+      const body: EntryBody = { kind: "probe", ...probe };
+      const entry: Entry = {
+        acceptedAt: now.toISOString(),
+        body,
+        bodyHash: sha256Hex(canonicalJson(bodyToJson(body))),
+        key: probeKey(probe),
+        objectName: entryObjectName(shardId, shard.nextSequence),
+        outbox: { state: "PENDING" },
+        progress: null,
+        sequence: shard.nextSequence,
+      };
+      const next: Shard = { ...shard, nextSequence: shard.nextSequence + 1, pendingOutbox: shard.pendingOutbox + 1 };
+      tx.put(shardName, shardToJson(next), shardDoc);
+      tx.put(this.#entryName(shardId, entry.sequence), entryToJson(entry), null);
+      return { kind: "recorded", entry };
+    });
+  }
+
   // Begin-close atomically moves OPEN to CLOSING and fixes closeHighWater at
-  // the last accepted sequence, for the shard of the calling purpose only.
-  async beginClose(request: CloseRequest, consumer: string): Promise<CloseOutcome> {
+  // the last accepted sequence, for the shard of the calling purpose only --
+  // its consumer and its direction. A QUARANTINE shard begins to close only
+  // when it is scan-ready on the entries this same transaction reads.
+  async beginClose(request: CloseRequest, consumer: string, intent: Intent): Promise<CloseOutcome> {
     return await this.#transact(request.shard, async (tx) => {
       const shardName = this.#shardName(request.shard);
       const keyName = this.#keyName(request.shard, request.key);
       const [shardDoc, keyDoc] = await tx.get([shardName, keyName]);
       if (!shardDoc) return { kind: "rejected", rejection: { reason: "NOT_FOUND", detail: "the shard does not exist" } };
       const shard = shardFromDocument(shardDoc);
-      if (shard.consumer !== consumer) return { kind: "rejected", rejection: { reason: "SHARD_MISMATCH", detail: `shard belongs to ${shard.consumer}` } };
+      if (shard.consumer !== consumer || shard.intent !== intent) return { kind: "rejected", rejection: { reason: "SHARD_MISMATCH", detail: `shard belongs to ${shard.consumer} ${shard.intent}` } };
       if (keyDoc) {
         const recorded = keyFromDocument(keyDoc);
         if (recorded.operation !== "close" || recorded.bodyHash !== request.bodyHash) return { kind: "conflict" };
         return { kind: "replayed", result: recorded.result };
       }
       if (shard.phase !== "OPEN") return { kind: "rejected", rejection: { reason: "SHARD_NOT_OPEN", phase: shard.phase } };
-      const now = this.#deps.now().toISOString();
-      const closing: Shard = { ...shard, phase: "CLOSING", closeHighWater: shard.nextSequence - 1, closeKeyHash: sha256Hex(request.key), closingAt: now };
-      const result = canonicalJson({ closeHighWater: closing.closeHighWater, closingAt: now, phase: "CLOSING", shard: request.shard });
+      const now = this.#deps.now();
+      if (shard.intent === "QUARANTINE") {
+        const readiness = scanReadiness(shard, await this.#entriesIn(tx, request.shard, shard.nextSequence - 1), now);
+        if (!readiness.ready) return { kind: "rejected", rejection: { reason: "NOT_READY", blockers: readiness.blockers } };
+      }
+      const nowText = now.toISOString();
+      const closing: Shard = { ...shard, phase: "CLOSING", closeHighWater: shard.nextSequence - 1, closeKeyHash: sha256Hex(request.key), closingAt: nowText };
+      const result = canonicalJson({ closeHighWater: closing.closeHighWater, closingAt: nowText, phase: "CLOSING", shard: request.shard });
       tx.put(shardName, shardToJson(closing), shardDoc);
       tx.put(keyName, keyToJson({ bodyHash: request.bodyHash, key: request.key, operation: "close", result }), null);
       return { kind: "closing", shard: closing, result };
     });
   }
 
-  // Reservation takes the target's actuator for one RECORDED effect before any
-  // policy is read, so a takeover always continues the same operation and an
-  // opposite intent waits until it is acknowledged or diverged.
-  async reserveActuator(shardId: string, sequence: number, email: string): Promise<ReservationOutcome> {
+  // Reservation takes the target identity's actuator for one RECORDED effect
+  // before any policy is read, so a takeover always continues the same
+  // operation and an opposite intent waits until it is acknowledged or diverged.
+  async reserveActuator(shardId: string, sequence: number, uniqueId: string): Promise<ReservationOutcome> {
     return await this.#transact(shardId, async (tx) => {
       const entryName = this.#entryName(shardId, sequence);
-      const actuatorName = this.#actuatorName(email);
+      const actuatorName = this.#actuatorName(uniqueId);
       const [entryDoc, actuatorDoc] = await tx.get([entryName, actuatorName]);
       if (!entryDoc) throw new LedgerError(`${shardId}: entry ${sequence} is missing.`);
       const entry = entryFromDocument(entryDoc);
+      if (entry.body.kind !== "effect" || entry.body.uniqueId !== uniqueId) throw new LedgerError(`${shardId}: entry ${sequence} is not an effect on ${uniqueId}.`);
       if (entry.progress?.state !== "RECORDED") return { kind: "unchanged", entry };
       const actuator = actuatorDoc ? actuatorFromDocument(actuatorDoc) : { epoch: 0, holder: null, lastEtag: null };
       if (actuator.holder) {
@@ -311,26 +375,26 @@ export class Ledger {
   }
 
   // The final close transaction: only a CLOSING shard with no pending or
-  // diverged effect and no pending outbox item may finalize. The terminal
-  // outbox entry is created here from the committed entries; the shard is
-  // FINALIZING, not CLOSED, until that entry is verified in GCS.
+  // diverged effect, no pending outbox item, and -- for a QUARANTINE shard --
+  // scan readiness recomputed on the very entries it reads may finalize. The
+  // terminal outbox entry is created here from the committed entries and
+  // records that readiness; the shard is FINALIZING, not CLOSED, until that
+  // entry is verified in GCS.
   async finishClose(shardId: string): Promise<FinishCloseOutcome> {
     return await this.#transact(shardId, async (tx) => {
       const shardName = this.#shardName(shardId);
       const [shardDoc] = await tx.get([shardName]);
-      if (!shardDoc) return { kind: "not-ready", shard: undefined };
+      if (!shardDoc) return { kind: "not-ready", shard: undefined, reason: "the shard does not exist" };
       const shard = shardFromDocument(shardDoc);
-      if (shard.phase !== "CLOSING" || shard.pendingEffects !== 0 || shard.pendingOutbox !== 0) return { kind: "not-ready", shard };
-      const names = sequences(shard.closeHighWater).map((sequence) => this.#entryName(shardId, sequence));
-      const docs = names.length === 0 ? [] : await tx.get(names);
-      const entries = docs.map((doc, index) => {
-        if (!doc) throw new LedgerError(`${shardId}: entry ${index + 1} is missing at close.`);
-        const entry = entryFromDocument(doc);
+      if (shard.phase !== "CLOSING") return { kind: "not-ready", shard, reason: `the shard is ${shard.phase}` };
+      if (shard.pendingEffects !== 0 || shard.pendingOutbox !== 0) return { kind: "not-ready", shard, reason: `${shard.pendingEffects} effects and ${shard.pendingOutbox} outbox items are pending` };
+      const committed = await this.#entriesIn(tx, shardId, shard.closeHighWater);
+      const entries = committed.map((entry) => {
         if (entry.outbox.state !== "PROJECTED" || (entry.progress !== null && entry.progress.state !== "ACKED")) {
           return undefined;
         }
         return {
-          body: entry.body,
+          body: bodyToJson(entry.body),
           bodyHash: entry.bodyHash,
           key: entry.key,
           outbox: { generation: entry.outbox.generation, objectName: entry.objectName, sha256: entry.outbox.sha256 },
@@ -348,21 +412,28 @@ export class Ledger {
           sequence: entry.sequence,
         };
       });
-      if (entries.some((entry) => entry === undefined)) return { kind: "not-ready", shard };
-      const now = this.#deps.now().toISOString();
+      if (entries.some((entry) => entry === undefined)) return { kind: "not-ready", shard, reason: "an entry is diverged or not yet projected" };
+      const now = this.#deps.now();
+      let readiness: ScanReadiness | null = null;
+      if (shard.intent === "QUARANTINE") {
+        readiness = scanReadiness(shard, committed, now);
+        if (!readiness.ready) return { kind: "not-ready", shard, reason: `not scan-ready: ${readiness.blockers.join("; ")}` };
+      }
+      const nowText = now.toISOString();
       const receipt = `${canonicalJson({
         closeHighWater: shard.closeHighWater,
         closingAt: shard.closingAt,
         consumer: shard.consumer,
         entries,
-        finalizingAt: now,
+        finalizingAt: nowText,
         intent: shard.intent,
+        readiness: readiness === null ? null : { blockers: [...readiness.blockers], horizonAt: readiness.horizonAt, ready: readiness.ready },
         shard: shardId,
         source: shard.source,
         targets: shard.targets,
       })}\n`;
       const terminal: TerminalOutbox = { objectName: terminalObjectName(shardId), progress: { state: "PENDING" }, receipt, sha256: sha256Hex(receipt) };
-      const finalizing: Shard = { ...shard, phase: "FINALIZING", finalizingAt: now, terminal };
+      const finalizing: Shard = { ...shard, phase: "FINALIZING", finalizingAt: nowText, terminal };
       tx.put(shardName, shardToJson(finalizing), shardDoc);
       return { kind: "finalizing", shard: finalizing };
     });
@@ -422,8 +493,8 @@ export class Ledger {
     return doc ? entryFromDocument(doc) : undefined;
   }
 
-  async readActuator(email: string): Promise<Actuator | undefined> {
-    const [doc] = await this.#batchGet([this.#actuatorName(email)], undefined);
+  async readActuator(uniqueId: string): Promise<Actuator | undefined> {
+    const [doc] = await this.#batchGet([this.#actuatorName(uniqueId)], undefined);
     return doc ? actuatorFromDocument(doc) : undefined;
   }
 
@@ -446,8 +517,17 @@ export class Ledger {
     return ids;
   }
 
+  async #entriesIn(tx: Transaction, shardId: string, upTo: number): Promise<readonly Entry[]> {
+    const names = sequences(upTo).map((sequence) => this.#entryName(shardId, sequence));
+    const docs = names.length === 0 ? [] : await tx.get(names);
+    return docs.map((doc, index) => {
+      if (!doc) throw new LedgerError(`${shardId}: entry ${index + 1} is missing.`);
+      return entryFromDocument(doc);
+    });
+  }
+
   // An effect transition is conditional on the entry, on the shard, and on the
-  // target's actuator naming this very operation at this very epoch.
+  // target identity's actuator naming this very operation at this very epoch.
   async #transitionEffect(
     shardId: string,
     sequence: number,
@@ -463,7 +543,7 @@ export class Ledger {
       if (!shardDoc || !entryDoc) throw new LedgerError(`${shardId}: entry ${sequence} or its shard is missing.`);
       const entry = entryFromDocument(entryDoc);
       if (entry.body.kind !== "effect") return { kind: "unchanged", entry };
-      const actuatorName = this.#actuatorName(emailOf(entry.body.resource));
+      const actuatorName = this.#actuatorName(entry.body.uniqueId);
       const [actuatorDoc] = await tx.get([actuatorName]);
       const actuator = actuatorDoc ? actuatorFromDocument(actuatorDoc) : undefined;
       if (!actuator?.holder || actuator.holder.effectId !== facts.effectId || actuator.epoch !== facts.epoch) return { kind: "unchanged", entry };
@@ -622,8 +702,9 @@ export class Ledger {
     return `${this.#shardName(shard)}/keys/${sha256Hex(key)}`;
   }
 
-  #actuatorName(email: string): string {
-    return `${this.#documents}/actuators/${email}`;
+  // Actuators are keyed by the target's permanent unique ID, never its email.
+  #actuatorName(uniqueId: string): string {
+    return `${this.#documents}/actuators/${uniqueId}`;
   }
 }
 
@@ -680,10 +761,6 @@ function sequences(upTo: number): number[] {
 
 function samePreparation(progress: PreparedFacts, facts: EffectFacts): boolean {
   return progress.effectId === facts.effectId && progress.epoch === facts.epoch;
-}
-
-export function emailOf(resource: string): string {
-  return resource.slice(resource.lastIndexOf("/") + 1);
 }
 
 // Documents are plain JSON records; the shard carries one derived field,
@@ -768,9 +845,9 @@ export function entryFromDocument(doc: StoredDocument): Entry {
   };
 }
 
-function bodyToJson(body: EntryBody): Record<string, Json> {
-  if (body.kind === "effect") return { account: body.account, intent: body.intent, kind: "effect", members: [...body.members], resource: body.resource };
-  return { account: body.account, checks: { ...body.checks }, kind: "canary", member: body.member, observedAt: body.observedAt };
+export function bodyToJson(body: EntryBody): Record<string, Json> {
+  if (body.kind === "effect") return { account: body.account, email: body.email, intent: body.intent, kind: "effect", members: [...body.members], resource: body.resource, uniqueId: body.uniqueId };
+  return { account: body.account, email: body.email, kind: "probe", member: body.member, observedAt: body.observedAt, outcome: body.outcome, permission: body.permission, phase: body.phase, principal: body.principal, uniqueId: body.uniqueId };
 }
 
 function bodyFromJson(json: Record<string, Json>): EntryBody {
@@ -778,16 +855,26 @@ function bodyFromJson(json: Record<string, Json>): EntryBody {
   if (kind === "effect") {
     const intent = str(json, "intent");
     if (!(intents as readonly string[]).includes(intent)) throw new LedgerError(`Unknown effect intent ${intent}.`);
-    return { kind, account: str(json, "account"), intent: intent as EntryBody & { kind: "effect" } extends { intent: infer I } ? I : never, members: strings(json, "members"), resource: str(json, "resource") };
+    return { kind, account: str(json, "account"), email: str(json, "email"), intent: intent as Intent, members: strings(json, "members"), resource: str(json, "resource"), uniqueId: str(json, "uniqueId") };
   }
-  if (kind === "canary") {
-    const checks = obj(json, "checks");
+  if (kind === "probe") {
+    const outcome = str(json, "outcome");
+    const phase = str(json, "phase");
+    const permission = str(json, "permission");
+    if (!(probeOutcomes as readonly string[]).includes(outcome) || !(probePhases as readonly string[]).includes(phase) || permission !== probePermission) {
+      throw new LedgerError("Stored probe carries an unknown outcome, phase, or permission.");
+    }
     return {
       kind,
       account: str(json, "account"),
-      checks: Object.fromEntries(canaryChecks.map((check) => [check, bool(checks, check)])) as Record<(typeof canaryChecks)[number], boolean>,
+      email: str(json, "email"),
       member: str(json, "member"),
       observedAt: str(json, "observedAt"),
+      outcome: outcome as ProbeRecord["outcome"],
+      permission,
+      phase: phase as ProbeRecord["phase"],
+      principal: str(json, "principal"),
+      uniqueId: str(json, "uniqueId"),
     };
   }
   throw new LedgerError(`Unknown entry kind ${kind}.`);

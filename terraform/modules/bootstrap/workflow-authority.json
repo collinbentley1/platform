@@ -146,59 +146,115 @@
   },
   {
     "workflow": ".github/workflows/protected-recovery-invoke.yml",
-    "job": "cdbentley",
-    "environment": "recovery-cdbentley",
+    "job": "cdbentley-quarantine",
+    "environment": "recovery-cdbentley-quarantine",
     "purpose": "recovery",
     "trustDomain": "recovery",
     "consumer": "cdbentley",
-    "intents": ["QUARANTINE", "RESTORE"],
+    "intent": "QUARANTINE",
     "callers": [
       { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
     ],
     "transitionEligible": true,
-    "serviceAccounts": ["gha-recovery-cdbentley"]
+    "serviceAccounts": ["gha-isolate-cdbentley"]
   },
   {
     "workflow": ".github/workflows/protected-recovery-invoke.yml",
-    "job": "critical-history",
-    "environment": "recovery-critical-history",
+    "job": "cdbentley-restore",
+    "environment": "recovery-cdbentley-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "cdbentley",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-cdbentley"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "critical-history-quarantine",
+    "environment": "recovery-critical-history-quarantine",
     "purpose": "recovery",
     "trustDomain": "recovery",
     "consumer": "critical-history",
-    "intents": ["QUARANTINE", "RESTORE"],
+    "intent": "QUARANTINE",
     "callers": [
       { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
     ],
     "transitionEligible": true,
-    "serviceAccounts": ["gha-recovery-critical-history"]
+    "serviceAccounts": ["gha-isolate-critical-history"]
   },
   {
     "workflow": ".github/workflows/protected-recovery-invoke.yml",
-    "job": "healthmcp",
-    "environment": "recovery-healthmcp",
+    "job": "critical-history-restore",
+    "environment": "recovery-critical-history-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "critical-history",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-critical-history"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "healthmcp-quarantine",
+    "environment": "recovery-healthmcp-quarantine",
     "purpose": "recovery",
     "trustDomain": "recovery",
     "consumer": "healthmcp",
-    "intents": ["QUARANTINE", "RESTORE"],
+    "intent": "QUARANTINE",
     "callers": [
       { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
     ],
     "transitionEligible": true,
-    "serviceAccounts": ["gha-recovery-healthmcp"]
+    "serviceAccounts": ["gha-isolate-healthmcp"]
   },
   {
     "workflow": ".github/workflows/protected-recovery-invoke.yml",
-    "job": "runsetta",
-    "environment": "recovery-runsetta",
+    "job": "healthmcp-restore",
+    "environment": "recovery-healthmcp-restore",
     "purpose": "recovery",
     "trustDomain": "recovery",
-    "consumer": "runsetta",
-    "intents": ["QUARANTINE", "RESTORE"],
+    "consumer": "healthmcp",
+    "intent": "RESTORE",
     "callers": [
       { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
     ],
     "transitionEligible": true,
-    "serviceAccounts": ["gha-recovery-runsetta"]
+    "serviceAccounts": ["gha-restore-healthmcp"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "runsetta-quarantine",
+    "environment": "recovery-runsetta-quarantine",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "runsetta",
+    "intent": "QUARANTINE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-isolate-runsetta"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "runsetta-restore",
+    "environment": "recovery-runsetta-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "runsetta",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-runsetta"]
   },
   {
     "workflow": ".github/workflows/reconcile-previews.yml",

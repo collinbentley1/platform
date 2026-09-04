@@ -14,8 +14,8 @@ output "reconciler_service_account_email" {
 }
 
 output "invoker_service_account_emails" {
-  description = "Purpose-level invoker per consumer; each holds only run.invoker on the broker."
-  value       = { for consumer, account in google_service_account.invoker : consumer => account.email }
+  description = "Purpose-level invoker per consumer and effect direction, keyed <consumer>/<intent>; each holds only run.invoker on the broker."
+  value       = { for invoker, account in google_service_account.invoker : invoker => account.email }
 }
 
 output "workload_identity_provider" {

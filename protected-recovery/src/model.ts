@@ -14,30 +14,32 @@ import {
 // compare-and-set of a target service account's IAM allow policy.
 //
 // Caller usage (every request carries a Google-signed ID token for the broker
-// audience; the purpose -- one consumer and its permitted effect directions, or
+// audience; the purpose -- one consumer and exactly one effect direction, or
 // the reconciler -- is derived from the authenticated service account, never
 // from the body):
 //
-//   POST /v1/shards/{shard}/entries    recovery invoker of the consumer
+//   POST /v1/shards/{shard}/entries    the consumer's invoker for that direction
 //     {"key", "consumer", "intent": "QUARANTINE"}                    one QUARANTINE effect per target account
-//     {"key", "consumer", "intent": "RESTORE", "source": "<shard>"}  one RESTORE effect per effect of the CLOSED source shard
-//     {"key", "consumer", "canary": {"account", "member", "observedAt", "checks": {...}}}
-//                                                                    negative-impersonation evidence for one target
+//     {"key", "consumer", "intent": "RESTORE", "source": "<shard>"}  one RESTORE effect per effect of the scan-ready CLOSED source shard
 //     201 accepted / 200 replayed     -> {"shard", "sequences", "key", "bodyHash", "acceptedAt"}
-//     409 KEY_BODY_MISMATCH | SHARD_NOT_OPEN | SHARD_FULL | SHARD_MISMATCH | SOURCE_NOT_COMPLETE | CANARY_PREMATURE | PINS_UNRECORDED
-//   POST /v1/shards/{shard}/close      recovery invoker   {"key"}
+//     409 KEY_BODY_MISMATCH | SHARD_NOT_OPEN | SHARD_FULL | SHARD_MISMATCH | SOURCE_NOT_COMPLETE | PINS_UNRECORDED
+//   POST /v1/shards/{shard}/close      the same invoker   {"key"}
 //     200                             -> {"shard", "phase": "CLOSING", "closeHighWater", "closingAt"}
-//   POST /v1/shards/{shard}/reconcile  recovery invoker, reconciler   {}
+//     409 NOT_READY                   -> {"blockers": [...]}  a QUARANTINE shard closes only once scan-ready
+//   POST /v1/shards/{shard}/reconcile  the same invoker, reconciler   {}
 //   POST /v1/reconcile                 reconciler                     {}   (every shard with recorded pending work)
 //     200                             -> {"shards": [ShardView]}
-//   GET  /v1/shards/{shard}            recovery invoker, reconciler
+//   GET  /v1/shards/{shard}            the same invoker, reconciler
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
 //   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE
 //
-// Retries are secured by the ledger: the same key with the same body returns
-// the recorded result; the same key with a different body is refused. A shard
-// is CLOSED only once its terminal receipt is verified in GCS; until then it is
-// FINALIZING and no caller-facing completion exists.
+// No body carries evidence. Negative impersonation probes are recorded by the
+// broker itself from its probe source, never from a caller, and a shard is
+// scan-ready only on that recorded evidence. Retries are secured by the ledger:
+// the same key with the same body returns the recorded result; the same key
+// with a different body is refused. A shard is CLOSED only once its terminal
+// receipt is verified in GCS; until then it is FINALIZING and no caller-facing
+// completion exists.
 
 export const authorityPath = "protected-recovery/authority.json";
 export const intents = recoveryIntents;
@@ -45,10 +47,28 @@ export type Intent = RecoveryIntent;
 export const managedRole = "roles/iam.workloadIdentityUser";
 // Binding removal blocks new impersonation only. A holder of the managed role
 // can mint a one-hour access token up to the moment removal propagates, so a
-// protected scan waits this long after the last plausibly successful mint.
+// protected scan waits this long after the last plausibly successful mint --
+// bounded by the first negative probe after the last positive one -- and then
+// needs another negative probe.
 export const tokenHorizonSeconds = 3600;
 export const maxEntriesPerShard = 256;
 export const maxBodyBytes = 8 * 1024;
+
+// A probe attempts exactly this permission as the managed member against the
+// exact target identity. The broker's own probe source performs it; no caller
+// can submit a result.
+export const probePermission = "iam.serviceAccounts.getAccessToken";
+export const probePhases = ["REVOCATION", "HORIZON"] as const;
+export type ProbePhase = (typeof probePhases)[number];
+export const probeOutcomes = ["ALLOWED", "DENIED"] as const;
+export type ProbeOutcome = (typeof probeOutcomes)[number];
+// No broker-verifiable negative-impersonation probe source exists yet. The
+// broker cannot mint a GitHub OIDC token to try the federated member itself,
+// a consumer-run attempt is an unverifiable assertion, and the broker's own
+// authority is limited to the target policies; so the production binding
+// reports every probe unavailable, readiness stays blocked, and this names the
+// live prerequisite that activation must satisfy before any protected close.
+export const probePrerequisite = "no broker-verifiable negative-impersonation probe source is deployed; activation must supply an approved source whose result binds the probe principal, the target unique ID, the attempted member and permission, a server-observed time, and an independently verifiable outcome";
 
 export class AuthorityError extends Error {}
 export class RequestError extends Error {}
@@ -59,6 +79,9 @@ export interface Consumer {
   readonly projectNumber: string;
   readonly repository: string;
   readonly repositoryId: string;
+  // The permanent numeric identity of every target account, keyed by account
+  // ID. Null until a reviewed change records the real one; nothing invents it.
+  readonly serviceAccountUniqueIds: Readonly<Record<string, string | null>>;
   readonly transitionWorkflowSha: string | null;
 }
 
@@ -74,8 +97,8 @@ export interface Broker {
 }
 
 // Deployment and fixed-resource coordinates only. Who may invoke, for which
-// consumer, in which directions, and which consumer accounts are bound to
-// which exact tuples all come from the canonical workflow-authority manifest.
+// consumer, in which direction, and which consumer accounts are bound to which
+// exact tuples all come from the canonical workflow-authority manifest.
 export interface RecoveryAuthority {
   readonly broker: Broker;
   readonly consumers: readonly Consumer[];
@@ -84,35 +107,42 @@ export interface RecoveryAuthority {
   readonly githubOwnerId: string;
   readonly platformRepository: string;
   readonly platformRepositoryId: string;
+  readonly targetAccounts: readonly string[];
 }
 
 export type Purpose =
-  | { readonly kind: "recovery"; readonly consumer: Consumer; readonly intents: readonly Intent[]; readonly serviceAccount: string }
+  | { readonly kind: "recovery"; readonly consumer: Consumer; readonly intent: Intent; readonly serviceAccount: string }
   | { readonly kind: "reconciler"; readonly serviceAccount: string };
 
-// One target service account of a consumer: its exact IAM resource and the
-// exact managed members of the managed role, derived from the inventory.
+// One target service account of a consumer: its permanent numeric identity,
+// the IAM resource addressed by that identity, and the exact managed members
+// of the managed role, derived from the inventory.
 export interface Target {
   readonly account: string;
   readonly email: string;
   readonly members: readonly string[];
   readonly pool: string;
   readonly resource: string;
+  readonly uniqueId: string;
 }
 
-export const canaryChecks = [
-  "attachmentsAbsent",
-  "impersonationDenied",
-  "keysAbsent",
-  "lifetimeExtensionAbsent",
-  "tokenCreatorsAbsent",
-  "wifDataPlaneAbsent",
-] as const;
-export type CanaryCheck = (typeof canaryChecks)[number];
+// A recorded probe: which principal tried which member and permission against
+// which exact identity, when the broker observed it, and what happened.
+export interface ProbeRecord {
+  readonly account: string;
+  readonly email: string;
+  readonly member: string;
+  readonly observedAt: string;
+  readonly outcome: ProbeOutcome;
+  readonly permission: typeof probePermission;
+  readonly phase: ProbePhase;
+  readonly principal: string;
+  readonly uniqueId: string;
+}
 
 export type EntryBody =
-  | { readonly kind: "effect"; readonly account: string; readonly intent: Intent; readonly members: readonly string[]; readonly resource: string }
-  | { readonly kind: "canary"; readonly account: string; readonly checks: Readonly<Record<CanaryCheck, boolean>>; readonly member: string; readonly observedAt: string };
+  | { readonly kind: "effect"; readonly account: string; readonly email: string; readonly intent: Intent; readonly members: readonly string[]; readonly resource: string; readonly uniqueId: string }
+  | ({ readonly kind: "probe" } & ProbeRecord);
 
 // Complete policy snapshots: the canonical bindings and their content hash,
 // plus the etag when the snapshot was observed rather than expected.
@@ -188,9 +218,9 @@ export type Shard =
 
 export type ShardPhase = Shard["phase"];
 
-// One actuator per target service account orders every effect against it:
-// PREPARE takes the actuator, ACK or DIVERGED releases it, and a takeover must
-// finish the recorded operation before an opposite intent can take it.
+// One actuator per target identity orders every effect against it: PREPARE
+// takes the actuator, ACK or DIVERGED releases it, and a takeover must finish
+// the recorded operation before an opposite intent can take it.
 export interface Actuator {
   readonly epoch: number;
   readonly holder: { readonly effectId: string; readonly sequence: number; readonly shard: string } | null;
@@ -206,8 +236,7 @@ export interface KeyRecord {
 
 export type AppendBody =
   | { readonly kind: "quarantine" }
-  | { readonly kind: "restore"; readonly source: string }
-  | { readonly kind: "canary"; readonly account: string; readonly checks: Readonly<Record<CanaryCheck, boolean>>; readonly member: string; readonly observedAt: string };
+  | { readonly kind: "restore"; readonly source: string };
 
 export interface AppendRequest {
   readonly kind: "append";
@@ -249,7 +278,6 @@ const projectId = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const repositoryName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const region = /^[a-z]+-[a-z]+[0-9]$/;
 const commitSha = /^[0-9a-f]{40}$/;
-const isoInstant = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 
 export function loadRecoveryAuthority(authorityText: string, manifestText: string): RecoveryAuthority {
   let document: unknown;
@@ -268,13 +296,16 @@ export function loadRecoveryAuthority(authorityText: string, manifestText: strin
     throw new AuthorityError(`${authorityPath}: githubOwner must be a GitHub owner and githubOwnerId and platformRepositoryId positive decimal IDs.`);
   }
   if (platformRepository !== `${githubOwner}/platform`) throw new AuthorityError(`${authorityPath}.platformRepository must be ${githubOwner}/platform.`);
-  const consumers = parseConsumers(root.consumers);
-  const broker = parseBroker(root.broker);
   const manifest = parseWorkflowAuthority(manifestText);
   if (manifest.failures.length > 0) throw new AuthorityError(manifest.failures.join("\n"));
+  const targetAccounts = [...new Set(manifest.entries.flatMap((entry) => (entry.trustDomain === "consumer" && entry.purpose === "gcp" ? entry.serviceAccounts : [])))].sort();
+  const consumers = parseConsumers(root.consumers, targetAccounts);
+  const broker = parseBroker(root.broker);
   for (const consumer of consumers) {
-    const invokers = manifest.entries.filter((entry): entry is RecoveryAuthorityEntry => entry.trustDomain === "recovery" && entry.consumer === consumer.repository);
-    if (invokers.length !== 1) throw new AuthorityError(`${manifestPath}: consumer ${consumer.repository} must have exactly one recovery invoker; found ${invokers.length}.`);
+    for (const intent of intents) {
+      const invokers = manifest.entries.filter((entry): entry is RecoveryAuthorityEntry => entry.trustDomain === "recovery" && entry.consumer === consumer.repository && entry.intent === intent);
+      if (invokers.length !== 1) throw new AuthorityError(`${manifestPath}: consumer ${consumer.repository} must have exactly one ${intent} invoker; found ${invokers.length}.`);
+    }
   }
   for (const entry of manifest.entries) {
     if (entry.trustDomain === "recovery" && !consumers.some((consumer) => consumer.repository === entry.consumer)) {
@@ -284,23 +315,24 @@ export function loadRecoveryAuthority(authorityText: string, manifestText: strin
       throw new AuthorityError(`${manifestPath}: the reconciler ${broker.reconcilerServiceAccount} cannot also be a recovery invoker.`);
     }
   }
-  return { broker, consumers, entries: manifest.entries, githubOwner, githubOwnerId, platformRepository, platformRepositoryId };
+  return { broker, consumers, entries: manifest.entries, githubOwner, githubOwnerId, platformRepository, platformRepositoryId, targetAccounts };
 }
 
-function parseConsumers(value: unknown): readonly Consumer[] {
+function parseConsumers(value: unknown, targetAccounts: readonly string[]): readonly Consumer[] {
   const label = `${authorityPath}.consumers`;
   if (!Array.isArray(value) || value.length === 0) throw new AuthorityError(`${label} must be a non-empty array.`);
   const consumers: Consumer[] = [];
   value.forEach((raw, index) => {
     const where = `${label}[${index}]`;
     const entry = record(raw, where);
-    exactKeys(entry, ["activeWorkflowSha", "projectId", "projectNumber", "repository", "repositoryId", "transitionWorkflowSha"], where);
+    exactKeys(entry, ["activeWorkflowSha", "projectId", "projectNumber", "repository", "repositoryId", "serviceAccountUniqueIds", "transitionWorkflowSha"], where);
     const consumer: Consumer = {
       activeWorkflowSha: nullableSha(entry.activeWorkflowSha, `${where}.activeWorkflowSha`),
       projectId: string(entry.projectId, `${where}.projectId`),
       projectNumber: string(entry.projectNumber, `${where}.projectNumber`),
       repository: string(entry.repository, `${where}.repository`),
       repositoryId: string(entry.repositoryId, `${where}.repositoryId`),
+      serviceAccountUniqueIds: parseUniqueIds(entry.serviceAccountUniqueIds, `${where}.serviceAccountUniqueIds`, targetAccounts),
       transitionWorkflowSha: nullableSha(entry.transitionWorkflowSha, `${where}.transitionWorkflowSha`),
     };
     if (!repositoryName.test(consumer.repository)) throw new AuthorityError(`${where}.repository must be a GitHub repository name.`);
@@ -316,11 +348,37 @@ function parseConsumers(value: unknown): readonly Consumer[] {
     for (const key of ["projectId", "projectNumber", "repository", "repositoryId"] as const) {
       if (consumers.some((other) => other[key] === consumer[key])) throw new AuthorityError(`${where}.${key} ${consumer[key]} is already declared.`);
     }
+    for (const [account, uniqueId] of Object.entries(consumer.serviceAccountUniqueIds)) {
+      if (uniqueId !== null && consumers.some((other) => Object.values(other.serviceAccountUniqueIds).includes(uniqueId))) {
+        throw new AuthorityError(`${where}.serviceAccountUniqueIds.${account} ${uniqueId} is already declared.`);
+      }
+    }
     const previous = consumers.at(-1);
     if (previous && previous.repository >= consumer.repository) throw new AuthorityError(`${label} must be sorted by repository.`);
     consumers.push(consumer);
   });
   return consumers;
+}
+
+// Exactly one unique ID slot per target account the manifest binds, each null
+// or one positive decimal ID; a slot that names no bound account, or a bound
+// account without a slot, is refused so the inventory and the identities can
+// never disagree about which accounts exist.
+function parseUniqueIds(value: unknown, label: string, targetAccounts: readonly string[]): Readonly<Record<string, string | null>> {
+  const ids = record(value, label);
+  exactKeys(ids, targetAccounts, label);
+  const parsed: Record<string, string | null> = {};
+  for (const account of targetAccounts) {
+    const uniqueId = ids[account];
+    if (uniqueId === null) {
+      parsed[account] = null;
+      continue;
+    }
+    if (typeof uniqueId !== "string" || !decimalId.test(uniqueId)) throw new AuthorityError(`${label}.${account} must be null or one positive decimal unique ID.`);
+    if (Object.values(parsed).includes(uniqueId)) throw new AuthorityError(`${label}.${account} ${uniqueId} is already declared.`);
+    parsed[account] = uniqueId;
+  }
+  return parsed;
 }
 
 function parseBroker(value: unknown): Broker {
@@ -360,8 +418,21 @@ function nullableSha(value: unknown, label: string): string | null {
   return value;
 }
 
+// Every consumer/account whose permanent identity is not yet recorded. The
+// runtime refuses to start while any remains, exactly as it refuses null
+// broker coordinates: an email-addressed effect could land on a recreated
+// account with the same address and a different identity.
+export function unrecordedIdentities(authority: RecoveryAuthority): readonly string[] {
+  return authority.consumers.flatMap((consumer) =>
+    Object.entries(consumer.serviceAccountUniqueIds)
+      .filter(([, uniqueId]) => uniqueId === null)
+      .map(([account]) => `${consumer.repository}/${account}`),
+  );
+}
+
 // Purpose is derived only from the authenticated service-account identity in
-// the broker project: one recovery entry of the manifest, or the reconciler.
+// the broker project: one recovery entry of the manifest -- one consumer and
+// one effect direction -- or the reconciler.
 export function purposeForIdentity(authority: RecoveryAuthority, email: string): Purpose | undefined {
   const projectId = authority.broker.projectId;
   if (projectId === null) return undefined;
@@ -373,7 +444,7 @@ export function purposeForIdentity(authority: RecoveryAuthority, email: string):
     if (entry.trustDomain !== "recovery" || entry.serviceAccounts[0] !== account) continue;
     const consumer = authority.consumers.find((candidate) => candidate.repository === entry.consumer);
     if (!consumer) return undefined;
-    return { kind: "recovery", consumer, intents: entry.intents, serviceAccount: account };
+    return { kind: "recovery", consumer, intent: entry.intent, serviceAccount: account };
   }
   return undefined;
 }
@@ -386,11 +457,17 @@ export function consumerPool(authority: RecoveryAuthority, consumer: Consumer): 
   return `projects/${consumer.projectNumber}/locations/global/workloadIdentityPools/${authority.broker.workloadIdentityPoolId}`;
 }
 
+export function serviceAccountResource(consumer: Consumer, uniqueId: string): string {
+  return `projects/${consumer.projectId}/serviceAccounts/${uniqueId}`;
+}
+
 // Every target of a consumer with its exact managed members: for each
 // consumer-domain gcp entry that binds the account, each declared caller and
 // event, the active SHA (plus the transition SHA only for transition-eligible
 // entries), the attribute.authority principal set that the consumer's own
-// bootstrap module binds. Missing pins refuse the derivation outright.
+// bootstrap module binds. The IAM resource is addressed by the recorded
+// permanent unique ID, never by the reusable email. Missing pins or missing
+// identities refuse the derivation outright.
 export function targetsFor(authority: RecoveryAuthority, consumer: Consumer): readonly Target[] | undefined {
   if (consumer.activeWorkflowSha === null) return undefined;
   const pool = consumerPool(authority, consumer);
@@ -417,13 +494,20 @@ export function targetsFor(authority: RecoveryAuthority, consumer: Consumer): re
       }
     }
   }
-  return [...members.keys()].sort().map((account) => ({
-    account,
-    email: `${account}@${consumer.projectId}.iam.gserviceaccount.com`,
-    members: [...members.get(account)!].sort(),
-    pool,
-    resource: `projects/${consumer.projectId}/serviceAccounts/${account}@${consumer.projectId}.iam.gserviceaccount.com`,
-  }));
+  const targets: Target[] = [];
+  for (const account of [...members.keys()].sort()) {
+    const uniqueId = consumer.serviceAccountUniqueIds[account];
+    if (uniqueId === null || uniqueId === undefined) return undefined;
+    targets.push({
+      account,
+      email: `${account}@${consumer.projectId}.iam.gserviceaccount.com`,
+      members: [...members.get(account)!].sort(),
+      pool,
+      resource: serviceAccountResource(consumer, uniqueId),
+      uniqueId,
+    });
+  }
+  return targets;
 }
 
 export function parseShardId(value: string): string {
@@ -432,32 +516,18 @@ export function parseShardId(value: string): string {
 }
 
 // Every body is parsed exactly once, here, against a closed key set. A body
-// that names a project, resource, role, member list, policy, or object name is
-// refused as an unknown field: those facts come from the identity and the
-// inventory only. The consumer and intent are repeated in the body so that the
-// recorded request is self-describing; they must equal the purpose's binding.
+// that names a project, resource, role, member list, policy, object name, or
+// any probe or canary evidence is refused as an unknown field: those facts
+// come from the identity, the inventory, and the broker's own probes only. The
+// consumer and intent are repeated in the body so that the recorded request is
+// self-describing; they must equal the purpose's binding.
 export function parseAppendBody(shard: string, body: unknown): AppendRequest {
   const source = requestRecord(body, "body");
   const consumer = typeof source.consumer === "string" && repositoryName.test(source.consumer) ? source.consumer : undefined;
   if (consumer === undefined) throw new RequestError("consumer must be a consumer repository name");
   const key = requestKey(source.key);
   let parsed: AppendBody;
-  if ("canary" in source) {
-    requestKeys(source, ["canary", "consumer", "key"]);
-    const canary = requestRecord(source.canary, "canary");
-    requestKeys(canary, ["account", "checks", "member", "observedAt"]);
-    if (typeof canary.account !== "string" || !serviceAccountId.test(canary.account)) throw new RequestError("canary.account must be a service account ID");
-    if (typeof canary.member !== "string" || !canary.member.startsWith("principalSet://iam.googleapis.com/")) throw new RequestError("canary.member must be the exact principal set that was tried");
-    if (typeof canary.observedAt !== "string" || !isoInstant.test(canary.observedAt) || Number.isNaN(Date.parse(canary.observedAt))) throw new RequestError("canary.observedAt must be an ISO-8601 UTC instant");
-    const checks = requestRecord(canary.checks, "canary.checks");
-    requestKeys(checks, canaryChecks);
-    const parsedChecks = {} as Record<CanaryCheck, boolean>;
-    for (const check of canaryChecks) {
-      if (typeof checks[check] !== "boolean") throw new RequestError(`canary.checks.${check} must be a boolean`);
-      parsedChecks[check] = checks[check];
-    }
-    parsed = { kind: "canary", account: canary.account, checks: parsedChecks, member: canary.member, observedAt: canary.observedAt };
-  } else if (source.intent === "RESTORE") {
+  if (source.intent === "RESTORE") {
     requestKeys(source, ["consumer", "intent", "key", "source"]);
     if (typeof source.source !== "string" || !shardId.test(source.source)) throw new RequestError("source must name the CLOSED quarantine shard to restore");
     parsed = { kind: "restore", source: source.source };
@@ -475,8 +545,6 @@ export function appendBodyJson(body: AppendBody): Record<string, unknown> {
       return { intent: "QUARANTINE" };
     case "restore":
       return { intent: "RESTORE", source: body.source };
-    case "canary":
-      return { canary: { account: body.account, checks: { ...body.checks }, member: body.member, observedAt: body.observedAt } };
   }
 }
 
@@ -495,53 +563,125 @@ export function parseReconcileBody(shard: string | null, body: unknown): Reconci
 
 export interface ScanReadiness {
   readonly blockers: readonly string[];
+  // The instant the token horizon drains for the latest revocation probe --
+  // the earliest a post-horizon probe can count -- once every target has one.
+  readonly horizonAt: string | null;
   readonly ready: boolean;
-  readonly readyAt: string | null;
+}
+
+// A probe the broker should record now: the phase, the exact target identity
+// and member, and the earliest observation time the ledger will admit for it.
+export interface ProbeNeed {
+  readonly account: string;
+  readonly email: string;
+  readonly member: string;
+  readonly notBefore: string;
+  readonly phase: ProbePhase;
+  readonly resource: string;
+  readonly uniqueId: string;
+}
+
+interface ProbeChain {
+  readonly horizon: number | null;
+  readonly post: Entry | undefined;
+  readonly revocation: Entry | undefined;
+}
+
+// The probes that count for one acknowledged target, in two phases. The
+// revocation probe is the earliest DENIED observation after the quarantine
+// acknowledgement and after the latest ALLOWED observation: minting may have
+// succeeded up to that moment, so the token horizon drains one hour after it.
+// The post-horizon probe is a DENIED observation at or after that horizon.
+// Any later ALLOWED observation restarts the chain; a timer alone never ends
+// it. Only probes that name the target's exact identity and a managed member
+// are considered.
+function probeChain(effect: Entry, entries: readonly Entry[]): ProbeChain {
+  const target = effect.body;
+  if (target.kind !== "effect" || effect.progress?.state !== "ACKED") throw new TypeError(`Entry ${effect.sequence} is not an acknowledged effect.`);
+  const ackedAt = Date.parse(effect.progress.ackedAt);
+  const probes = entries
+    .filter((entry): entry is Entry & { readonly body: { readonly kind: "probe" } & ProbeRecord } =>
+      entry.body.kind === "probe" && entry.body.account === target.account && entry.body.uniqueId === target.uniqueId && target.members.includes(entry.body.member) && Date.parse(entry.body.observedAt) >= ackedAt,
+    )
+    .sort((left, right) => Date.parse(left.body.observedAt) - Date.parse(right.body.observedAt) || left.sequence - right.sequence);
+  const lastAllowed = probes.filter((probe) => probe.body.outcome === "ALLOWED").at(-1);
+  const denied = probes.filter((probe) => probe.body.outcome === "DENIED" && (!lastAllowed || Date.parse(probe.body.observedAt) > Date.parse(lastAllowed.body.observedAt)));
+  const revocation = denied[0];
+  if (!revocation) return { horizon: null, post: undefined, revocation: undefined };
+  const horizon = Date.parse(revocation.body.observedAt) + tokenHorizonSeconds * 1000;
+  return { horizon, post: denied.find((probe) => Date.parse(probe.body.observedAt) >= horizon), revocation };
+}
+
+function ackedEffects(shard: Shard, entries: readonly Entry[]): ReadonlyArray<{ readonly account: string; readonly effect: Entry | undefined }> {
+  return Object.keys(shard.targets)
+    .sort()
+    .map((account) => ({ account, effect: entries.find((entry) => entry.sequence === shard.targets[account]) }));
 }
 
 // Scan-ready is a pure judgement over committed ledger facts: every target of
 // a QUARANTINE shard acknowledged with no alternate issuer in its policy, a
-// fresh negative impersonation canary per exact target accepted after that
-// target's acknowledgement with every live prerequisite confirmed, and the
-// one-hour token horizon drained since the latest such canary. A fixed
-// propagation timer alone never satisfies it.
+// broker-recorded DENIED probe of a managed member against the exact target
+// identity after that target's acknowledgement, the one-hour token horizon
+// drained since that probe, and another DENIED probe after the horizon. A
+// fixed propagation timer alone never satisfies it, and nothing a caller
+// submits contributes to it.
 export function scanReadiness(shard: Shard, entries: readonly Entry[], now: Date): ScanReadiness {
   const blockers: string[] = [];
-  if (shard.intent !== "QUARANTINE") return { blockers: ["shard intent is RESTORE"], ready: false, readyAt: null };
-  const accounts = Object.keys(shard.targets).sort();
-  if (accounts.length === 0) blockers.push("no target has been journaled");
+  if (shard.intent !== "QUARANTINE") return { blockers: ["shard intent is RESTORE"], horizonAt: null, ready: false };
+  const targets = ackedEffects(shard, entries);
+  if (targets.length === 0) blockers.push("no target has been journaled");
   let horizon = 0;
-  for (const account of accounts) {
-    const effect = entries.find((entry) => entry.sequence === shard.targets[account]);
+  let horizonKnown = true;
+  for (const { account, effect } of targets) {
     if (!effect || effect.body.kind !== "effect" || effect.progress === null) {
       blockers.push(`${account}: effect entry is missing`);
+      horizonKnown = false;
       continue;
     }
     if (effect.progress.state !== "ACKED") {
       blockers.push(`${account}: quarantine is ${effect.progress.state}`);
+      horizonKnown = false;
       continue;
     }
     if (effect.progress.alternateIssuers.length > 0) blockers.push(`${account}: alternate credential issuers ${effect.progress.alternateIssuers.join(", ")}`);
-    const ackedAt = Date.parse(effect.progress.ackedAt);
-    const canary = entries.filter((entry) => entry.body.kind === "canary" && entry.body.account === account).at(-1);
-    const evidence = canary?.body.kind === "canary" ? canary.body : undefined;
-    if (!canary || !evidence) {
-      blockers.push(`${account}: no negative impersonation canary`);
+    const chain = probeChain(effect, entries);
+    if (!chain.revocation || chain.horizon === null) {
+      blockers.push(`${account}: no DENIED impersonation probe after the quarantine acknowledgement`);
+      horizonKnown = false;
       continue;
     }
-    const acceptedAt = Date.parse(canary.acceptedAt);
-    if (!(acceptedAt > ackedAt) || Date.parse(evidence.observedAt) < ackedAt) {
-      blockers.push(`${account}: canary predates the quarantine acknowledgement`);
+    horizon = Math.max(horizon, chain.horizon);
+    if (now.getTime() < chain.horizon) {
+      blockers.push(`${account}: token horizon drains at ${new Date(chain.horizon).toISOString()}`);
       continue;
     }
-    if (!effect.body.members.includes(evidence.member)) blockers.push(`${account}: canary tried ${evidence.member}, not a managed member`);
-    const failed = canaryChecks.filter((check) => !evidence.checks[check]);
-    if (failed.length > 0) blockers.push(`${account}: canary reports ${failed.join(", ")} false`);
-    horizon = Math.max(horizon, acceptedAt + tokenHorizonSeconds * 1000);
+    if (!chain.post) blockers.push(`${account}: no DENIED impersonation probe after the token horizon ${new Date(chain.horizon).toISOString()}`);
   }
-  const readyAt = blockers.length === 0 ? new Date(horizon).toISOString() : null;
-  if (readyAt !== null && now.getTime() < horizon) blockers.push(`token horizon drains at ${readyAt}`);
-  return { blockers, ready: blockers.length === 0, readyAt };
+  return { blockers, horizonAt: horizonKnown && horizon > 0 ? new Date(horizon).toISOString() : null, ready: blockers.length === 0 };
+}
+
+// The probes the broker should record for an OPEN QUARANTINE shard now: a
+// revocation probe for every acknowledged target without one, and a
+// post-horizon probe for every target whose horizon has drained without one.
+// Targets with an alternate issuer are never ready in this shard, so they are
+// not probed. The member tried is the target's first managed member.
+export function probesNeeded(shard: Shard, entries: readonly Entry[], now: Date): readonly ProbeNeed[] {
+  if (shard.phase !== "OPEN" || shard.intent !== "QUARANTINE") return [];
+  const needs: ProbeNeed[] = [];
+  for (const { effect } of ackedEffects(shard, entries)) {
+    if (!effect || effect.body.kind !== "effect" || effect.progress?.state !== "ACKED" || effect.progress.alternateIssuers.length > 0) continue;
+    const member = effect.body.members[0];
+    if (member === undefined) continue;
+    const base = { account: effect.body.account, email: effect.body.email, member, resource: effect.body.resource, uniqueId: effect.body.uniqueId };
+    const chain = probeChain(effect, entries);
+    if (!chain.revocation || chain.horizon === null) needs.push({ ...base, notBefore: effect.progress.ackedAt, phase: "REVOCATION" });
+    else if (!chain.post && now.getTime() >= chain.horizon) needs.push({ ...base, notBefore: new Date(chain.horizon).toISOString(), phase: "HORIZON" });
+  }
+  return needs;
+}
+
+export function probeKey(probe: ProbeRecord): string {
+  return `probe/${probe.account}/${probe.phase}/${probe.observedAt}`;
 }
 
 function requestKey(value: unknown): string {

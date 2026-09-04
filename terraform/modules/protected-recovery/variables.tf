@@ -55,19 +55,63 @@ variable "transition_workflow_sha" {
   }
 }
 
+# Evidence that enables the broker's authority over consumer accounts. It is
+# not a switch: every field is verified against this deployment. The image and
+# platform revision must be this plan's own inputs, the Deny canary must have
+# succeeded at that same revision and cover at least the module's required
+# permissions with the broker excepted, the organization must be the live
+# parent of every consumer project (data.google_project.consumer), and every
+# target unique ID must be recorded (google_project_iam_custom_role.actuator).
+# Null keeps the module without any authority over consumer accounts, which
+# is the only state offline inputs can reach: no organization exists, no Deny
+# canary has run, and the committed target identities are null. The run's
+# success, head SHA, and artifact digest are verified against the GitHub run
+# record by the activation review; nothing here can confirm them offline.
 variable "broker_authority_evidence" {
-  description = "Evidence that the consumer projects sit under an organization and that every exact IAM Deny permission and exception has been canaried: the organization ID and the run ID of the successful Deny canary. Null keeps the broker without any authority over consumer accounts, so the deployment stays inert until its prerequisites pass."
+  description = "Reviewed evidence, mechanically bound to this deployment, that the consumer projects sit under the named organization and that every exact IAM Deny permission and exception has been canaried at this platform revision against this broker image. Null keeps the broker without any authority over consumer accounts."
   type = object({
-    deny_canary_run_id = string
-    organization_id    = string
+    organization_id = string
+    platform_sha    = string
+    broker_image    = string
+    deny_canary = object({
+      run_id          = string
+      head_sha        = string
+      conclusion      = string
+      artifact_sha256 = string
+      permissions     = list(string)
+      exceptions      = list(string)
+    })
   })
   default = null
 
   validation {
-    condition = var.broker_authority_evidence == null || (
+    condition = var.broker_authority_evidence == null || try(
       can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.organization_id)) &&
-      can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.deny_canary_run_id))
+      can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.deny_canary.run_id)) &&
+      can(regex("^[0-9a-f]{40}$", var.broker_authority_evidence.deny_canary.head_sha)) &&
+      can(regex("^[0-9a-f]{64}$", var.broker_authority_evidence.deny_canary.artifact_sha256)) &&
+      var.broker_authority_evidence.deny_canary.conclusion == "success",
+      false,
     )
-    error_message = "broker_authority_evidence must carry a numeric organization_id and a numeric deny_canary_run_id, never fabricated placeholders."
+    error_message = "broker_authority_evidence must carry a numeric organization_id, a numeric deny_canary.run_id, a full head_sha, a sha256 artifact digest, and conclusion \"success\"; never fabricated placeholders."
+  }
+
+  validation {
+    condition = var.broker_authority_evidence == null || try(
+      var.broker_authority_evidence.platform_sha == var.active_workflow_sha &&
+      var.broker_authority_evidence.deny_canary.head_sha == var.active_workflow_sha &&
+      var.broker_authority_evidence.broker_image == var.broker_image,
+      false,
+    )
+    error_message = "broker_authority_evidence must be bound to this deployment: platform_sha and deny_canary.head_sha must equal active_workflow_sha, and broker_image must equal the digest-pinned broker_image being deployed."
+  }
+
+  validation {
+    condition = var.broker_authority_evidence == null || try(
+      length(setsubtract(local.required_deny_coverage, toset(var.broker_authority_evidence.deny_canary.permissions))) == 0 &&
+      contains(var.broker_authority_evidence.deny_canary.exceptions, local.broker_principal),
+      false,
+    )
+    error_message = "broker_authority_evidence.deny_canary must cover every permission in the module's required Deny coverage and except exactly the broker principal; a canary of a smaller set cannot enable authority."
   }
 }

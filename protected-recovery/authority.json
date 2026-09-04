@@ -19,6 +19,17 @@
       "repositoryId": "1255553151",
       "projectId": "cdbentley",
       "projectNumber": "882468538648",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
       "activeWorkflowSha": null,
       "transitionWorkflowSha": null
     },
@@ -27,6 +38,17 @@
       "repositoryId": "280932482",
       "projectId": "critical-history-16823277",
       "projectNumber": "422714632513",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
       "activeWorkflowSha": null,
       "transitionWorkflowSha": null
     },
@@ -35,6 +57,17 @@
       "repositoryId": "1025243085",
       "projectId": "medlock-1025243085",
       "projectNumber": "229383559510",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
       "activeWorkflowSha": null,
       "transitionWorkflowSha": null
     },
@@ -43,6 +76,17 @@
       "repositoryId": "711292980",
       "projectId": "runsetta",
       "projectNumber": "601124730704",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
       "activeWorkflowSha": null,
       "transitionWorkflowSha": null
     }

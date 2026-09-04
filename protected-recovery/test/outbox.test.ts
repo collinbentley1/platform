@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { type EntryBody, probePermission } from "../src/model";
 import { entryEvidence, project } from "../src/outbox";
 import { FakeEvidence } from "./support";
 
@@ -25,11 +26,11 @@ describe("outbox projection", () => {
 
   test("entry evidence is the committed body and outcome, never a pending effect", () => {
     const base = { acceptedAt: "2026-09-04T12:00:00.000Z", bodyHash: "h", key: "k", objectName: "shards/s/entries/000001.json", outbox: { state: "PENDING" as const }, sequence: 1 };
-    const effect = { kind: "effect" as const, account: "gha-terraform", intent: "QUARANTINE" as const, members: ["principalSet://x"], resource: "projects/p/serviceAccounts/e" };
+    const effect = { kind: "effect" as const, account: "gha-terraform", email: "gha-terraform@p.iam.gserviceaccount.com", intent: "QUARANTINE" as const, members: ["principalSet://x"], resource: "projects/p/serviceAccounts/101080000000000000000", uniqueId: "101080000000000000000" };
     expect(() => entryEvidence("s", { ...base, body: effect, progress: { state: "RECORDED" } })).toThrow("not acknowledged");
-    const canary = { kind: "canary" as const, account: "gha-terraform", checks: { attachmentsAbsent: true, impersonationDenied: true, keysAbsent: true, lifetimeExtensionAbsent: true, tokenCreatorsAbsent: true, wifDataPlaneAbsent: true }, member: "principalSet://x", observedAt: "2026-09-04T12:00:00.000Z" };
-    const text = new TextDecoder().decode(entryEvidence("s", { ...base, body: canary, progress: null }));
+    const probe: EntryBody = { kind: "probe", account: "gha-terraform", email: effect.email, member: "principalSet://x", observedAt: "2026-09-04T12:00:00.000Z", outcome: "DENIED", permission: probePermission, phase: "REVOCATION", principal: "prober@p.iam.gserviceaccount.com", uniqueId: effect.uniqueId };
+    const text = new TextDecoder().decode(entryEvidence("s", { ...base, body: probe, progress: null }));
     expect(text.endsWith("\n")).toBe(true);
-    expect(JSON.parse(text)).toMatchObject({ body: canary, progress: null, sequence: 1, shard: "s" });
+    expect(JSON.parse(text)).toMatchObject({ body: probe, progress: null, sequence: 1, shard: "s" });
   });
 });

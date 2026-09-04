@@ -1,14 +1,25 @@
 #!/bin/bash
-# Shape one request to the protected-recovery broker for one consumer and print
-# the reply. The purpose is the authenticated invoker identity, never an input:
-# this script may only choose between the operations the broker exposes for
-# that identity and forward its literal consumer. The ID token reaches curl
+# Shape one request to the protected-recovery broker for one consumer and one
+# effect direction, and print the reply. The purpose is the authenticated
+# invoker identity, never an input: this script may only choose between the
+# operations the broker exposes for that identity and forward its literal
+# consumer and direction. No evidence of any kind travels in a body; probes
+# are recorded by the broker from its own source. The ID token reaches curl
 # through a private config file, never through argv.
 set -euo pipefail
 
 consumer="$1"
+direction="$2"
 : "${BROKER_URL:?}" "${ID_TOKEN:?}" "${IDEMPOTENCY_KEY:?}" "${OPERATION:?}" "${SHARD:?}"
 [[ "$SHARD" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]
+case "$direction" in
+  quarantine) intent=QUARANTINE ;;
+  restore) intent=RESTORE ;;
+  *)
+    echo "Unknown direction $direction." >&2
+    exit 1
+    ;;
+esac
 
 workdir="$(mktemp -d)"
 trap 'rm -rf -- "$workdir"' EXIT
@@ -18,17 +29,13 @@ printf 'header = "Authorization: Bearer %s"\n' "$ID_TOKEN" > "$workdir/auth.cfg"
 method=POST
 body="$workdir/body.json"
 case "$OPERATION" in
-  quarantine)
+  append)
     path="/v1/shards/$SHARD/entries"
-    jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" '{key: $key, consumer: $consumer, intent: "QUARANTINE"}' > "$body"
-    ;;
-  restore)
-    path="/v1/shards/$SHARD/entries"
-    jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" --arg source "${ARGUMENT:?}" '{key: $key, consumer: $consumer, intent: "RESTORE", source: $source}' > "$body"
-    ;;
-  canary)
-    path="/v1/shards/$SHARD/entries"
-    jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" --argjson canary "${ARGUMENT:?}" '{key: $key, consumer: $consumer, canary: $canary}' > "$body"
+    if [ "$intent" = RESTORE ]; then
+      jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" --arg source "${ARGUMENT:?}" '{key: $key, consumer: $consumer, intent: "RESTORE", source: $source}' > "$body"
+    else
+      jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" '{key: $key, consumer: $consumer, intent: "QUARANTINE"}' > "$body"
+    fi
     ;;
   close)
     path="/v1/shards/$SHARD/close"

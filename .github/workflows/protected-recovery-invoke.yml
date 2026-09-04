@@ -1,12 +1,18 @@
 name: Protected recovery invoke
 
 # Owner-dispatched requests to the protected-recovery broker. Each consumer has
-# one job, one literal environment, and one purpose-level invoker: the job's
-# exact tuple is the only principal the broker project binds to that invoker,
-# the invoker holds only run.invoker on the broker, and the broker derives the
-# consumer and the permitted effect directions from the invoker identity. Reruns
-# are secured by the ledger: the idempotency key is the run, so a rerun replays
-# the recorded result instead of acting twice.
+# two jobs, one per effect direction, each with its own literal environment and
+# its own purpose-level invoker: the quarantine job exchanges only for
+# gha-isolate-<consumer> and the restore job only for gha-restore-<consumer>.
+# The job's exact direct-dispatch tuple (workflow_ref, workflow_sha,
+# environment, event) is the only principal the broker project binds to that
+# invoker, the invoker holds only run.invoker on the broker, and the broker
+# derives the consumer and the one permitted effect direction from the invoker
+# identity; close, reconcile, and status act only on shards of that same
+# direction. No evidence travels in any request: negative impersonation probes
+# are recorded by the broker from its own source. Reruns are secured by the
+# ledger: the idempotency key is the run, so a rerun replays the recorded
+# result instead of acting twice.
 
 on:
   workflow_dispatch:
@@ -20,23 +26,28 @@ on:
           - critical-history
           - healthmcp
           - runsetta
-      operation:
-        description: quarantine and restore append journaled effects; canary appends negative-impersonation evidence; close, reconcile, and status act on the named shard.
+      direction:
+        description: The one effect direction this dispatch may exercise; every operation below acts on shards of this direction only.
         required: true
         type: choice
         options:
           - quarantine
           - restore
-          - canary
+      operation:
+        description: append journals the direction's effects into a new shard; close, reconcile, and status act on the named shard.
+        required: true
+        type: choice
+        options:
+          - append
           - close
           - reconcile
           - status
       shard:
-        description: Shard acted on; a new session ID for quarantine and restore.
+        description: Shard acted on; a new session ID for append.
         required: true
         type: string
       argument:
-        description: For restore, the CLOSED quarantine shard to restore; for canary, the JSON canary record; otherwise empty.
+        description: For a restore append, the CLOSED and scan-ready quarantine shard to restore; otherwise empty.
         required: false
         type: string
 
@@ -47,15 +58,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  cdbentley:
-    name: cdbentley ${{ inputs.operation }}
-    if: inputs.target_repository == 'cdbentley'
+  cdbentley-quarantine:
+    name: cdbentley quarantine ${{ inputs.operation }}
+    if: inputs.target_repository == 'cdbentley' && inputs.direction == 'quarantine'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: recovery-cdbentley
+    environment: recovery-cdbentley-quarantine
     permissions:
       contents: read # Read the reviewed broker coordinates and invoke script.
-      id-token: write # Exchange only for the cdbentley purpose-level invoker.
+      id-token: write # Exchange only for the cdbentley quarantine purpose-level invoker.
 
     steps:
       - name: Checkout
@@ -76,7 +87,7 @@ jobs:
           {
             echo "url=$url"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
-            echo "invoker=gha-recovery-cdbentley@${project_id}.iam.gserviceaccount.com"
+            echo "invoker=gha-isolate-cdbentley@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
       - name: Exchange for the purpose-level invoker
@@ -96,20 +107,20 @@ jobs:
           ARGUMENT: ${{ inputs.argument }}
           BROKER_URL: ${{ steps.broker.outputs.url }}
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
-          IDEMPOTENCY_KEY: ${{ inputs.operation }}/${{ github.run_id }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
           SHARD: ${{ inputs.shard }}
-        run: bash protected-recovery/invoke.sh cdbentley
+        run: bash protected-recovery/invoke.sh cdbentley quarantine
 
-  critical-history:
-    name: critical-history ${{ inputs.operation }}
-    if: inputs.target_repository == 'critical-history'
+  cdbentley-restore:
+    name: cdbentley restore ${{ inputs.operation }}
+    if: inputs.target_repository == 'cdbentley' && inputs.direction == 'restore'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: recovery-critical-history
+    environment: recovery-cdbentley-restore
     permissions:
       contents: read # Read the reviewed broker coordinates and invoke script.
-      id-token: write # Exchange only for the critical-history purpose-level invoker.
+      id-token: write # Exchange only for the cdbentley restore purpose-level invoker.
 
     steps:
       - name: Checkout
@@ -130,7 +141,7 @@ jobs:
           {
             echo "url=$url"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
-            echo "invoker=gha-recovery-critical-history@${project_id}.iam.gserviceaccount.com"
+            echo "invoker=gha-restore-cdbentley@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
       - name: Exchange for the purpose-level invoker
@@ -150,20 +161,20 @@ jobs:
           ARGUMENT: ${{ inputs.argument }}
           BROKER_URL: ${{ steps.broker.outputs.url }}
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
-          IDEMPOTENCY_KEY: ${{ inputs.operation }}/${{ github.run_id }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
           SHARD: ${{ inputs.shard }}
-        run: bash protected-recovery/invoke.sh critical-history
+        run: bash protected-recovery/invoke.sh cdbentley restore
 
-  healthmcp:
-    name: healthmcp ${{ inputs.operation }}
-    if: inputs.target_repository == 'healthmcp'
+  critical-history-quarantine:
+    name: critical-history quarantine ${{ inputs.operation }}
+    if: inputs.target_repository == 'critical-history' && inputs.direction == 'quarantine'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: recovery-healthmcp
+    environment: recovery-critical-history-quarantine
     permissions:
       contents: read # Read the reviewed broker coordinates and invoke script.
-      id-token: write # Exchange only for the healthmcp purpose-level invoker.
+      id-token: write # Exchange only for the critical-history quarantine purpose-level invoker.
 
     steps:
       - name: Checkout
@@ -184,7 +195,7 @@ jobs:
           {
             echo "url=$url"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
-            echo "invoker=gha-recovery-healthmcp@${project_id}.iam.gserviceaccount.com"
+            echo "invoker=gha-isolate-critical-history@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
       - name: Exchange for the purpose-level invoker
@@ -204,20 +215,20 @@ jobs:
           ARGUMENT: ${{ inputs.argument }}
           BROKER_URL: ${{ steps.broker.outputs.url }}
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
-          IDEMPOTENCY_KEY: ${{ inputs.operation }}/${{ github.run_id }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
           SHARD: ${{ inputs.shard }}
-        run: bash protected-recovery/invoke.sh healthmcp
+        run: bash protected-recovery/invoke.sh critical-history quarantine
 
-  runsetta:
-    name: runsetta ${{ inputs.operation }}
-    if: inputs.target_repository == 'runsetta'
+  critical-history-restore:
+    name: critical-history restore ${{ inputs.operation }}
+    if: inputs.target_repository == 'critical-history' && inputs.direction == 'restore'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: recovery-runsetta
+    environment: recovery-critical-history-restore
     permissions:
       contents: read # Read the reviewed broker coordinates and invoke script.
-      id-token: write # Exchange only for the runsetta purpose-level invoker.
+      id-token: write # Exchange only for the critical-history restore purpose-level invoker.
 
     steps:
       - name: Checkout
@@ -238,7 +249,7 @@ jobs:
           {
             echo "url=$url"
             echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
-            echo "invoker=gha-recovery-runsetta@${project_id}.iam.gserviceaccount.com"
+            echo "invoker=gha-restore-critical-history@${project_id}.iam.gserviceaccount.com"
           } >> "$GITHUB_OUTPUT"
 
       - name: Exchange for the purpose-level invoker
@@ -258,7 +269,223 @@ jobs:
           ARGUMENT: ${{ inputs.argument }}
           BROKER_URL: ${{ steps.broker.outputs.url }}
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
-          IDEMPOTENCY_KEY: ${{ inputs.operation }}/${{ github.run_id }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
           SHARD: ${{ inputs.shard }}
-        run: bash protected-recovery/invoke.sh runsetta
+        run: bash protected-recovery/invoke.sh critical-history restore
+
+  healthmcp-quarantine:
+    name: healthmcp quarantine ${{ inputs.operation }}
+    if: inputs.target_repository == 'healthmcp' && inputs.direction == 'quarantine'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: recovery-healthmcp-quarantine
+    permissions:
+      contents: read # Read the reviewed broker coordinates and invoke script.
+      id-token: write # Exchange only for the healthmcp quarantine purpose-level invoker.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          url="$(jq -er --arg number "$project_number" '"https://\(.broker.serviceName)-\($number).\(.broker.region).run.app"' "$authority")"
+          {
+            echo "url=$url"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "invoker=gha-isolate-healthmcp@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange for the purpose-level invoker
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.invoker }}
+          token_format: id_token
+          id_token_audience: ${{ steps.broker.outputs.url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Invoke the broker
+        env:
+          ARGUMENT: ${{ inputs.argument }}
+          BROKER_URL: ${{ steps.broker.outputs.url }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
+          OPERATION: ${{ inputs.operation }}
+          SHARD: ${{ inputs.shard }}
+        run: bash protected-recovery/invoke.sh healthmcp quarantine
+
+  healthmcp-restore:
+    name: healthmcp restore ${{ inputs.operation }}
+    if: inputs.target_repository == 'healthmcp' && inputs.direction == 'restore'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: recovery-healthmcp-restore
+    permissions:
+      contents: read # Read the reviewed broker coordinates and invoke script.
+      id-token: write # Exchange only for the healthmcp restore purpose-level invoker.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          url="$(jq -er --arg number "$project_number" '"https://\(.broker.serviceName)-\($number).\(.broker.region).run.app"' "$authority")"
+          {
+            echo "url=$url"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "invoker=gha-restore-healthmcp@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange for the purpose-level invoker
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.invoker }}
+          token_format: id_token
+          id_token_audience: ${{ steps.broker.outputs.url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Invoke the broker
+        env:
+          ARGUMENT: ${{ inputs.argument }}
+          BROKER_URL: ${{ steps.broker.outputs.url }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
+          OPERATION: ${{ inputs.operation }}
+          SHARD: ${{ inputs.shard }}
+        run: bash protected-recovery/invoke.sh healthmcp restore
+
+  runsetta-quarantine:
+    name: runsetta quarantine ${{ inputs.operation }}
+    if: inputs.target_repository == 'runsetta' && inputs.direction == 'quarantine'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: recovery-runsetta-quarantine
+    permissions:
+      contents: read # Read the reviewed broker coordinates and invoke script.
+      id-token: write # Exchange only for the runsetta quarantine purpose-level invoker.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          url="$(jq -er --arg number "$project_number" '"https://\(.broker.serviceName)-\($number).\(.broker.region).run.app"' "$authority")"
+          {
+            echo "url=$url"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "invoker=gha-isolate-runsetta@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange for the purpose-level invoker
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.invoker }}
+          token_format: id_token
+          id_token_audience: ${{ steps.broker.outputs.url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Invoke the broker
+        env:
+          ARGUMENT: ${{ inputs.argument }}
+          BROKER_URL: ${{ steps.broker.outputs.url }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
+          OPERATION: ${{ inputs.operation }}
+          SHARD: ${{ inputs.shard }}
+        run: bash protected-recovery/invoke.sh runsetta quarantine
+
+  runsetta-restore:
+    name: runsetta restore ${{ inputs.operation }}
+    if: inputs.target_repository == 'runsetta' && inputs.direction == 'restore'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: recovery-runsetta-restore
+    permissions:
+      contents: read # Read the reviewed broker coordinates and invoke script.
+      id-token: write # Exchange only for the runsetta restore purpose-level invoker.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          url="$(jq -er --arg number "$project_number" '"https://\(.broker.serviceName)-\($number).\(.broker.region).run.app"' "$authority")"
+          {
+            echo "url=$url"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "invoker=gha-restore-runsetta@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange for the purpose-level invoker
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.invoker }}
+          token_format: id_token
+          id_token_audience: ${{ steps.broker.outputs.url }}
+          id_token_include_email: true
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Invoke the broker
+        env:
+          ARGUMENT: ${{ inputs.argument }}
+          BROKER_URL: ${{ steps.broker.outputs.url }}
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
+          OPERATION: ${{ inputs.operation }}
+          SHARD: ${{ inputs.shard }}
+        run: bash protected-recovery/invoke.sh runsetta restore

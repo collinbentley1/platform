@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { manifestPath } from "../../tools/ci/workflow-authority";
-import { type ServiceAccountIam, GoogleServiceAccountIam, driveEffect } from "./effects";
-import { type FirestoreTarget, type Rejection, Ledger, LedgerUnavailable, emailOf } from "./ledger";
+import { type ImpersonationProbe, type ServiceAccountIam, GoogleServiceAccountIam, driveEffect, undeployedProbe } from "./effects";
+import { type FirestoreTarget, type Rejection, Ledger, LedgerUnavailable } from "./ledger";
 import {
   type Entry,
   type ParsedRequest,
@@ -20,16 +20,19 @@ import {
   parseCloseBody,
   parseReconcileBody,
   parseShardId,
+  probePermission,
+  probesNeeded,
   purposeForIdentity,
   scanReadiness,
   targetsFor,
+  unrecordedIdentities,
 } from "./model";
 import { type EvidenceStore, GoogleEvidenceStore, entryEvidence, project } from "./outbox";
 
 // The thin HTTP service. Identity is verified first and purpose is derived from
 // it; the body is parsed once against a closed grammar; the purpose's binding
-// to its consumer and effect directions is enforced; then the ledger, effects,
-// and outbox modules do the work.
+// to its consumer and its one effect direction is enforced; then the ledger,
+// effects, probe, and outbox modules do the work.
 
 export interface Identity {
   readonly email: string;
@@ -45,6 +48,7 @@ export interface BrokerDependencies {
   readonly iam: ServiceAccountIam;
   readonly ledger: Ledger;
   readonly now: () => Date;
+  readonly probe: ImpersonationProbe;
 }
 
 export interface BrokerResponse {
@@ -65,7 +69,7 @@ export class Broker {
     const { ledger } = this.#deps;
     switch (request.kind) {
       case "append": {
-        if (purpose.kind !== "recovery" || purpose.consumer.repository !== request.consumer || !purpose.intents.includes(intentOf(request.body))) return forbidden();
+        if (purpose.kind !== "recovery" || purpose.consumer.repository !== request.consumer || purpose.intent !== intentOf(request.body)) return forbidden();
         const targets = request.body.kind === "quarantine" ? targetsFor(this.#deps.authority, purpose.consumer) : undefined;
         const outcome = await ledger.append(request, targets);
         switch (outcome.kind) {
@@ -82,7 +86,7 @@ export class Broker {
       // eslint-disable-next-line no-fallthrough
       case "close": {
         if (purpose.kind !== "recovery") return forbidden();
-        const outcome = await ledger.beginClose(request, purpose.consumer.repository);
+        const outcome = await ledger.beginClose(request, purpose.consumer.repository, purpose.intent);
         switch (outcome.kind) {
           case "closing":
           case "replayed":
@@ -124,11 +128,19 @@ export class Broker {
   // Drive every recorded pending step of one shard and finish the close only
   // when nothing remains. Every step is idempotent and conditional, so any
   // number of instances (or zero, followed by one) reaches the same state.
+  // For an OPEN QUARANTINE shard the broker also records the probes it needs
+  // from its probe source; with no source deployed, nothing is recorded.
   async reconcileShard(shardId: string): Promise<Record<string, unknown> | undefined> {
-    const { authority, evidence, iam, ledger } = this.#deps;
+    const { authority, evidence, iam, ledger, now, probe } = this.#deps;
     let shard = await ledger.readShard(shardId);
     if (!shard) return undefined;
     const notes: string[] = [];
+    const projectEntry = async (entry: Entry): Promise<void> => {
+      const projected = await project(evidence, entry.objectName, entryEvidence(shardId, entry));
+      if (projected.kind === "projected") await ledger.markEntryProjected(shardId, entry.sequence, projected.generation, projected.sha256);
+      else if (projected.kind === "diverged") await ledger.divergeEntryOutbox(shardId, entry.sequence, projected.reason);
+      else notes.push(`${entry.sequence}: outbox pending; ${projected.reason}`);
+    };
     if (shard.phase === "OPEN" || shard.phase === "CLOSING") {
       const consumer = consumerNamed(authority, shard.consumer);
       for (const initial of await ledger.readEntries(shardId, shard.nextSequence - 1)) {
@@ -138,26 +150,43 @@ export class Broker {
             notes.push(`${entry.sequence}: pending; consumer ${shard.consumer} is not declared`);
             continue;
           }
-          const target: Target = { account: entry.body.account, email: emailOf(entry.body.resource), members: entry.body.members, pool: consumerPool(authority, consumer), resource: entry.body.resource };
+          const target: Target = { account: entry.body.account, email: entry.body.email, members: entry.body.members, pool: consumerPool(authority, consumer), resource: entry.body.resource, uniqueId: entry.body.uniqueId };
           const driven = await driveEffect(ledger, iam, shardId, entry, target);
           entry = driven.entry;
           if (driven.kind === "pending") notes.push(`${entry.sequence}: pending; ${driven.reason}`);
           else if (driven.kind === "stale") notes.push(`${entry.sequence}: stale actuator; nothing written`);
         }
         if ((entry.progress === null || entry.progress.state === "ACKED") && entry.outbox.state === "PENDING") {
-          const projected = await project(evidence, entry.objectName, entryEvidence(shardId, entry));
-          if (projected.kind === "projected") await ledger.markEntryProjected(shardId, entry.sequence, projected.generation, projected.sha256);
-          else if (projected.kind === "diverged") await ledger.divergeEntryOutbox(shardId, entry.sequence, projected.reason);
-          else notes.push(`${entry.sequence}: outbox pending; ${projected.reason}`);
+          await projectEntry(entry);
         } else if (entry.progress?.state === "DIVERGED") {
           notes.push(`${entry.sequence}: diverged; ${entry.progress.reason}`);
         }
       }
       shard = await ledger.readShard(shardId);
       if (!shard) return undefined;
+      if (shard.phase === "OPEN" && shard.intent === "QUARANTINE") {
+        const entries = await ledger.readEntries(shardId, shard.nextSequence - 1);
+        for (const need of probesNeeded(shard, entries, now())) {
+          const result = await probe.probe({ email: need.email, member: need.member, permission: probePermission, resource: need.resource, uniqueId: need.uniqueId });
+          if (result.kind === "unavailable") {
+            notes.push(`${need.account}: ${need.phase} probe unavailable; ${result.reason}`);
+            continue;
+          }
+          const { notBefore: _notBefore, resource: _resource, ...identity } = need;
+          const recorded = await ledger.recordProbe(shardId, { ...identity, observedAt: result.observedAt, outcome: result.outcome, permission: probePermission, principal: result.principal });
+          if (recorded.kind === "refused") {
+            notes.push(`${need.account}: ${need.phase} probe refused; ${recorded.reason}`);
+            continue;
+          }
+          await projectEntry(recorded.entry);
+        }
+        shard = await ledger.readShard(shardId);
+        if (!shard) return undefined;
+      }
       if (shard.phase === "CLOSING") {
         const finished = await ledger.finishClose(shardId);
         if (finished.kind === "finalizing") shard = finished.shard;
+        else notes.push(`close pending; ${finished.reason}`);
       }
     }
     if (shard.phase === "FINALIZING" && shard.terminal.progress.state === "PENDING") {
@@ -170,8 +199,10 @@ export class Broker {
   }
 }
 
+// A purpose may touch only the shards of its own consumer and its own
+// direction; the reconciler may touch any recorded shard.
 function allowed(purpose: Purpose, shard: Shard): boolean {
-  return purpose.kind === "reconciler" || (purpose.consumer.repository === shard.consumer && purpose.intents.includes(shard.intent));
+  return purpose.kind === "reconciler" || (purpose.consumer.repository === shard.consumer && purpose.intent === shard.intent);
 }
 
 function forbidden(): BrokerResponse {
@@ -185,6 +216,7 @@ function notFound(): BrokerResponse {
 function rejected(rejection: Rejection): BrokerResponse {
   if (rejection.reason === "NOT_FOUND") return notFound();
   if (rejection.reason === "SHARD_NOT_OPEN") return { status: 409, body: { error: rejection.reason, phase: rejection.phase } };
+  if (rejection.reason === "NOT_READY") return { status: 409, body: { blockers: [...rejection.blockers], error: rejection.reason } };
   return { status: rejection.reason === "SHARD_MISMATCH" ? 403 : 409, body: { detail: rejection.detail, error: rejection.reason } };
 }
 
@@ -328,6 +360,15 @@ const clockSkewSeconds = 60;
 // Cloud Run enforces roles/run.invoker at its edge, then forwards the bearer.
 // The broker verifies the Google-signed ID token itself so that the purpose is
 // derived from a proven service-account identity and the exact audience.
+//
+// The token travels in the Authorization header only: invoke.sh sends it
+// there, and this verifier reads it there. Google documents that Cloud Run
+// removes the token signature only from the X-Serverless-Authorization
+// header, which this service neither sends nor reads. No test in this
+// repository exercises the Cloud Run edge, so the live forwarded-header
+// behaviour -- that a request authenticated at the edge with Authorization
+// reaches the container with a signature this verifier accepts -- is a
+// mandatory ACTIVATION canary before any purpose can be exercised.
 export class GoogleIdentityVerifier implements IdentityVerifier {
   readonly #deps: GoogleIdentityDependencies;
 
@@ -422,9 +463,16 @@ export interface RuntimeConfiguration {
   readonly port: number;
 }
 
+// The service refuses to start on null broker coordinates and on any target
+// whose permanent unique ID is not recorded: an email-addressed effect could
+// otherwise land on a recreated account with the same address.
 export function configurationFromEnvironment(env: Readonly<Record<string, string | undefined>>, authority: RecoveryAuthority): RuntimeConfiguration {
   if (authority.broker.projectId === null) {
     throw new Error("protected-recovery/authority.json records no broker project; the service refuses to start.");
+  }
+  const unrecorded = unrecordedIdentities(authority);
+  if (unrecorded.length > 0) {
+    throw new Error(`protected-recovery/authority.json records no unique ID for ${unrecorded.join(", ")}; the service refuses to start.`);
   }
   const required = (name: string): string => {
     const value = env[name];
@@ -462,6 +510,9 @@ if (import.meta.main) {
     iam: new GoogleServiceAccountIam({ fetch, token }),
     ledger,
     now,
+    // No approved probe source exists; every probe is unavailable and no
+    // QUARANTINE shard can become scan-ready, close, or be restored.
+    probe: undeployedProbe,
   });
   const verifier = new GoogleIdentityVerifier({ audience: configuration.audience, jwks: googleJwks(fetch, now), now });
   const server = Bun.serve({
