@@ -2605,7 +2605,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "d10c8b379aa9f2a0acab24fa19273c31a500bd980da013b1558d88780096c80b"
+  "e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
@@ -3019,7 +3019,6 @@ for (const boundary of [
   "active_workflow_sha         = var.active_workflow_sha",
   "transition_workflow_sha     = local.transition_workflow_sha",
   'transition_workflow_sha = var.transition_workflow_sha == "" ? null : var.transition_workflow_sha',
-  "condition     = !var.legacy_compatibility_mode",
 ]) {
   requireContains(
     "terraform/deployments/bootstrap/main.tf",

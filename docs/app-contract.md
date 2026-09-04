@@ -164,8 +164,9 @@ tuples of the jobs that exchange for it, as enumerated per id-token job in
 attestation jobs bind no Google identity, each no-role canary has its own
 `production-canary`, `preview-cloud-canary`, or `preview-publish-canary`
 environment, and the `preview-operations` tuples authenticate only the
-read-only `gha-preview-operator` IAM auditor and the service-scoped
-`gha-preview-commit` committer. Cloud Run revalidates the attached service
+read-only `gha-preview-operator` IAM auditor, the service-scoped
+`gha-preview-commit` committer, and the no-role `gha-wif-canary`.
+Cloud Run revalidates the attached service
 identity and image during `update-traffic`, so that coarse capability is
 contained by the exact tuple, the immutable numeric-repository-ID
 project/service map, fixed CLI arguments, and no PR checkout or PR-controlled

@@ -27,16 +27,6 @@ run "reject_pre_migration_transition_sha" {
   expect_failures = [var.transition_workflow_sha]
 }
 
-run "reject_legacy_compatibility_mode" {
-  command = plan
-
-  variables {
-    legacy_compatibility_mode = true
-  }
-
-  expect_failures = [var.legacy_compatibility_mode]
-}
-
 run "steady_state_passes_no_transition_sha" {
   command = plan
 

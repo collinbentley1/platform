@@ -178,8 +178,9 @@ but bind no Google identity, and each no-role canary enters its own
 `production-canary`, `preview-cloud-canary`, or `preview-publish-canary`
 environment so its tuple can mint nothing but `gha-wif-canary`.
 `preview-operations` tuples authenticate only the read-only
-`gha-preview-operator` IAM auditor and the service-scoped `gha-preview-commit`
-transaction committer. Cloud Run revalidates the service identity and image
+`gha-preview-operator` IAM auditor, the service-scoped `gha-preview-commit`
+transaction committer, and the no-role `gha-wif-canary`.
+Cloud Run revalidates the service identity and image
 during `gcloud run services update-traffic`, so the API-minimum traffic
 operation is contained by that exact tuple, the immutable numeric-repository-ID
 project/service map, fixed CLI arguments, and the absence of PR checkout or

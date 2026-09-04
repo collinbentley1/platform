@@ -43,13 +43,8 @@ variable "federation_quarantined" {
 }
 
 variable "legacy_compatibility_mode" {
-  description = "Retained pipeline input. Exact job_workflow_ref trust has no compatibility phase, so the only accepted value is false."
+  description = "Retained pipeline input that is accepted and ignored: exact job_workflow_ref trust has no compatibility phase, so nothing here or in the module consumes it."
   type        = bool
-
-  validation {
-    condition     = !var.legacy_compatibility_mode
-    error_message = "legacy_compatibility_mode must be false: every binding is an exact reusable-workflow reference and no legacy fallback exists."
-  }
 }
 
 variable "transition_workflow_sha" {

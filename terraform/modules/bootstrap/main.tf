@@ -921,7 +921,7 @@ resource "google_service_account_iam_member" "workflow_authority" {
         for entry in local.workflow_authority : (
           contains(["attestation", "gcp"], entry.purpose) &&
           (entry.purpose == "gcp") == (length(entry.serviceAccounts) > 0) &&
-          !strcontains(join("", concat([entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
+          !strcontains(join("", concat([local.github_repo_full_name, entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
         )
       ])
       error_message = "workflow-authority.json must declare only attestation or gcp purposes, accounts only for gcp jobs, and no reserved delimiter in any tuple value."

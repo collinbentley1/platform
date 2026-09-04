@@ -164,14 +164,15 @@ export async function checkWorkflowAuthority(root: string): Promise<WorkflowAuth
       if (job.permissions === undefined && document.permissions === undefined) {
         failures.push(`${path}: job ${id} declares no permissions and the workflow declares none.`);
       }
-      if (!mintsIdToken(job.permissions ?? document.permissions)) continue;
+      const permissions = job.permissions ?? document.permissions;
+      if (!mintsIdToken(permissions)) continue;
       const entry = manifest.entries.find((candidate) => candidate.workflow === path && candidate.job === id);
       if (!entry) {
         failures.push(`${path}: job ${id} requests id-token: write but ${manifestPath} declares no authority for it.`);
         continue;
       }
       covered.add(entry);
-      checkJob(entry, job, failures);
+      checkJob(entry, job, permissions, failures);
     }
   }
   for (const entry of manifest.entries) {
@@ -220,9 +221,9 @@ async function parseWorkflow(root: string, path: string, failures: string[]): Pr
   return undefined;
 }
 
-function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, failures: string[]): void {
+function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, permissions: unknown, failures: string[]): void {
   const where = `${entry.workflow}: job ${entry.job}`;
-  if (job.permissions === "write-all") failures.push(`${where} must declare an explicit permissions mapping, not write-all.`);
+  if (permissions === "write-all") failures.push(`${where} must declare an explicit permissions mapping, not write-all.`);
   const environment = literalEnvironment(job.environment);
   if (environment === undefined) failures.push(`${where} environment must be one literal environment name.`);
   else if (environment !== entry.environment) failures.push(`${where} environment ${environment} does not match the manifest environment ${entry.environment}.`);
@@ -271,7 +272,7 @@ async function checkCaller(root: string, entry: WorkflowAuthorityEntry, caller: 
     }
   }
   const jobs = isRecord(document.jobs) ? Object.values(document.jobs) : [];
-  const calls = jobs.filter((job) => isRecord(job) && job.uses === `${platformRepository}/${entry.workflow}@__PLATFORM_SHA__` && mintsIdToken(job.permissions));
+  const calls = jobs.filter((job) => isRecord(job) && job.uses === `${platformRepository}/${entry.workflow}@__PLATFORM_SHA__` && mintsIdToken(job.permissions ?? document.permissions));
   if (calls.length !== 1) {
     failures.push(`${path}: exactly one job must call ${platformRepository}/${entry.workflow}@__PLATFORM_SHA__ with id-token: write; found ${calls.length}.`);
   }

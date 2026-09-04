@@ -14,7 +14,7 @@
     ".github/workflows/deploy-prod.yml": "sha256:522fb500b7e8b68af15dd9c9d75d61d1250323f5026353a1d8dc826ee143f7ba",
     ".github/workflows/infrastructure.yml": "sha256:e83431a887021aeb97e184aba65d2eb6597ad692e2fe8a393232dbc9d63682cd",
     ".github/workflows/reconcile-previews.yml": "sha256:0172ca48e6e14ce3cf01b19aa4345fb08d3c3ea9f252e4aa144a7877fa2e76a2",
-    "terraform/modules/bootstrap/main.tf": "sha256:d10c8b379aa9f2a0acab24fa19273c31a500bd980da013b1558d88780096c80b",
+    "terraform/modules/bootstrap/main.tf": "sha256:e8366e4556e4456c74c9abf37cfb4a0cc278a540e0283180de1fd6676bf639cf",
     "terraform/modules/bootstrap/variables.tf": "sha256:f5c98ec81aee156ae102b142ba490d15c2f1dcd3c9e1b5515221060313f9f619",
     "terraform/modules/cloud-run-service/main.tf": "sha256:349780e0b92a85bbf4e6d1f330bfecadbb887c5183cca9a35729bdfec518dbab",
     "tools/ci/cloud-run-dhi-parity.sh": "sha256:bb3b759148c081b0135378046db1b09c32f710733bca9a96c00fa34d1815ce32",

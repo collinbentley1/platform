@@ -242,6 +242,16 @@ describe("workflow authority manifest", () => {
     ]);
   });
 
+  test("write-all permissions a declared job inherits from its workflow are refused", async () => {
+    const root = await fixtureRoot();
+    await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>
+      text.replace("\npermissions: {}\n", "\npermissions: write-all\n").replace("    permissions:\n      id-token: write # Exchange only for the no-role exact-WIF canary identity.\n", ""),
+    );
+    expect(await failuresOf(root)).toEqual([
+      ".github/workflows/deploy-prod.yml: job canary must declare an explicit permissions mapping, not write-all.",
+    ]);
+  });
+
   test("the reserved composite delimiter is refused in every manifest value", async () => {
     const root = await fixtureRoot();
     await editEntry(root, "deploy-prod.yml", "canary", (canary) => {
@@ -271,6 +281,15 @@ describe("workflow authority manifest", () => {
     expect(await failuresOf(root)).toEqual([
       `${template}: exactly one job must call collinbentley1/platform/.github/workflows/cleanup-preview.yml@__PLATFORM_SHA__ with id-token: write; found 0.`,
     ]);
+  });
+
+  test("a caller job that inherits id-token: write from its workflow permissions is counted", async () => {
+    const root = await fixtureRoot();
+    const template = "templates/app/.github/workflows/cleanup-preview.yml";
+    await editFile(root, template, (text) =>
+      text.replace("\npermissions: {}\n", "\npermissions:\n  id-token: write\n").replace("    permissions:\n      actions: read # Download only the exact prefetch artifact id the reusable workflow produces.\n      id-token: write # Exchange only for the exact-SHA preview traffic operator.\n      pull-requests: read # Let the reusable cleanup re-read current lifecycle state.\n", ""),
+    );
+    expect(await failuresOf(root)).toEqual([]);
   });
 
   test("symbolic links and non-workflow entries in the workflow directory fail closed", async () => {

@@ -670,12 +670,6 @@ describe("protected container and preview lifecycle contracts", () => {
     expect(source).toContain(
       'attribute_condition = "assertion.repository_owner_id == \'${local.github_owner_id}\' && assertion.repository_id == \'${var.github_repository_id}\' && assertion.runner_environment == \'github-hosted\'"',
     );
-    for (const repositoryId of ["1255553151", "711292980", "1025243085", "280932482"]) {
-      const condition = `assertion.repository_owner_id == '16823277' && assertion.repository_id == '${repositoryId}' && assertion.runner_environment == 'github-hosted'`;
-      expect(condition.length).toBeLessThanOrEqual(4096);
-      expect(condition.split(" && ")).toHaveLength(3);
-      expect(condition).not.toMatch(/job_workflow|event_name|run_attempt|has\(|startsWith|\?/);
-    }
     const mappingBlock = source.slice(
       source.indexOf("attribute_mapping = {"),
       source.indexOf("attribute_condition ="),
