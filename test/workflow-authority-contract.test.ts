@@ -150,31 +150,38 @@ describe("the live inventory agrees with the declaration", () => {
   // The structural gate passes the live condition for reasons that can be
   // checked here: each rendering is a conjunction whose guard -- the owner
   // and repository IDs, the presence checks, the run attempt, the runner, the
-  // SHA disjunction at either element count -- binds nothing on its own, and
-  // whose last conjunct is a disjunction bounded by whole-operand trust forms
-  // naming exactly the cloud-authority workflows.
-  test("the live condition renders as four conjunctions, each bounded by its workflow disjunction", async () => {
+  // SHA disjunction at any of its three element counts -- binds nothing on its
+  // own, and whose last conjunct is a disjunction bounded by whole-operand
+  // trust forms naming exactly the cloud-authority workflows.
+  test("the live condition renders as six conjunctions, each bounded by its workflow disjunction", async () => {
     const trust = trustedWorkflowsFromTerraform((await liveSources()).terraform);
     expect(trust.kind).toBe("trusted");
     if (trust.kind !== "trusted") return;
     const oneSha = "var.trusted_platform_workflow_shas has one element";
-    const moreShas = "var.trusted_platform_workflow_shas has more than one element";
+    const twoShas = "var.trusted_platform_workflow_shas has two elements";
+    const moreShas = "var.trusted_platform_workflow_shas has more than two elements";
     expect(trust.conditions.map((condition) => condition.choices)).toEqual([
       ["var.legacy_compatibility_mode is true", oneSha],
+      ["var.legacy_compatibility_mode is true", twoShas],
       ["var.legacy_compatibility_mode is true", moreShas],
       ["var.legacy_compatibility_mode is false", oneSha],
+      ["var.legacy_compatibility_mode is false", twoShas],
       ["var.legacy_compatibility_mode is false", moreShas],
     ]);
     const guard = (shas: string) =>
       "assertion.repository_owner_id == 'var.github_owner_id' && assertion.repository_id == 'var.github_repository_id' && " +
       "has(assertion.job_workflow_ref) && has(assertion.job_workflow_sha) && has(assertion.run_attempt) && " +
       `assertion.run_attempt == '1' && assertion.runner_environment == 'github-hosted' && (${shas})`;
-    const oneShaGuard = guard("assertion.job_workflow_sha == 'sha'");
-    const moreShasGuard = guard("assertion.job_workflow_sha == 'sha' || assertion.job_workflow_sha == 'sha'");
-    expect(conditionStructure(oneShaGuard).kind).toBe("unbounded");
-    expect(conditionStructure(moreShasGuard).kind).toBe("unbounded");
+    const one = "assertion.job_workflow_sha == 'sha'";
+    const guards: Record<string, string> = {
+      [oneSha]: guard(one),
+      [twoShas]: guard(`${one} || ${one}`),
+      [moreShas]: guard(`${one} || ${one} || ${one}`),
+    };
+    for (const prefix of Object.values(guards)) expect(conditionStructure(prefix).kind).toBe("unbounded");
     for (const condition of trust.conditions) {
-      const prefix = condition.choices.includes(oneSha) ? oneShaGuard : moreShasGuard;
+      const count = condition.choices.find((choice) => choice in guards) ?? "";
+      const prefix = guards[count] ?? "";
       expect(condition.text.startsWith(`${prefix} && (`)).toBe(true);
       expect(condition.text.endsWith(")")).toBe(true);
       const disjunction = condition.text.slice(prefix.length + " && (".length, -1);
@@ -644,6 +651,58 @@ describe("the file universe refuses what it cannot classify", () => {
     ]);
     expect([...universe.sources.keys()]).toEqual(["infra/main.tf"]);
   });
+
+  // The walk sweeps the whole repository, not just the Terraform tree, so a
+  // benign symlink beside the code -- one that resolves to a regular file and
+  // is not itself named like Terraform -- must be left alone. It used to be
+  // refused as a Terraform source, breaking the entire lint with a message
+  // naming a file Terraform never reads.
+  test("a benign symlink to a regular file does not fail the scan", async () => {
+    const temporary = await temporaryRoot("platform-authority-benign-symlink-");
+    await mkdir(join(temporary, "terraform/modules/x"), { recursive: true });
+    await writeFile(join(temporary, "terraform/modules/x/main.tf"), "locals {}\n");
+    await writeFile(join(temporary, "README.md"), "docs\n");
+    await symlink("README.md", join(temporary, "docs-link"));
+    const universe = await terraformUniverse(temporary);
+    expect(universe.kind).toBe("resolved");
+    if (universe.kind !== "resolved") return;
+    expect([...universe.sources.keys()]).toEqual(["terraform/modules/x/main.tf"]);
+  });
+
+  // The shape refusal is narrowed, not removed: a symlink that could stand in
+  // for a directory is still refused wherever it sits, whatever its name, so
+  // no directory can be smuggled past a walk that never follows a link.
+  test("a symlink that resolves to a directory is still refused, whatever its name", async () => {
+    const temporary = await temporaryRoot("platform-authority-dir-symlink-");
+    await mkdir(join(temporary, "terraform/modules/x"), { recursive: true });
+    await mkdir(join(temporary, "elsewhere"), { recursive: true });
+    await writeFile(join(temporary, "terraform/modules/x/main.tf"), "locals {}\n");
+    await symlink("elsewhere", join(temporary, "dir-link"));
+    const universe = await terraformUniverse(temporary);
+    expect(universe.kind).toBe("rejected");
+    if (universe.kind !== "rejected") return;
+    expect(universe.failures).toContain("dir-link is a symbolic link; Terraform sources must be regular files.");
+  });
+
+  // An entry that cannot even be inspected is a finding naming it, not a raw
+  // stack trace: a directory readable enough to list but not to traverse fails
+  // the lstat on each entry inside it, and that must read the same way as a
+  // file that cannot be opened.
+  test.skipIf(process.getuid?.() === 0)("an entry that cannot be inspected is named, not a stack trace", async () => {
+    const temporary = await temporaryRoot("platform-authority-uninspectable-");
+    const sealed = join(temporary, "terraform/modules/sealed");
+    await mkdir(sealed, { recursive: true });
+    await writeFile(join(sealed, "main.tf"), "locals {}\n");
+    await chmod(sealed, 0o400);
+    try {
+      const universe = await terraformUniverse(temporary);
+      expect(universe.kind).toBe("rejected");
+      if (universe.kind !== "rejected") return;
+      expect(universe.failures.join(" ")).toContain("terraform/modules/sealed/main.tf could not be inspected");
+    } finally {
+      await chmod(sealed, 0o700);
+    }
+  });
 });
 
 describe("Terraform trust is read from provider conditions only", () => {
@@ -1105,13 +1164,33 @@ describe("the effective condition is bounded by its boolean structure", () => {
       "when var.shas is empty, the condition cannot be decomposed: an operand is empty",
     );
   });
+
+  // `length(var.shas) > 0` proves the variable nonempty, but the `for`
+  // iterates compact(var.shas), which drops empty strings -- and the pin
+  // `^[0-9a-f]*$` matches the empty string, so `[""]` passes validation while
+  // compact() empties it. The nonempty claim is therefore lost when compact()
+  // (or flatten()) wraps the variable, the empty rendering is kept, and the
+  // empty condition it would produce fails closed rather than being assumed
+  // away.
+  test("a for over compact(var) loses nonempty, so the empty rendering is still checked", () => {
+    const emptyMatchable =
+      `variable "shas" {\n  type = set(string)\n\n  validation {\n    condition = (\n      length(var.shas) > 0 &&\n` +
+      `      alltrue([for sha in var.shas : can(regex("^[0-9a-f]*$", sha))])\n    )\n    error_message = "x"\n  }\n}\n`;
+    const shas =
+      `locals {\n  shas = join(" || ", [\n    for sha in compact(var.shas) : "assertion.job_workflow_sha == '${hole("sha")}'"\n  ])\n}\n`;
+    expect(trustFailures(singleFile(emptyMatchable + shas + provider(`"(${hole("local.shas")}) && ${exact}"`)))).toContain(
+      "when var.shas is empty, the condition cannot be decomposed: an operand is empty",
+    );
+  });
 });
 
 // The separator is the one place a join can introduce an operator, and the
 // rendering used to drop it: a `for` yielded one element and no separator, so
 // a disjunct hidden in the separator was invisible to the structural gate and
-// the lint exited 0 for it.
-describe("the separator of a join over a for is rendered between two elements", () => {
+// the lint exited 0 for it. The separator now shows at every element count,
+// and the `for` is rendered at three of them (see the three-element-only
+// fail-open exercised below).
+describe("the separator of a join over a for is rendered between its elements", () => {
   const hole = (body: string) => "${" + body + "}";
   const exact = trustLine("deploy-prod.yml");
   const attacker = "assertion.repository_owner == 'attacker'";
@@ -1119,26 +1198,27 @@ describe("the separator of a join over a for is rendered between two elements", 
     `variable "shas" {\n  type = set(string)\n\n  validation {\n    condition = (\n      length(var.shas) > 0 &&\n` +
     `      alltrue([for sha in var.shas : can(regex("^[0-9a-f]{40}$", sha))])\n    )\n    error_message = "x"\n  }\n}\n`;
   const shaFor = `for sha in sort(tolist(var.shas)) : "assertion.job_workflow_sha == '${hole("sha")}'"`;
+  const sha = "assertion.job_workflow_sha == 'sha'";
   // The live shape: the SHA disjunction built in a local and spliced as a
   // conjunct beside the trust form.
   const spliced = (separator: string) =>
     pinnedShas +
     `locals {\n  shas = join(${separator}, [\n    ${shaFor}\n  ])\n}\n` +
     provider(`"(${hole("local.shas")}) && (${exact})"`);
+  // Any content the separator carries appears the moment two elements sit on
+  // either side of it, so it is the two-element rendering that first refuses.
   const widened =
-    "when var.shas has more than one element, the condition admits a token from any workflow through the || operand";
+    "when var.shas has two elements, the condition admits a token from any workflow through the || operand";
 
-  test("a || separator is admitted, and the for is rendered at both element counts", () => {
+  test("a || separator is admitted, and the for is rendered at three element counts", () => {
     const trust = trustedWorkflowsFromTerraform(singleFile(spliced('" || "')));
     expect(trust.kind).toBe("trusted");
     if (trust.kind !== "trusted") return;
     expect([...trust.workflows]).toEqual(["deploy-prod.yml"]);
     expect(trust.conditions.map((condition) => [condition.choices, condition.text])).toEqual([
-      [["var.shas has one element"], `(assertion.job_workflow_sha == 'sha') && (${exact})`],
-      [
-        ["var.shas has more than one element"],
-        `(assertion.job_workflow_sha == 'sha' || assertion.job_workflow_sha == 'sha') && (${exact})`,
-      ],
+      [["var.shas has one element"], `(${sha}) && (${exact})`],
+      [["var.shas has two elements"], `(${sha} || ${sha}) && (${exact})`],
+      [["var.shas has more than two elements"], `(${sha} || ${sha} || ${sha}) && (${exact})`],
     ]);
   });
 
@@ -1147,20 +1227,40 @@ describe("the separator of a join over a for is rendered between two elements", 
     [
       "|| true",
       '") || true || ("',
-      "when var.shas has more than one element, the condition uses the boolean literal true as an operand",
+      "when var.shas has two elements, the condition uses the boolean literal true as an operand",
     ],
     [
       "a CEL comment and a newline",
       '" || true // \\n || "',
-      "when var.shas has more than one element, the condition cannot be decomposed: the CEL comment at",
+      "when var.shas has two elements, the condition cannot be decomposed: the CEL comment at",
     ],
     [
       "a heredoc",
       "<<-EOT\n    ) || true || (\n  EOT\n  ",
-      "when var.shas has more than one element, the condition uses the boolean literal true as an operand",
+      "when var.shas has two elements, the condition uses the boolean literal true as an operand",
     ],
   ])("a separator carrying %s is refused", (_label, separator, message) => {
     expect(trustFailures(singleFile(spliced(separator)))).toContain(message);
+  });
+
+  // The three-element-only fail-open: a separator that breaks out of the
+  // parentheses around the join leaves the first and last SHA checks bound by
+  // the conjoined trust form, but a third element stands as a bare `||`
+  // operand between two separators -- admitting every token that presents its
+  // SHA. One and two elements render bounded; three does not.
+  test("a separator that isolates a middle element is refused only at three elements", () => {
+    const isolating = pinnedShas +
+      `locals {\n  shas = join(") || (", [\n    ${shaFor}\n  ])\n}\n` +
+      provider(`"${exact} && (${hole("local.shas")}) && ${exact}"`);
+    const trust = trustedWorkflowsFromTerraform(singleFile(isolating));
+    expect(trust.kind).toBe("invalid");
+    if (trust.kind !== "invalid") return;
+    const joined = trust.failures.join(" ");
+    expect(joined).toContain(`when var.shas has more than two elements, the condition admits a token from any workflow through the || operand "${sha}"`);
+    // The one- and two-element renderings stay bounded: the fail-open is the
+    // middle element alone, which only exists once there are at least three.
+    expect(joined).not.toContain("when var.shas has one element");
+    expect(joined).not.toContain("when var.shas has two elements");
   });
 
   // The same for-join as a list item of an outer join, beside the trust form
@@ -1412,7 +1512,7 @@ describe("the lint entrypoint refuses hostile workflow entries", () => {
     [
       "a join separator carrying a disjunct",
       extraProvider(`"($` + `{local.extra_shas}) && (${trustLine("deploy-prod.yml")})"`, separatorInjection),
-      "when var.extra_shas has more than one element, the condition admits a token from any workflow through the || operand \"assertion.repository_owner == 'attacker'\"",
+      "when var.extra_shas has two elements, the condition admits a token from any workflow through the || operand \"assertion.repository_owner == 'attacker'\"",
     ],
   ])("a second provider admitting %s beside a reviewed clause fails", async (_label, source, message) => {
     const result = await lintCopy(async (copy) => {
@@ -1420,6 +1520,45 @@ describe("the lint entrypoint refuses hostile workflow entries", () => {
     });
     expect(result.exitCode).not.toBe(0);
     expect(result.output).toContain(message);
+    expectOnlyFindingsAbout(result.output, "terraform/deployments/prod/extra.tf: google_iam_workload_identity_pool_provider.extra");
+  }, 30_000);
+
+  // The three-element fail-open: the SHA disjunction spliced as a conjunct
+  // without its own parentheses. `A` binds the first and last SHA checks
+  // through the trust form conjoined on either side, so one and two elements
+  // read as bounded operands; a third element stands alone as a bare `||`
+  // operand between two separators, admitting every token that presents its
+  // SHA. The variables.tf is the live nonempty, full-SHA pin, and three or
+  // more trusted SHAs is the ordinary state during a rotation. The rendering
+  // used to stop at two elements and the lint exited 0 for this provider.
+  const f1FailOpen =
+    `variable "trusted_platform_workflow_shas" {\n  type = set(string)\n\n  validation {\n    condition = (\n` +
+    `      length(var.trusted_platform_workflow_shas) > 0 &&\n` +
+    `      alltrue([for sha in var.trusted_platform_workflow_shas : can(regex("^[0-9a-f]{40}$", sha))])\n` +
+    `    )\n    error_message = "x"\n  }\n}\n` +
+    `locals {\n` +
+    `  production_workflow_condition = "assertion.job_workflow_ref == '${platformPath}deploy-prod.yml@' + assertion.job_workflow_sha && assertion.event_name == 'push'"\n` +
+    `  trusted_workflow_sha_condition = join(" || ", [\n` +
+    `    for sha in sort(tolist(var.trusted_platform_workflow_shas)) : "assertion.job_workflow_sha == '$` + `{sha}'"\n  ])\n` +
+    `  provider_condition = "$` + `{local.production_workflow_condition} && $` +
+    `{local.trusted_workflow_sha_condition} && $` + `{local.production_workflow_condition}"\n}\n` +
+    `resource "google_iam_workload_identity_pool_provider" "extra" {\n` +
+    `  workload_identity_pool_provider_id = "github-extra"\n  attribute_condition = local.provider_condition\n` +
+    `  oidc { issuer_uri = "https://token.actions.githubusercontent.com/" }\n}\n`;
+
+  test("a SHA disjunction spliced without its parentheses fails at three or more elements", async () => {
+    const result = await lintCopy(async (copy) => {
+      await writeFile(join(copy, "terraform/deployments/prod/extra.tf"), f1FailOpen);
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain(
+      `when var.trusted_platform_workflow_shas has more than two elements, ` +
+        `the condition admits a token from any workflow through the || operand "assertion.job_workflow_sha == 'sha'"`,
+    );
+    // Only the three-element rendering is the fail-open; one and two stay
+    // bounded and must not surface as findings.
+    expect(result.output).not.toContain("has one element");
+    expect(result.output).not.toContain("has two elements");
     expectOnlyFindingsAbout(result.output, "terraform/deployments/prod/extra.tf: google_iam_workload_identity_pool_provider.extra");
   }, 30_000);
 

@@ -17,7 +17,7 @@
 // file that cannot be read or parsed: authority that cannot be read cannot be
 // bounded.
 
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   type SecretContextReference,
@@ -143,9 +143,18 @@ type EntryShape =
   | "entry of unknown type";
 
 // `lstat`, never `stat`: the question is what the entry itself is, not what a
-// link happens to point at today.
-async function entryShape(path: string): Promise<EntryShape> {
-  const stats = await lstat(path);
+// link happens to point at today. An entry that cannot even be inspected is a
+// failure naming the file, never an uncaught error -- the same principle the
+// listing and the read below hold to: authority that cannot be read cannot be
+// bounded.
+async function entryShape(path: string, display: string, failures: string[]): Promise<EntryShape | undefined> {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    failures.push(`${display} could not be inspected: ${errorMessage(error)}.`);
+    return undefined;
+  }
   if (stats.isSymbolicLink()) return "symbolic link";
   if (stats.isFile()) return "regular file";
   if (stats.isDirectory()) return "directory";
@@ -153,6 +162,18 @@ async function entryShape(path: string): Promise<EntryShape> {
   if (stats.isSocket()) return "socket";
   if (stats.isBlockDevice() || stats.isCharacterDevice()) return "device";
   return "entry of unknown type";
+}
+
+// Whether a symbolic link resolves to a directory today. Used only to refuse
+// such a link: the walk never follows one, but a link that could stand in for
+// a directory must not be able to smuggle one in. A broken or unreadable link
+// resolves to no directory, so it is not refused on this ground.
+async function symlinkResolvesToDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 async function entryNames(path: string, display: string, failures: string[]): Promise<string[]> {
@@ -186,7 +207,8 @@ export async function workflowUniverse(root: string): Promise<FileUniverse> {
   const directory = join(root, workflowDirectory);
   for (const name of await entryNames(directory, workflowDirectory, failures)) {
     const display = `${workflowDirectory}/${name}`;
-    const shape = await entryShape(join(directory, name));
+    const shape = await entryShape(join(directory, name), display, failures);
+    if (shape === undefined) continue;
     if (shape !== "regular file") {
       failures.push(
         `${display} is a ${shape}; the workflow directory may hold only regular *.yml or *.yaml files.`,
@@ -229,13 +251,27 @@ async function collectTerraform(
   const listing = directory === "" ? "the repository root" : directory;
   for (const name of await entryNames(join(root, directory), listing, failures)) {
     const display = directory === "" ? name : `${directory}/${name}`;
-    const shape = await entryShape(join(root, display));
+    const shape = await entryShape(join(root, display), display, failures);
+    if (shape === undefined) continue;
     if (shape === "directory") {
       if (!unscannedDirectories.has(name)) await collectTerraform(root, display, failures, sources);
       continue;
     }
     if (shape !== "regular file") {
-      failures.push(`${display} is a ${shape}; Terraform sources must be regular files.`);
+      // The walk sweeps the whole repository, most of which is not Terraform,
+      // so a non-regular entry is refused only when it is named like a source
+      // the scan would otherwise read, or when it is a link that could stand
+      // in for a directory -- refused so directory traversal cannot be
+      // smuggled past a walk that never follows a link on its own. Any other
+      // stray link, pipe or socket the configuration never reads is left
+      // alone, so a benign symlink beside the code cannot fail the whole lint.
+      const namedLikeTerraform = terraformFileName.test(name) || jsonTerraformFileName.test(name);
+      if (
+        namedLikeTerraform ||
+        (shape === "symbolic link" && (await symlinkResolvesToDirectory(join(root, display))))
+      ) {
+        failures.push(`${display} is a ${shape}; Terraform sources must be regular files.`);
+      }
       continue;
     }
     if (jsonTerraformFileName.test(name)) {
@@ -1494,15 +1530,20 @@ function scanFragment(fragment: ConditionFragment, pins: ReadonlyMap<string, Var
 // and a local.* reference. A pinned value spliced into a literal is rendered
 // as the reference itself, so `'${var.github_owner_id}'` becomes
 // `'var.github_owner_id'`: the pin bounds what it can hold, and a string's
-// content is never read as structure. A `for` is rendered twice: as one
-// element, and as two elements with the separator between them. Every
-// element renders alike, so a third would add no operand of a new shape; the
-// separator is text of the maintainer's choosing and the one place a join
-// can introduce an operator, and it used to be dropped from the rendering,
-// so `join(") || (assertion.repository_owner == 'x') || (", [for ...])` read
-// as a single comparison. Over a collection that may be empty the `for`
-// yields the empty text as well, because an empty join leaves a hole in the
-// condition. Anything else refuses the provider.
+// content is never read as structure. A `for` is rendered at three element
+// counts: one, two, and more than two. Two is not enough -- every element
+// renders alike, but a middle element, flanked by the separator on both
+// sides, is a `||` operand of a shape that appears at neither one nor two
+// elements, where every element still abuts the text enclosing the join. So a
+// SHA disjunction spliced as `A && ${shas} && A` without its parentheses
+// reads as bounded operands until a third element leaves the bare middle SHA
+// check standing alone. The separator is text of the maintainer's choosing
+// and the one place a join can introduce an operator, and it used to be
+// dropped from the rendering, so `join(") || (assertion.repository_owner ==
+// 'x') || (", [for ...])` read as a single comparison. Over a collection that
+// may be empty -- including one a compact() or flatten() around the variable
+// can empty -- the `for` yields the empty text as well, because an empty join
+// leaves a hole in the condition. Anything else refuses the provider.
 // ---------------------------------------------------------------------------
 
 interface RenderedBranch {
@@ -1761,11 +1802,31 @@ function renderFor(
   if (pin?.kind !== "pinned") return unreadable(`${where} iterates over var.${source}, which no validation pins.`);
   const body = renderExpression(context, file, from + match[0].length, to, new Set([...iterators, iterator]), where);
   if (body.kind === "unreadable") return body;
+  // `length(var.X) > 0` proves the variable nonempty, but a `for` over
+  // compact(var.X) or flatten(var.X) drops elements, so the collection it
+  // actually iterates can still be empty -- and a pattern that matches the
+  // empty string lets `[""]` satisfy the length pin while compact() empties
+  // it. Where the collection reshapes the variable that way the empty
+  // rendering is kept, so the empty condition it would produce is checked
+  // rather than assumed away.
+  const nonempty = pin.nonempty && !/\b(?:compact|flatten)\s*\(/.test(collection);
+  // Three element counts, not two. Every element renders alike, but a middle
+  // element -- one flanked by the separator on both sides -- is a `||` operand
+  // of a shape that appears at neither one nor two elements: at two elements
+  // every element still abuts the text enclosing the join. So `A && X || X ||
+  // X && A` (a SHA disjunction spliced without its parentheses) reads as three
+  // bounded operands at n<=2 and admits the bare middle `X` only at n>=3. A
+  // third element exposes that operand; a fourth only repeats it, so three is
+  // enough.
   const options: ChoiceOption[] = [
     { label: `var.${source} has one element`, pieces: body.pieces },
-    { label: `var.${source} has more than one element`, pieces: [...body.pieces, separator, ...body.pieces] },
+    { label: `var.${source} has two elements`, pieces: [...body.pieces, separator, ...body.pieces] },
+    {
+      label: `var.${source} has more than two elements`,
+      pieces: [...body.pieces, separator, ...body.pieces, separator, ...body.pieces],
+    },
   ];
-  if (!pin.nonempty) options.push({ label: `var.${source} is empty`, pieces: [] });
+  if (!nonempty) options.push({ label: `var.${source} is empty`, pieces: [] });
   return { kind: "pieces", pieces: [{ options }] };
 }
 
