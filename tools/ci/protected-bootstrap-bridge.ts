@@ -112,7 +112,7 @@ const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CLEANUP_RETRY_INTERVAL_MS = 2_000;
 const IAM_CONSISTENCY_MAX_WAIT_MS = 5 * 60_000;
 const PRE_ELEVATION_CONVERGENCE_MINUTES = IAM_CONSISTENCY_MAX_WAIT_MS / 60_000;
-const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
+export const MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS = 7 * 60;
 // The apply budget is the job envelope minus runner setup and the same-job
 // tail, so it shortens by one second for every second of setup. What it must
 // still buy is the whole reviewed internal operation window, less the
@@ -126,7 +126,7 @@ const EXACT_CLEANUP_RESERVE_SECONDS = 5 * 60;
 // read-and-write with an already-expired API deadline and fails at the last
 // step. The work is deterministic and small: a metadata read, a
 // generation-bound read, and two write-plus-readback pairs.
-const OWNER_PUBLICATION_RESERVE_SECONDS = 60;
+export const OWNER_PUBLICATION_RESERVE_SECONDS = 60;
 const APPLY_CLEANUP_OVERHEAD_SECONDS = WRAPPER_CLEANUP_LEAD_SECONDS +
   EXACT_CLEANUP_RESERVE_SECONDS;
 // How much of that window setup may consume. The worst pre-elevation instant

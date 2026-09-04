@@ -452,8 +452,15 @@ jobs:
           # and elevated an executor. Setup measures 6 to 9 seconds here.
           case "$EXECUTION_MODE" in
             # A rehearsal runs the federation lifecycle and no Terraform, so it
-            # takes the plan envelope rather than the apply one.
-            plan|rehearsal)
+            # takes the plan envelope rather than the apply one. It still
+            # publishes an owner receipt, so its floor sits one publication
+            # reserve above plan's, as the bridge requires.
+            rehearsal)
+              bridge_reserve_seconds=$((17 * 60))
+              bridge_minimum_seconds=$((8 * 60))
+              bridge_maximum_seconds=$((25 * 60))
+              ;;
+            plan)
               bridge_reserve_seconds=$((17 * 60))
               bridge_minimum_seconds=$((7 * 60))
               bridge_maximum_seconds=$((25 * 60))

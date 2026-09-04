@@ -75,6 +75,8 @@ import {
   federationQuarantineRecordFromJson,
   restoreQuarantinedFederation,
   PRODUCTION_APPLY_ENABLED,
+  MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS,
+  OWNER_PUBLICATION_RESERVE_SECONDS,
   recoverFederationQuarantines,
   type FederationRecoverySummary,
   proveConsumerFreeze,
@@ -259,6 +261,37 @@ describe("protected owner Terraform bridge", () => {
     expect(workflow).not.toContain("id: recovery-bun");
     expect(workflow).toContain("bridge_reserve_seconds=$((17 * 60))");
     expect(workflow).toContain("bridge_maximum_seconds=$((25 * 60))");
+    // A rehearsal still publishes an owner receipt, so the bridge floors it at
+    // the plan floor plus the publication reserve. Each arm's literal must
+    // track its own floor: with a shared 420 floor the shell precheck accepted
+    // a budget that validateInvocation then rejected, wasting a protected run.
+    const modeCasesStart = workflow.lastIndexOf(
+      'case "$EXECUTION_MODE" in',
+      workflow.indexOf("bridge_reserve_seconds="),
+    );
+    const modeCases = workflow.slice(
+      modeCasesStart,
+      workflow.indexOf("\n          esac", modeCasesStart),
+    );
+    expect(modeCases).toContain("\n            rehearsal)\n");
+    expect(modeCases).toContain("\n            plan)\n");
+    const rehearsalArm = modeCases.slice(
+      modeCases.indexOf("\n            rehearsal)\n"),
+      modeCases.indexOf("\n            plan)\n"),
+    );
+    const planArm = modeCases.slice(
+      modeCases.indexOf("\n            plan)\n"),
+      modeCases.indexOf("\n            apply)\n"),
+    );
+    const rehearsalFloorSeconds = MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS +
+      OWNER_PUBLICATION_RESERVE_SECONDS;
+    expect(rehearsalFloorSeconds).toBe(480);
+    expect(rehearsalArm).toContain(
+      `bridge_minimum_seconds=$((${rehearsalFloorSeconds / 60} * 60))`,
+    );
+    expect(planArm).toContain(
+      `bridge_minimum_seconds=$((${MINIMUM_PLAN_BRIDGE_BUDGET_SECONDS / 60} * 60))`,
+    );
     expect(workflow).toContain("bridge_reserve_seconds=$((2 * 60))");
     // The apply floor is the ceiling less the reviewed setup tolerance; a
     // 34-minute floor admitted runs 239 seconds short of the pre-elevation
