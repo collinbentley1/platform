@@ -12,9 +12,8 @@ import { join } from "node:path";
 // shares through its byte-identical rendered caller template.
 export const manifestPath = "terraform/modules/bootstrap/workflow-authority.json";
 export const workflowDirectory = ".github/workflows";
-export const callerTemplateDirectory = "templates/app";
-export const platformRepository = "collinbentley1/platform";
-export const githubOwnerId = "16823277";
+const callerTemplateDirectory = "templates/app";
+const platformRepository = "collinbentley1/platform";
 
 // Reserved delimiter of the attribute.authority composite. Git refuses ':' in
 // ref names and GitHub refuses it in owner and repository names, so no
@@ -23,9 +22,9 @@ export const githubOwnerId = "16823277";
 export const authorityDelimiter = ":";
 
 export const purposes = ["attestation", "gcp"] as const;
-export type Purpose = (typeof purposes)[number];
+type Purpose = (typeof purposes)[number];
 
-export const serviceAccountIds = [
+const serviceAccountIds = [
   "gha-deploy-parity",
   "gha-preview-commit",
   "gha-preview-deploy",
@@ -37,7 +36,7 @@ export const serviceAccountIds = [
   "gha-wif-canary",
 ] as const;
 
-export interface AuthorityCaller {
+interface AuthorityCaller {
   readonly events: readonly string[];
   readonly ref: string;
   readonly workflow: string;
@@ -53,7 +52,7 @@ export interface WorkflowAuthorityEntry {
   readonly workflow: string;
 }
 
-export interface WorkflowAuthorityCheck {
+interface WorkflowAuthorityCheck {
   readonly entries: readonly WorkflowAuthorityEntry[];
   readonly failures: readonly string[];
   readonly workflows: readonly string[];
