@@ -27,8 +27,8 @@ import {
 //     200                             -> {"shard", "phase": "CLOSING", "closeHighWater", "closingAt"}
 //     409 NOT_READY                   -> {"blockers": [...]}  a QUARANTINE shard closes only once scan-ready
 //   POST /v1/shards/{shard}/reconcile  the same invoker, reconciler   {}
-//   POST /v1/reconcile                 reconciler                     {}   (every shard with recorded pending work)
-//     200                             -> {"shards": [ShardView]}
+//   POST /v1/reconcile                 reconciler                     {}   (every shard with recorded pending work, paginated)
+//     200                             -> {"shards": [ShardView], "next": cursor | null}
 //   GET  /v1/shards/{shard}            the same invoker, reconciler
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
 //   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE

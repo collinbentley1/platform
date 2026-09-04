@@ -103,6 +103,7 @@ interface FirestoreValue {
   readonly integerValue?: string;
   readonly mapValue?: { readonly fields?: Readonly<Record<string, FirestoreValue>> };
   readonly nullValue?: null;
+  readonly referenceValue?: string;
   readonly stringValue?: string;
 }
 
@@ -121,6 +122,7 @@ type Json = string | number | boolean | null | readonly Json[] | { readonly [key
 
 const maxTransactionAttempts = 128;
 const maxResponseBytes = 4 * 1024 * 1024;
+const reconcileCursorDocument = "reconciler/cursor";
 
 export class Ledger {
   readonly #deps: LedgerDependencies;
@@ -498,13 +500,18 @@ export class Ledger {
     return doc ? actuatorFromDocument(doc) : undefined;
   }
 
-  // Shards with recorded pending work. The reconciler may act only on what
-  // this returns; the equality filter needs no composite index.
-  async listReconcilable(limit: number): Promise<readonly string[]> {
+  // One page of shards with recorded pending work, in document-name order,
+  // starting after the named shard. The reconciler may act only on what this
+  // returns; the equality filter with the implicit name order needs no
+  // composite index, and the cursor lets a sweep continue past shards that
+  // can make no progress.
+  async listReconcilable(limit: number, after: string | null): Promise<readonly string[]> {
     const body = await this.#call("runQuery", {
       structuredQuery: {
         from: [{ collectionId: "shards" }],
         limit,
+        orderBy: [{ direction: "ASCENDING", field: { fieldPath: "__name__" } }],
+        ...(after === null ? {} : { startAt: { before: false, values: [{ referenceValue: this.#shardName(after) }] } }),
         where: { fieldFilter: { field: { fieldPath: "reconcile" }, op: "EQUAL", value: { booleanValue: true } } },
       },
     });
@@ -515,6 +522,24 @@ export class Ledger {
       ids.push(item.document.name.slice(item.document.name.lastIndexOf("/") + 1));
     }
     return ids;
+  }
+
+  // Where the fleet sweep stopped: the last shard reconciled when the time
+  // budget ran out, or null once the complete reconcilable set was visited.
+  async readReconcileCursor(): Promise<string | null> {
+    const [doc] = await this.#batchGet([`${this.#documents}/${reconcileCursorDocument}`], undefined);
+    if (!doc) return null;
+    const after = decodeFields(doc.fields).after;
+    if (after !== null && typeof after !== "string") throw new LedgerError("Reconcile cursor is malformed.");
+    return after;
+  }
+
+  async writeReconcileCursor(after: string | null): Promise<void> {
+    await this.#transact(reconcileCursorDocument, async (tx) => {
+      const name = `${this.#documents}/${reconcileCursorDocument}`;
+      const [doc] = await tx.get([name]);
+      tx.put(name, { after, updatedAt: this.#deps.now().toISOString() }, doc);
+    });
   }
 
   async #entriesIn(tx: Transaction, shardId: string, upTo: number): Promise<readonly Entry[]> {

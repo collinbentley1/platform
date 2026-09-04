@@ -25,6 +25,8 @@ export const proberPrincipal = "recovery-prober@recovery-test.iam.gserviceaccoun
 
 export class Clock {
   now: Date;
+  // Seconds the clock moves on every read, to make time budgets deterministic.
+  secondsPerRead = 0;
 
   constructor(start = "2026-09-04T12:00:00.000Z") {
     this.now = new Date(start);
@@ -34,7 +36,10 @@ export class Clock {
     this.now = new Date(this.now.getTime() + seconds * 1000);
   }
 
-  read = (): Date => new Date(this.now.getTime());
+  read = (): Date => {
+    if (this.secondsPerRead > 0) this.advance(this.secondsPerRead);
+    return new Date(this.now.getTime());
+  };
 }
 
 // The real repository authority with the broker project assigned, the

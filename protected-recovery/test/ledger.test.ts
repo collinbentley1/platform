@@ -206,4 +206,44 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     expect((await ledger.readShard("q"))!.nextSequence).toBe(10);
   });
 
+  test("the fleet sweep pages through the complete reconcilable set across invocations even when the first shards are terminally stuck", async () => {
+    const w = await cdbentley();
+    const { broker, clock, iam, ledger, targets } = w;
+    const shards = Array.from({ length: 70 }, (_, index) => `s-${String(index).padStart(2, "0")}`);
+    for (const shard of shards) expect((await ledger.append(quarantine(shard, "cdbentley", `k-${shard}`), targets)).kind).toBe("accepted");
+    // Pages are in document-name order and continue after the named shard; the cursor persists between sweeps.
+    expect(await ledger.listReconcilable(64, null)).toEqual(shards.slice(0, 64));
+    expect(await ledger.listReconcilable(64, shards[63]!)).toEqual(shards.slice(64));
+    expect(await ledger.listReconcilable(64, shards[69]!)).toEqual([]);
+    expect(await ledger.readReconcileCursor()).toBeNull();
+    await ledger.writeReconcileCursor("s-10");
+    expect(await ledger.readReconcileCursor()).toBe("s-10");
+    await ledger.writeReconcileCursor(null);
+    expect(await ledger.readReconcileCursor()).toBeNull();
+    // Every shard is stuck: IAM never answers for any identity, so all seventy keep reconcile: true forever.
+    iam.unavailableIdentities = Number.MAX_SAFE_INTEGER;
+    // Each look at the clock costs twenty seconds, so a sweep's ninety-second budget covers only a few shards.
+    clock.secondsPerRead = 20;
+    const visited: string[] = [];
+    let sweeps = 0;
+    for (;;) {
+      sweeps += 1;
+      const result = await broker.reconcileFleet();
+      const ids = (result.shards as Array<{ shard: string }>).map((view) => view.shard);
+      expect(ids.length).toBeGreaterThan(0);
+      expect(ids.length).toBeLessThan(shards.length);
+      visited.push(...ids);
+      if (result.next === null) break;
+      expect(result.next).toBe(ids.at(-1)!);
+      expect(await ledger.readReconcileCursor()).toBe(result.next as string);
+      expect(sweeps).toBeLessThan(shards.length);
+    }
+    expect(sweeps).toBeGreaterThan(1);
+    expect(visited).toEqual(shards);
+    expect(await ledger.readReconcileCursor()).toBeNull();
+    // The next sweep starts over from the first shard, and a cursor left past the end restarts within one sweep.
+    expect((((await broker.reconcileFleet()).shards as Array<{ shard: string }>)[0]!).shard).toBe(shards[0]!);
+    await ledger.writeReconcileCursor("zz-past-the-end");
+    expect((((await broker.reconcileFleet()).shards as Array<{ shard: string }>)[0]!).shard).toBe(shards[0]!);
+  }, 300_000);
 });

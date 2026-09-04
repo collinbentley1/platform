@@ -215,7 +215,7 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     expect((await call("GET", "/v1/shards/s", reconcilerEmail)).status).toBe(200);
     const sweep = await call("POST", "/v1/reconcile", reconcilerEmail, {});
     expect(sweep.status).toBe(200);
-    expect(await sweep.json()).toMatchObject({ shards: [{ shard: "s" }] });
+    expect(await sweep.json()).toMatchObject({ next: null, shards: [{ shard: "s" }] });
     // A close before readiness is refused with the blockers, and the shard stays OPEN.
     const notReady = await call("POST", "/v1/shards/s/close", isolate, { key: "c" });
     expect(notReady.status).toBe(409);

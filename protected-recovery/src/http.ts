@@ -56,7 +56,13 @@ export interface BrokerResponse {
   readonly status: number;
 }
 
+// One page of the fleet sweep, and the time the sweep may spend in one
+// invocation: Cloud Run allows the request 120 seconds and Scheduler waits
+// 180, so the sweep stops early, records where it stopped, and the next
+// invocation continues from there. Shards that can make no progress are
+// visited and passed, never allowed to hold the front of the queue.
 const reconcileBatch = 64;
+const reconcileBudgetMs = 90_000;
 
 export class Broker {
   readonly #deps: BrokerDependencies;
@@ -102,12 +108,7 @@ export class Broker {
         if (request.shard === null) {
           // A fleet-wide reconcile is the reconciler's alone.
           if (purpose.kind !== "reconciler") return forbidden();
-          const views: Record<string, unknown>[] = [];
-          for (const shard of await ledger.listReconcilable(reconcileBatch)) {
-            const view = await this.reconcileShard(shard);
-            if (view) views.push(view);
-          }
-          return { status: 200, body: { shards: views } };
+          return { status: 200, body: await this.reconcileFleet() };
         }
         const shard = await ledger.readShard(request.shard);
         if (!shard) return notFound();
@@ -123,6 +124,48 @@ export class Broker {
         return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), scanReady: scanReadiness(shard, entries, this.#deps.now()) } } };
       }
     }
+  }
+
+  // Sweep the complete reconcilable set in document-name order, one page at a
+  // time, from where the previous sweep stopped. When the budget runs out the
+  // cursor records the last shard reached; when the end is reached the cursor
+  // clears so the next sweep restarts. A cursor left past the end of a set
+  // that has since shrunk restarts within the same sweep.
+  async reconcileFleet(): Promise<Record<string, unknown>> {
+    const { ledger, now } = this.#deps;
+    const started = now().getTime();
+    const views: Record<string, unknown>[] = [];
+    let after = await ledger.readReconcileCursor();
+    let restarted = after === null;
+    let exhausted = false;
+    for (;;) {
+      const page = await ledger.listReconcilable(reconcileBatch, after);
+      if (page.length === 0) {
+        if (!restarted && views.length === 0) {
+          after = null;
+          restarted = true;
+          continue;
+        }
+        exhausted = true;
+        break;
+      }
+      let processed = 0;
+      for (const shard of page) {
+        if (now().getTime() - started >= reconcileBudgetMs) break;
+        const view = await this.reconcileShard(shard);
+        if (view) views.push(view);
+        after = shard;
+        processed += 1;
+      }
+      if (processed < page.length) break;
+      if (page.length < reconcileBatch) {
+        exhausted = true;
+        break;
+      }
+    }
+    const next = exhausted ? null : after;
+    await ledger.writeReconcileCursor(next);
+    return { next, shards: views };
   }
 
   // Drive every recorded pending step of one shard and finish the close only
