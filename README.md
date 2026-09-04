@@ -155,8 +155,9 @@ access are disabled across the complete PR-controlled build action.
 
 Cloud publication and Cloud Run mutation use different protected environments
 and identities. Secretless `production-publish` and `preview-publish` jobs can
-impersonate only `gha-prod-publish` and `gha-preview-publish`; each publisher has
-Writer on exactly one Artifact Registry repository and no Cloud Run or runtime
+impersonate only the matching `gha-prod-publish` or `gha-preview-publish`
+publisher and the no-role `gha-wif-canary`; each publisher has Writer on
+exactly one Artifact Registry repository and no Cloud Run or runtime
 `actAs` access. `production` and `preview-cloud` use separate deploy identities
 with the service-scoped Cloud Run role, `actAs` on only the matching runtime,
 and Reader on only the matching image repository, as Cloud Run requires; they
