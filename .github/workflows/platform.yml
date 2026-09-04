@@ -305,8 +305,32 @@ jobs:
             exit 1
           fi
 
+      - name: Start the checksum-pinned Firestore emulator 1.22.0
+        env:
+          FIRESTORE_EMULATOR_SHA256: 9b6498b7f62714d67f48f59b3818883cd682dbcd46b9f59511de81c97bb5166c
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/cloud-firestore-emulator.jar"
+          curl --fail --show-error --silent --location \
+            --output "$jar" \
+            https://storage.googleapis.com/firebase-preview-drop/emulator/cloud-firestore-emulator-v1.22.0.jar
+          echo "${FIRESTORE_EMULATOR_SHA256}  ${jar}" | sha256sum --check --strict
+          nohup "${JAVA_HOME_21_X64:?}/bin/java" -Duser.language=en -cp "$jar" \
+            com.google.cloud.datastore.emulator.firestore.CloudFirestore --host=127.0.0.1 --port=8080 \
+            > "$RUNNER_TEMP/firestore-emulator.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl --silent http://127.0.0.1:8080/ | grep -q Ok; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/firestore-emulator.log" >&2
+          echo "The Firestore emulator did not become ready." >&2
+          exit 1
+
       - name: Verify platform
         env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
           PROTECTED_BOOTSTRAP_DOCKER_BINARY: /usr/bin/docker
           PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1"
           TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
@@ -443,6 +467,11 @@ jobs:
 
       - name: Test stable preview-domain selection
         run: terraform -chdir=terraform/deployments/exposure test -no-color
+
+      - name: Test protected recovery cardinality
+        run: |
+          terraform -chdir=terraform/modules/protected-recovery init -backend=false -input=false -lockfile=readonly
+          terraform -chdir=terraform/modules/protected-recovery test -no-color
 
       - name: Run digest-pinned Checkov against the trusted platform Terraform
         env:

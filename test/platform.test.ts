@@ -1248,6 +1248,7 @@ describe("platform scaffold and doctor", () => {
     expect(gates).toHaveLength(1);
     const [gate] = gates;
     expect(gate?.env).toEqual({
+      FIRESTORE_EMULATOR_HOST: "127.0.0.1:8080",
       PROTECTED_BOOTSTRAP_DOCKER_BINARY: "/usr/bin/docker",
       PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1",
       TERRAFORM_SANDBOX_IMAGE:
