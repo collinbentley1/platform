@@ -163,24 +163,26 @@ and Reader on only the matching image repository, as Cloud Run requires; they
 cannot upload or delete artifacts. Medlock's production deploy identity alone
 also has Secret Version Adder on exactly `waitlist-identity-keyset`; it cannot
 read, list, disable, or destroy versions, and every other deploy identity has no
-secret grant. `preview-operations` uses
-the existing `gha-preview-deploy` identity through the distinct
-`attribute.preview_operator_workflow_sha` WIF path. Cloud Run revalidates the
-service identity and image during `gcloud run services update-traffic`, so the
-API-minimum traffic operation requires the same service-scoped update,
-preview-runtime `actAs`, and exact-preview-repository Reader permissions as a
-deployment. Those coarse permissions could deploy a preview revision, so their
-containment is the exact reviewed cleanup/reconcile workflow SHA,
-`preview-operations` environment/event claims, immutable numeric-repository-ID
+secret grant. Every cloud workflow authenticates through one Workload Identity
+Federation provider that admits only this owner's immutable numeric repository
+ID; the provider carries no workflow logic. Which reusable workflow may mint
+which service account is decided entirely by per-workflow Workload Identity
+User bindings on the exact `job_workflow_ref` of its reviewed reusable workflow
+at the active platform commit, derived from
+`terraform/modules/bootstrap/workflow-authority.json`, the one inventory that
+lint also checks against every workflow on disk. `preview-operations` runs
+authenticate only the read-only `gha-preview-operator` IAM auditor and the
+service-scoped `gha-preview-commit` transaction committer. Cloud Run
+revalidates the service identity and image during `gcloud run services
+update-traffic`, so the API-minimum traffic operation is contained by the exact
+reviewed workflow reference, the immutable numeric-repository-ID
 project/service map, fixed CLI arguments, and the absence of PR checkout or
 PR-controlled code after authentication. No credential reaches the untrusted PR
-build. `gha-preview-operator` is transition-only: the immediately previous SHA
-may retain its old binding during repin, while the active SHA binds the distinct
-operator-workflow attribute only to `gha-preview-deploy`; the transition set and
-legacy fallback are empty at steady state. The retired operator receives no
-steady-state Cloud Run, registry, runtime `actAs`, project, secret, state, data,
-or production access. Protect both publish environments before pinning a
-consumer to this workflow.
+build. Only `cleanup-preview.yml` and `reconcile-previews.yml` are
+transition-eligible: during a repin the immediately previous reviewed commit
+may keep exchanging for them, while deploy, publish, and infrastructure paths
+bind the active commit only, and the transition SHA is null at steady state.
+Protect both publish environments before pinning a consumer to this workflow.
 
 ## Runtime Configuration
 

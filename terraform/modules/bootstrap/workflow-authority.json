@@ -1,0 +1,115 @@
+[
+  {
+    "path": ".github/workflows/application.yml",
+    "authority": "none",
+    "serviceAccounts": [],
+    "environments": [],
+    "events": ["workflow_call"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/bun-dependency-update.yml",
+    "authority": "none",
+    "serviceAccounts": [],
+    "environments": [],
+    "events": ["schedule", "workflow_call", "workflow_dispatch"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/cleanup-preview.yml",
+    "authority": "cloud",
+    "serviceAccounts": ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"],
+    "environments": ["dhi-base-prefetch-20260822-098dca9280b3", "preview-operations"],
+    "events": ["workflow_call"],
+    "transitionEligible": true
+  },
+  {
+    "path": ".github/workflows/deploy-preview.yml",
+    "authority": "cloud",
+    "serviceAccounts": [
+      "gha-deploy-parity",
+      "gha-preview-commit",
+      "gha-preview-deploy",
+      "gha-preview-operator",
+      "gha-preview-publish",
+      "gha-wif-canary"
+    ],
+    "environments": [
+      "dhi-base-prefetch-20260822-098dca9280b3",
+      "preview-cloud",
+      "preview-operations",
+      "preview-publish",
+      "supply-chain"
+    ],
+    "events": ["workflow_call"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/deploy-prod.yml",
+    "authority": "cloud",
+    "serviceAccounts": [
+      "gha-deploy-parity",
+      "gha-preview-commit",
+      "gha-preview-deploy",
+      "gha-prod-deploy",
+      "gha-prod-publish",
+      "gha-wif-canary"
+    ],
+    "environments": [
+      "dhi-base-prefetch-20260822-098dca9280b3",
+      "production",
+      "production-publish",
+      "supply-chain"
+    ],
+    "events": ["workflow_call"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/infrastructure.yml",
+    "authority": "cloud",
+    "serviceAccounts": ["gha-terraform", "gha-wif-canary"],
+    "environments": ["production"],
+    "events": ["workflow_call"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/platform.yml",
+    "authority": "none",
+    "serviceAccounts": [],
+    "environments": [],
+    "events": ["pull_request", "push:main"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/protected-bootstrap-implementation.yml",
+    "authority": "owner-secret",
+    "serviceAccounts": [],
+    "environments": ["protected-bootstrap-owner-token"],
+    "events": ["workflow_dispatch"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/reconcile-previews.yml",
+    "authority": "cloud",
+    "serviceAccounts": ["gha-preview-commit", "gha-preview-operator", "gha-wif-canary"],
+    "environments": ["dhi-base-prefetch-20260822-098dca9280b3", "preview-operations"],
+    "events": ["workflow_call"],
+    "transitionEligible": true
+  },
+  {
+    "path": ".github/workflows/refresh-grype-db.yml",
+    "authority": "none",
+    "serviceAccounts": [],
+    "environments": [],
+    "events": ["schedule", "workflow_dispatch"],
+    "transitionEligible": false
+  },
+  {
+    "path": ".github/workflows/socket-firewall.yml",
+    "authority": "none",
+    "serviceAccounts": [],
+    "environments": [],
+    "events": ["workflow_call"],
+    "transitionEligible": false
+  }
+]

@@ -25,15 +25,8 @@ module "bootstrap" {
   state_bucket_location       = "US-EAST4"
   github_owner                = "collinbentley1"
   github_repo                 = "example"
-  github_owner_id             = "16823277"
   github_repository_id        = "123456789"
-  trusted_platform_workflow_shas = [
-    "0123456789abcdef0123456789abcdef01234567",
-  ]
-  preview_operations_active_workflow_shas = [
-    "0123456789abcdef0123456789abcdef01234567",
-  ]
-  preview_operator_transition_workflow_shas              = []
-  legacy_compatibility_mode                              = false
+  active_workflow_sha         = "0123456789abcdef0123456789abcdef01234567"
+
   manage_automatic_default_service_account_grants_policy = false
 }

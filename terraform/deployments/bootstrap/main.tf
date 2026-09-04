@@ -43,8 +43,13 @@ variable "federation_quarantined" {
 }
 
 variable "legacy_compatibility_mode" {
-  description = "Owner-selected WIF migration phase. True retains only constrained compatibility bindings; false is the required steady state."
+  description = "Retained pipeline input. Exact job_workflow_ref trust has no compatibility phase, so the only accepted value is false."
   type        = bool
+
+  validation {
+    condition     = !var.legacy_compatibility_mode
+    error_message = "legacy_compatibility_mode must be false: every binding is an exact reusable-workflow reference and no legacy fallback exists."
+  }
 }
 
 variable "transition_workflow_sha" {
@@ -72,24 +77,10 @@ variable "transition_workflow_sha" {
     )
     error_message = "transition_workflow_sha must be empty or an immediately previous reviewed safe SHA, never a vulnerable pre-migration release."
   }
-
-  validation {
-    condition     = !(var.legacy_compatibility_mode && var.transition_workflow_sha != "")
-    error_message = "legacy_compatibility_mode is allowed only for the initial migration with an empty transition_workflow_sha."
-  }
 }
 
 locals {
-  trusted_workflow_shas = toset(compact([
-    var.active_workflow_sha,
-    var.transition_workflow_sha,
-  ]))
-  preview_operations_active_workflow_shas = toset([
-    var.active_workflow_sha,
-  ])
-  preview_operator_transition_workflow_shas = toset(compact([
-    var.transition_workflow_sha,
-  ]))
+  transition_workflow_sha = var.transition_workflow_sha == "" ? null : var.transition_workflow_sha
 
   deployments = {
     "1255553151" = {
@@ -215,21 +206,18 @@ provider "google" {
 module "bootstrap" {
   source = "../../modules/bootstrap"
 
-  app                                       = local.deployment.app
-  project_id                                = local.deployment.project_id
-  region                                    = local.deployment.region
-  state_bucket_name                         = local.deployment.state_bucket_name
-  bootstrap_state_bucket_name               = local.deployment.bootstrap_state_bucket_name
-  state_bucket_location                     = local.deployment.state_bucket_location
-  github_owner                              = "collinbentley1"
-  github_repo                               = local.deployment.github_repo
-  github_owner_id                           = "16823277"
-  github_repository_id                      = local.deployment.github_repository_id
-  trusted_platform_workflow_shas            = local.trusted_workflow_shas
-  preview_operations_active_workflow_shas   = local.preview_operations_active_workflow_shas
-  preview_operator_transition_workflow_shas = local.preview_operator_transition_workflow_shas
-  legacy_compatibility_mode                 = var.legacy_compatibility_mode
-  federation_quarantined                    = var.federation_quarantined
+  app                         = local.deployment.app
+  project_id                  = local.deployment.project_id
+  region                      = local.deployment.region
+  state_bucket_name           = local.deployment.state_bucket_name
+  bootstrap_state_bucket_name = local.deployment.bootstrap_state_bucket_name
+  state_bucket_location       = local.deployment.state_bucket_location
+  github_owner                = "collinbentley1"
+  github_repo                 = local.deployment.github_repo
+  github_repository_id        = local.deployment.github_repository_id
+  active_workflow_sha         = var.active_workflow_sha
+  transition_workflow_sha     = local.transition_workflow_sha
+  federation_quarantined      = var.federation_quarantined
   # These four personal projects have no organization parent. Google permits
   # Organization Policy Administrator only at organization scope and marks the
   # write permissions unsupported in project custom roles. The authoritative

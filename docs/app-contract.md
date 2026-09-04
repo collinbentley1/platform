@@ -154,21 +154,21 @@ deploy identities can update only the pre-created matching Cloud Run service,
 they cannot upload or delete registry artifacts. Medlock's production deployer
 alone may add a version to exactly `waitlist-identity-keyset`; it cannot read,
 list, disable, or destroy versions, and all other deployers have zero Secret
-Manager grants. The `preview-operations`
-workflows authenticate `gha-preview-deploy` through the distinct
-`attribute.preview_operator_workflow_sha` claim path. Cloud Run revalidates the
-attached service identity and image during `update-traffic`, so the API-minimum
-traffic operation requires the same exact-service update, preview-runtime
-`actAs`, and exact-preview-repository Reader grants as deployment. Because that
-underlying capability is coarse, only the exact reviewed cleanup/reconcile
-workflow SHA can exchange it; environment and event claims, the immutable
+Manager grants. Every cloud workflow exchanges through one provider that admits
+only this owner's immutable numeric repository ID; each service account is
+bound to the exact `job_workflow_ref` of its reviewed reusable workflow at the
+active platform commit, as declared in
+`terraform/modules/bootstrap/workflow-authority.json`. The `preview-operations`
+workflows authenticate only the read-only `gha-preview-operator` IAM auditor and
+the service-scoped `gha-preview-commit` committer. Cloud Run revalidates the
+attached service identity and image during `update-traffic`, so that coarse
+capability is contained by the exact reviewed workflow reference, the immutable
 numeric-repository-ID project/service map, fixed CLI arguments, and no PR
-checkout or PR-controlled code after authentication contain it. No credential
-reaches the untrusted PR build. The previous SHA may retain its old
-`gha-preview-operator` binding only during repin; active/new SHA trust targets
-`gha-preview-deploy`, and the transition set is empty at steady state. The
-retired operator has no steady-state service, registry, runtime `actAs`, project,
-secret, state, data, or production access. A stale-deploy invalidation rechecks
+checkout or PR-controlled code after authentication. No credential reaches the
+untrusted PR build. Only `cleanup-preview.yml` and `reconcile-previews.yml` are
+transition-eligible: the immediately previous reviewed commit may keep
+exchanging for them during a repin, deploy and publish paths bind the active
+commit only, and the transition SHA is null at steady state. A stale-deploy invalidation rechecks
 the current traffic tag under the shared cloud lock and removes it only when it
 still points to the exact full-SHA/repository-ID-labelled revision created by
 that stale run.

@@ -167,10 +167,15 @@ describe("durable preview/production DHI parity", () => {
       expect(`${cloudRunRole}\n${imageRole}`).not.toContain(forbidden);
     }
     expect(bootstrap).toContain('account_id   = "gha-deploy-parity"');
-    expect(bootstrap).toContain("deployment_parity_wif_preview_workflow_sha");
-    expect(bootstrap).toContain("attribute.preview_deploy_workflow_sha/${each.value}");
-    expect(bootstrap).toContain("deployment_parity_wif_prod_workflow_sha");
-    expect(bootstrap).toContain("attribute.prod_workflow_sha/${each.value}");
+    const authority = JSON.parse(
+      await readFile(join(repoRoot, "terraform/modules/bootstrap/workflow-authority.json"), "utf8"),
+    ) as Array<{ path: string; serviceAccounts: string[] }>;
+    const grantedTo = (account: string) =>
+      authority.filter((entry) => entry.serviceAccounts.includes(account)).map((entry) => entry.path);
+    expect(grantedTo("gha-deploy-parity")).toEqual([
+      ".github/workflows/deploy-preview.yml",
+      ".github/workflows/deploy-prod.yml",
+    ]);
     const revisionDeployer = block(
       bootstrap,
       "google_project_iam_custom_role",
@@ -197,9 +202,17 @@ describe("durable preview/production DHI parity", () => {
       "run.services.update",
     ]);
     expect(bootstrap).toContain('account_id   = "gha-preview-commit"');
-    expect(bootstrap).toContain('resource "google_service_account_iam_member" "preview_commit_wif_workflow_sha"');
-    expect(bootstrap).toContain('resource "google_service_account_iam_member" "preview_commit_wif_preview_operations_workflow_sha"');
-    expect(bootstrap).not.toContain('resource "google_service_account_iam_member" "preview_deploy_wif_preview_operations_workflow_sha"');
+    expect(grantedTo("gha-preview-commit")).toEqual([
+      ".github/workflows/cleanup-preview.yml",
+      ".github/workflows/deploy-preview.yml",
+      ".github/workflows/deploy-prod.yml",
+      ".github/workflows/reconcile-previews.yml",
+    ]);
+    expect(grantedTo("gha-preview-deploy")).toEqual([
+      ".github/workflows/deploy-preview.yml",
+      ".github/workflows/deploy-prod.yml",
+    ]);
+    expect(bootstrap).toContain('resource "google_service_account_iam_member" "workflow_authority"');
     const prodImageGrant = block(
       serviceModule,
       "google_artifact_registry_repository_iam_member",
