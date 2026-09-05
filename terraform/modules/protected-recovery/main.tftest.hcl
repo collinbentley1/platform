@@ -1,11 +1,11 @@
 mock_provider "google" {}
-mock_provider "http" {}
 mock_provider "external" {}
 
 override_data {
   target = data.google_project.current
   values = {
     number = "123456789012"
+    org_id = "100000000001"
   }
 }
 
@@ -28,13 +28,13 @@ variables {
 # "c" is a SHA no binding may ever name. The runs below pin the complete
 # consumer -> direction -> invoker matrix, prove that neighbouring tuples bind
 # nothing, that every invoker and member-delivery identity holds run.invoker
-# only, that the broker is the only writer, that the activation sequence is
-# permitted by the required Deny matrix, and that broker authority over
-# consumer accounts is absent without evidence and unreachable while the
-# committed target identities are null. The enabled path -- every identity
-# recorded and verified, the Deny canary's attestation verified and bound to
-# its signer, the live Deny state bound to the attested one -- is exercised
-# by enabled/enabled.tftest.hcl.in through
+# only, that the broker is the only writer, that the required Deny matrix in
+# each of its forms is derived exactly from this deployment, and that broker
+# authority over consumer accounts is absent without evidence and unreachable
+# while the committed target identities are null or no bootstrap principal is
+# declared. The enabled path -- every identity recorded and verified, both
+# canary phases verified and bound to their signer, the live Deny state
+# carrying the matrix -- is exercised by enabled/enabled.tftest.hcl.in through
 # tools/ci/protected-recovery-enabled-test.sh against an isolated copy.
 # These are mocked plan-shape tests over strings: they cannot prove which
 # claims a real GitHub token carries. Decoding a real token from a
@@ -216,11 +216,12 @@ run "invokers_hold_only_run_invoker_and_the_broker_is_the_only_writer" {
         [for grant in values(google_storage_bucket_iam_member.broker_evidence) : grant.role],
         [for grant in values(google_project_iam_member.broker_inventory) : grant.role],
         [for grant in google_organization_iam_member.broker_inventory : grant.role],
+        [for grant in google_organization_iam_member.broker_deny_reviewer : grant.role],
         [google_project_iam_member.broker_ledger.role],
       ) : role
-      if contains(["roles/iam.serviceAccountTokenCreator", "roles/iam.serviceAccountKeyAdmin", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/iam.securityReviewer", "roles/owner", "roles/editor", "roles/viewer", "roles/datastore.owner", "roles/storage.admin", "roles/run.admin"], role)
+      if contains(["roles/iam.serviceAccountTokenCreator", "roles/iam.serviceAccountKeyAdmin", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/iam.securityReviewer", "roles/iam.denyAdmin", "roles/owner", "roles/editor", "roles/viewer", "roles/datastore.owner", "roles/storage.admin", "roles/run.admin"], role)
     ]) == 0
-    error_message = "No grant may create tokens or keys, administer service accounts or pools, or hold a basic, admin, or broad reviewer role."
+    error_message = "No grant may create tokens or keys, administer service accounts, pools, or deny policies, or hold a basic, admin, or broad reviewer role."
   }
 
   assert {
@@ -235,7 +236,7 @@ run "invokers_hold_only_run_invoker_and_the_broker_is_the_only_writer" {
 
   assert {
     condition     = { for env in google_cloud_run_v2_service.broker.template[0].containers[0].env : env.name => env.value if env.name != "EVIDENCE_BUCKET" && env.name != "FIRESTORE_DATABASE_ID" } == { BROKER_AUDIENCE = "https://protected-recovery-123456789012.us-east4.run.app", FIRESTORE_PROJECT_ID = "recovery-test" }
-    error_message = "The broker must receive exactly its audience and ledger coordinates."
+    error_message = "The broker must receive exactly its audience and ledger coordinates; the Deny state it enforces is derived from the committed authority, never from a deployment input."
   }
 
   assert {
@@ -253,25 +254,31 @@ run "broker_authority_over_consumer_accounts_is_absent_without_evidence" {
   }
 
   assert {
-    condition     = length(google_project_iam_custom_role.inventory) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(data.http.canary_run) == 0 && length(data.http.canary_artifact) == 0 && length(data.external.canary_verification) == 0 && length(data.http.deny_policies) == 0 && length(data.http.deny_policy) == 0
-    error_message = "Without evidence no inventory role exists anywhere, no GitHub record is read, no attestation is verified, and no live Deny policy is read."
+    condition     = length(google_project_iam_custom_role.inventory) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_deny_reviewer) == 0 && length(data.external.canary_verification) == 0 && length(data.external.deny_state) == 0 && length(data.external.service_state) == 0 && length(terraform_data.authority_gate) == 0
+    error_message = "Without evidence no inventory or deny-reviewer role exists anywhere, no GitHub record is read, no attestation is verified, no live Deny policy or service state is read, and no apply-time gate exists."
   }
 
   assert {
     condition     = length(local.unrecorded_identities) == 36 && !local.identities_recorded
     error_message = "The committed authority records no target identity; all thirty-six (consumer, account) identities must be unrecorded until a reviewed change records the real ones."
   }
+
+  assert {
+    condition     = local.bootstrap_principal == null && length(local.maintenance_principals) == 0 && local.organization_recorded == null
+    error_message = "The committed authority names no bootstrap principal, no maintenance principal, and no organization; nothing here may invent them."
+  }
 }
 
 # The exact Deny matrix this deployment requires, derived from its own
 # coordinates: every permission the approved brief names, at the broker
-# project and at every consumer project, each with its exact exception set.
+# project, at every consumer project, and at the organization, each with its
+# exact exception set in each of the four forms.
 run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
   command = plan
 
   assert {
-    condition     = length(local.required_deny_matrix) == 33 + 4 * 26 && alltrue([for row in values(local.required_deny_matrix) : row.denied == ["principalSet://goog/public:all"]])
-    error_message = "The matrix must carry thirty-three broker-project rows and twenty-six rows per consumer project, every one denying every principal."
+    condition     = length(local.required_deny_matrix) == 35 + 4 * 28 + 5 && alltrue([for row in values(local.required_deny_matrix) : row.denied == ["principalSet://goog/public:all"]]) && length([for row in values(local.required_deny_matrix) : row if startswith(row.attachment, "cloudresourcemanager.googleapis.com/organizations/")]) == 5
+    error_message = "The steady matrix must carry thirty-five broker-project rows, twenty-eight rows per consumer project, and five organization rows, every one denying every principal."
   }
 
   assert {
@@ -280,26 +287,36 @@ run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
       length(local.invoker_tuples) == 8 && length(local.canary_tuples) == 1 && length(local.member_tuples) == 0 &&
       alltrue([for tuple in local.invoker_tuples : startswith(tuple, "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-") && !strcontains(tuple, "*")]) &&
       sort(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getOpenIdToken"].exceptions) == sort(concat(["principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com"], local.invoker_tuples)) &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.update"].exceptions == ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|storage.googleapis.com/objects.delete"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.signJwt"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.update"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com"] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com"] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/medlock-1025243085|iam.googleapis.com/serviceAccounts.setIamPolicy"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com", "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com"] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/critical-history-16823277|iam.googleapis.com/serviceAccounts.delete"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/runsetta|iam.googleapis.com/workloadIdentityPools.undelete"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/runsetta|iam.googleapis.com/serviceAccounts.actAs"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/services.update"].exceptions == [] &&
-      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|serviceusage.googleapis.com/services.disable"].exceptions == []
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.update"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]) &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.get"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]) &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.list"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]) &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|storage.googleapis.com/objects.delete"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.signJwt"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.update"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|artifactregistry.googleapis.com/repositories.uploadArtifacts"].exceptions) == 0 &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/medlock-1025243085|iam.googleapis.com/serviceAccounts.setIamPolicy"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]) &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/critical-history-16823277|iam.googleapis.com/serviceAccounts.delete"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/runsetta|iam.googleapis.com/workloadIdentityPools.undelete"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/runsetta|iam.googleapis.com/serviceAccounts.actAs"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/services.update"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/workerpools.update"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|serviceusage.googleapis.com/services.disable"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|iam.googleapis.com/roles.update"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|orgpolicy.googleapis.com/policy.set"].exceptions) == 0
     )
-    error_message = "Each row's exception set must be exactly the principals this deployment derives for it: the broker for the ledger and evidence; the exact invoker and canary tuples, never a pool wildcard, for access tokens; the Scheduler agent, the exact invoker tuples, and the exact member tuples for ID tokens; the applying identity for the broker deployment and for the grants its own apply makes in consumer projects; the broker and the applying identity alone for consumer target policies; and nobody for keys, signing, delegation, evidence overwrite, identity lifecycle, federation replacement, workload attachment, and API disablement."
+    error_message = "Each steady row's exception set must be exactly the principals this deployment derives for it: the broker for the ledger and evidence; the exact invoker and canary tuples, never a pool wildcard, for access tokens; the Scheduler agent, the exact invoker tuples, and the exact member tuples for ID tokens; the broker alone for consumer target policies; and nobody -- no applying identity, no deploy identity -- for the broker deployment, consumer project IAM, keys, signing, delegation, evidence overwrite, identity lifecycle, federation replacement, workload attachment, deployment, API disablement, role definitions, and organization policy."
   }
 
   assert {
     condition = alltrue([for permission in [
+      "artifactregistry.googleapis.com/repositories.uploadArtifacts",
       "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+      "datastore.googleapis.com/entities.get",
+      "datastore.googleapis.com/entities.list",
       "iam.googleapis.com/serviceAccountKeys.create",
+      "iam.googleapis.com/serviceAccounts.actAs",
       "iam.googleapis.com/serviceAccounts.create",
       "iam.googleapis.com/serviceAccounts.delete",
       "iam.googleapis.com/serviceAccounts.disable",
@@ -334,33 +351,59 @@ run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
       "run.googleapis.com/jobs.update",
       "run.googleapis.com/services.create",
       "run.googleapis.com/services.update",
+      "run.googleapis.com/workerpools.create",
+      "run.googleapis.com/workerpools.update",
       "serviceusage.googleapis.com/services.disable",
-    ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/projects/runsetta|${permission}")])
-    error_message = "Every supported mutation path the review named must be required: project IAM, service-account lifecycle, workload identity pool and provider lifecycle, and Cloud Run service lifecycle at the broker project, and identity, project IAM, federation lifecycle, workload attachment (actAs, Compute, Cloud Run, Cloud Build), and API disablement at every consumer project."
+      ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/projects/runsetta|${permission}")]) && alltrue([for permission in [
+      "iam.googleapis.com/roles.create",
+      "iam.googleapis.com/roles.delete",
+      "iam.googleapis.com/roles.undelete",
+      "iam.googleapis.com/roles.update",
+      "orgpolicy.googleapis.com/policy.set",
+    ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/organizations/unrecorded|${permission}")])
+    error_message = "Every supported mutation path the review named must be required: project IAM, service-account lifecycle, workload identity pool and provider lifecycle, Cloud Run service lifecycle, image upload, and ledger reads at the broker project; identity, project IAM, federation lifecycle, workload attachment (actAs, Compute, Cloud Run services, jobs, and worker pools, Cloud Build), and API disablement at every consumer project; and role definitions and organization policy at the organization."
   }
 
-  # Every mutation the module's own apply makes is permitted its principal by
-  # the matrix, so the activation sequence -- broker project first, then Deny,
-  # then the evidenced grants -- can run without an unevidenced window.
+  # The deployment form widens exactly the consumer's deploy rows to its two
+  # deploy identities; with no bootstrap or maintenance principal declared the
+  # other forms are the steady form, so the activation sequence -- which needs
+  # the bootstrap principal excepted -- is blocked outright.
   assert {
-    condition     = length(local.activation_blocked) == 0 && length(local.activation_mutations) == 10 + 8 + 8 + 8 + 1 + 1 + 1 + 1 + 4
-    error_message = "The required matrix must except the applying identity, the invoker, member, and canary tuples, the Scheduler agent, and the broker for exactly the mutations activation makes; blocked: [${join(", ", local.activation_blocked)}]."
+    condition = (
+      length([for key, row in local.matrices.deployment : key if local.required_deny_matrix[key].exceptions != row.exceptions]) == 4 * 3 &&
+      local.matrices.deployment["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/services.update"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/gha-preview-deploy@cdbentley.iam.gserviceaccount.com", "principal://iam.googleapis.com/projects/-/serviceAccounts/gha-prod-deploy@cdbentley.iam.gserviceaccount.com"]) &&
+      local.matrices.deployment["cloudresourcemanager.googleapis.com/projects/cdbentley|iam.googleapis.com/serviceAccounts.actAs"].exceptions == sort(["principal://iam.googleapis.com/projects/-/serviceAccounts/gha-preview-deploy@cdbentley.iam.gserviceaccount.com", "principal://iam.googleapis.com/projects/-/serviceAccounts/gha-prod-deploy@cdbentley.iam.gserviceaccount.com"]) &&
+      length(local.matrices.deployment["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/jobs.create"].exceptions) == 0 &&
+      local.matrices.bootstrap == local.required_deny_matrix &&
+      local.matrices.maintenance == local.required_deny_matrix &&
+      length(local.activation_blocked) > 0 &&
+      alltrue([for blocked in local.activation_blocked : endswith(blocked, "|unrecorded")]) &&
+      length(local.activation_mutations) == 10 + 8 + 3 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 4
+    )
+    error_message = "The deployment form must except exactly the two deploy identities on exactly run.services.create|update and actAs per consumer; with no bootstrap principal declared the bootstrap and maintenance forms are the steady form and every mutation of the activation apply is blocked, naming the unrecorded principal."
   }
 }
 
-# Consistent evidence names records that the mocked GitHub reads do not
-# return: even so, the committed target identities are null, so nothing is
-# read from any consumer account and nothing is granted.
+# Consistent evidence names records that the mocked reads do not return: even
+# so, the committed target identities are null, so nothing is read from any
+# consumer account and nothing is granted.
 run "evidence_grants_nothing_while_target_identities_are_unrecorded" {
   command = plan
 
   variables {
     broker_authority_evidence = {
       organization_id = "100000000001"
-      deny_canary = {
-        run_id          = "100000000002"
-        artifact_id     = "100000000003"
+      deny_control = {
+        run_id          = "100000000001"
+        artifact_id     = "100000000002"
         artifact_sha256 = "abababababababababababababababababababababababababababababababab"
+        archive_sha256  = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+      deny_canary = {
+        run_id          = "100000000003"
+        artifact_id     = "100000000004"
+        artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
       }
     }
   }
@@ -391,10 +434,17 @@ run "reject_a_consumer_project_outside_the_evidenced_organization" {
   variables {
     broker_authority_evidence = {
       organization_id = "100000000001"
-      deny_canary = {
-        run_id          = "100000000002"
-        artifact_id     = "100000000003"
+      deny_control = {
+        run_id          = "100000000001"
+        artifact_id     = "100000000002"
         artifact_sha256 = "abababababababababababababababababababababababababababababababab"
+        archive_sha256  = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+      deny_canary = {
+        run_id          = "100000000003"
+        artifact_id     = "100000000004"
+        artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
       }
     }
   }
@@ -425,10 +475,43 @@ run "reject_fabricated_evidence" {
   variables {
     broker_authority_evidence = {
       organization_id = "1"
+      deny_control = {
+        run_id          = "pending"
+        artifact_id     = "TBD"
+        artifact_sha256 = "n/a"
+        archive_sha256  = "n/a"
+      }
       deny_canary = {
         run_id          = "pending"
         artifact_id     = "TBD"
         artifact_sha256 = "n/a"
+        archive_sha256  = "n/a"
+      }
+    }
+  }
+
+  expect_failures = [var.broker_authority_evidence]
+}
+
+# One digest standing for both the archive and the raw file is the exact
+# defect the two values model: refused at the input.
+run "reject_evidence_whose_archive_and_raw_digests_are_one_value" {
+  command = plan
+
+  variables {
+    broker_authority_evidence = {
+      organization_id = "100000000001"
+      deny_control = {
+        run_id          = "100000000001"
+        artifact_id     = "100000000002"
+        artifact_sha256 = "abababababababababababababababababababababababababababababababab"
+        archive_sha256  = "abababababababababababababababababababababababababababababababab"
+      }
+      deny_canary = {
+        run_id          = "100000000003"
+        artifact_id     = "100000000004"
+        artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
       }
     }
   }

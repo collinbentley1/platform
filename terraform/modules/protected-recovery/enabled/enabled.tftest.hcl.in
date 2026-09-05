@@ -1,35 +1,47 @@
 # The enabled path of the protected-recovery module: every target's permanent
-# unique ID recorded and verified live, the Deny canary's attestation
-# verified and bound to its signer, and the live Deny state bound to the
-# attested one. The committed authority records no identity and no such
-# records exist offline, so tools/ci/protected-recovery-enabled-test.sh
-# renders this template into an isolated copy of the repository whose
-# authority.json records a test identity for each of the thirty-six targets
-# and the active platform commit for every consumer (plus a transition commit
-# for runsetta), and whose mocked reads answer with fixtures/deny-canary.json
-# and its adversarial variants. A line consisting of one of these placeholders
-# (each wrapped in double at-signs) names the record rendered there:
+# unique ID recorded and verified live, both phases of the Deny canary
+# verified and bound to their signer and to each other, the live Deny state
+# bound to the attested one, and the consumer attachment rows that rest on a
+# disabled API bound to a live read of that API. The committed authority
+# records no identity and no such records exist offline, so
+# tools/ci/protected-recovery-enabled-test.sh renders this template into an
+# isolated copy of the repository whose authority.json records a test
+# identity for each of the thirty-six targets and the active platform commit
+# for every consumer (plus a transition commit for runsetta), and whose
+# mocked reads answer with the two predicates the canary producer's own shape
+# renders (tools/ci/protected-recovery-canary-fixture.ts) and their
+# adversarial variants. A line consisting of one of these placeholders (each
+# wrapped in double at-signs) names the record rendered there:
 #
-#   VERIFICATION:<certificate>:<predicate>   the verified attestation, as
-#       tools/ci/protected-recovery-verify-canary.sh answers it; certificate
-#       variants consistent, other-workflow, other-run, other-head,
-#       other-repository, self-hosted; predicate variants consistent,
-#       extra-exception, unrelated-resource, missing-observation,
-#       other-image, and unverified (verification refused outright)
+#   TARGET_IDENTITIES   the thirty-six live account reads, each resolving to
+#       its recorded unique ID
+#   VERIFICATION:<phase>:<variant>   the verified attestation of one phase,
+#       as tools/ci/protected-recovery-verify-canary.sh answers it; variants
+#       consistent, unverified, other-workflow, other-run, other-head,
+#       other-repository, self-hosted (the certificate), extra-exception,
+#       unrelated-resource, missing-observation, other-image, other-phase,
+#       other-control, request-mismatch, missing-cause, unexercised (the
+#       predicate), run-missing, run-other-head, artifact-digest,
+#       control-after-deny (the records)
 #   LIVE_DENY_STATE   the live deny policies of every attachment point,
-#       listed and read, exactly as attested
-#   LIVE_DENY_POLICY:<variant>   the broker project's live policy with
-#       one deviation: etag-moved, exception-widened, condition-added,
+#       listed and read, exactly as the deny phase attested them
+#   LIVE_DENY_POLICY:<variant>   the broker project's live policy with one
+#       deviation: etag-moved, exception-widened, condition-added,
 #       permission-missing
 #   LIVE_DENY_LISTING:missing   the broker project's listing without its
 #       policy
+#   LIVE_SERVICE_STATE   every consumer project's Compute and Cloud Build
+#       API read, disabled
+#   LIVE_SERVICE_STATE:<project>:<service>:<state>   one such read with the
+#       given state
 #
-# and the ARTIFACT_SHA256 placeholder is the digest of the fixture bytes.
-# These are mocked plan-shape and apply-shape tests: they prove what the gate
-# does with each record and that the activation sequence is permitted by the
-# matrix it requires, not that GitHub, gh, or Google answer as modelled. The
-# identity of the test accounts is 1 + consumer index + account index +
-# sixteen zeros, in the sorted order of protected-recovery/authority.json.
+# and the RAW_<phase> and ARCHIVE_<phase> placeholders are the digests of each
+# phase's fixture bytes and of its archive. These are mocked plan-shape and
+# apply-shape tests: they prove what the gate does with each record and that
+# the activation sequence is permitted by the matrix it requires, not that
+# GitHub, gh, or Google answer as modelled. The identity of the test accounts
+# is 1 + consumer index + account index + sixteen zeros, in the sorted order
+# of protected-recovery/authority.json.
 
 # The mocked apply of the activation sequence needs the computed names the
 # dependent IAM resources validate to be well-formed; the values are shapes,
@@ -52,13 +64,13 @@ mock_provider "google" {
     }
   }
 }
-mock_provider "http" {}
 mock_provider "external" {}
 
 override_data {
   target = data.google_project.current
   values = {
     number = "123456789012"
+    org_id = "100000000001"
   }
 }
 
@@ -86,323 +98,22 @@ override_data {
   values = { org_id = "100000000001" }
 }
 
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-deploy-parity"]
-  values = {
-    email     = "gha-deploy-parity@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-deploy-parity@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101010000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-preview-commit"]
-  values = {
-    email     = "gha-preview-commit@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-preview-commit@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101020000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-preview-deploy"]
-  values = {
-    email     = "gha-preview-deploy@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-preview-deploy@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101030000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-preview-operator"]
-  values = {
-    email     = "gha-preview-operator@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-preview-operator@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101040000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-preview-publish"]
-  values = {
-    email     = "gha-preview-publish@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-preview-publish@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101050000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-prod-deploy"]
-  values = {
-    email     = "gha-prod-deploy@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-prod-deploy@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101060000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-prod-publish"]
-  values = {
-    email     = "gha-prod-publish@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-prod-publish@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101070000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-terraform"]
-  values = {
-    email     = "gha-terraform@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-terraform@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101080000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["cdbentley/gha-wif-canary"]
-  values = {
-    email     = "gha-wif-canary@cdbentley.iam.gserviceaccount.com"
-    name      = "projects/cdbentley/serviceAccounts/gha-wif-canary@cdbentley.iam.gserviceaccount.com"
-    unique_id = "101090000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-deploy-parity"]
-  values = {
-    email     = "gha-deploy-parity@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-deploy-parity@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102010000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-preview-commit"]
-  values = {
-    email     = "gha-preview-commit@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-commit@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102020000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-preview-deploy"]
-  values = {
-    email     = "gha-preview-deploy@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-deploy@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102030000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-preview-operator"]
-  values = {
-    email     = "gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102040000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-preview-publish"]
-  values = {
-    email     = "gha-preview-publish@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-publish@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102050000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-prod-deploy"]
-  values = {
-    email     = "gha-prod-deploy@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-prod-deploy@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102060000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-prod-publish"]
-  values = {
-    email     = "gha-prod-publish@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-prod-publish@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102070000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-terraform"]
-  values = {
-    email     = "gha-terraform@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-terraform@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102080000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["critical-history/gha-wif-canary"]
-  values = {
-    email     = "gha-wif-canary@critical-history-16823277.iam.gserviceaccount.com"
-    name      = "projects/critical-history-16823277/serviceAccounts/gha-wif-canary@critical-history-16823277.iam.gserviceaccount.com"
-    unique_id = "102090000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-deploy-parity"]
-  values = {
-    email     = "gha-deploy-parity@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-deploy-parity@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103010000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-preview-commit"]
-  values = {
-    email     = "gha-preview-commit@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-commit@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103020000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-preview-deploy"]
-  values = {
-    email     = "gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103030000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-preview-operator"]
-  values = {
-    email     = "gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103040000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-preview-publish"]
-  values = {
-    email     = "gha-preview-publish@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-publish@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103050000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-prod-deploy"]
-  values = {
-    email     = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103060000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-prod-publish"]
-  values = {
-    email     = "gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103070000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-terraform"]
-  values = {
-    email     = "gha-terraform@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-terraform@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103080000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["healthmcp/gha-wif-canary"]
-  values = {
-    email     = "gha-wif-canary@medlock-1025243085.iam.gserviceaccount.com"
-    name      = "projects/medlock-1025243085/serviceAccounts/gha-wif-canary@medlock-1025243085.iam.gserviceaccount.com"
-    unique_id = "103090000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-deploy-parity"]
-  values = {
-    email     = "gha-deploy-parity@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-deploy-parity@runsetta.iam.gserviceaccount.com"
-    unique_id = "104010000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-preview-commit"]
-  values = {
-    email     = "gha-preview-commit@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-preview-commit@runsetta.iam.gserviceaccount.com"
-    unique_id = "104020000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-preview-deploy"]
-  values = {
-    email     = "gha-preview-deploy@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-preview-deploy@runsetta.iam.gserviceaccount.com"
-    unique_id = "104030000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-preview-operator"]
-  values = {
-    email     = "gha-preview-operator@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-preview-operator@runsetta.iam.gserviceaccount.com"
-    unique_id = "104040000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-preview-publish"]
-  values = {
-    email     = "gha-preview-publish@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-preview-publish@runsetta.iam.gserviceaccount.com"
-    unique_id = "104050000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-prod-deploy"]
-  values = {
-    email     = "gha-prod-deploy@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-prod-deploy@runsetta.iam.gserviceaccount.com"
-    unique_id = "104060000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-prod-publish"]
-  values = {
-    email     = "gha-prod-publish@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-prod-publish@runsetta.iam.gserviceaccount.com"
-    unique_id = "104070000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-terraform"]
-  values = {
-    email     = "gha-terraform@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-terraform@runsetta.iam.gserviceaccount.com"
-    unique_id = "104080000000000000000"
-  }
-}
-override_data {
-  target = data.google_service_account.target["runsetta/gha-wif-canary"]
-  values = {
-    email     = "gha-wif-canary@runsetta.iam.gserviceaccount.com"
-    name      = "projects/runsetta/serviceAccounts/gha-wif-canary@runsetta.iam.gserviceaccount.com"
-    unique_id = "104090000000000000000"
-  }
-}
+@@TARGET_IDENTITIES@@
 
-# GitHub's records of the canary run, its artifact, and the artifact's attestation.
+# Both phases of the canary, verified: the run and artifact records, the two
+# digests, the certificate, and the statement carrying the predicate.
 override_data {
-  target = data.http.canary_run[0]
-  values = {
-    status_code   = 200
-    response_body = <<-JSON
-      {"id":100000000002,"run_attempt":1,"status":"completed","conclusion":"success","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":".github/workflows/protected-recovery-deny-canary.yml","event":"workflow_dispatch","repository":{"id":1255856466},"head_repository":{"id":1255856466}}
-    JSON
-  }
+  target = data.external.canary_verification["control"]
+  @@VERIFICATION:control:consistent@@
 }
-
 override_data {
-  target = data.http.canary_artifact[0]
-  values = {
-    status_code   = 200
-    response_body = <<-JSON
-      {"id":100000000003,"name":"deny-canary","digest":"sha256:@@ARTIFACT_SHA256@@","expired":false,"workflow_run":{"id":100000000002,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
-    JSON
-  }
-}
-
-# gh attestation verify's answer for the artifact, and the live Deny state.
-override_data {
-  target = data.external.canary_verification[0]
-  @@VERIFICATION:consistent:consistent@@
+  target = data.external.canary_verification["deny"]
+  @@VERIFICATION:deny:consistent@@
 }
 
 @@LIVE_DENY_STATE@@
+
+@@LIVE_SERVICE_STATE@@
 
 variables {
   project_id          = "recovery-test"
@@ -410,16 +121,52 @@ variables {
   active_workflow_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   broker_authority_evidence = {
     organization_id = "100000000001"
+    deny_control = {
+      run_id          = "100000000001"
+      artifact_id     = "100000000002"
+      artifact_sha256 = "@@RAW_control@@"
+      archive_sha256  = "@@ARCHIVE_control@@"
+    }
     deny_canary = {
-      run_id          = "100000000002"
-      artifact_id     = "100000000003"
-      artifact_sha256 = "@@ARTIFACT_SHA256@@"
+      run_id          = "100000000003"
+      artifact_id     = "100000000004"
+      artifact_sha256 = "@@RAW_deny@@"
+      archive_sha256  = "@@ARCHIVE_deny@@"
     }
   }
 }
 
+# The activation sequence from an empty broker project, applied with mock
+# providers and state carried from run to run: the broker project alone
+# without evidence (this run), the evidenced grants once the Deny state stands
+# and every mutation the apply makes is permitted its principal (the next
+# run), every adversarial record refused with the grants left exactly as they
+# stand (the runs after it), and revocation of the grants when the evidence is
+# withdrawn (the last run). The Deny state and the service states are read
+# through the apply-time fence, which every apply that changes the grants
+# replaces; once the evidenced apply stands, the adversarial records leave the
+# fence in place, so each of them is judged by a plan that reads the live
+# state and refuses the grant there.
+run "activation_step_one_installs_the_broker_project_alone" {
+  command = apply
+
+  variables {
+    broker_authority_evidence = null
+  }
+
+  assert {
+    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(data.google_project.consumer) == 0
+    error_message = "Step one must create nothing in any consumer project and read none."
+  }
+
+  assert {
+    condition     = length(google_service_account_iam_member.invoker_authority) == 8 && length(google_service_account_iam_member.member_authority) == 61 && length(google_service_account_iam_member.canary_authority) == 1 && length(google_cloud_run_v2_service_iam_member.invokers) == 13 && google_iam_workload_identity_pool_provider.members.workload_identity_pool_provider_id == "github-members"
+    error_message = "Step one must create the broker project's identities and their bindings: invokers, member-delivery identities, and the Deny canary, so the canary can run before any grant exists."
+  }
+}
+
 run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actuators" {
-  command = plan
+  command = apply
 
   assert {
     condition     = local.evidence_verified && length(local.evidence_failures) == 0 && length(local.unsatisfied_deny_rows) == 0 && length(local.live_unsatisfied_rows) == 0 && length(local.missing_live_permissions) == 0 && length(local.activation_blocked) == 0
@@ -427,13 +174,35 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
   }
 
   assert {
-    condition     = local.canary_verified && local.certificate_bound && local.canary_certificate.buildSignerURI == "https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main" && local.canary_certificate.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000002/attempts/1" && local.canary_certificate.sourceRepositoryDigest == var.active_workflow_sha
-    error_message = "The verified certificate must bind the predicate to the deny-canary workflow at the active commit, the named run, and the platform repository."
+    condition     = local.verified.control && local.verified.deny && local.certificate_bound.control && local.certificate_bound.deny && local.certificates.deny.buildSignerURI == "https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main" && local.certificates.control.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000001/attempts/1" && local.certificates.deny.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000003/attempts/1" && local.certificates.deny.sourceRepositoryDigest == var.active_workflow_sha
+    error_message = "Each phase's verified certificate must bind its predicate to the deny-canary workflow at the active commit, the phase's own run, and the platform repository."
   }
 
   assert {
-    condition     = local.live_matches_canary && length(data.http.deny_policies) == 5 && length(data.http.deny_policy) == 5 && length(local.live_rules) == 5 + 4 * 4 && length(local.required_deny_matrix) == 33 + 4 * 26
-    error_message = "Every attachment point's live deny policies must be read and be exactly the attested ones, and the whole matrix must be carried by them."
+    condition     = local.predicates.control.phase == "control" && local.predicates.deny.phase == "deny" && tostring(local.predicates.deny.controlRunId) == "100000000001" && local.evidence_checks.control_before_deny
+    error_message = "The deny phase must name the control run and follow it in time."
+  }
+
+  # Every required row is proven by the pair -- a DENIED observation naming
+  # the row's permission beside an ALLOWED observation of the byte-identical
+  # request -- except the sixteen consumer Compute and Cloud Build rows, which
+  # rest on the identical request answering SERVICE_DISABLED in both phases
+  # beside the live read proving each API disabled.
+  assert {
+    condition     = length([for key, satisfied in local.deny_pair_satisfied : key if satisfied]) == 35 + 5 + 4 * 24 && local.unserviceable_rows == sort(flatten([for attachment in values(local.consumer_attachments) : [for permission in keys(local.unserviceable_permissions) : "${attachment}|${permission}"]])) && length(local.unserviceable_rows) == 16 && length(data.external.service_state) == 8 && length(local.service_reads) == 8
+    error_message = "Exactly the consumer Compute and Cloud Build rows may rest on a disabled API, each beside its live read; every other row must be proven by the paired denial."
+  }
+
+  assert {
+    condition     = local.live_matches_canary && length(data.external.deny_state) == 6 && length(local.live_rules) == 13 && length(local.required_deny_matrix) == 35 + 4 * 28 + 5 && local.live_overlay == "steady"
+    error_message = "Every attachment point's live deny policies must be read and be exactly the attested ones, the whole matrix must be carried by them, and the live overlay must be steady."
+  }
+
+  # The matrix the broker runtime derives (protected-recovery/src/deny.ts)
+  # and the one this module derives are one definition: every form equal.
+  assert {
+    condition     = jsonencode(local.matrices.steady) == jsonencode(jsondecode(file("${path.module}/enabled/fixtures/matrix-steady.json"))) && jsonencode(local.matrices.bootstrap) == jsonencode(jsondecode(file("${path.module}/enabled/fixtures/matrix-bootstrap.json"))) && jsonencode(local.matrices.maintenance) == jsonencode(jsondecode(file("${path.module}/enabled/fixtures/matrix-maintenance.json"))) && jsonencode(local.matrices.deployment) == jsonencode(jsondecode(file("${path.module}/enabled/fixtures/matrix-deployment.json")))
+    error_message = "The module's Deny matrix must equal the broker runtime's derivation in every form."
   }
 
   assert {
@@ -483,9 +252,15 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
       alltrue([for consumer, grant in google_project_iam_member.broker_inventory : grant.project == local.consumers[consumer].projectId]) &&
       length(google_organization_iam_custom_role.inventory) == 1 && google_organization_iam_custom_role.inventory[0].org_id == "100000000001" && google_organization_iam_custom_role.inventory[0].role_id == "protectedRecoveryInventory" &&
       !contains(google_organization_iam_custom_role.inventory[0].permissions, "iam.serviceAccounts.getAccessToken") &&
-      length(google_organization_iam_member.broker_inventory) == 1 && google_organization_iam_member.broker_inventory[0].org_id == "100000000001"
+      length(google_organization_iam_member.broker_inventory) == 1 && google_organization_iam_member.broker_inventory[0].org_id == "100000000001" &&
+      length(google_organization_iam_member.broker_deny_reviewer) == 1
     )
-    error_message = "The broker must hold exactly the read-only inventory role in every consumer project and at the evidenced organization, and nothing that issues credentials or writes policies."
+    error_message = "The broker must hold exactly the read-only inventory role in every consumer project and at the evidenced organization, the deny reviewer role at the organization, and nothing that issues credentials or writes policies."
+  }
+
+  assert {
+    condition     = local.evidence_verified && length(local.activation_blocked) == 0 && length(google_project_iam_custom_role.actuator) == 4 && length(google_service_account_iam_member.actuator) == 36 && length(google_project_iam_member.broker_inventory) == 4 && length(google_organization_iam_member.broker_inventory) == 1
+    error_message = "Step two must grant exactly the four actuator roles, thirty-six actuator grants, four inventory grants, and one organization inventory grant, every one a mutation the matrix permits the applying identity."
   }
 }
 
@@ -504,31 +279,26 @@ run "a_recreated_identity_at_the_same_address_is_refused" {
   expect_failures = [data.google_service_account.target]
 }
 
+# The records of either phase: a run GitHub does not record, a run of another
+# head, an artifact whose recorded digest differs from the downloaded bytes,
+# and a control run that did not finish before the deny run began.
 run "a_run_github_does_not_record_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_run[0]
-    values = {
-      status_code   = 404
-      response_body = "{\"message\":\"Not Found\"}"
-    }
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:run-missing@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
 }
 
-run "a_run_of_another_head_or_workflow_is_refused" {
+run "a_control_run_of_another_head_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_run[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        {"id":100000000002,"run_attempt":1,"status":"completed","conclusion":"success","head_sha":"cccccccccccccccccccccccccccccccccccccccc","path":".github/workflows/protected-recovery-invoke.yml","event":"workflow_dispatch","repository":{"id":1255856466},"head_repository":{"id":1255856466}}
-      JSON
-    }
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:run-other-head@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -538,24 +308,48 @@ run "an_artifact_whose_recorded_digest_differs_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_artifact[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        {"id":100000000003,"name":"deny-canary","digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","expired":false,"workflow_run":{"id":100000000002,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
-      JSON
-    }
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:artifact-digest@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
 }
 
+run "a_control_run_that_did_not_precede_the_deny_run_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:control-after-deny@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "control_before_deny")
+    error_message = "A control run updated after the deny run began must fail control_before_deny."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+# The attestation of either phase: unverifiable, or signed by another
+# workflow, run, head, repository, or runner.
 run "an_attestation_gh_cannot_verify_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:consistent:unverified@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:unverified@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_unverifiable_control_attestation_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:unverified@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -565,8 +359,8 @@ run "an_attestation_signed_by_another_workflow_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:other-workflow:consistent@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:other-workflow@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -576,8 +370,8 @@ run "an_attestation_signed_by_another_run_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:other-run:consistent@@
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:other-run@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -587,8 +381,8 @@ run "an_attestation_signed_at_another_head_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:other-head:consistent@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:other-head@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -598,8 +392,8 @@ run "an_attestation_signed_from_another_repository_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:other-repository:consistent@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:other-repository@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -609,19 +403,24 @@ run "an_attestation_signed_on_a_self_hosted_runner_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:self-hosted:consistent@@
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:self-hosted@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
 }
 
+# The predicate of either phase: an exception outside the form, an unrelated
+# resource, a permission never observed, another image, a phase that is not
+# what it claims, a deny run naming another control run, a deny request that
+# is not the control request, a refusal without an IAM cause, and a
+# permission the producer never exercised.
 run "an_extra_exception_principal_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:consistent:extra-exception@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:extra-exception@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -631,8 +430,8 @@ run "a_canary_against_an_unrelated_resource_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:consistent:unrelated-resource@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:unrelated-resource@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -642,8 +441,29 @@ run "a_required_permission_never_observed_denied_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:consistent:missing-observation@@
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:missing-observation@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create") && contains(local.evidence_failures, "coverage_complete")
+    error_message = "A row whose denial was never observed must be named unsatisfied and fail coverage_complete."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_required_permission_never_observed_allowed_in_the_control_phase_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:missing-observation@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create")
+    error_message = "A denial with no successful control of the same request is not evidence of the rule."
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -653,8 +473,83 @@ run "evidence_of_another_broker_image_is_refused" {
   command = plan
 
   override_data {
-    target = data.external.canary_verification[0]
-    @@VERIFICATION:consistent:other-image@@
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:other-image@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_predicate_of_the_other_phase_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:other-phase@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_deny_run_naming_another_control_run_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:other-control@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "control_before_deny")
+    error_message = "A deny predicate that names another control run must fail control_before_deny."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_denial_of_another_request_than_the_control_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:request-mismatch@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create")
+    error_message = "A denial of a request other than the one the control phase succeeded with proves nothing about the rule."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_refusal_without_an_iam_cause_naming_the_permission_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:missing-cause@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create")
+    error_message = "A 403 that carries no IAM permission denial naming the row's permission is not a Deny observation."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_predicate_with_an_unexercised_permission_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:unexercised@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "deny_predicate_bound")
+    error_message = "A predicate whose unexercised list is not empty must fail deny_predicate_bound."
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -721,8 +616,36 @@ run "a_live_policy_deleted_since_the_canary_is_refused" {
   @@LIVE_DENY_LISTING:missing@@
 
   assert {
-    condition     = !local.live_matches_canary && length(data.http.deny_policy) == 4
+    condition     = !local.live_matches_canary && contains(local.evidence_failures, "deny_state_current")
     error_message = "An attested policy the live state no longer lists must fail deny_state_current."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+# A consumer attachment row rests on a disabled API only while the API is
+# disabled: an enabled Compute API turns its three rows into unproven rows.
+run "an_unserviceable_row_whose_api_is_live_enabled_is_refused" {
+  command = plan
+
+  @@LIVE_SERVICE_STATE:runsetta:compute.googleapis.com:ENABLED@@
+
+  assert {
+    condition     = length(local.unserviceable_rows) == 13 && contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/runsetta|compute.googleapis.com/instances.create") && contains(local.evidence_failures, "coverage_complete")
+    error_message = "A SERVICE_DISABLED observation beside a live read that says the API is enabled must leave the row unsatisfied."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_unserviceable_row_whose_api_cannot_be_read_is_refused" {
+  command = plan
+
+  @@LIVE_SERVICE_STATE:cdbentley:cloudbuild.googleapis.com:unread@@
+
+  assert {
+    condition     = contains(local.evidence_failures, "services_read") && contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/cdbentley|cloudbuild.googleapis.com/builds.create")
+    error_message = "A service state that cannot be read must fail services_read and leave the row unsatisfied."
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -747,40 +670,8 @@ run "without_evidence_nothing_is_granted_even_with_every_identity_recorded" {
   }
 
   assert {
-    condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0
+    condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(data.external.service_state) == 0
     error_message = "Recorded identities alone must grant nothing; only verified evidence enables authority."
-  }
-}
-
-# The activation sequence from an empty broker project, applied with mock
-# providers and state carried from run to run: the broker project alone
-# without evidence, the evidenced grants once the Deny state stands and every
-# mutation the apply makes is permitted its principal, and revocation of the
-# grants when the evidence is withdrawn.
-run "activation_step_one_installs_the_broker_project_alone" {
-  command = apply
-
-  variables {
-    broker_authority_evidence = null
-  }
-
-  assert {
-    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(data.google_project.consumer) == 0
-    error_message = "Step one must create nothing in any consumer project and read none."
-  }
-
-  assert {
-    condition     = length(google_service_account_iam_member.invoker_authority) == 8 && length(google_service_account_iam_member.member_authority) == 61 && length(google_service_account_iam_member.canary_authority) == 1 && length(google_cloud_run_v2_service_iam_member.invokers) == 13 && google_iam_workload_identity_pool_provider.members.workload_identity_pool_provider_id == "github-members"
-    error_message = "Step one must create the broker project's identities and their bindings: invokers, member-delivery identities, and the Deny canary, so the canary can run before any grant exists."
-  }
-}
-
-run "activation_step_two_grants_authority_under_the_evidenced_deny_state" {
-  command = apply
-
-  assert {
-    condition     = local.evidence_verified && length(local.activation_blocked) == 0 && length(google_project_iam_custom_role.actuator) == 4 && length(google_service_account_iam_member.actuator) == 36 && length(google_project_iam_member.broker_inventory) == 4 && length(google_organization_iam_member.broker_inventory) == 1
-    error_message = "Step two must grant exactly the four actuator roles, thirty-six actuator grants, four inventory grants, and one organization inventory grant, every one a mutation the matrix permits the applying identity."
   }
 }
 

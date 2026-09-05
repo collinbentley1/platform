@@ -473,8 +473,29 @@ jobs:
           terraform -chdir=terraform/modules/protected-recovery init -backend=false -input=false -lockfile=readonly
           terraform -chdir=terraform/modules/protected-recovery test -no-color
 
+      # The enabled-path harness renders its fixtures with the broker runtime's
+      # own derivations, so it needs the same pinned Bun the verify job uses.
+      - name: Install checksum-pinned Bun 1.4.0 for the enabled-path fixtures
+        env:
+          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/bun.zip"
+          destination="$RUNNER_TEMP/bun-bin"
+          curl --fail --show-error --silent --location \
+            --output "$archive" \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+          echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$destination"
+          unzip -q "$archive" -d "$destination"
+          echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
+          "$destination/bun-linux-x64/bun" -e 'if (Bun.version !== "1.4.0") process.exit(1)'
+
       - name: Test the protected recovery enabled path with every target identity populated
         run: bash tools/ci/protected-recovery-enabled-test.sh
+
+      - name: Prove the protected recovery live reads write no bearer into state
+        run: bash tools/ci/protected-recovery-state-scan-test.sh
 
       - name: Run digest-pinned Checkov against the trusted platform Terraform
         env:
