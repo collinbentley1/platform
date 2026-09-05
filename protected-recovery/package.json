@@ -1,0 +1,11 @@
+{
+  "name": "@collinbentley/protected-recovery",
+  "version": "0.1.0",
+  "description": "Protected-recovery broker: Firestore-ordered quarantine and restore of consumer federated authority through IAM allow-policy compare-and-set.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run --no-env-file src/http.ts",
+    "test": "bun test"
+  }
+}

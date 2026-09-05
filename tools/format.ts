@@ -3,7 +3,7 @@ import { join, relative } from "node:path";
 
 const mode = Bun.argv.includes("--write") ? "write" : "check";
 const root = join(import.meta.dir, "..");
-const formattedRoots = new Set([".github", "docs", "templates", "terraform", "tools"]);
+const formattedRoots = new Set([".github", "docs", "protected-recovery", "templates", "terraform", "tools"]);
 const formattedFiles = new Set([
   ".gitignore",
   "bunfig.toml",

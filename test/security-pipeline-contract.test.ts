@@ -579,7 +579,15 @@ describe("protected container and preview lifecycle contracts", () => {
       (step) => step.name === "Revalidate current pull request lifecycle before OIDC",
     );
     expect(lifecycle?.run).toBeString();
-    for (const step of cleanup.jobs.cleanup.steps.slice(2)) {
+    // The rerun guard, the unconditional broker delivery, and the lifecycle
+    // check itself run before the gate; every other step is gated on it.
+    const preGate = new Set([
+      "Reject workflow reruns before any privileged action",
+      "Deliver this job's credential to the protected-recovery broker",
+      "Revalidate current pull request lifecycle before OIDC",
+    ]);
+    for (const step of cleanup.jobs.cleanup.steps) {
+      if (preGate.has(step.name as string)) continue;
       if (step.name === "Retire cleanup transaction credentials") {
         expect(step.if).toBe("always() && github.run_attempt == '1'");
       } else if (step.name === "Report fail-closed cleanup evidence failure") {
@@ -706,14 +714,21 @@ describe("protected container and preview lifecycle contracts", () => {
     expect(workflow.jobs.deploy.outputs["lifecycle-keep"]).toBe(
       "${{ steps.traffic-commit.outputs.admitted }}",
     );
-    expect(workflow.jobs.invalidate.if).toBe(
-      "always() && needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')",
+    // The invalidate job runs on every non-draft preview event so it can deliver its credential first; the
+    // mandatory exact-revision invalidation is decided in a step whose output gates the mutation.
+    expect(workflow.jobs.invalidate.if).toStartWith("always() && github.event_name == 'pull_request_target'");
+    const staleDecision = workflow.jobs.invalidate.steps.find(
+      (step: Record<string, any>) => step.name === "Decide whether a stale preview must be invalidated",
+    );
+    expect(staleDecision.env.STALE).toBe(
+      "${{ needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success') }}",
     );
     const invalidate = workflow.jobs.invalidate.steps.find(
       (step: Record<string, any>) =>
         step.name === "Remove only the failed run's exact tag with one proven etag transaction",
     );
     const invalidateRun = invalidate.run as string;
+    expect(invalidate.if).toContain("steps.stale.outputs.proceed == 'true'");
     expect(invalidate.env.EXPECTED_TARGET_REVISION).toBe(
       "${{ needs.deploy.outputs.deployed-revision }}",
     );

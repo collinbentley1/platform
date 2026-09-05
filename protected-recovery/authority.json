@@ -1,0 +1,98 @@
+{
+  "broker": {
+    "projectId": null,
+    "projectNumber": null,
+    "region": "us-east4",
+    "serviceName": "protected-recovery",
+    "firestoreDatabase": "protected-recovery",
+    "reconcilerServiceAccount": "recovery-reconciler",
+    "workloadIdentityPoolId": "github-actions",
+    "workloadIdentityProviderId": "github",
+    "memberWorkloadIdentityProviderId": "github-members"
+  },
+  "organizationId": null,
+  "bootstrapPrincipal": null,
+  "maintenancePrincipals": [],
+  "githubOwner": "collinbentley1",
+  "githubOwnerId": "16823277",
+  "platformRepository": "collinbentley1/platform",
+  "platformRepositoryId": "1255856466",
+  "consumers": [
+    {
+      "repository": "cdbentley",
+      "repositoryId": "1255553151",
+      "projectId": "cdbentley",
+      "projectNumber": "882468538648",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "critical-history",
+      "repositoryId": "280932482",
+      "projectId": "critical-history-16823277",
+      "projectNumber": "422714632513",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "healthmcp",
+      "repositoryId": "1025243085",
+      "projectId": "medlock-1025243085",
+      "projectNumber": "229383559510",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    },
+    {
+      "repository": "runsetta",
+      "repositoryId": "711292980",
+      "projectId": "runsetta",
+      "projectNumber": "601124730704",
+      "serviceAccountUniqueIds": {
+        "gha-deploy-parity": null,
+        "gha-preview-commit": null,
+        "gha-preview-deploy": null,
+        "gha-preview-operator": null,
+        "gha-preview-publish": null,
+        "gha-prod-deploy": null,
+        "gha-prod-publish": null,
+        "gha-terraform": null,
+        "gha-wif-canary": null
+      },
+      "activeWorkflowSha": null,
+      "transitionWorkflowSha": null
+    }
+  ]
+}

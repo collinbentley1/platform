@@ -14,8 +14,10 @@ locals {
   platform_repository = "collinbentley1/platform"
 
   # The one inventory of federated authority: one entry per id-token job of a
-  # platform reusable workflow. tools/ci/workflow-authority.ts validates the
-  # same file against every workflow and caller template on disk.
+  # platform workflow, classified by trust domain. tools/ci/workflow-authority.ts
+  # validates the same file against every workflow and caller template on disk.
+  # This module binds only consumer-domain entries; recovery-domain entries are
+  # bound by terraform/modules/protected-recovery through the broker's own pool.
   workflow_authority = jsondecode(file("${path.module}/workflow-authority.json"))
 
   # Reserved delimiter of the attribute.authority composite. Git refuses ':' in
@@ -901,7 +903,7 @@ locals {
             ]
           ]
         ]
-      ]
+      ] if entry.trustDomain == "consumer"
       ]) : binding.key => merge(binding, {
       member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"
     })
@@ -919,12 +921,14 @@ resource "google_service_account_iam_member" "workflow_authority" {
     precondition {
       condition = alltrue([
         for entry in local.workflow_authority : (
-          contains(["attestation", "gcp"], entry.purpose) &&
-          (entry.purpose == "gcp") == (length(entry.serviceAccounts) > 0) &&
-          !strcontains(join("", concat([local.github_repo_full_name, entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
+          entry.trustDomain != "consumer" || (
+            contains(["attestation", "gcp"], entry.purpose) &&
+            (entry.purpose == "gcp") == (length(entry.serviceAccounts) > 0) &&
+            !strcontains(join("", concat([local.github_repo_full_name, entry.workflow, entry.job, entry.environment], flatten([for caller in entry.callers : concat([caller.workflow, caller.ref], caller.events)]))), local.authority_delimiter)
+          )
         )
       ])
-      error_message = "workflow-authority.json must declare only attestation or gcp purposes, accounts only for gcp jobs, and no reserved delimiter in any tuple value."
+      error_message = "workflow-authority.json consumer-domain entries must declare only attestation or gcp purposes, accounts only for gcp jobs, and no reserved delimiter in any tuple value."
     }
   }
 }

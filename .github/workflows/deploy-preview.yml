@@ -566,6 +566,44 @@ jobs:
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
 
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
       - name: Resolve trusted canary configuration
         id: app
         env:
@@ -621,6 +659,44 @@ jobs:
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
 
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
       - name: Resolve trusted publisher-canary configuration
         id: app
         env:
@@ -662,10 +738,14 @@ jobs:
       - verify-image
     if: >-
       always() &&
-      needs.canary.result == 'success' &&
-      needs.prefetch-bases.result == 'success' &&
-      needs.publish-canary.result == 'success' &&
-      needs.verify-image.result == 'success'
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
     environment: preview-publish
     permissions:
       actions: read # Read only the exact promoted artifact id from this run.
@@ -681,6 +761,52 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
+      - name: Require every upstream job to have succeeded before any exchange
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          UPSTREAM_SUCCEEDED: ${{ needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish-canary.result == 'success' && needs.verify-image.result == 'success' }}
+        run: |
+          set -euo pipefail
+          test "$UPSTREAM_SUCCEEDED" = "true"
 
       - name: Fetch the exact reusable-workflow policy source before OIDC
         id: policy
@@ -910,9 +1036,15 @@ jobs:
       - prefetch-bases
       - publish
     if: >-
-      needs.attest.result == 'success' &&
-      needs.prefetch-bases.result == 'success' &&
-      needs.publish.result == 'success'
+      always() &&
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
     environment: preview-cloud
     permissions:
       actions: read # Download only this run's exact DHI base closure before OIDC.
@@ -934,6 +1066,52 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
+
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
+      - name: Require every upstream job to have succeeded before any exchange
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          UPSTREAM_SUCCEEDED: ${{ needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success' }}
+        run: |
+          set -euo pipefail
+          test "$UPSTREAM_SUCCEEDED" = "true"
 
       - name: Resolve trusted application configuration
         id: app
@@ -1920,8 +2098,14 @@ jobs:
       - prefetch-bases
     if: >-
       always() &&
-      needs.deploy.outputs.deployed-revision != '' &&
-      (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')
+      github.event_name == 'pull_request_target' &&
+      github.ref == 'refs/heads/main' &&
+      github.base_ref == 'main' &&
+      github.event.pull_request.head.repo.id == github.event.repository.id &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
     environment: preview-operations
     permissions:
       actions: read # Download only this run's exact DHI base closure.
@@ -1939,7 +2123,56 @@ jobs:
           set -euo pipefail
           test "$GITHUB_RUN_ATTEMPT" = "1"
 
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
+      - name: Decide whether a stale preview must be invalidated
+        id: stale
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          STALE: ${{ needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success') }}
+        run: |
+          set -euo pipefail
+          echo "proceed=$STALE" >> "$GITHUB_OUTPUT"
+          [ "$STALE" = true ] || echo "No stale preview to invalidate; the delivery above is this job's whole work."
+
       - name: Resolve trusted application configuration
+        if: steps.stale.outputs.proceed == 'true'
         id: app
         env:
           REPOSITORY_ID: ${{ github.event.repository.id }}
@@ -1970,6 +2203,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Fetch exact preview controller policy before OIDC
+        if: steps.stale.outputs.proceed == 'true'
         id: parity-policy
         env:
           WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
@@ -2006,7 +2240,7 @@ jobs:
 
       - name: Bind the exact DHI base artifact before OIDC
         id: artifact-bind
-        if: needs.prefetch-bases.result == 'success'
+        if: steps.stale.outputs.proceed == 'true' && (needs.prefetch-bases.result == 'success')
         continue-on-error: true
         env:
           ARTIFACT_DIGEST: ${{ needs.prefetch-bases.outputs.artifact-digest }}
@@ -2030,7 +2264,7 @@ jobs:
 
       - name: Download only the exact DHI base artifact id
         id: artifact-download
-        if: needs.prefetch-bases.result == 'success' && steps.artifact-bind.outcome == 'success'
+        if: steps.stale.outputs.proceed == 'true' && (needs.prefetch-bases.result == 'success' && steps.artifact-bind.outcome == 'success')
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -2040,6 +2274,7 @@ jobs:
           skip-decompress: true
 
       - name: Install checksum-pinned Google Cloud CLI
+        if: steps.stale.outputs.proceed == 'true'
         id: gcloud
         continue-on-error: true
         env:
@@ -2066,6 +2301,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prove exact preview operator workflow-SHA WIF trust
+        if: steps.stale.outputs.proceed == 'true'
         id: wif-canary
         continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -2079,6 +2315,7 @@ jobs:
           access_token_lifetime: 300s
 
       - name: Authenticate the dedicated preview runtime IAM auditor for invalidation
+        if: steps.stale.outputs.proceed == 'true'
         id: iam-audit-auth
         continue-on-error: true
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
@@ -2093,7 +2330,7 @@ jobs:
 
       - name: Prove every preview runtime remains access-free before invalidation
         id: iam-audit
-        if: steps.iam-audit-auth.outcome == 'success'
+        if: steps.stale.outputs.proceed == 'true' && (steps.iam-audit-auth.outcome == 'success')
         continue-on-error: true
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
@@ -2105,6 +2342,7 @@ jobs:
           echo "admitted=true" >> "$GITHUB_OUTPUT"
 
       - name: Authenticate the dedicated preview transaction committer for invalidation
+        if: steps.stale.outputs.proceed == 'true'
         id: commit-auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
@@ -2118,13 +2356,14 @@ jobs:
         id: maintenance
         continue-on-error: true
         if: >-
-          needs.prefetch-bases.result == 'success' &&
+          steps.stale.outputs.proceed == 'true' &&
+          (needs.prefetch-bases.result == 'success' &&
           steps.artifact-bind.outcome == 'success' &&
           steps.artifact-download.outcome == 'success' &&
           steps.gcloud.outcome == 'success' &&
           steps.wif-canary.outcome == 'success' &&
           steps.iam-audit.outputs.admitted == 'true' &&
-          steps.commit-auth.outcome == 'success'
+          steps.commit-auth.outcome == 'success')
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
@@ -2156,14 +2395,15 @@ jobs:
       - name: Seal preview exposure when invalidation evidence is unavailable
         id: fail-closed-seal
         if: >-
-          steps.commit-auth.outcome == 'success' &&
+          steps.stale.outputs.proceed == 'true' &&
+          (steps.commit-auth.outcome == 'success' &&
           (needs.prefetch-bases.result != 'success' ||
-           steps.artifact-bind.outcome != 'success' ||
-           steps.artifact-download.outcome != 'success' ||
-           steps.gcloud.outcome != 'success' ||
-           steps.wif-canary.outcome != 'success' ||
-           steps.iam-audit.outputs.admitted != 'true' ||
-           steps.maintenance.outcome == 'failure')
+          steps.artifact-bind.outcome != 'success' ||
+          steps.artifact-download.outcome != 'success' ||
+          steps.gcloud.outcome != 'success' ||
+          steps.wif-canary.outcome != 'success' ||
+          steps.iam-audit.outputs.admitted != 'true' ||
+          steps.maintenance.outcome == 'failure'))
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           ACCESS_TOKEN: ${{ steps.commit-auth.outputs.access_token }}
@@ -2199,7 +2439,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Report fail-closed invalidation evidence failure
-        if: steps.fail-closed-seal.outputs.admitted == 'true'
+        if: steps.stale.outputs.proceed == 'true' && (steps.fail-closed-seal.outputs.admitted == 'true')
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         run: |
           echo "Preview exposure was sealed because invalidation evidence was unavailable." >&2

@@ -1,0 +1,314 @@
+name: Protected recovery deny canary
+
+# The Deny canary of the protected-recovery deployment: three owner-dispatched
+# phases of one exercise of every IAM Deny rule attached to the broker
+# project, to the organization, and to every consumer project, as the canary
+# identity (tools/ci/protected-recovery-deny-canary.sh).
+#
+#   control   dispatched first, with the canary principal excepted from every
+#             rule and holding the routine allow roles the requests need.
+#             Every request must succeed and every operation it starts must
+#             end without error: it creates the throwaway resources in each
+#             attachment scope, leaves each in the pre-state the deny phase's
+#             request requires, and proves each request well-formed and
+#             allowed.
+#   deny      dispatched next, naming the control run, with the canary
+#             removed from every exception set and the allow roles left in
+#             place. The same requests -- the same canonical digest -- against
+#             the same resources in the same pre-state must be refused with
+#             IAM permission denials naming the rows' own permissions.
+#   cleanup   dispatched last, naming the control run, under the control form
+#             again: removes every throwaway resource the control run created
+#             and attests the removal; a leftover fails the run.
+#
+# All three runs attest exactly what they observed -- policy names, etags,
+# rules, the allow policies at every attachment point, and per-permission
+# outcomes with the request digest, the pre-state, the permissions the
+# request needs, the operation, and the returned cause; or the removals and
+# leftovers -- as an artifact whose signed attestation the Terraform module
+# verifies (gh attestation verify, through tools/ci/protected-recovery-
+# verify-canary.sh) before it grants the broker any authority over consumer
+# accounts. The module pairs the two exercise runs row by row on the request
+# digest and the pre-state (a refusal is evidence only beside the success of
+# the identical request), requires the same Allows in both, requires every
+# co-denied permission proven in isolation, binds the runs to the live
+# policies by name and etag, requires the cleanup to have followed with
+# nothing left over, reads live that the canary's Allows are retired, and
+# refuses a predicate whose `unexercised` or `failures` list is not empty;
+# this workflow refuses to attest one as well.
+#
+# The canary identity, gha-deny-canary in the broker project, is bound by the
+# module to exactly this job's direct-dispatch tuple and holds no standing
+# authority from the module. The root grants it, immediately before the
+# control run and until after the cleanup run, the allow roles the exercises
+# need in each attachment scope -- service-account, workload-identity, Cloud
+# Run, Cloud Scheduler, Artifact Registry, and project IAM administration in
+# the broker project; the same, with Service Usage administration, in every
+# consumer project; organization role and organization-policy
+# administration, project and folder creation, project movement, and project
+# and folder deletion at the organization; datastore and storage object roles
+# on the ledger and the evidence bucket -- and removes them afterwards. The
+# token-creator edges of the token and delegation rows are provisioned by the
+# control phase itself on its own throwaway accounts. Both exercise runs
+# record those Allows, and the module reads live at apply that none remains;
+# the broker's credential inventory refuses every quarantine while such a
+# grant remains in any consumer project.
+#
+# Prerequisites the exercises need in each attachment scope, surfaced by the
+# module rather than assumed: the Artifact Registry API in the broker project
+# (the module enables it); the Cloud Scheduler API in every attachment project
+# for the actAs row, which no other enabled consumer API can exercise on its
+# own (the consumer projects do not enable it today; the module refuses the
+# row until they do); the Compute and Cloud Build attachment rows of the
+# consumer projects answer SERVICE_DISABLED where those APIs are not enabled,
+# which the module accepts only together with a live read proving them
+# disabled; and, at the organization, quota for one throwaway project per
+# control run, which the cleanup run deletes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: The phase of the exercise this run performs.
+        required: true
+        type: choice
+        options:
+          - control
+          - deny
+          - cleanup
+      control_run_id:
+        description: For the deny and cleanup phases, the run ID of the control phase whose throwaway resources this run addresses; empty for the control phase.
+        required: false
+        type: string
+      organization_id:
+        description: Numeric ID of the organization that parents the broker project and every consumer project; the third attachment point, attested for the module's organization check.
+        required: true
+        type: string
+      broker_image:
+        description: The digest-pinned broker image the evidenced deployment runs; attested for the module's image check.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: protected-recovery-deny-canary
+  cancel-in-progress: false
+
+jobs:
+  exercise:
+    name: Exercise the required Deny matrix (${{ inputs.phase }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    environment: protected-recovery-deny-canary
+    permissions:
+      attestations: write # Attest the observed Deny matrix so the module can verify its signer.
+      contents: read # Read the reviewed broker coordinates and the canary script.
+      id-token: write # Exchange only for the Deny canary identity; sign the attestation.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          {
+            echo "project_id=$project_id"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "canary=gha-deny-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bind this run to its phase and to the control run it addresses
+        id: phase
+        env:
+          PHASE: ${{ inputs.phase }}
+          CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+        run: |
+          set -euo pipefail
+          case "$PHASE" in
+            control)
+              test -z "$CONTROL_RUN_ID"
+              echo "control_run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+              ;;
+            deny|cleanup)
+              [[ "$CONTROL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+              test "$CONTROL_RUN_ID" != "$GITHUB_RUN_ID"
+              echo "control_run_id=$CONTROL_RUN_ID" >> "$GITHUB_OUTPUT"
+              ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Exchange for the Deny canary identity
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.canary }}
+          token_format: access_token
+          access_token_lifetime: 3600s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      # Each phase attests one predicate file under one artifact name with one
+      # predicate type; the module verifies exactly these
+      # (terraform/modules/protected-recovery, output deny_canary_contract).
+      - name: Bind this phase to its predicate, artifact, and predicate type
+        id: contract
+        env:
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          case "$PHASE" in
+            control|deny)
+              echo "predicate=$RUNNER_TEMP/deny-canary.json"
+              echo "artifact=deny-canary"
+              echo "predicate_type=https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v3"
+              ;;
+            cleanup)
+              echo "predicate=$RUNNER_TEMP/deny-canary-cleanup.json"
+              echo "artifact=deny-canary-cleanup"
+              echo "predicate_type=https://github.com/collinbentley1/platform/protected-recovery/deny-canary-cleanup/v3"
+              ;;
+            *) exit 1 ;;
+          esac >> "$GITHUB_OUTPUT"
+          case "$PHASE" in
+            control) echo "key=deny_control" ;;
+            deny) echo "key=deny_canary" ;;
+            cleanup) echo "key=deny_cleanup" ;;
+          esac >> "$GITHUB_OUTPUT"
+
+      - name: Exercise every live Deny rule as the canary identity
+        if: inputs.phase != 'cleanup'
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          BROKER_IMAGE: ${{ inputs.broker_image }}
+          CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
+          CONTROL_RUN_ID: ${{ steps.phase.outputs.control_run_id }}
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+          PHASE: ${{ inputs.phase }}
+        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary.json"
+
+      # A removal that leaves anything over fails here and is never attested
+      # away: the module requires the attested leftovers to be empty.
+      - name: Remove the throwaway resources of the control run
+        if: inputs.phase == 'cleanup'
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          BROKER_IMAGE: ${{ inputs.broker_image }}
+          CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
+          CONTROL_RUN_ID: ${{ steps.phase.outputs.control_run_id }}
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+          PHASE: cleanup
+        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary-cleanup.json"
+
+      # On success, on failure, and on cancellation alike: whatever a phase
+      # creates and removes within itself -- keys of the throwaway accounts,
+      # queued canary builds -- is removed again here. A key or build that
+      # could not be removed, or a listing that could not be made, is a
+      # leftover, and a leftover fails this step and the run.
+      - name: Remove this run's transient resources
+        if: always() && steps.phase.outcome == 'success' && steps.auth.outcome == 'success'
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          BROKER_IMAGE: ${{ inputs.broker_image }}
+          CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
+          CONTROL_RUN_ID: ${{ steps.phase.outputs.control_run_id }}
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+          PHASE: ${{ inputs.phase }}
+          TRANSIENT_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          status=0
+          bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary-transient.json" || status=$?
+          if [ -f "$RUNNER_TEMP/deny-canary-transient.json" ]; then
+            jq -r '.leftovers[]' "$RUNNER_TEMP/deny-canary-transient.json" | sed 's/^/transient leftover: /' >&2
+          fi
+          exit "$status"
+
+      # Nothing incomplete is attested: every permission of every live rule
+      # must have been exercised, the phase must have observed only what it
+      # exists to observe, every denial must name its own row's permission,
+      # every started operation must have ended well, the Allows must have
+      # been recorded, and no provisioning or wait may have failed; a cleanup
+      # must have left nothing over.
+      - name: Require complete coverage and a consistent phase before attestation
+        env:
+          PHASE: ${{ inputs.phase }}
+          PREDICATE: ${{ steps.contract.outputs.predicate }}
+        run: |
+          set -euo pipefail
+          case "$PHASE" in
+            control|deny)
+              jq -r '"unexercised: \(.unexercised | length); failures: \(.failures | length); allow policies: \(.allowPolicies | length); outcomes: \([.policies[].rules[].canary[].outcome] | group_by(.) | map("\(.[0])=\(length)") | join(", "))"' "$PREDICATE"
+              jq -e '.schema == "protected-recovery/deny-canary/v3" and (.unexercised | length) == 0 and (.failures | length) == 0 and (.allowPolicies | length) > 0' "$PREDICATE" > /dev/null
+              jq -e '[.policies[].rules[].canary[] | select(.outcome == "DENIED" and .response.permission != .permission)] | length == 0' "$PREDICATE" > /dev/null
+              jq -e '[.policies[].rules[].canary[] | select(.outcome == "ALLOWED" and .operation != null and (.operation.done != true or .operation.error != null))] | length == 0' "$PREDICATE" > /dev/null
+              ;;
+          esac
+          case "$PHASE" in
+            control) jq -e '[.policies[].rules[].canary[] | select(.outcome != "ALLOWED" and .outcome != "UNSERVICEABLE")] | length == 0' "$PREDICATE" > /dev/null ;;
+            deny) jq -e '[.policies[].rules[].canary[] | select(.outcome != "DENIED" and .outcome != "UNSERVICEABLE")] | length == 0' "$PREDICATE" > /dev/null ;;
+            cleanup)
+              jq -r '"removed: \(.removed | length); leftovers: \(.leftovers | length)"' "$PREDICATE"
+              jq -e '.schema == "protected-recovery/deny-canary-cleanup/v3" and .phase == "cleanup" and (.leftovers | length) == 0 and (.removed | length) > 0' "$PREDICATE" > /dev/null
+              ;;
+          esac
+
+      - name: Upload the attested predicate of this phase
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.contract.outputs.artifact }}
+          path: ${{ steps.contract.outputs.predicate }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attest the predicate of this phase
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.contract.outputs.predicate }}
+          predicate-type: ${{ steps.contract.outputs.predicate_type }}
+          predicate-path: ${{ steps.contract.outputs.predicate }}
+
+      # The evidence the module takes for this phase: the run, the artifact,
+      # the raw digest the attestation signs, and the archive digest GitHub
+      # records for the artifact -- two values that must differ, as the module
+      # requires (tools/ci/protected-recovery-artifact-digests.sh).
+      - name: Record the evidence of this phase
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          EVIDENCE_KEY: ${{ steps.contract.outputs.key }}
+          PHASE: ${{ inputs.phase }}
+          PREDICATE: ${{ steps.contract.outputs.predicate }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=tools/ci/protected-recovery-artifact-digests.sh
+          . tools/ci/protected-recovery-artifact-digests.sh
+          raw="$(raw_digest "$PREDICATE")"
+          archive="${ARTIFACT_DIGEST#sha256:}"
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$archive" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EVIDENCE_KEY" =~ ^deny_(control|canary|cleanup)$ ]]
+          test "$raw" != "$archive"
+          {
+            echo "## Deny canary evidence (${PHASE} phase)"
+            echo
+            echo '```hcl'
+            echo "${EVIDENCE_KEY} = {"
+            echo "  run_id          = \"${GITHUB_RUN_ID}\""
+            echo "  artifact_id     = \"${ARTIFACT_ID}\""
+            echo "  artifact_sha256 = \"${raw}\""
+            echo "  archive_sha256  = \"${archive}\""
+            echo "}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

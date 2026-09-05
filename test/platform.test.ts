@@ -156,7 +156,13 @@ describe("platform scaffold and doctor", () => {
     expect(checkov).not.toContain("id-token: write");
     expect(reusable.match(/id-token: write/g) ?? []).toHaveLength(1);
     expect(convergence).toContain(
-      "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+      "if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    );
+    expect(convergence).toContain(
+      "UPSTREAM_SUCCEEDED: ${{ needs.terraform-validate.result == 'success' && needs.checkov.result == 'success' }}",
+    );
+    expect(convergence.indexOf("Deliver this job's credential to the protected-recovery broker")).toBeLessThan(
+      convergence.indexOf("Require every upstream job to have succeeded before any exchange"),
     );
     expect(convergence).toContain("environment: production");
     expect(convergence).toContain("id-token: write");
@@ -1248,6 +1254,7 @@ describe("platform scaffold and doctor", () => {
     expect(gates).toHaveLength(1);
     const [gate] = gates;
     expect(gate?.env).toEqual({
+      FIRESTORE_EMULATOR_HOST: "127.0.0.1:8080",
       PROTECTED_BOOTSTRAP_DOCKER_BINARY: "/usr/bin/docker",
       PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1",
       TERRAFORM_SANDBOX_IMAGE:
@@ -2876,7 +2883,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "fcda60e0df635275e8d21f2c1c1d03ec474dc9be6b399ffafaf485edb88d7906",
+      "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',
@@ -3020,6 +3027,14 @@ describe("platform scaffold and doctor", () => {
     expect(attestations.map((entry) => entry.serviceAccounts)).toEqual([[], []]);
     expect(manifest.filter((entry) => entry.transitionEligible).map(jobKey)).toEqual([
       ".github/workflows/cleanup-preview.yml#cleanup",
+      ".github/workflows/protected-recovery-invoke.yml#cdbentley-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#cdbentley-restore",
+      ".github/workflows/protected-recovery-invoke.yml#critical-history-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#critical-history-restore",
+      ".github/workflows/protected-recovery-invoke.yml#healthmcp-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#healthmcp-restore",
+      ".github/workflows/protected-recovery-invoke.yml#runsetta-quarantine",
+      ".github/workflows/protected-recovery-invoke.yml#runsetta-restore",
       ".github/workflows/reconcile-previews.yml#reconcile",
     ]);
     expect(manifest.filter((entry) => entry.job.endsWith("canary")).map((entry) => entry.serviceAccounts)).toEqual([
@@ -3317,12 +3332,12 @@ describe("platform scaffold and doctor", () => {
         "publish-canary":
           "github.event_name == 'pull_request_target' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         publish:
-          "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish-canary.result == 'success' && needs.verify-image.result == 'success'",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         attest: "needs.publish.result == 'success'",
         deploy:
-          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         invalidate:
-          "always() && needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
       },
       "deploy-prod.yml": {
         "rerun-guard": null,
@@ -3330,10 +3345,11 @@ describe("platform scaffold and doctor", () => {
         build: "github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.prefetch-bases.result == 'success'",
         "verify-image": "needs.build.result == 'success' && needs.prefetch-bases.result == 'success'",
         canary: "github.event_name == 'push' && github.ref == 'refs/heads/main'",
-        publish: "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.verify-image.result == 'success'",
+        publish:
+          "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
         attest: "needs.publish.result == 'success'",
         deploy:
-          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
+          "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
       },
       "cleanup-preview.yml": {
         "rerun-guard": null,
@@ -3353,7 +3369,7 @@ describe("platform scaffold and doctor", () => {
         "rerun-guard": null,
         "terraform-validate": null,
         checkov: null,
-        "terraform-convergence": "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        "terraform-convergence": "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
       },
     };
 
