@@ -7,7 +7,8 @@
     "firestoreDatabase": "protected-recovery",
     "reconcilerServiceAccount": "recovery-reconciler",
     "workloadIdentityPoolId": "github-actions",
-    "workloadIdentityProviderId": "github"
+    "workloadIdentityProviderId": "github",
+    "memberWorkloadIdentityProviderId": "github-members"
   },
   "githubOwner": "collinbentley1",
   "githubOwnerId": "16823277",

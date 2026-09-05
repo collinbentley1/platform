@@ -100,6 +100,16 @@ const expectedEntries: WorkflowAuthorityEntry[] = [
   entry("deploy-prod.yml", "deploy", "production", "gcp", productionCaller, ["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-prod-deploy"]),
   entry("deploy-prod.yml", "publish", "production-publish", "gcp", productionCaller, ["gha-prod-publish", "gha-wif-canary"]),
   entry("infrastructure.yml", "terraform-convergence", "production", "gcp", productionCaller, ["gha-terraform", "gha-wif-canary"]),
+  {
+    callers: [{ events: ["workflow_dispatch"], ref: "refs/heads/main", workflow: ".github/workflows/protected-recovery-deny-canary.yml" }],
+    environment: "protected-recovery-deny-canary",
+    job: "exercise",
+    purpose: "deny-canary",
+    serviceAccounts: ["gha-deny-canary"],
+    transitionEligible: false,
+    trustDomain: "recovery",
+    workflow: ".github/workflows/protected-recovery-deny-canary.yml",
+  },
   recovery("cdbentley", "QUARANTINE"),
   recovery("cdbentley", "RESTORE"),
   recovery("critical-history", "QUARANTINE"),
@@ -125,6 +135,7 @@ describe("workflow authority manifest", () => {
       "infrastructure.yml",
       "platform.yml",
       "protected-bootstrap-implementation.yml",
+      "protected-recovery-deny-canary.yml",
       "protected-recovery-invoke.yml",
       "reconcile-previews.yml",
       "refresh-grype-db.yml",
@@ -214,6 +225,7 @@ describe("workflow authority manifest", () => {
     });
     expect(await failuresOf(root)).toEqual([
       ".github/workflows/deploy-prod.yml: job attest exchanges for [] but the manifest binds [gha-wif-canary].",
+      ".github/workflows/deploy-prod.yml: job attest runs actions/attest but is not declared attestation or deny-canary.",
     ]);
   });
 
@@ -347,7 +359,7 @@ describe("workflow authority manifest", () => {
     expect(failure([])).toEqual([`${manifestPath}: must be a non-empty array of id-token job entries.`]);
     expect(failure([manifestEntry({ extra: true })])[0]).toContain("keys must be exactly");
     expect(failure([manifestEntry({ trustDomain: "broker" })])[0]).toContain("trustDomain must be one of");
-    expect(failure([manifestEntry({ purpose: "recovery" })])[0]).toContain("purpose recovery is exactly the recovery trust domain");
+    expect(failure([manifestEntry({ purpose: "recovery" })])[0]).toContain("purposes recovery and deny-canary are exactly the recovery trust domain");
     expect(failure([manifestEntry({ purpose: "cloud" })])[0]).toContain("purpose must be one of");
     expect(failure([manifestEntry({ workflow: "workflows/deploy-prod.yml" })])[0]).toContain("workflow must name");
     expect(failure([manifestEntry({ workflow: ".github/workflows/../deploy-prod.yml" })])[0]).toContain("workflow must name");
@@ -418,7 +430,7 @@ describe("workflow authority manifest", () => {
     const failure = (manifest: unknown) => parseWorkflowAuthority(JSON.stringify(manifest)).failures;
     expect(failure([manifestEntry({})])).toEqual([]);
     expect(failure([manifestEntry({}), restoreEntry])).toEqual([]);
-    expect(failure([manifestEntry({ purpose: "gcp" })])[0]).toContain("purpose recovery is exactly the recovery trust domain");
+    expect(failure([manifestEntry({ purpose: "gcp" })])[0]).toContain("purposes recovery and deny-canary are exactly the recovery trust domain");
     expect(failure([manifestEntry({ consumer: "cdbentley/../runsetta" })])[0]).toContain("consumer must be one consumer repository name");
     expect(failure([manifestEntry({ intent: ["QUARANTINE", "RESTORE"] })])[0]).toContain("intent must be one of QUARANTINE, RESTORE");
     expect(failure([manifestEntry({ intent: "DISABLE" })])[0]).toContain("intent must be one of QUARANTINE, RESTORE");

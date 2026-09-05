@@ -19,7 +19,8 @@ describe("recovery authority", () => {
     expect(authority.targetAccounts).toEqual(["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-preview-operator", "gha-preview-publish", "gha-prod-deploy", "gha-prod-publish", "gha-terraform", "gha-wif-canary"]);
     expect(authority.consumers.every((consumer) => Object.values(consumer.serviceAccountUniqueIds).every((uniqueId) => uniqueId === null))).toBe(true);
     expect(unrecordedIdentities(authority)).toHaveLength(36);
-    expect(authority.entries.filter((entry) => entry.trustDomain === "recovery")).toHaveLength(8);
+    expect(authority.entries.filter((entry) => entry.purpose === "recovery")).toHaveLength(8);
+    expect(authority.entries.filter((entry) => entry.purpose === "deny-canary").map((entry) => `${entry.workflow}#${entry.job}`)).toEqual([".github/workflows/protected-recovery-deny-canary.yml#exercise"]);
     // No identity can hold a purpose until the broker project is recorded, and no target derives without its identity.
     expect(purposeForIdentity(authority, "gha-isolate-cdbentley@anything.iam.gserviceaccount.com")).toBeUndefined();
     expect(targetsFor(authority, { ...authority.consumers[0]!, activeWorkflowSha: activeSha })).toBeUndefined();
@@ -60,6 +61,7 @@ describe("recovery authority", () => {
     expect(edit((authority) => (consumers(authority)[0]!.transitionWorkflowSha = activeSha))).toThrow("requires activeWorkflowSha");
     expect(edit((authority) => (authority.broker as Record<string, unknown>).projectId = "recovery-test")).toThrow("both be null or both be assigned");
     expect(edit((authority) => (authority.broker as Record<string, unknown>).reconcilerServiceAccount = "gha-isolate-cdbentley")).toThrow("cannot also be a recovery invoker");
+    expect(edit((authority) => (authority.broker as Record<string, unknown>).reconcilerServiceAccount = "gha-deny-canary")).toThrow("cannot also be a recovery invoker");
     expect(edit((authority) => (authority.broker as Record<string, unknown>).evidenceBucket = "bucket")).toThrow("keys must be exactly");
     expect(edit((authority) => (authority.platformRepository = "evil/platform"))).toThrow("must be collinbentley1/platform");
     // Target identities: exactly the manifest's bound accounts, each null or one positive decimal ID, never shared.
@@ -83,6 +85,11 @@ describe("recovery authority", () => {
     const entries = JSON.parse(manifest) as Array<Record<string, unknown>>;
     const withoutRestore = entries.filter((entry) => !(entry.trustDomain === "recovery" && entry.consumer === "cdbentley" && entry.intent === "RESTORE"));
     expect(() => loadRecoveryAuthority(JSON.stringify(base), JSON.stringify(withoutRestore))).toThrow("consumer cdbentley must have exactly one RESTORE invoker; found 0");
+    // Exactly one Deny canary job, and no entry may bind a member-delivery identity: the module binds those alone.
+    const withoutCanary = entries.filter((entry) => entry.purpose !== "deny-canary");
+    expect(() => loadRecoveryAuthority(JSON.stringify(base), JSON.stringify(withoutCanary))).toThrow("exactly one Deny canary job must be declared");
+    const bindingMember = entries.map((entry) => (entry.purpose === "deny-canary" ? { ...entry, serviceAccounts: ["gha-member-cdbentley"] } : entry));
+    expect(() => loadRecoveryAuthority(JSON.stringify(base), JSON.stringify(bindingMember))).toThrow(/Deny canary identity|member-delivery identity/);
   });
 
   test("purpose is derived only from the invoker identity in the broker project, one consumer and one direction each", async () => {
@@ -101,6 +108,7 @@ describe("recovery authority", () => {
       "gha-recovery-cdbentley@recovery-test.iam.gserviceaccount.com",
       "gha-terraform@recovery-test.iam.gserviceaccount.com",
       "gha-isolate-other@recovery-test.iam.gserviceaccount.com",
+      "gha-deny-canary@recovery-test.iam.gserviceaccount.com",
       "recovery-broker@recovery-test.iam.gserviceaccount.com",
       "collin@example.com",
     ]) {

@@ -28,6 +28,7 @@ const platformWorkflows = [
   ...reusableWorkflows,
   "platform.yml",
   "protected-bootstrap-implementation.yml",
+  "protected-recovery-deny-canary.yml",
   "protected-recovery-invoke.yml",
   "refresh-grype-db.yml",
 ];

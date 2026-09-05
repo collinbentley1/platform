@@ -145,6 +145,18 @@
     "serviceAccounts": ["gha-terraform", "gha-wif-canary"]
   },
   {
+    "workflow": ".github/workflows/protected-recovery-deny-canary.yml",
+    "job": "exercise",
+    "environment": "protected-recovery-deny-canary",
+    "purpose": "deny-canary",
+    "trustDomain": "recovery",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-deny-canary.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-deny-canary"]
+  },
+  {
     "workflow": ".github/workflows/protected-recovery-invoke.yml",
     "job": "cdbentley-quarantine",
     "environment": "recovery-cdbentley-quarantine",

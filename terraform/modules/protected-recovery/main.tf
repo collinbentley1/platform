@@ -23,7 +23,7 @@ locals {
   # each naming its own direction-bound invoker -- and the consumer-domain
   # entries are bound by each consumer's bootstrap.
   workflow_authority = jsondecode(file("${path.module}/../bootstrap/workflow-authority.json"))
-  recovery_entries   = { for entry in local.workflow_authority : "${entry.consumer}/${entry.intent}" => entry if entry.trustDomain == "recovery" }
+  recovery_entries   = { for entry in local.workflow_authority : "${entry.consumer}/${entry.intent}" => entry if entry.trustDomain == "recovery" && entry.purpose == "recovery" }
   target_accounts    = sort(distinct(flatten([for entry in local.workflow_authority : entry.serviceAccounts if entry.trustDomain == "consumer" && entry.purpose == "gcp"])))
   # One credential per direction: "gha-quarantine-<consumer>" would exceed the
   # 30-character service account ID limit, so QUARANTINE is named "isolate".

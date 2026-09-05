@@ -1,0 +1,119 @@
+name: Protected recovery deny canary
+
+# The Deny canary of the protected-recovery deployment. One owner-dispatched
+# job reads every IAM Deny policy attached to the broker project and to each
+# consumer project, exercises every denied permission of every rule as the
+# canary identity, and attests exactly what it observed -- policy names,
+# etags, rules, and per-permission outcomes -- as an artifact whose
+# signed attestation the Terraform module verifies (gh attestation verify,
+# through tools/ci/protected-recovery-verify-canary.sh) before it grants the
+# broker any authority over consumer accounts. The module then binds that
+# evidence to the live policies by name and etag, so evidence of a policy
+# that has since changed is refused.
+#
+# The canary identity, gha-deny-canary in the broker project, is bound by the
+# module to exactly this job's direct-dispatch tuple and holds no standing
+# authority from the module. To observe a DENIED answer that is the Deny
+# policy's, it must hold the allow permission it exercises and must sit in no
+# rule's exception set: the deployer grants it the routine administrative
+# allow roles on the broker and consumer projects immediately before a canary
+# run and removes them immediately after, and the broker's credential
+# inventory refuses any quarantine while such a grant remains. Every exercise
+# is a real API call in a form that is a no-op or self-reverting when the
+# Deny fails (see tools/ci/protected-recovery-deny-canary.sh); permissions the
+# script has no safe exercise for are attested as unexercised, which leaves
+# their rows unsatisfied and activation blocked.
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization_id:
+        description: Numeric ID of the organization that parents every consumer project; attested for the module's organization check.
+        required: true
+        type: string
+      broker_image:
+        description: The digest-pinned broker image the evidenced deployment runs; attested for the module's image check.
+        required: true
+        type: string
+      throwaway_service_account:
+        description: Email of a throwaway service account in the broker project that the canary may try to key, sign for, disable, delete, and undelete.
+        required: true
+        type: string
+      throwaway_workload_identity_pool:
+        description: ID of a throwaway workload identity pool in the broker project that the canary may try to update, delete, and undelete, and under which it may try to create a provider.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: protected-recovery-deny-canary
+  cancel-in-progress: false
+
+jobs:
+  exercise:
+    name: Exercise the required Deny matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: protected-recovery-deny-canary
+    permissions:
+      attestations: write # Attest the observed Deny matrix so the module can verify its signer.
+      contents: read # Read the reviewed broker coordinates and the canary script.
+      id-token: write # Exchange only for the Deny canary identity; sign the attestation.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve the reviewed broker coordinates
+        id: broker
+        run: |
+          set -euo pipefail
+          authority=protected-recovery/authority.json
+          project_id="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
+          project_number="$(jq -er '.broker.projectNumber | select(type == "string")' "$authority")"
+          pool="$(jq -er '.broker.workloadIdentityPoolId' "$authority")"
+          provider="$(jq -er '.broker.workloadIdentityProviderId' "$authority")"
+          {
+            echo "project_id=$project_id"
+            echo "workload_identity_provider=projects/${project_number}/locations/global/workloadIdentityPools/${pool}/providers/${provider}"
+            echo "canary=gha-deny-canary@${project_id}.iam.gserviceaccount.com"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Exchange for the Deny canary identity
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ steps.broker.outputs.workload_identity_provider }}
+          service_account: ${{ steps.broker.outputs.canary }}
+          token_format: access_token
+          access_token_lifetime: 1800s
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Exercise every live Deny rule as the canary identity
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          BROKER_IMAGE: ${{ inputs.broker_image }}
+          CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+          THROWAWAY_SERVICE_ACCOUNT: ${{ inputs.throwaway_service_account }}
+          THROWAWAY_WORKLOAD_IDENTITY_POOL: ${{ inputs.throwaway_workload_identity_pool }}
+        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary.json"
+
+      - name: Upload the observed Deny matrix
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deny-canary
+          path: ${{ runner.temp }}/deny-canary.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attest the observed Deny matrix
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/deny-canary.json
+          predicate-type: https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v1
+          predicate-path: ${{ runner.temp }}/deny-canary.json

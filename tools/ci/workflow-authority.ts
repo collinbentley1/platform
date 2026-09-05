@@ -30,7 +30,7 @@ const platformRepository = "collinbentley1/platform";
 // manifest is refused if any of its values does.
 export const authorityDelimiter = ":";
 
-export const purposes = ["attestation", "gcp", "recovery"] as const;
+export const purposes = ["attestation", "deny-canary", "gcp", "recovery"] as const;
 type Purpose = (typeof purposes)[number];
 export const trustDomains = ["consumer", "recovery"] as const;
 type TrustDomain = (typeof trustDomains)[number];
@@ -46,6 +46,20 @@ const recoveryInvokerPrefixes: Readonly<Record<RecoveryIntent, string>> = { QUAR
 export function recoveryInvokerName(consumer: string, intent: RecoveryIntent): string {
   return `${recoveryInvokerPrefixes[intent]}${consumer}`;
 }
+
+// The member-delivery identity of one consumer in the broker project: the
+// only account the consumer's canonical jobs may impersonate there, holding
+// run.invoker on the broker alone, through which each job delivers its own
+// credential (protected-recovery/deliver-member.sh).
+export function memberDeliveryName(consumer: string): string {
+  return `gha-member-${consumer}`;
+}
+
+// The Deny canary of the broker deployment: one direct workflow_dispatch job
+// of the platform repository that exercises the broker's required Deny matrix
+// and attests what it observed; its one identity holds no standing authority
+// from this module.
+export const denyCanaryServiceAccount = "gha-deny-canary";
 
 const serviceAccountIds = [
   "gha-deploy-parity",
@@ -86,7 +100,16 @@ export interface RecoveryAuthorityEntry extends AuthorityEntryBase {
   readonly trustDomain: "recovery";
 }
 
-export type WorkflowAuthorityEntry = ConsumerAuthorityEntry | RecoveryAuthorityEntry;
+// The one Deny canary job: a direct workflow_dispatch job of the platform
+// repository that exchanges only for the canary identity and attests its
+// observations (actions/attest), so the protected-recovery module can verify
+// the attestation's signer against exactly this job.
+export interface DenyCanaryAuthorityEntry extends AuthorityEntryBase {
+  readonly purpose: "deny-canary";
+  readonly trustDomain: "recovery";
+}
+
+export type WorkflowAuthorityEntry = ConsumerAuthorityEntry | RecoveryAuthorityEntry | DenyCanaryAuthorityEntry;
 
 interface WorkflowAuthorityCheck {
   readonly entries: readonly WorkflowAuthorityEntry[];
@@ -139,8 +162,11 @@ export function parseWorkflowAuthority(text: string): WorkflowAuthorityCheck {
     if (entries.some((other) => other.workflow === entry.workflow && other.environment === entry.environment)) {
       failures.push(`${label}: ${entry.workflow} job ${entry.job} shares environment ${entry.environment} with another id-token job, so their authority tuples would collide.`);
     }
-    if (entry.trustDomain === "recovery" && entries.some((other) => other.trustDomain === "recovery" && other.consumer === entry.consumer && other.intent === entry.intent)) {
+    if (entry.purpose === "recovery" && entries.some((other) => other.purpose === "recovery" && other.consumer === entry.consumer && other.intent === entry.intent)) {
       failures.push(`${label}: consumer ${entry.consumer} already has a ${entry.intent} invoker.`);
+    }
+    if (entry.purpose === "deny-canary" && entries.some((other) => other.purpose === "deny-canary")) {
+      failures.push(`${label}: only one Deny canary job may be declared.`);
     }
     entries.push(entry);
   });
@@ -155,16 +181,17 @@ function parseEntry(value: unknown, label: string, failures: string[]): Workflow
   if (!isRecord(value)) return fail("must be an object");
   const trustDomain = value.trustDomain;
   if (!isTrustDomain(trustDomain)) return fail(`trustDomain must be one of ${trustDomains.join(", ")}`);
-  const entryKeys = trustDomain === "consumer" ? consumerEntryKeys : recoveryEntryKeys;
+  const entryKeys = trustDomain === "consumer" || value.purpose === "deny-canary" ? consumerEntryKeys : recoveryEntryKeys;
   if (Object.keys(value).sort().join(",") !== entryKeys.join(",")) return fail(`keys must be exactly ${entryKeys.join(", ")}`);
   const { callers, environment, job, purpose, serviceAccounts, transitionEligible, workflow } = value;
   if (typeof workflow !== "string" || !workflowPath.test(workflow)) return fail("workflow must name a platform .github/workflows/*.yml or *.yaml file");
   if (typeof job !== "string" || !jobId.test(job)) return fail("job must be a GitHub job identifier");
   if (typeof environment !== "string" || !environmentName.test(environment)) return fail("environment must be one literal environment name");
   if (!isPurpose(purpose)) return fail(`purpose must be one of ${purposes.join(", ")}`);
-  if ((purpose === "recovery") !== (trustDomain === "recovery")) return fail("purpose recovery is exactly the recovery trust domain");
+  if ((purpose === "recovery" || purpose === "deny-canary") !== (trustDomain === "recovery")) return fail("purposes recovery and deny-canary are exactly the recovery trust domain");
   if (typeof transitionEligible !== "boolean") return fail("transitionEligible must be a boolean");
   if (transitionEligible && purpose === "attestation") return fail("transitionEligible requires purpose gcp or recovery");
+  if (transitionEligible && purpose === "deny-canary") return fail("the Deny canary runs only at the active platform commit");
   if (!Array.isArray(callers) || callers.length === 0) return fail("callers must be a non-empty list");
   const parsedCallers: AuthorityCaller[] = [];
   for (const caller of callers) {
@@ -180,10 +207,17 @@ function parseEntry(value: unknown, label: string, failures: string[]): Workflow
     parsedCallers.push({ events, ref: caller.ref, workflow: caller.workflow });
   }
   const base = { callers: parsedCallers, environment, job, transitionEligible, workflow };
-  if (trustDomain === "consumer" && purpose !== "recovery") {
+  if (trustDomain === "consumer" && (purpose === "attestation" || purpose === "gcp")) {
     const accounts = stringList(serviceAccounts, (id) => (serviceAccountIds as readonly string[]).includes(id));
     if (!accounts) return fail("serviceAccounts must be a sorted, unique list of known service account IDs");
     if ((purpose === "gcp") !== accounts.length > 0) return fail("serviceAccounts must be non-empty exactly when purpose is gcp");
+    return { ...base, purpose, serviceAccounts: accounts, trustDomain };
+  }
+  if (trustDomain !== "recovery") return fail("consumer entries have purpose attestation or gcp");
+  if (purpose === "deny-canary") {
+    const accounts = stringList(serviceAccounts, (id) => id === denyCanaryServiceAccount);
+    if (!accounts || accounts.length !== 1) return fail(`serviceAccounts must be exactly the Deny canary identity ${denyCanaryServiceAccount}`);
+    if (parsedCallers.length !== 1 || parsedCallers[0]!.workflow !== workflow) return fail("callers must name exactly this workflow, because the Deny canary is its own caller");
     return { ...base, purpose, serviceAccounts: accounts, trustDomain };
   }
   // A recovery job is a direct workflow_dispatch job and therefore its own
@@ -312,6 +346,8 @@ function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, p
   } else if (!sameList(exchanged, entry.serviceAccounts)) {
     failures.push(`${where} exchanges for [${exchanged.join(", ")}] but the manifest binds [${entry.serviceAccounts.join(", ")}].`);
   }
+  if (entry.purpose === "deny-canary" && !attests) failures.push(`${where} is declared deny-canary but never runs actions/attest.`);
+  if (entry.purpose !== "attestation" && entry.purpose !== "deny-canary" && attests) failures.push(`${where} runs actions/attest but is not declared attestation or deny-canary.`);
 }
 
 // Consumer caller facts are checked against the consumer caller template,

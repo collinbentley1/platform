@@ -3,6 +3,7 @@ import {
   type RecoveryAuthorityEntry,
   type RecoveryIntent,
   type WorkflowAuthorityEntry,
+  memberDeliveryName,
   parseWorkflowAuthority,
   manifestPath,
   recoveryIntents,
@@ -98,6 +99,10 @@ export interface Consumer {
 
 export interface Broker {
   readonly firestoreDatabase: string;
+  // The provider of the broker pool through which the consumers' canonical
+  // jobs reach their member-delivery identity; distinct from the platform
+  // repository's own provider.
+  readonly memberWorkloadIdentityProviderId: string;
   readonly projectId: string | null;
   readonly projectNumber: string | null;
   readonly reconcilerServiceAccount: string;
@@ -389,12 +394,16 @@ export function loadRecoveryAuthority(authorityText: string, manifestText: strin
   const broker = parseBroker(root.broker);
   for (const consumer of consumers) {
     for (const intent of intents) {
-      const invokers = manifest.entries.filter((entry): entry is RecoveryAuthorityEntry => entry.trustDomain === "recovery" && entry.consumer === consumer.repository && entry.intent === intent);
+      const invokers = manifest.entries.filter((entry): entry is RecoveryAuthorityEntry => entry.purpose === "recovery" && entry.consumer === consumer.repository && entry.intent === intent);
       if (invokers.length !== 1) throw new AuthorityError(`${manifestPath}: consumer ${consumer.repository} must have exactly one ${intent} invoker; found ${invokers.length}.`);
     }
+    if (manifest.entries.some((entry) => entry.serviceAccounts.includes(memberDeliveryName(consumer.repository)))) {
+      throw new AuthorityError(`${manifestPath}: the member-delivery identity ${memberDeliveryName(consumer.repository)} is bound by this module alone and cannot be an entry's account.`);
+    }
   }
+  if (manifest.entries.filter((entry) => entry.purpose === "deny-canary").length !== 1) throw new AuthorityError(`${manifestPath}: exactly one Deny canary job must be declared.`);
   for (const entry of manifest.entries) {
-    if (entry.trustDomain === "recovery" && !consumers.some((consumer) => consumer.repository === entry.consumer)) {
+    if (entry.purpose === "recovery" && !consumers.some((consumer) => consumer.repository === entry.consumer)) {
       throw new AuthorityError(`${manifestPath}: recovery invoker for ${entry.consumer} names no consumer declared in ${authorityPath}.`);
     }
     if (entry.trustDomain === "recovery" && entry.serviceAccounts[0] === broker.reconcilerServiceAccount) {
@@ -470,9 +479,10 @@ function parseUniqueIds(value: unknown, label: string, targetAccounts: readonly 
 function parseBroker(value: unknown): Broker {
   const label = `${authorityPath}.broker`;
   const broker = record(value, label);
-  exactKeys(broker, ["firestoreDatabase", "projectId", "projectNumber", "reconcilerServiceAccount", "region", "serviceName", "workloadIdentityPoolId", "workloadIdentityProviderId"], label);
+  exactKeys(broker, ["firestoreDatabase", "memberWorkloadIdentityProviderId", "projectId", "projectNumber", "reconcilerServiceAccount", "region", "serviceName", "workloadIdentityPoolId", "workloadIdentityProviderId"], label);
   const shared = {
     firestoreDatabase: string(broker.firestoreDatabase, `${label}.firestoreDatabase`),
+    memberWorkloadIdentityProviderId: string(broker.memberWorkloadIdentityProviderId, `${label}.memberWorkloadIdentityProviderId`),
     reconcilerServiceAccount: string(broker.reconcilerServiceAccount, `${label}.reconcilerServiceAccount`),
     region: string(broker.region, `${label}.region`),
     serviceName: string(broker.serviceName, `${label}.serviceName`),
@@ -483,9 +493,10 @@ function parseBroker(value: unknown): Broker {
   if (!/^[a-z][a-z0-9-]{0,48}$/.test(shared.serviceName)) throw new AuthorityError(`${label}.serviceName must be a Cloud Run service name.`);
   if (!/^[a-z][a-z0-9-]{0,61}[a-z0-9]$/.test(shared.firestoreDatabase)) throw new AuthorityError(`${label}.firestoreDatabase must be a Firestore database ID.`);
   if (!serviceAccountId.test(shared.reconcilerServiceAccount)) throw new AuthorityError(`${label}.reconcilerServiceAccount must be a service account ID.`);
-  for (const id of [shared.workloadIdentityPoolId, shared.workloadIdentityProviderId]) {
+  for (const id of [shared.workloadIdentityPoolId, shared.workloadIdentityProviderId, shared.memberWorkloadIdentityProviderId]) {
     if (!/^[a-z][a-z0-9-]{3,31}$/.test(id)) throw new AuthorityError(`${label}: pool and provider IDs must be workload identity IDs.`);
   }
+  if (shared.memberWorkloadIdentityProviderId === shared.workloadIdentityProviderId) throw new AuthorityError(`${label}: the member provider must differ from the platform provider.`);
   // The security project does not exist yet. Its coordinates are null until a
   // reviewed change records the real ones; nothing here invents them.
   if (broker.projectId === null && broker.projectNumber === null) return { ...shared, projectId: null, projectNumber: null };
@@ -527,7 +538,7 @@ export function purposeForIdentity(authority: RecoveryAuthority, email: string):
   const account = email.slice(0, -suffix.length);
   if (account === authority.broker.reconcilerServiceAccount) return { kind: "reconciler", serviceAccount: account };
   for (const entry of authority.entries) {
-    if (entry.trustDomain !== "recovery" || entry.serviceAccounts[0] !== account) continue;
+    if (entry.trustDomain !== "recovery" || entry.purpose !== "recovery" || entry.serviceAccounts[0] !== account) continue;
     const consumer = authority.consumers.find((candidate) => candidate.repository === entry.consumer);
     if (!consumer) return undefined;
     return { kind: "recovery", consumer, intent: entry.intent, serviceAccount: account };
