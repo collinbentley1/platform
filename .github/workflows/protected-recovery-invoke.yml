@@ -9,10 +9,15 @@ name: Protected recovery invoke
 # invoker, the invoker holds only run.invoker on the broker, and the broker
 # derives the consumer and the one permitted effect direction from the invoker
 # identity; close, reconcile, and status act only on shards of that same
-# direction. No evidence travels in any request: negative impersonation probes
-# are recorded by the broker from its own source. Reruns are secured by the
-# ledger: the idempotency key is the run, so a rerun replays the recorded
-# result instead of acting twice.
+# direction, and the round operations -- round-open, which opens one delivery
+# round bound to every member, the platform pins, every target's identity,
+# policy etag, and inventory hash, and the live Deny state; round-status,
+# which reads its receipts and what it still owes -- belong to the quarantine
+# direction alone. No evidence travels in any request: negative impersonation
+# probes are recorded by the broker from its own source. Reruns are secured
+# by the ledger: the idempotency key is the run, so a rerun replays the
+# recorded result instead of acting twice. The broker's reply is the run's
+# broker-reply artifact, which the orchestrator reads.
 
 on:
   workflow_dispatch:
@@ -34,7 +39,7 @@ on:
           - quarantine
           - restore
       operation:
-        description: append journals the direction's effects into a new shard; close, reconcile, and status act on the named shard.
+        description: append journals the direction's effects into a new shard; close, reconcile, and status act on the named shard; round-open opens a delivery round and round-status reads one (quarantine direction only).
         required: true
         type: choice
         options:
@@ -42,12 +47,14 @@ on:
           - close
           - reconcile
           - status
+          - round-open
+          - round-status
       shard:
-        description: Shard acted on; a new session ID for append.
+        description: Shard acted on; a new session ID for append; the OPEN quarantine shard a REVOCATION or HORIZON round probes, or "-" for a CONTROL round or round-status.
         required: true
         type: string
       argument:
-        description: For a restore append, the CLOSED and scan-ready quarantine shard to restore; otherwise empty.
+        description: For a restore append, the CLOSED and scan-ready quarantine shard to restore; for round-open, <CONTROL|REVOCATION|HORIZON>/<label>; for round-status, the round identifier; otherwise empty.
         required: false
         type: string
 
@@ -109,8 +116,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh cdbentley quarantine
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   cdbentley-restore:
     name: cdbentley restore ${{ inputs.operation }}
@@ -163,8 +180,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh cdbentley restore
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   critical-history-quarantine:
     name: critical-history quarantine ${{ inputs.operation }}
@@ -217,8 +244,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh critical-history quarantine
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   critical-history-restore:
     name: critical-history restore ${{ inputs.operation }}
@@ -271,8 +308,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh critical-history restore
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   healthmcp-quarantine:
     name: healthmcp quarantine ${{ inputs.operation }}
@@ -325,8 +372,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh healthmcp quarantine
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   healthmcp-restore:
     name: healthmcp restore ${{ inputs.operation }}
@@ -379,8 +436,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh healthmcp restore
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   runsetta-quarantine:
     name: runsetta quarantine ${{ inputs.operation }}
@@ -433,8 +500,18 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh runsetta quarantine
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   runsetta-restore:
     name: runsetta restore ${{ inputs.operation }}
@@ -487,5 +564,15 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh runsetta restore
+
+      - name: Record the broker's reply as this run's artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: broker-reply
+          path: ${{ runner.temp }}/broker-reply.json
+          if-no-files-found: ignore
+          retention-days: 7

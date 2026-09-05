@@ -6,7 +6,7 @@ import { type IdentityOutcome, type ImpersonationProbe, type Jwk, type MemberCre
 import { Broker, type BrokerResponse, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
 import { type CredentialInventory, type DenyStateOutcome, type InventoryOutcome, inventoryFindings } from "../src/inventory";
 import { type Fresh, Ledger } from "../src/ledger";
-import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type Target, consumerPool, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, probesNeeded, purposeForIdentity, targetOfEffect, targetsFor } from "../src/model";
+import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type RoundPhase, type Target, consumerPool, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, parseRoundBody, probesNeeded, purposeForIdentity, targetOfEffect, targetsFor } from "../src/model";
 import { type EvidenceStore, type GetOutcome, type PutOutcome } from "../src/outbox";
 
 // Test support. The ledger is the real Firestore emulator (FIRESTORE_EMULATOR_HOST);
@@ -476,6 +476,7 @@ export function memberClaims(authority: RecoveryAuthority, consumer: Consumer, m
     job_workflow_sha: composite[2],
     repository_id: consumer.repositoryId,
     repository_owner_id: authority.githubOwnerId,
+    run_attempt: "1",
     run_id: runId,
     runner_environment: "github-hosted",
     sub: `repo:${authority.githubOwner}/${consumer.repository}:environment:${composite[3]}`,
@@ -529,28 +530,53 @@ export function seedTargets(iam: FakeIam, targets: readonly Target[], extra: rea
   }
 }
 
-// Seed a consumer's targets and record every member's positive control by a
-// delivery round while the bindings stand: what admission needs.
+let roundCounter = 0;
+
+// Open one delivery round through the consumer's QUARANTINE invoker and the
+// real request path, at fresh coordinates; returns the round identifier.
+export async function openRound(w: World, repository: string, phase: RoundPhase, shard: string | null): Promise<string> {
+  roundCounter += 1;
+  const label = `${phase.toLowerCase()}-${roundCounter}`;
+  const request = parseRoundBody({ consumer: repository, key: `round/${label}`, label, phase, shard });
+  const response = await w.broker.handle(purposeForIdentity(w.authority, invokerEmail(repository))!, request);
+  if (response.status !== 201) throw new Error(`opening the ${phase} round answered ${response.status}: ${JSON.stringify(response.body)}`);
+  return (response.body.round as { round: string }).round;
+}
+
+// One complete CONTROL round: opened, then every canonical job delivers once
+// while the bindings stand. What a quarantine's admission needs.
+export async function controlRound(w: World, repository: string): Promise<string> {
+  const round = await openRound(w, repository, "CONTROL", null);
+  for (const response of await deliverAll(w, repository)) {
+    if (response.status !== 200) throw new Error(`the CONTROL delivery answered ${response.status}: ${JSON.stringify(response.body)}`);
+  }
+  const manifest = await w.ledger.readRound(round);
+  if (!manifest || manifest.completedAt === null) throw new Error(`the CONTROL round ${round} did not complete`);
+  return round;
+}
+
+// Seed a consumer's targets and complete one CONTROL round while the
+// bindings stand: what admission needs.
 export async function prime(w: World, repository: string): Promise<readonly Target[]> {
   const targets = targetsFor(w.authority, consumerOf(w, repository))!;
   seedTargets(w.iam, targets);
-  for (const response of await deliverAll(w, repository)) {
-    if (response.status !== 200) throw new Error(`priming delivery answered ${response.status}: ${JSON.stringify(response.body)}`);
-  }
+  await controlRound(w, repository);
   return targets;
 }
 
 // Drive an OPEN QUARANTINE shard to scan-ready through the broker's own
 // observation recording: reconcile (acknowledges effects and records the
-// inventory baselines), a delivery round (records the revocation probe of
-// every member from the deliveries themselves), drain the one-hour token
-// horizon, another round (the post-horizon probes), then reconcile again to
-// project the journaled probes.
+// inventory baselines), a REVOCATION round (the deliveries themselves record
+// the revocation probe of every member), drain the one-hour token horizon, a
+// HORIZON round (the post-horizon probes), then reconcile again to project
+// the journaled probes.
 export async function makeReady(w: World, shard: string): Promise<void> {
   await w.broker.reconcileShard(shard);
   const repository = (await w.ledger.readShard(shard))!.consumer;
+  await openRound(w, repository, "REVOCATION", shard);
   await deliverAll(w, repository);
   w.clock.advance(3600);
+  await openRound(w, repository, "HORIZON", shard);
   await deliverAll(w, repository);
   await w.broker.reconcileShard(shard);
 }

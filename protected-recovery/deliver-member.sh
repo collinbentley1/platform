@@ -93,7 +93,7 @@ jq -n --rawfile token "$workdir/member.jwt" '{token: ($token | rtrimstr("\n"))}'
 status="$(curl --silent --show-error --max-time 100 --config "$workdir/broker.cfg" --request POST \
   --header 'Content-Type: application/json' --data-binary "@$workdir/body.json" --output "$workdir/answer.json" --write-out '%{http_code}' "$broker_url/v1/members" || echo 000)"
 if [ "$status" = 200 ]; then
-  echo "protected-recovery: delivered; $(jq -c '{member, controls, probes: (.probes | length), unavailable}' "$workdir/answer.json" 2> /dev/null || cat "$workdir/answer.json")"
+  echo "protected-recovery: delivered; $(jq -c '{member, controls, probes: (.probes | length), rounds, unavailable}' "$workdir/answer.json" 2> /dev/null || cat "$workdir/answer.json")"
   exit 0
 fi
 fail_soft "the broker answered HTTP ${status}: $(tr -d '\n' < "$workdir/answer.json" | cut -c1-300)"

@@ -22,6 +22,11 @@ import {
   type OutboxProgress,
   type PreparedFacts,
   type ProbeRecord,
+  type RoundBinding,
+  type RoundManifest,
+  type RoundPointer,
+  type RoundReceipt,
+  type RoundRequest,
   type ScanReadiness,
   type Shard,
   type Target,
@@ -47,6 +52,9 @@ import {
   probeOutcomes,
   probePermission,
   probePhases,
+  roundComplete,
+  roundId,
+  roundPhases,
   scanReadiness,
   sha256Hex,
   terminalObjectName,
@@ -72,6 +80,12 @@ export type MaintenanceOutcome =
 export class LedgerUnavailable extends Error {}
 export class LedgerError extends Error {}
 
+// A transactional read answered with a contention status. Firestore expects
+// the transaction function to be rerun in that case exactly as it does when
+// the commit answers so; the error is internal to the retry loop and never
+// escapes a transaction.
+class TransactionContended extends Error {}
+
 export interface FirestoreTarget {
   readonly baseUrl: string;
   readonly database: string;
@@ -88,7 +102,16 @@ export interface LedgerDependencies {
 export type Rejection =
   | { readonly reason: "SHARD_NOT_OPEN"; readonly phase: Shard["phase"] }
   | { readonly reason: "NOT_READY"; readonly blockers: readonly string[] }
-  | { readonly reason: "MAINTENANCE_OPEN" | "NOT_FOUND" | "PINS_UNRECORDED" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
+  | { readonly reason: "MAINTENANCE_OPEN" | "NOT_FOUND" | "PINS_UNRECORDED" | "ROUND_INCOMPLETE" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
+
+export type RoundOpenOutcome =
+  | { readonly kind: "opened"; readonly id: string; readonly round: RoundManifest }
+  | { readonly kind: "replayed"; readonly id: string; readonly round: RoundManifest }
+  | { readonly kind: "rejected"; readonly rejection: Rejection };
+
+export type ReceiptOutcome =
+  | { readonly kind: "recorded"; readonly complete: boolean; readonly round: RoundManifest }
+  | { readonly kind: "refused"; readonly reason: string };
 
 export type AppendOutcome =
   | { readonly kind: "accepted"; readonly entries: readonly Entry[]; readonly result: string }
@@ -123,6 +146,20 @@ export type FinishCloseOutcome =
   | { readonly kind: "not-ready"; readonly shard: Shard | undefined; readonly reason: string };
 
 export type Fresh = Readonly<Record<string, FreshInventory>>;
+
+// The one document that orders quarantine acceptance, terminal close, and
+// maintenance opening against each other: the QUARANTINE shards accepted and
+// not yet CLOSED, and a version advanced by every transition.
+export interface Coordination {
+  readonly active: readonly string[];
+  readonly version: number;
+}
+
+const emptyCoordination: Coordination = { active: [], version: 0 };
+
+function withActive(coordination: Coordination, active: readonly string[]): Coordination {
+  return { active: [...new Set(active)].sort(), version: coordination.version + 1 };
+}
 
 interface EffectFacts {
   readonly effectId: string;
@@ -169,12 +206,14 @@ export class Ledger {
   // Append succeeds only in OPEN. The shard document is read and rewritten in
   // the same transaction as the entry and key documents, so every concurrent
   // append is ordered before a close or refused after it. A QUARANTINE request
-  // journals one effect per inventory target; a RESTORE request journals one
-  // effect per acknowledged effect of its source shard, which must be CLOSED
-  // with a projected receipt, scan-ready on its committed state, and whose
-  // targets' inventories -- observed by the broker immediately before this
-  // call -- must still equal the baselines its readiness was built on.
-  async append(request: AppendRequest, targets: readonly Target[] | undefined, sourceInventory?: Fresh): Promise<AppendOutcome> {
+  // journals one effect per inventory target and names the complete CONTROL
+  // round that admitted it, which this transaction reads and requires to be
+  // complete; a RESTORE request journals one effect per acknowledged effect
+  // of its source shard, which must be CLOSED with a projected receipt,
+  // scan-ready on its committed state, and whose targets' inventories --
+  // observed by the broker immediately before this call -- must still equal
+  // the baselines its readiness was built on.
+  async append(request: AppendRequest, targets: readonly Target[] | undefined, sourceInventory?: Fresh, controlRound?: string): Promise<AppendOutcome> {
     return await this.#transact(request.shard, async (tx) => {
       const shardName = this.#shardName(request.shard);
       const keyName = this.#keyName(request.shard, request.key);
@@ -194,15 +233,28 @@ export class Ledger {
         if (shard.consumer !== request.consumer || shard.intent !== intent) return reject({ reason: "SHARD_MISMATCH", detail: `shard is ${shard.consumer} ${shard.intent}` });
         if (shard.phase !== "OPEN") return reject({ reason: "SHARD_NOT_OPEN", phase: shard.phase });
       } else {
-        shard = { phase: "OPEN", consumer: request.consumer, createdAt: nowText, intent, nextSequence: 1, pendingEffects: 0, pendingOutbox: 0, source: request.body.kind === "restore" ? request.body.source : null, targets: {} };
+        shard = { phase: "OPEN", consumer: request.consumer, controlRound: request.body.kind === "quarantine" ? controlRound ?? null : null, createdAt: nowText, intent, nextSequence: 1, pendingEffects: 0, pendingOutbox: 0, source: request.body.kind === "restore" ? request.body.source : null, targets: {} };
       }
       if (Object.keys(shard.targets).length > 0) return reject({ reason: "SHARD_MISMATCH", detail: "targets are already journaled in this shard" });
       let bodies: EntryBody[];
+      let coordination: { readonly doc: StoredDocument | null; readonly state: Coordination } | undefined;
       if (request.body.kind === "quarantine") {
         if (!targets) return reject({ reason: "PINS_UNRECORDED", detail: "the consumer's workflow SHA pins or target identities are not recorded" });
-        const [ticketDoc] = await tx.get([this.#maintenanceName()]);
+        // The ticket and the coordination document are read in this
+        // transaction: a ticket that opens after this read makes this commit
+        // contend, and the coordination write below makes any concurrent
+        // opening contend, so acceptance and opening are ordered.
+        const [ticketDoc, coordinationDoc] = await tx.get([this.#maintenanceName(), this.#coordinationName()]);
         const ticket = ticketDoc ? maintenanceFromDocument(ticketDoc) : undefined;
         if (ticket && ticket.open && Date.parse(ticket.expiresAt) > now.getTime()) return reject({ reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}` });
+        coordination = { doc: coordinationDoc ?? null, state: coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination };
+        if (controlRound !== undefined) {
+          const [roundDoc] = await tx.get([this.#roundName(controlRound)]);
+          if (!roundDoc) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${controlRound} does not exist` });
+          const round = roundFromDocument(roundDoc);
+          if (round.consumer !== request.consumer || round.phase !== "CONTROL") return reject({ reason: "ROUND_INCOMPLETE", detail: `round ${controlRound} is the ${round.phase} round of ${round.consumer}` });
+          if (round.completedAt === null) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${controlRound} is not complete` });
+        }
         bodies = targets.map((target) => ({ kind: "effect", account: target.account, email: target.email, intent: "QUARANTINE", members: target.members, resource: target.resource, uniqueId: target.uniqueId }));
       } else {
         const sourceId = request.body.source;
@@ -253,6 +305,7 @@ export class Ledger {
       tx.put(shardName, shardToJson(next), shardDoc);
       for (const entry of entries) tx.put(this.#entryName(request.shard, entry.sequence), entryToJson(entry), null);
       tx.put(keyName, keyToJson({ bodyHash: request.bodyHash, key: request.key, operation: "append", result }), null);
+      if (coordination) tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination.state, [...coordination.state.active, request.shard])), coordination.doc);
       return { kind: "accepted", entries, result };
     });
   }
@@ -546,6 +599,12 @@ export class Ledger {
         terminal: { ...shard.terminal, progress: { state: "PROJECTED", generation, projectedAt: now, sha256: shard.terminal.sha256 } },
       };
       tx.put(shardName, shardToJson(closed), shardDoc);
+      // The terminal close is the one exit from the coordination document.
+      if (shard.intent === "QUARANTINE") {
+        const [coordinationDoc] = await tx.get([this.#coordinationName()]);
+        const coordination = coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination;
+        tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination, coordination.active.filter((active) => active !== shardId))), coordinationDoc);
+      }
       return closed;
     });
   }
@@ -637,20 +696,21 @@ export class Ledger {
     });
   }
 
-  // What one managed member's deliveries proved: one document per member,
-  // never carrying the bearer, merged by each delivery so a target whose
-  // mint could not be observed this time keeps the control an earlier
-  // delivery established. The ledger database is the broker's alone: the
-  // evidenced Deny matrix denies every other principal its reads and writes.
+  // What one managed member's latest delivery proved: one document per
+  // member, never carrying the bearer, replaced by each delivery -- nothing
+  // from an earlier delivery survives into it, so the record is one run's
+  // outcome and never a merge of several. Admission does not rest on it;
+  // the round manifests do that. The ledger database is the broker's alone:
+  // the evidenced Deny matrix denies every other principal its reads and
+  // writes.
   async putMemberControl(record: MemberControlRecord): Promise<MemberControlRecord> {
     const name = this.#memberName(record.member);
     return await this.#transact(name, async (tx) => {
       const [doc] = await tx.get([name]);
       const previous = doc ? memberControlFromDocument(doc) : undefined;
       if (previous && previous.member !== record.member) throw new LedgerError("Stored member control names another member.");
-      const merged: MemberControlRecord = { ...record, targets: { ...previous?.targets, ...record.targets } };
-      tx.put(name, memberControlToJson(merged), doc);
-      return merged;
+      tx.put(name, memberControlToJson(record), doc);
+      return record;
     });
   }
 
@@ -666,6 +726,87 @@ export class Ledger {
     return `${this.#documents}/members/${sha256Hex(member)}`;
   }
 
+  // A round is opened once at its coordinates with the binding the broker
+  // observed at that moment; a second opening replays it. A REVOCATION or
+  // HORIZON round is opened only against an OPEN QUARANTINE shard of the
+  // consumer, read in the same transaction. The consumer's pointer document
+  // gains the round while it is open to receipts.
+  async openRound(request: RoundRequest, openedBy: string, binding: RoundBinding): Promise<RoundOpenOutcome> {
+    const { consumer, label, phase, shard } = request.body;
+    const id = roundId(consumer, phase, shard, label);
+    const roundName = this.#roundName(id);
+    const pointerName = this.#roundPointerName(consumer);
+    return await this.#transact(`rounds/${id}`, async (tx) => {
+      const [roundDoc, pointerDoc] = await tx.get([roundName, pointerName]);
+      if (roundDoc) return { kind: "replayed", id, round: roundFromDocument(roundDoc) };
+      if (shard !== null) {
+        const [shardDoc] = await tx.get([this.#shardName(shard)]);
+        if (!shardDoc) return { kind: "rejected", rejection: { reason: "NOT_FOUND", detail: `the shard ${shard} does not exist` } };
+        const journaled = shardFromDocument(shardDoc);
+        if (journaled.consumer !== consumer || journaled.intent !== "QUARANTINE") return { kind: "rejected", rejection: { reason: "SHARD_MISMATCH", detail: `shard ${shard} is ${journaled.consumer} ${journaled.intent}` } };
+        if (journaled.phase !== "OPEN") return { kind: "rejected", rejection: { reason: "SHARD_NOT_OPEN", phase: journaled.phase } };
+      }
+      const now = this.#deps.now().toISOString();
+      const round: RoundManifest = { ...binding, completedAt: null, consumer, key: request.key, label, openedAt: now, openedBy, phase, receipts: {}, shard, version: 1 };
+      const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
+      tx.put(roundName, roundToJson(round), null);
+      tx.put(pointerName, roundPointerToJson({ control: pointer.control, open: [...new Set([...pointer.open, id])].sort() }), pointerDoc ?? null);
+      return { kind: "opened", id, round };
+    });
+  }
+
+  // A receipt is admitted into an open round only from an expected member,
+  // from a run of a platform commit the round binds, minting against exactly
+  // the bound identities it is a member of. The receipt that completes the
+  // round completes it in the same transaction and, for a CONTROL round,
+  // makes it the consumer's admitting round.
+  async recordReceipt(id: string, member: string, receipt: RoundReceipt): Promise<ReceiptOutcome> {
+    const roundName = this.#roundName(id);
+    return await this.#transact(`rounds/${id}`, async (tx) => {
+      const [roundDoc] = await tx.get([roundName]);
+      if (!roundDoc) return { kind: "refused", reason: "the round does not exist" };
+      const round = roundFromDocument(roundDoc);
+      if (round.completedAt !== null) return { kind: "refused", reason: `the round completed at ${round.completedAt}` };
+      if (!round.members.includes(member)) return { kind: "refused", reason: "the round expects no delivery from this member" };
+      if (!round.platformShas.includes(receipt.platformSha)) return { kind: "refused", reason: `the delivery ran the platform at ${receipt.platformSha}, which the round does not bind` };
+      for (const [account, control] of Object.entries(receipt.controls)) {
+        const target = round.targets[account];
+        if (!target) return { kind: "refused", reason: `the delivery minted against ${account}, which the round does not bind` };
+        if (target.uniqueId !== control.uniqueId) return { kind: "refused", reason: `the delivery minted against ${control.uniqueId}, not the bound identity ${target.uniqueId} of ${account}` };
+        if (!target.members.includes(member)) return { kind: "refused", reason: `${member} is not a bound member of ${account}` };
+      }
+      const next: RoundManifest = { ...round, receipts: { ...round.receipts, [member]: receipt }, version: round.version + 1 };
+      const complete = roundComplete(next);
+      const completed: RoundManifest = complete ? { ...next, completedAt: this.#deps.now().toISOString() } : next;
+      if (complete) {
+        const pointerName = this.#roundPointerName(round.consumer);
+        const [pointerDoc] = await tx.get([pointerName]);
+        const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
+        tx.put(pointerName, roundPointerToJson({ control: round.phase === "CONTROL" ? id : pointer.control, open: pointer.open.filter((open) => open !== id) }), pointerDoc ?? null);
+      }
+      tx.put(roundName, roundToJson(completed), roundDoc);
+      return { kind: "recorded", complete, round: completed };
+    });
+  }
+
+  async readRound(id: string): Promise<RoundManifest | undefined> {
+    const [doc] = await this.#batchGet([this.#roundName(id)], undefined);
+    return doc ? roundFromDocument(doc) : undefined;
+  }
+
+  async readRoundPointer(consumer: string): Promise<RoundPointer> {
+    const [doc] = await this.#batchGet([this.#roundPointerName(consumer)], undefined);
+    return doc ? roundPointerFromDocument(doc) : emptyRoundPointer;
+  }
+
+  #roundName(id: string): string {
+    return `${this.#documents}/rounds/${id}`;
+  }
+
+  #roundPointerName(consumer: string): string {
+    return `${this.#documents}/coordination/rounds-${consumer}`;
+  }
+
   // The OPEN QUARANTINE shards of one consumer, in document-name order: the
   // shards a delivered credential may record a probe into.
   async listOpenQuarantines(consumer: string): Promise<readonly string[]> {
@@ -673,14 +814,6 @@ export class Ledger {
       { fieldFilter: { field: { fieldPath: "consumer" }, op: "EQUAL", value: { stringValue: consumer } } },
       { fieldFilter: { field: { fieldPath: "intent" }, op: "EQUAL", value: { stringValue: "QUARANTINE" } } },
       { fieldFilter: { field: { fieldPath: "phase" }, op: "EQUAL", value: { stringValue: "OPEN" } } },
-    ]);
-  }
-
-  // Every QUARANTINE shard of any consumer that is not CLOSED.
-  async listActiveQuarantines(): Promise<readonly string[]> {
-    return await this.#shardQuery([
-      { fieldFilter: { field: { fieldPath: "intent" }, op: "EQUAL", value: { stringValue: "QUARANTINE" } } },
-      { fieldFilter: { field: { fieldPath: "phase" }, op: "IN", value: { arrayValue: { values: [{ stringValue: "OPEN" }, { stringValue: "CLOSING" }, { stringValue: "FINALIZING" }] } } } },
     ]);
   }
 
@@ -706,9 +839,14 @@ export class Ledger {
   // The maintenance ticket. Open refuses while any QUARANTINE shard is not
   // CLOSED or another key holds an open ticket; the same key replays. Close
   // marks the open ticket closed; closing an absent or closed ticket is
-  // idempotent. Both read every active quarantine inside the transaction
-  // that writes the ticket, and append reads the ticket inside the
-  // transaction that accepts a QUARANTINE, so neither can overlap the other.
+  // idempotent. Mutual exclusion with quarantines rests on one coordination
+  // document (coordination/quarantines): the transaction that accepts a
+  // QUARANTINE reads the ticket and writes the shard into that document, the
+  // transaction that closes the shard writes it out, and the transaction that
+  // opens a ticket reads that document and writes the ticket. Every pair of
+  // these transactions touches a common document, so Firestore orders them
+  // and no interleaving admits an open ticket beside a quarantine that is
+  // not CLOSED. An out-of-transaction query could not establish that.
   async readMaintenance(): Promise<MaintenanceTicket | null> {
     const [doc] = await this.#batchGet([this.#maintenanceName()], undefined);
     if (!doc) return null;
@@ -717,10 +855,9 @@ export class Ledger {
   }
 
   async openMaintenance(key: string, openedBy: string): Promise<MaintenanceOutcome> {
-    const active = await this.listActiveQuarantines();
     return await this.#transact(this.#maintenanceName(), async (tx) => {
       const name = this.#maintenanceName();
-      const [doc] = await tx.get([name]);
+      const [doc, coordinationDoc] = await tx.get([name, this.#coordinationName()]);
       const now = this.#deps.now();
       const current = doc ? maintenanceFromDocument(doc) : undefined;
       if (current && current.open && Date.parse(current.expiresAt) > now.getTime()) {
@@ -730,13 +867,23 @@ export class Ledger {
         }
         return { kind: "refused", reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${current.openedAt} by ${current.openedBy} is open until ${current.expiresAt}` };
       }
-      const shards = (await tx.get(active.map((shard) => this.#shardName(shard)))).flatMap((candidate) => (candidate ? [shardFromDocument(candidate)] : []));
-      const blocking = active.filter((_, index) => shards[index] !== undefined && shards[index]!.intent === "QUARANTINE" && shards[index]!.phase !== "CLOSED");
-      if (blocking.length > 0) return { kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${blocking.join(", ")}` };
+      const active = coordinationDoc ? coordinationFromDocument(coordinationDoc).active : emptyCoordination.active;
+      if (active.length > 0) return { kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${active.join(", ")}` };
       const ticket: MaintenanceTicket = { expiresAt: new Date(now.getTime() + maintenanceTicketSeconds * 1000).toISOString(), key, openedAt: now.toISOString(), openedBy };
       tx.put(name, { ...ticket, open: true }, doc);
       return { kind: "opened", ticket };
     });
+  }
+
+  // The coordination document as committed: every QUARANTINE shard accepted
+  // and not yet CLOSED, and the version every such transition advanced.
+  async readCoordination(): Promise<Coordination> {
+    const [doc] = await this.#batchGet([this.#coordinationName()], undefined);
+    return doc ? coordinationFromDocument(doc) : emptyCoordination;
+  }
+
+  #coordinationName(): string {
+    return `${this.#documents}/coordination/quarantines`;
   }
 
   async closeMaintenance(key: string): Promise<MaintenanceOutcome> {
@@ -840,6 +987,13 @@ export class Ledger {
     return await run;
   }
 
+  // A contention answer -- ABORTED or FAILED_PRECONDITION -- at either stage
+  // of a transaction reruns the complete transaction function from a fresh
+  // begin that names the previous transaction, with bounded backoff, inside
+  // the one attempt bound: a transactional read that answers so is retried
+  // exactly as a commit that answers so. Every other failure of the body --
+  // malformed data, a broken invariant, an unreachable ledger -- rolls the
+  // transaction back and propagates as itself.
   async #transactNow<T>(body: (tx: Transaction) => Promise<T>): Promise<T> {
     let previous: string | undefined;
     for (let attempt = 1; attempt <= maxTransactionAttempts; attempt += 1) {
@@ -852,6 +1006,11 @@ export class Ledger {
         result = await body(tx);
       } catch (error) {
         await this.#rollback(tx.id);
+        if (error instanceof TransactionContended) {
+          previous = tx.id;
+          await this.#backoff(attempt);
+          continue;
+        }
         throw error;
       }
       if (tx.writes.length === 0) {
@@ -860,14 +1019,18 @@ export class Ledger {
       }
       const commit = await this.#request("commit", { transaction: tx.id, writes: tx.writes });
       if (commit.ok) return result;
-      if (commit.status === "ABORTED" || commit.status === "FAILED_PRECONDITION") {
+      if (contended(commit.status)) {
         previous = tx.id;
-        await Bun.sleep(Math.min(200, 10 + attempt * 5) + Math.random() * 30);
+        await this.#backoff(attempt);
         continue;
       }
       throw new LedgerError(`commit failed: ${commit.status}`);
     }
     throw new LedgerUnavailable("The ledger transaction did not commit within its contention bound.");
+  }
+
+  async #backoff(attempt: number): Promise<void> {
+    await Bun.sleep(Math.min(200, 10 + attempt * 5) + Math.random() * 30);
   }
 
   async #rollback(transaction: string): Promise<void> {
@@ -878,8 +1041,16 @@ export class Ledger {
     }
   }
 
+  // A read inside a transaction that answers with a contention status is the
+  // transaction's to rerun; a read outside one has no transaction to rerun
+  // and fails as the generic ledger error it is.
   async #batchGet(names: readonly string[], transaction: string | undefined): Promise<ReadonlyArray<StoredDocument | null>> {
-    const body = await this.#call("batchGet", transaction === undefined ? { documents: names } : { documents: names, transaction });
+    const response = await this.#request("batchGet", transaction === undefined ? { documents: names } : { documents: names, transaction });
+    if (!response.ok) {
+      if (transaction !== undefined && contended(response.status)) throw new TransactionContended(`batchGet answered ${response.status}`);
+      throw new LedgerError(`batchGet failed: ${response.status}`);
+    }
+    const body = response.body;
     if (!Array.isArray(body)) throw new LedgerError("batchGet returned a non-array.");
     const found = new Map<string, StoredDocument>();
     const missing = new Set<string>();
@@ -1042,6 +1213,10 @@ function verifyInventory<S extends Shard>(shard: S, fresh: Fresh): S {
   return { ...shard, targets };
 }
 
+function contended(status: string): boolean {
+  return status === "ABORTED" || status === "FAILED_PRECONDITION";
+}
+
 function sequences(upTo: number): number[] {
   return Array.from({ length: upTo }, (_, index) => index + 1);
 }
@@ -1067,6 +1242,7 @@ function awaitingChain(shard: Shard): boolean {
 export function shardToJson(shard: Shard): Record<string, Json> {
   const base: Record<string, Json> = {
     consumer: shard.consumer,
+    controlRound: shard.controlRound,
     createdAt: shard.createdAt,
     intent: shard.intent,
     nextSequence: shard.nextSequence,
@@ -1094,6 +1270,7 @@ export function shardFromDocument(doc: StoredDocument): Shard {
   if (source !== null && typeof source !== "string") throw new LedgerError("Shard source is malformed.");
   const base = {
     consumer: str(json, "consumer"),
+    controlRound: nullableStr(json, "controlRound"),
     createdAt: str(json, "createdAt"),
     intent: intent as Shard["intent"],
     nextSequence: int(json, "nextSequence"),
@@ -1299,6 +1476,105 @@ function summaryFromJson(json: Record<string, Json>): InventorySummary {
   };
 }
 
+const emptyRoundPointer: RoundPointer = { control: null, open: [] };
+
+function roundToJson(round: RoundManifest): Record<string, Json> {
+  return {
+    completedAt: round.completedAt,
+    consumer: round.consumer,
+    denyState: { form: round.denyState.form, policies: round.denyState.policies.map((policy) => ({ attachment: policy.attachment, etag: policy.etag, name: policy.name })) },
+    key: round.key,
+    label: round.label,
+    members: [...round.members],
+    openedAt: round.openedAt,
+    openedBy: round.openedBy,
+    phase: round.phase,
+    platformShas: [...round.platformShas],
+    receipts: Object.fromEntries(Object.keys(round.receipts).sort().map((member) => {
+      const receipt = round.receipts[member]!;
+      return [member, {
+        controls: Object.fromEntries(Object.keys(receipt.controls).sort().map((account) => {
+          const control = receipt.controls[account]!;
+          return [account, { observedAt: control.observedAt, outcome: control.outcome, uniqueId: control.uniqueId }];
+        })),
+        deliveredAt: receipt.deliveredAt,
+        platformSha: receipt.platformSha,
+        principal: receipt.principal,
+        runAttempt: receipt.runAttempt,
+        runId: receipt.runId,
+      }];
+    })),
+    shard: round.shard,
+    targets: Object.fromEntries(Object.keys(round.targets).sort().map((account) => {
+      const target = round.targets[account]!;
+      return [account, { inventoryHash: target.inventoryHash, members: [...target.members], policyEtag: target.policyEtag, uniqueId: target.uniqueId }];
+    })),
+    version: round.version,
+  };
+}
+
+function roundFromDocument(doc: StoredDocument): RoundManifest {
+  const json = decodeFields(doc.fields);
+  const phase = str(json, "phase");
+  if (!(roundPhases as readonly string[]).includes(phase)) throw new LedgerError(`Unknown round phase ${phase}.`);
+  const denyState = obj(json, "denyState");
+  const rawPolicies = denyState.policies;
+  if (!Array.isArray(rawPolicies)) throw new LedgerError("Round deny state is malformed.");
+  const receipts = obj(json, "receipts");
+  const targets = obj(json, "targets");
+  return {
+    completedAt: nullableStr(json, "completedAt"),
+    consumer: str(json, "consumer"),
+    denyState: {
+      form: str(denyState, "form"),
+      policies: rawPolicies.map((policy) => {
+        if (!isRecord(policy)) throw new LedgerError("Round deny state is malformed.");
+        const record = policy as Record<string, Json>;
+        return { attachment: str(record, "attachment"), etag: str(record, "etag"), name: str(record, "name") };
+      }),
+    },
+    key: str(json, "key"),
+    label: str(json, "label"),
+    members: strings(json, "members"),
+    openedAt: str(json, "openedAt"),
+    openedBy: str(json, "openedBy"),
+    phase: phase as RoundManifest["phase"],
+    platformShas: strings(json, "platformShas"),
+    receipts: Object.fromEntries(Object.keys(receipts).sort().map((member) => {
+      const receipt = obj(receipts, member);
+      const controls = obj(receipt, "controls");
+      return [member, {
+        controls: Object.fromEntries(Object.keys(controls).sort().map((account) => {
+          const control = obj(controls, account);
+          const outcome = str(control, "outcome");
+          if (!(probeOutcomes as readonly string[]).includes(outcome)) throw new LedgerError("Stored receipt carries an unknown outcome.");
+          return [account, { observedAt: str(control, "observedAt"), outcome: outcome as MemberControl["outcome"], uniqueId: str(control, "uniqueId") }];
+        })),
+        deliveredAt: str(receipt, "deliveredAt"),
+        platformSha: str(receipt, "platformSha"),
+        principal: str(receipt, "principal"),
+        runAttempt: str(receipt, "runAttempt"),
+        runId: str(receipt, "runId"),
+      }];
+    })),
+    shard: nullableStr(json, "shard"),
+    targets: Object.fromEntries(Object.keys(targets).sort().map((account) => {
+      const target = obj(targets, account);
+      return [account, { inventoryHash: str(target, "inventoryHash"), members: strings(target, "members"), policyEtag: str(target, "policyEtag"), uniqueId: str(target, "uniqueId") }];
+    })),
+    version: int(json, "version"),
+  };
+}
+
+function roundPointerToJson(pointer: RoundPointer): Record<string, Json> {
+  return { control: pointer.control, open: [...pointer.open] };
+}
+
+function roundPointerFromDocument(doc: StoredDocument): RoundPointer {
+  const json = decodeFields(doc.fields);
+  return { control: nullableStr(json, "control"), open: strings(json, "open") };
+}
+
 function memberControlToJson(record: MemberControlRecord): Record<string, Json> {
   return {
     consumer: record.consumer,
@@ -1324,6 +1600,17 @@ function memberControlFromDocument(doc: StoredDocument): MemberControlRecord {
     controls[account] = { observedAt: str(control, "observedAt"), outcome: outcome as MemberControl["outcome"], uniqueId: str(control, "uniqueId") };
   }
   return { consumer: str(json, "consumer"), deliveredAt: str(json, "deliveredAt"), expiresAt: str(json, "expiresAt"), member: str(json, "member"), principal: str(json, "principal"), targets: controls };
+}
+
+function coordinationToJson(coordination: Coordination): Record<string, Json> {
+  return { active: [...coordination.active], version: coordination.version };
+}
+
+function coordinationFromDocument(doc: StoredDocument): Coordination {
+  const json = decodeFields(doc.fields);
+  const active = strings(json, "active");
+  if (new Set(active).size !== active.length || [...active].sort().join(",") !== active.join(",")) throw new LedgerError("Coordination document is malformed.");
+  return { active, version: int(json, "version") };
 }
 
 function maintenanceFromDocument(doc: StoredDocument): MaintenanceTicket & { readonly open: boolean } {

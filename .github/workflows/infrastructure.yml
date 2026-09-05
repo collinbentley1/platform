@@ -385,7 +385,11 @@ jobs:
     needs:
       - terraform-validate
       - checkov
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # always(): this job is a managed member of the protected-recovery broker
+    # and delivers its credential on every main-branch push, whether or not
+    # its upstream jobs succeeded; the upstream gate is re-established as a
+    # step after the delivery and before any exchange.
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: production
     concurrency:
       group: deployment-parity-${{ github.event.repository.id }}
@@ -462,6 +466,14 @@ jobs:
           done
           rm -rf -- "$git_home"
           PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
+      - name: Require every upstream job to have succeeded before any exchange
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          UPSTREAM_SUCCEEDED: ${{ needs.terraform-validate.result == 'success' && needs.checkov.result == 'success' }}
+        run: |
+          set -euo pipefail
+          test "$UPSTREAM_SUCCEEDED" = "true"
 
       - name: Reject a stale main-branch run after acquiring the production lock
         env:

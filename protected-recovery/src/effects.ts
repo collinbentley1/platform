@@ -493,9 +493,11 @@ const clockSkewSeconds = 60;
 // What a verified member credential proves: the consumer whose provider it
 // is minted for, the exact managed member the provider derives from its
 // claims, the federated principal STS creates for it (the provider's
-// google.subject mapping, never the raw GitHub subject), and its expiry.
+// google.subject mapping, never the raw GitHub subject), its expiry, and
+// the run, attempt, and platform commit (job_workflow_sha) of the job that
+// delivered it, which a round receipt records.
 export type VerifiedMember =
-  | { readonly kind: "verified"; readonly consumer: Consumer; readonly expiresAt: string; readonly member: string; readonly principal: string }
+  | { readonly kind: "verified"; readonly consumer: Consumer; readonly expiresAt: string; readonly member: string; readonly platformSha: string; readonly principal: string; readonly runAttempt: string; readonly runId: string }
   | { readonly kind: "unavailable"; readonly reason: string };
 
 export interface MemberVerificationDependencies {
@@ -525,14 +527,15 @@ export async function verifyMemberCredential(deps: MemberVerificationDependencie
   }
   const composite = ["workflow_ref", "job_workflow_ref", "job_workflow_sha", "environment", "event_name"].map((claim) => claims[claim]);
   const subject = ["repository_owner_id", "repository_id", "runner_environment", "run_id"].map((claim) => claims[claim]);
-  if (!composite.every((value): value is string => typeof value === "string" && value.length > 0) || !subject.every((value): value is string => typeof value === "string" && value.length > 0)) {
+  const runAttempt = claims.run_attempt;
+  if (!composite.every((value): value is string => typeof value === "string" && value.length > 0) || !subject.every((value): value is string => typeof value === "string" && value.length > 0) || typeof runAttempt !== "string" || runAttempt.length === 0) {
     return { kind: "unavailable", reason: "the member credential lacks the run or the authority claims" };
   }
   const pool = consumerPool(deps.authority, owner);
   const member = `principalSet://iam.googleapis.com/${pool}/attribute.authority/${composite.join(":")}`;
   const bound = targetsFor(deps.authority, owner)?.some((target) => target.members.includes(member)) ?? false;
   if (!bound) return { kind: "unavailable", reason: `the member credential is ${member}, which the inventory binds to no target of ${owner.repository}` };
-  return { kind: "verified", consumer: owner, expiresAt: new Date(claims.exp * 1000).toISOString(), member, principal: `principal://iam.googleapis.com/${pool}/subject/${subject.join(":")}` };
+  return { kind: "verified", consumer: owner, expiresAt: new Date(claims.exp * 1000).toISOString(), member, platformSha: composite[2]!, principal: `principal://iam.googleapis.com/${pool}/subject/${subject.join(":")}`, runAttempt, runId: subject[3]! };
 }
 
 export interface IssuanceProbeDependencies {

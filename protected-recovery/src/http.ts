@@ -23,10 +23,12 @@ import {
   type Entry,
   type InventoryRecord,
   type MemberControl,
-  type MemberControlRecord,
   type ParsedRequest,
   type Purpose,
   type RecoveryAuthority,
+  type RoundBinding,
+  type RoundManifest,
+  type RoundRequest,
   type Shard,
   type Target,
   RequestError,
@@ -41,11 +43,14 @@ import {
   parseDeliverBody,
   parseMaintenanceBody,
   parseReconcileBody,
+  parseRoundBody,
+  parseRoundId,
   parseShardId,
   probePermission,
-  probePrerequisite,
   probesNeeded,
   purposeForIdentity,
+  roundId,
+  roundOwed,
   scanReadiness,
   targetOfEffect,
   targetsFor,
@@ -180,11 +185,13 @@ export class Broker {
         let outcome;
         if (request.body.kind === "quarantine") {
           const targets = targetsFor(authority, purpose.consumer);
+          let controlRound: string | undefined;
           if (targets && !recorded) {
-            const refusal = await this.#admissible(purpose.consumer, targets);
-            if (refusal) return refusal;
+            const admission = await this.#admissible(purpose.consumer, targets);
+            if (admission.kind === "refused") return admission.response;
+            controlRound = admission.round;
           }
-          outcome = await ledger.append(request, targets);
+          outcome = await ledger.append(request, targets, undefined, controlRound);
         } else {
           const source = recorded ? undefined : await ledger.readShard(request.body.source);
           const fresh = source && source.consumer === purpose.consumer.repository ? (await this.#observe(request.body.source, source, purpose.consumer)).fresh : undefined;
@@ -249,6 +256,14 @@ export class Broker {
       }
       case "deliver":
         return await this.#deliver(purpose, request.token);
+      case "round":
+        return await this.#openRound(purpose, request);
+      case "round-read": {
+        const round = await ledger.readRound(request.round);
+        if (!round) return notFound();
+        if (!(purpose.kind === "reconciler" || (purpose.kind === "recovery" && purpose.consumer.repository === round.consumer))) return forbidden();
+        return { status: 200, body: { round: roundView(request.round, round) } };
+      }
       case "maintenance": {
         // The maintenance ticket is the RESTORE direction's: it is the
         // return to ordinary operation that infrastructure work belongs to.
@@ -260,15 +275,65 @@ export class Broker {
     }
   }
 
+  // A round is opened by the consumer's QUARANTINE invoker at exact
+  // coordinates and bound, at that moment, to every member, the platform
+  // commits the consumer records, every target's identity, policy etag, and
+  // inventory hash from one fresh batch inventory, and the live Deny state.
+  // A round with a dirty or unavailable inventory is refused; a round that
+  // exists is replayed.
+  async #openRound(purpose: Purpose, request: RoundRequest): Promise<BrokerResponse> {
+    const { authority, inventory, ledger } = this.#deps;
+    if (purpose.kind !== "recovery" || purpose.intent !== "QUARANTINE" || purpose.consumer.repository !== request.body.consumer) return forbidden();
+    const consumer = purpose.consumer;
+    const id = roundId(consumer.repository, request.body.phase, request.body.shard, request.body.label);
+    const existing = await ledger.readRound(id);
+    if (existing) return { status: 200, body: { round: roundView(id, existing) } };
+    let targets: readonly Target[] | undefined;
+    if (request.body.shard === null) {
+      targets = targetsFor(authority, consumer);
+      if (!targets) return { status: 409, body: { detail: "the consumer's workflow SHA pins or target identities are not recorded", error: "PINS_UNRECORDED" } };
+    } else {
+      const shard = await ledger.readShard(request.body.shard);
+      if (!shard) return notFound();
+      if (!allowed(purpose, shard)) return forbidden();
+      if (shard.phase !== "OPEN") return { status: 409, body: { error: "SHARD_NOT_OPEN", phase: shard.phase } };
+      const entries = await ledger.readEntries(request.body.shard, shard.nextSequence - 1);
+      targets = entries.flatMap((entry) => (entry.body.kind === "effect" && shard.targets[entry.body.account]?.effect.state === "ACKED" ? [targetOfEffect(authority, consumer, entry.body)] : []));
+      if (targets.length === 0) return { status: 409, body: { detail: "the shard has no acknowledged target to probe", error: "SHARD_NOT_OPEN", phase: shard.phase } };
+    }
+    const outcomes = await inventory.inventoryAll(targets, consumer);
+    const blockers: string[] = [];
+    const bound: Record<string, RoundBinding["targets"][string]> = {};
+    let denyState: RoundBinding["denyState"] | undefined;
+    for (const [index, target] of targets.entries()) {
+      const outcome = outcomes[index];
+      if (!outcome || outcome.kind === "unavailable") {
+        blockers.push(`${target.account}: credential inventory unavailable; ${outcome?.reason ?? "no outcome"}`);
+        continue;
+      }
+      if (outcome.inventory.findings.length > 0) blockers.push(`${target.account}: ${outcome.inventory.findings.join(", ")}`);
+      const policy = outcome.inventory.summary.policies.find((candidate) => candidate.resource === target.resource);
+      if (!policy) blockers.push(`${target.account}: the inventory carries no allow policy etag for ${target.resource}`);
+      bound[target.account] = { inventoryHash: outcome.inventory.hash, members: target.members, policyEtag: policy?.etag ?? "", uniqueId: target.uniqueId };
+      denyState ??= outcome.inventory.summary.denyState;
+    }
+    if (blockers.length > 0 || denyState === undefined) return { status: 409, body: { blockers, error: "INVENTORY_BLOCKED" } };
+    const platformShas = [consumer.activeWorkflowSha, ...(consumer.transitionWorkflowSha === null ? [] : [consumer.transitionWorkflowSha])].filter((sha): sha is string => sha !== null);
+    const members = [...new Set(targets.flatMap((target) => target.members))].sort();
+    const opened = await ledger.openRound(request, purpose.serviceAccount, { denyState, members, platformShas, targets: bound });
+    if (opened.kind === "rejected") return rejected(opened.rejection);
+    return { status: opened.kind === "opened" ? 201 : 200, body: { round: roundView(opened.id, opened.round) } };
+  }
+
   // A canonical job delivers its own credential through its consumer's
   // member-delivery identity. The broker verifies it exactly as the consumer
   // provider would, binds it to that consumer, requires enough remaining life
   // for the whole delivery, exchanges it at STS once, and mints as the member
-  // against every target it is bound to, right now: each outcome is the
-  // member's positive control for that target, and the revocation or
-  // post-horizon probe of every OPEN QUARANTINE shard that needs it. The
-  // bearer is discarded with the request; no reply and no document carries
-  // it.
+  // against every target it is bound to, right now: each outcome is a
+  // receipt in every open round of the consumer whose binding the delivery
+  // satisfies, and the revocation or post-horizon probe of every OPEN
+  // QUARANTINE shard that needs it. The bearer is discarded with the
+  // request; no reply and no document carries it.
   async #deliver(purpose: Purpose, token: string): Promise<BrokerResponse> {
     const { authority, ledger, now, probe } = this.#deps;
     if (purpose.kind !== "member") return forbidden();
@@ -288,7 +353,14 @@ export class Broker {
       if (result.kind === "observed") controls[result.target.account] = { observedAt: result.observedAt, outcome: result.outcome, uniqueId: result.target.uniqueId };
       else unavailable.push(`${result.target.account}: ${result.reason}`);
     }
-    await ledger.putMemberControl({ consumer: verified.consumer.repository, deliveredAt: now().toISOString(), expiresAt: verified.expiresAt, member: verified.member, principal: minted.principal, targets: controls });
+    const deliveredAt = now().toISOString();
+    await ledger.putMemberControl({ consumer: verified.consumer.repository, deliveredAt, expiresAt: verified.expiresAt, member: verified.member, principal: minted.principal, targets: controls });
+    // The receipt goes to every round of the consumer that is open to it.
+    const rounds: Record<string, unknown>[] = [];
+    for (const id of (await ledger.readRoundPointer(verified.consumer.repository)).open) {
+      const recorded = await ledger.recordReceipt(id, verified.member, { controls, deliveredAt, platformSha: verified.platformSha, principal: minted.principal, runAttempt: verified.runAttempt, runId: verified.runId });
+      rounds.push({ round: id, ...(recorded.kind === "recorded" ? { complete: recorded.complete, phase: recorded.round.phase, recorded: true } : { recorded: false, refused: recorded.reason }) });
+    }
     const probes: Record<string, unknown>[] = [];
     const byAccount = new Map(targets.map((target) => [target.account, target]));
     for (const shardId of await ledger.listOpenQuarantines(verified.consumer.repository)) {
@@ -301,7 +373,7 @@ export class Broker {
         probes.push({ account: need.account, phase: need.phase, shard: shardId, ...(recorded.kind === "recorded" ? { role: recorded.role } : { refused: recorded.reason }) });
       }
     }
-    return { status: 200, body: { controls: Object.fromEntries(Object.keys(controls).sort().map((account) => [account, controls[account]!.outcome])), member: verified.member, probes, unavailable } };
+    return { status: 200, body: { controls: Object.fromEntries(Object.keys(controls).sort().map((account) => [account, controls[account]!.outcome])), member: verified.member, probes, rounds, unavailable } };
   }
 
   // Sweep the complete reconcilable set in document-name order, one page at a
@@ -393,8 +465,8 @@ export class Broker {
       const pending = entries.flatMap((entry) => (entry.body.kind === "effect" && (entry.progress?.state === "RECORDED" || entry.progress?.state === "PREPARED") && consumer ? [targetOfEffect(authority, consumer, entry.body)] : []));
       if (pending.length > 0 && consumer) {
         if (shard.intent === "QUARANTINE") {
-          const refusal = await this.#admissible(consumer, pending);
-          if (refusal) admission = `${String(refusal.body.error)}; ${describe(refusal.body)}`;
+          const verdict = await this.#admissible(consumer, pending);
+          if (verdict.kind === "refused") admission = `${String(verdict.response.body.error)}; ${describe(verdict.response.body)}`;
         } else {
           const deny = await inventory.denyState(consumer);
           if (deny.kind === "unavailable") admission = `DENY_STATE_UNAVAILABLE; ${deny.reason}`;
@@ -456,36 +528,63 @@ export class Broker {
   }
 
   // Whether a QUARANTINE of these targets may be accepted, prepared, or
-  // resumed right now: no maintenance ticket is open, every managed member
-  // of every target has a recorded positive control (its canonical job
-  // delivered and minted as it), and every target's inventory -- the live
-  // Deny state included -- is observed and clean. Otherwise the refusal names
-  // exactly what is missing, and nothing has been mutated.
-  async #admissible(consumer: Consumer, targets: readonly Target[]): Promise<BrokerResponse | undefined> {
+  // resumed right now: no maintenance ticket is open; the consumer has one
+  // complete CONTROL round, recent enough, bound to the current platform
+  // pins, that carries a receipt from every managed member of every target
+  // minted ALLOWED against that target's exact identity; every target's
+  // inventory -- the live Deny state included -- is observed and clean; and
+  // that inventory still equals the round's binding -- the same inventory
+  // hash and allow-policy etag per target, the same Deny policies by etag
+  // and the same form -- so the positive controls were established under
+  // exactly the state the quarantine would act on. Otherwise the refusal
+  // names exactly what is missing, and nothing has been mutated.
+  async #admissible(consumer: Consumer, targets: readonly Target[]): Promise<{ readonly kind: "admitted"; readonly round: string } | { readonly kind: "refused"; readonly response: BrokerResponse }> {
     const { inventory, ledger } = this.#deps;
+    const refuse = (response: BrokerResponse): { readonly kind: "refused"; readonly response: BrokerResponse } => ({ kind: "refused", response });
     const ticket = await ledger.readMaintenance();
-    if (ticket) return { status: 409, body: { detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}`, error: "MAINTENANCE_OPEN" } };
-    const controls = new Map<string, MemberControlRecord | undefined>();
+    if (ticket) return refuse({ status: 409, body: { detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}`, error: "MAINTENANCE_OPEN" } });
+    const pointer = await ledger.readRoundPointer(consumer.repository);
+    const round = pointer.control === null ? undefined : await ledger.readRound(pointer.control);
+    if (!pointer.control || !round || round.completedAt === null) return refuse({ status: 409, body: { detail: `no complete CONTROL round of ${consumer.repository}: every canonical job that is a managed member must deliver its credential to POST /v1/members into one round opened at POST /v1/rounds, and mint ALLOWED against every target it is bound to, before any quarantine`, error: "PROBE_UNAVAILABLE" } });
     const missing: string[] = [];
     const earliest = this.#deps.now().getTime() - controlValiditySeconds * 1000;
+    if (Date.parse(round.completedAt) < earliest) missing.push(`the CONTROL round ${pointer.control} completed at ${round.completedAt}, older than ${controlValiditySeconds}s`);
+    const pins = [consumer.activeWorkflowSha, ...(consumer.transitionWorkflowSha === null ? [] : [consumer.transitionWorkflowSha])].filter((sha): sha is string => sha !== null);
+    if (pins.join(",") !== [...round.platformShas].join(",")) missing.push(`the CONTROL round ${pointer.control} bound the platform at ${round.platformShas.join(", ")}, not the recorded ${pins.join(", ")}`);
     for (const target of targets) {
       if (target.members.length === 0) missing.push(`${target.account}: no managed member`);
+      const bound = round.targets[target.account];
+      if (!bound || bound.uniqueId !== target.uniqueId) {
+        missing.push(`${target.account}: the CONTROL round ${pointer.control} does not bind identity ${target.uniqueId}`);
+        continue;
+      }
       for (const member of target.members) {
-        if (!controls.has(member)) controls.set(member, await ledger.readMemberControl(member));
-        const control = controls.get(member)?.targets[target.account];
-        if (!control || control.outcome !== "ALLOWED" || control.uniqueId !== target.uniqueId) missing.push(`${target.account}/${member}: ${probePrerequisite(member)}`);
-        else if (Date.parse(control.observedAt) < earliest) missing.push(`${target.account}/${member}: the positive control of ${control.observedAt} is older than ${controlValiditySeconds}s; ${probePrerequisite(member)}`);
+        const control = round.receipts[member]?.controls[target.account];
+        if (!bound.members.includes(member)) missing.push(`${target.account}/${member}: the CONTROL round ${pointer.control} does not bind this member`);
+        else if (!control || control.outcome !== "ALLOWED" || control.uniqueId !== target.uniqueId) missing.push(`${target.account}/${member}: no ALLOWED receipt in the CONTROL round ${pointer.control}`);
       }
     }
-    if (missing.length > 0) return { status: 409, body: { detail: missing.join("; "), error: "PROBE_UNAVAILABLE" } };
+    if (missing.length > 0) return refuse({ status: 409, body: { detail: missing.join("; "), error: "PROBE_UNAVAILABLE" } });
     const blockers: string[] = [];
+    const stale: string[] = [];
     const outcomes = await inventory.inventoryAll(targets, consumer);
     for (const [index, target] of targets.entries()) {
       const outcome = outcomes[index];
-      if (!outcome || outcome.kind === "unavailable") blockers.push(`${target.account}: credential inventory unavailable; ${outcome?.reason ?? "no outcome"}`);
-      else if (outcome.inventory.findings.length > 0) blockers.push(`${target.account}: ${outcome.inventory.findings.join(", ")}`);
+      if (!outcome || outcome.kind === "unavailable") {
+        blockers.push(`${target.account}: credential inventory unavailable; ${outcome?.reason ?? "no outcome"}`);
+        continue;
+      }
+      if (outcome.inventory.findings.length > 0) blockers.push(`${target.account}: ${outcome.inventory.findings.join(", ")}`);
+      const bound = round.targets[target.account]!;
+      const policy = outcome.inventory.summary.policies.find((candidate) => candidate.resource === target.resource);
+      if (outcome.inventory.hash !== bound.inventoryHash) stale.push(`${target.account}: the credential inventory changed since the CONTROL round ${pointer.control} bound it`);
+      if (policy?.etag !== bound.policyEtag) stale.push(`${target.account}: the allow policy of ${target.resource} moved since the CONTROL round ${pointer.control} bound it`);
+      const live = outcome.inventory.summary.denyState;
+      if (live.form !== round.denyState.form || canonicalPolicies(live.policies) !== canonicalPolicies(round.denyState.policies)) stale.push(`${target.account}: the live Deny state (${live.form}) is not the state the CONTROL round ${pointer.control} bound (${round.denyState.form})`);
     }
-    return blockers.length === 0 ? undefined : { status: 409, body: { blockers, error: "INVENTORY_BLOCKED" } };
+    if (blockers.length > 0) return refuse({ status: 409, body: { blockers, error: "INVENTORY_BLOCKED" } });
+    if (stale.length > 0) return refuse({ status: 409, body: { blockers: [...new Set(stale)], error: "ROUND_STALE" } });
+    return { kind: "admitted", round: pointer.control };
   }
 
   // The freshly observed inventory of every acknowledged target of a shard,
@@ -514,6 +613,10 @@ export class Broker {
     }
     return { fresh: Object.fromEntries(Object.entries(fresh).map(([account, record]) => [account, { findings: record.findings, hash: record.hash, observedAt: record.observedAt, observedUntil: record.observedUntil }])), records, unavailable };
   }
+}
+
+function canonicalPolicies(policies: ReadonlyArray<{ readonly attachment: string; readonly etag: string; readonly name: string }>): string {
+  return JSON.stringify([...policies].map((policy) => [policy.attachment, policy.name, policy.etag]).sort());
 }
 
 // The journaled target of every effect entry of a shard, by account.
@@ -550,6 +653,32 @@ function rejected(rejection: Rejection): BrokerResponse {
   return { status: rejection.reason === "SHARD_MISMATCH" ? 403 : 409, body: { detail: rejection.detail, error: rejection.reason } };
 }
 
+// The round as its invoker and the orchestrator see it: the binding, every
+// receipt's outcomes (never a bearer), and every delivery still owed.
+function roundView(id: string, round: RoundManifest): Record<string, unknown> {
+  return {
+    complete: round.completedAt !== null,
+    completedAt: round.completedAt,
+    consumer: round.consumer,
+    denyState: round.denyState,
+    label: round.label,
+    members: [...round.members],
+    openedAt: round.openedAt,
+    openedBy: round.openedBy,
+    owed: roundOwed(round),
+    phase: round.phase,
+    platformShas: [...round.platformShas],
+    receipts: Object.fromEntries(Object.keys(round.receipts).sort().map((member) => {
+      const receipt = round.receipts[member]!;
+      return [member, { controls: Object.fromEntries(Object.keys(receipt.controls).sort().map((account) => [account, receipt.controls[account]!.outcome])), deliveredAt: receipt.deliveredAt, platformSha: receipt.platformSha, principal: receipt.principal, runAttempt: receipt.runAttempt, runId: receipt.runId }];
+    })),
+    round: id,
+    shard: round.shard,
+    targets: Object.fromEntries(Object.keys(round.targets).sort().map((account) => [account, { ...round.targets[account]!, members: [...round.targets[account]!.members] }])),
+    version: round.version,
+  };
+}
+
 function shardView(shardId: string, shard: Shard): Record<string, unknown> {
   const terminal = shard.phase === "FINALIZING" || shard.phase === "CLOSED"
     ? { generation: shard.terminal.progress.state === "PROJECTED" ? shard.terminal.progress.generation : null, objectName: shard.terminal.objectName, sha256: shard.terminal.sha256, state: shard.terminal.progress.state }
@@ -557,6 +686,7 @@ function shardView(shardId: string, shard: Shard): Record<string, unknown> {
   return {
     closeHighWater: shard.phase === "OPEN" ? null : shard.closeHighWater,
     consumer: shard.consumer,
+    controlRound: shard.controlRound,
     intent: shard.intent,
     nextSequence: shard.nextSequence,
     pendingEffects: shard.pendingEffects,
@@ -590,6 +720,8 @@ const routes = {
   read: /^\/v1\/shards\/([^/]+)$/,
   reconcileAll: /^\/v1\/reconcile$/,
   reconcileShard: /^\/v1\/shards\/([^/]+)\/reconcile$/,
+  round: /^\/v1\/rounds\/([^/]+)$/,
+  rounds: /^\/v1\/rounds$/,
 } as const;
 
 export interface ServiceDependencies {
@@ -642,6 +774,14 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
     }
   };
   if (request.method === "GET") {
+    const round = routes.round.exec(path);
+    if (round) {
+      try {
+        return { kind: "round-read", round: parseRoundId(decodeURIComponent(round[1]!)) };
+      } catch {
+        throw new NotFound();
+      }
+    }
     const match = routes.read.exec(path);
     if (!match) throw new NotFound();
     return { kind: "read", shard: decode(match[1]!) };
@@ -657,6 +797,7 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
   if (routes.reconcileAll.test(path)) return parseReconcileBody(null, body);
   if (routes.members.test(path)) return parseDeliverBody(body);
   if (routes.maintenance.test(path)) return parseMaintenanceBody(body);
+  if (routes.rounds.test(path)) return parseRoundBody(body);
   throw new NotFound();
 }
 

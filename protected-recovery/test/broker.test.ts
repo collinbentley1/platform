@@ -51,6 +51,85 @@ describe.skipIf(!emulatorHost)("maintenance, the restore fence, and external dep
     expect((await broker.handle(isolate, quarantine("q2", "cdbentley", "k2"))).status).toBe(201);
   }, 180_000);
 
+  test("quarantine acceptance and maintenance opening are ordered by one coordination document -- written by the transactions that accept a quarantine and close it, read by the one that opens a ticket -- so concurrent attempts across two instances never both succeed and the document is exactly the set of quarantines not CLOSED", async () => {
+    // Every Firestore read made inside a transaction, and every commit, observed.
+    const reads: Array<{ readonly documents: readonly string[]; readonly transaction: string | undefined }> = [];
+    const commits: Array<readonly string[]> = [];
+    const observing: typeof fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as { documents?: string[]; transaction?: string; writes?: Array<{ update?: { name: string } }> }) : {};
+      if (url.endsWith(":batchGet")) reads.push({ documents: body.documents ?? [], transaction: body.transaction });
+      if (url.endsWith(":commit")) commits.push((body.writes ?? []).flatMap((write) => (write.update ? [write.update.name] : [])));
+      return await fetch(input, init);
+    }, { preconnect: fetch.preconnect });
+    const w = await world(new Clock(), observing);
+    const { broker, ledger } = w;
+    const other = w.anotherInstance().ledger;
+    const targets = await prime(w, "cdbentley");
+    const coordination = (name: string) => name.endsWith("/coordination/quarantines");
+    expect(await ledger.readCoordination()).toEqual({ active: [], version: 0 });
+    // From a clean state -- no ticket, no quarantine -- acceptance and opening race on two instances. Exactly one
+    // wins each time, and after every race the committed state satisfies the invariant: an open ticket never
+    // stands beside a quarantine that is not CLOSED, and the coordination document names exactly those quarantines.
+    let accepted = 0;
+    let opened = 0;
+    for (let race = 0; race < 4; race += 1) {
+      const shard = `q-${race}`;
+      const before = reads.length;
+      const [appended, ticket] = await Promise.all([ledger.append(quarantine(shard, "cdbentley", `k-${race}`), targets), other.openMaintenance(`m-${race}`, "gha-restore-cdbentley")]);
+      const won = [appended.kind === "accepted", ticket.kind === "opened"];
+      expect(won.filter(Boolean)).toHaveLength(1);
+      // Both transactions read the coordination document inside their own transaction.
+      const transactional = reads.slice(before).filter((read) => read.transaction !== undefined && read.documents.some(coordination));
+      expect(transactional.length).toBeGreaterThanOrEqual(2);
+      const state = await ledger.readCoordination();
+      const maintenance = await ledger.readMaintenance();
+      if (ticket.kind === "opened") {
+        opened += 1;
+        expect(appended).toMatchObject({ kind: "rejected", rejection: { reason: "MAINTENANCE_OPEN" } });
+        expect(await ledger.readShard(shard)).toBeUndefined();
+        expect(state.active).toEqual([]);
+        expect(maintenance).toMatchObject({ key: `m-${race}` });
+        expect((await other.closeMaintenance(`m-${race}`)).kind).toBe("closed");
+      } else {
+        accepted += 1;
+        expect(ticket).toEqual({ kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${shard}` });
+        expect(maintenance).toBeNull();
+        expect(state.active).toEqual([shard]);
+        // The acceptance commit wrote the shard into the coordination document in the same commit as the shard.
+        expect(commits.some((names) => names.some(coordination) && names.some((name) => name.endsWith(`/shards/${shard}`)))).toBe(true);
+        // Opening stays refused through CLOSING and FINALIZING, and the terminal close writes the shard out.
+        await makeReady(w, shard);
+        expect((await beginClose(w, shard, `c-${race}`)).kind).toBe("closing");
+        expect(await other.openMaintenance(`m-${race}-closing`, "gha-restore-cdbentley")).toMatchObject({ kind: "refused", reason: "QUARANTINE_ACTIVE" });
+        expect((await broker.reconcileShard(shard) as { phase: string }).phase).toBe("CLOSED");
+        expect((await ledger.readCoordination()).active).toEqual([]);
+        // The quarantine removed the managed bindings: they are put back and a fresh delivery round records the
+        // ALLOWED controls the next race's quarantine needs.
+        await prime(w, "cdbentley");
+      }
+      // Every transition advanced the version.
+      expect((await ledger.readCoordination()).version).toBeGreaterThan(state.version - 1);
+    }
+    expect(accepted + opened).toBe(4);
+    // Two quarantines of two consumers are both named until each is CLOSED, in sorted order.
+    const runsettaTargets = await prime(w, "runsetta");
+    expect((await ledger.append(quarantine("zz", "runsetta", "k-zz"), runsettaTargets)).kind).toBe("accepted");
+    expect((await other.append(quarantine("aa", "cdbentley", "k-aa"), targets)).kind).toBe("accepted");
+    expect((await ledger.readCoordination()).active).toEqual(["aa", "zz"]);
+    // Twenty concurrent openings across both instances while quarantines stand: every one refused, none opened.
+    const attempts = await Promise.all(Array.from({ length: 20 }, (_, index) => (index % 2 === 0 ? ledger : other).openMaintenance(`burst-${index}`, "gha-restore-cdbentley")));
+    expect(attempts.every((attempt) => attempt.kind === "refused" && attempt.reason === "QUARANTINE_ACTIVE")).toBe(true);
+    expect(await ledger.readMaintenance()).toBeNull();
+    // A RESTORE shard is not a quarantine and never enters the document.
+    await makeReady(w, "aa");
+    expect((await beginClose(w, "aa", "c-aa")).kind).toBe("closing");
+    expect((await broker.reconcileShard("aa") as { phase: string }).phase).toBe("CLOSED");
+    expect((await ledger.readCoordination()).active).toEqual(["zz"]);
+    expect((await ledger.append(restore("ra", "cdbentley", "k-ra", "aa"), targets, await freshOf(w, "aa"))).kind).toBe("accepted");
+    expect((await ledger.readCoordination()).active).toEqual(["zz"]);
+  }, 300_000);
+
   test("a RESTORE effect is prepared and written only under the steady Deny form, and a PREPARED one is re-admitted before it resumes", async () => {
     const w = await world();
     const { broker, iam, inventory, ledger } = w;

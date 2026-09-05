@@ -156,7 +156,13 @@ describe("platform scaffold and doctor", () => {
     expect(checkov).not.toContain("id-token: write");
     expect(reusable.match(/id-token: write/g) ?? []).toHaveLength(1);
     expect(convergence).toContain(
-      "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+      "if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
+    );
+    expect(convergence).toContain(
+      "UPSTREAM_SUCCEEDED: ${{ needs.terraform-validate.result == 'success' && needs.checkov.result == 'success' }}",
+    );
+    expect(convergence.indexOf("Deliver this job's credential to the protected-recovery broker")).toBeLessThan(
+      convergence.indexOf("Require every upstream job to have succeeded before any exchange"),
     );
     expect(convergence).toContain("environment: production");
     expect(convergence).toContain("id-token: write");
@@ -3363,7 +3369,7 @@ describe("platform scaffold and doctor", () => {
         "rerun-guard": null,
         "terraform-validate": null,
         checkov: null,
-        "terraform-convergence": "github.event_name == 'push' && github.ref == 'refs/heads/main'",
+        "terraform-convergence": "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
       },
     };
 

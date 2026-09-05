@@ -24,9 +24,10 @@ import {
 //     {"key", "consumer", "intent": "RESTORE", "source": "<shard>"}  one RESTORE effect per effect of the scan-ready CLOSED source shard
 //     201 accepted / 200 replayed     -> {"shard", "sequences", "key", "bodyHash", "acceptedAt"}
 //     409 KEY_BODY_MISMATCH | SHARD_NOT_OPEN | SHARD_FULL | SHARD_MISMATCH | SOURCE_NOT_COMPLETE | PINS_UNRECORDED
-//     409 PROBE_UNAVAILABLE | INVENTORY_BLOCKED   a QUARANTINE is refused before acceptance unless the broker's own
-//                                                 issuance probe is operational against every target and the credential
-//                                                 inventory of every target is observed and clean
+//     409 PROBE_UNAVAILABLE | ROUND_STALE | INVENTORY_BLOCKED   a QUARANTINE is refused before acceptance unless one complete
+//                                                 CONTROL round -- a receipt from every exact member, minted ALLOWED against
+//                                                 every target it is bound to -- exists, its binding still holds against the
+//                                                 credential inventory observed now, and that inventory is clean
 //   POST /v1/shards/{shard}/close      the same invoker   {"key"}
 //     200                             -> {"shard", "phase": "CLOSING", "closeHighWater", "closingAt"}
 //     409 NOT_READY                   -> {"blockers": [...]}  a QUARANTINE shard closes only once scan-ready
@@ -35,12 +36,22 @@ import {
 //     200                             -> {"shards": [ShardView], "next": cursor | null}
 //   GET  /v1/shards/{shard}            the same invoker, reconciler
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
+//   POST /v1/rounds                    the consumer's QUARANTINE invoker
+//     {"key", "consumer", "phase": "CONTROL", "shard": null, "label"}           the positive-control round before a quarantine
+//     {"key", "consumer", "phase": "REVOCATION" | "HORIZON", "shard", "label"}  the probe rounds of one OPEN quarantine shard
+//     201 opened / 200 replayed       -> {"round": RoundView}   the round manifest, bound at opening to every exact member,
+//                                        the platform pins, every target's permanent identity, policy etag, and inventory
+//                                        hash, and the live Deny state by policy etag and form; idempotent on its coordinates
+//     409 PINS_UNRECORDED | INVENTORY_BLOCKED | SHARD_NOT_OPEN, 404 NOT_FOUND
+//   GET  /v1/rounds/{round}            either invoker of the consumer, reconciler
+//     200                             -> {"round": RoundView}   the receipts recorded so far and every delivery still owed
 //   POST /v1/members                   the consumer's member-delivery identity   {"token": "<GitHub OIDC token>"}
-//     200                             -> {"member", "controls", "probes"}   the canonical job's own credential, verified,
-//                                        exchanged at STS, and used at once to mint as the member against every target it is
-//                                        bound to; the outcomes are recorded (a positive control before any quarantine, the
-//                                        revocation or post-horizon probe of every OPEN quarantine that needs it) and the
-//                                        bearer is discarded -- it is never stored
+//     200                             -> {"member", "controls", "probes", "rounds"}   the canonical job's own credential,
+//                                        verified, exchanged at STS, and used at once to mint as the member against every
+//                                        target it is bound to; the outcomes are recorded (a receipt in every open round of
+//                                        the consumer whose binding the delivery satisfies, the revocation or post-horizon
+//                                        probe of every OPEN quarantine that needs it) and the bearer is discarded -- it is
+//                                        never stored
 //     409 MEMBER_UNVERIFIED | MEMBER_EXPIRING   refused before any exchange
 //   POST /v1/maintenance               a RESTORE invoker   {"key", "action": "open" | "close"}
 //     200                             -> {"ticket": {...} | null}   the maintenance ticket under which the root may widen the
@@ -280,11 +291,118 @@ export interface MemberControlRecord {
 // opened while any QUARANTINE shard is not CLOSED.
 export const maintenanceTicketSeconds = 4 * 3600;
 
-// How recent a member's positive control must be for a quarantine to be
-// accepted, prepared, or resumed: the canonical job must have delivered and
-// minted within this window, so admission rests on a channel proven to exist
-// in its current form, not on a control from a job that may since have gone.
+// How recent the complete CONTROL round a quarantine rests on must be for the
+// quarantine to be accepted, prepared, or resumed: every canonical job must
+// have delivered and minted within this window, so admission rests on a
+// channel proven to exist in its current form, not on a round from jobs that
+// may since have gone.
 export const controlValiditySeconds = 24 * 3600;
+
+// A delivery round: one complete pass of every canonical job of a consumer
+// through POST /v1/members, represented as one manifest the broker binds at
+// opening and completes only from receipts that satisfy the binding.
+//
+//   CONTROL      before a quarantine, with the bindings standing: every member
+//                mints against every target it is bound to. A quarantine
+//                target is accepted, prepared, or resumed only against one
+//                complete CONTROL round whose binding still holds and whose
+//                receipt from every member of that target is ALLOWED.
+//   REVOCATION   after the quarantine is acknowledged: every member mints
+//                again, the revocation probe of its chain, DENIED once the
+//                binding is gone.
+//   HORIZON      after the token horizon: every member mints once more.
+//
+// The binding: the exact members, the platform commits the consumer records
+// (which every delivery's job_workflow_sha must be one of), every target's
+// permanent identity, allow-policy etag, and inventory hash, and the live
+// Deny state by policy etag and form. A receipt records the delivering run
+// and attempt, the federated principal, and the outcome against each target.
+export const roundPhases = ["CONTROL", "HORIZON", "REVOCATION"] as const;
+export type RoundPhase = (typeof roundPhases)[number];
+
+export interface RoundTarget {
+  readonly inventoryHash: string;
+  readonly members: readonly string[];
+  readonly policyEtag: string;
+  readonly uniqueId: string;
+}
+
+export interface RoundReceipt {
+  readonly controls: Readonly<Record<string, MemberControl>>;
+  readonly deliveredAt: string;
+  readonly platformSha: string;
+  readonly principal: string;
+  readonly runAttempt: string;
+  readonly runId: string;
+}
+
+export interface RoundBinding {
+  readonly denyState: DenyStateSummary;
+  readonly members: readonly string[];
+  readonly platformShas: readonly string[];
+  readonly targets: Readonly<Record<string, RoundTarget>>;
+}
+
+export interface RoundManifest extends RoundBinding {
+  readonly completedAt: string | null;
+  readonly consumer: string;
+  readonly key: string;
+  readonly label: string;
+  readonly openedAt: string;
+  readonly openedBy: string;
+  readonly phase: RoundPhase;
+  readonly receipts: Readonly<Record<string, RoundReceipt>>;
+  readonly shard: string | null;
+  readonly version: number;
+}
+
+// One consumer's rounds: the latest complete CONTROL round, which admits its
+// quarantines, and every round still open to receipts.
+export interface RoundPointer {
+  readonly control: string | null;
+  readonly open: readonly string[];
+}
+
+// A round is identified by its coordinates alone, so a retried opening
+// reuses it.
+export function roundId(consumer: string, phase: RoundPhase, shard: string | null, label: string): string {
+  return sha256Hex(canonicalJson({ consumer, label, phase, shard }));
+}
+
+export interface RoundDebt {
+  readonly account: string;
+  readonly member: string;
+  readonly reason: string;
+}
+
+// What a round still owes: for every member and every target it is bound
+// to, a receipt whose control was minted against that target's exact
+// identity. The outcome is judged where it matters -- admission needs
+// ALLOWED in the CONTROL round for each target it admits; a shard's chains
+// need DENIED after its acknowledgement -- so a round is complete when every
+// expected delivery has happened, whatever each mint answered.
+export function roundOwed(round: RoundManifest): readonly RoundDebt[] {
+  const owed: RoundDebt[] = [];
+  for (const member of round.members) {
+    const receipt = round.receipts[member];
+    for (const account of Object.keys(round.targets).sort()) {
+      const target = round.targets[account]!;
+      if (!target.members.includes(member)) continue;
+      if (!receipt) {
+        owed.push({ account, member, reason: "the canonical job that is this member has not delivered to this round" });
+        continue;
+      }
+      const control = receipt.controls[account];
+      if (!control) owed.push({ account, member, reason: "the delivery did not mint against this target" });
+      else if (control.uniqueId !== target.uniqueId) owed.push({ account, member, reason: `the delivery minted against ${control.uniqueId}, not the bound identity ${target.uniqueId}` });
+    }
+  }
+  return owed;
+}
+
+export function roundComplete(round: RoundManifest): boolean {
+  return roundOwed(round).length === 0;
+}
 
 export interface MaintenanceTicket {
   readonly expiresAt: string;
@@ -413,6 +531,9 @@ export interface TargetState {
 
 interface ShardBase {
   readonly consumer: string;
+  // The complete CONTROL round that admitted a QUARANTINE shard; null for a
+  // RESTORE shard.
+  readonly controlRound: string | null;
   readonly createdAt: string;
   readonly intent: Intent;
   readonly nextSequence: number;
@@ -500,13 +621,27 @@ export interface MaintenanceRequest {
   readonly key: string;
 }
 
-export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest | MaintenanceRequest;
+export interface RoundRequest {
+  readonly kind: "round";
+  readonly body: { readonly consumer: string; readonly label: string; readonly phase: RoundPhase; readonly shard: string | null };
+  readonly bodyHash: string;
+  readonly key: string;
+}
+
+export interface RoundReadRequest {
+  readonly kind: "round-read";
+  readonly round: string;
+}
+
+export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest | MaintenanceRequest | RoundRequest | RoundReadRequest;
 
 export function intentOf(body: AppendBody): Intent {
   return body.kind === "restore" ? "RESTORE" : "QUARANTINE";
 }
 
 const shardId = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const roundLabel = /^[a-z0-9][a-z0-9-]{0,40}$/;
+const roundDocumentId = /^[0-9a-f]{64}$/;
 const idempotencyKey = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
 const decimalId = /^[1-9][0-9]*$/;
 const serviceAccountId = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
@@ -848,6 +983,29 @@ export function parseDeliverBody(body: unknown): DeliverRequest {
   requestKeys(source, ["token"]);
   if (typeof source.token !== "string" || source.token.length > 6 * 1024 || !memberToken.test(source.token)) throw new RequestError("token must be one compact JWS");
   return { kind: "deliver", token: source.token };
+}
+
+// A round is opened by its coordinates: the consumer, the phase, the OPEN
+// quarantine shard it probes (none for CONTROL), and an operator label.
+export function parseRoundBody(body: unknown): RoundRequest {
+  const source = requestRecord(body, "body");
+  requestKeys(source, ["consumer", "key", "label", "phase", "shard"]);
+  const consumer = typeof source.consumer === "string" && repositoryName.test(source.consumer) ? source.consumer : undefined;
+  if (consumer === undefined) throw new RequestError("consumer must be a consumer repository name");
+  const key = requestKey(source.key);
+  if (typeof source.label !== "string" || !roundLabel.test(source.label)) throw new RequestError("label must match ^[a-z0-9][a-z0-9-]{0,40}$");
+  if (typeof source.phase !== "string" || !(roundPhases as readonly string[]).includes(source.phase)) throw new RequestError(`phase must be one of ${roundPhases.join(", ")}`);
+  const phase = source.phase as RoundPhase;
+  if (source.shard !== null && (typeof source.shard !== "string" || !shardId.test(source.shard))) throw new RequestError("shard must be null or match ^[a-z0-9][a-z0-9-]{0,62}$");
+  const shard = source.shard as string | null;
+  if (phase === "CONTROL" && shard !== null) throw new RequestError("a CONTROL round binds no shard");
+  if (phase !== "CONTROL" && shard === null) throw new RequestError(`a ${phase} round names the OPEN quarantine shard it probes`);
+  return { kind: "round", body: { consumer, label: source.label, phase, shard }, bodyHash: sha256Hex(canonicalJson({ consumer, key, label: source.label, phase, shard })), key };
+}
+
+export function parseRoundId(value: string): string {
+  if (!roundDocumentId.test(value)) throw new RequestError("round must be one round identifier");
+  return value;
 }
 
 export function parseMaintenanceBody(body: unknown): MaintenanceRequest {

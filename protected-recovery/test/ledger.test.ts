@@ -524,4 +524,90 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     expect(iam.writes.filter((write) => write.resource === targets[0]!.resource)).toHaveLength(1);
     expect(iam.writes).toHaveLength(9);
   }, 60_000);
+
+  test("a contention answer at the read stage reruns the complete transaction from a begin naming the previous one, exactly as one at the commit stage does; malformed reads, invariants, and reads outside a transaction stay fatal; perpetual contention ends at the attempt bound", async () => {
+    const clock = new Clock();
+    // The Firestore REST exchange, observed and selectively answered: a
+    // contention status for the next transactional reads or commits, or a
+    // malformed read, then the emulator's own answers.
+    const contention = (status: string): Response => new Response(JSON.stringify({ error: { code: 409, message: "too much contention", status } }), { headers: { "content-type": "application/json" }, status: 409 });
+    const calls: Array<{ readonly body: Record<string, unknown>; readonly method: string; readonly response: string }> = [];
+    let readContention: string[] = [];
+    let commitContention: string[] = [];
+    let readMalformed = 0;
+    const fetcher: typeof fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = url.slice(url.lastIndexOf(":") + 1);
+      const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {};
+      const answer = async (): Promise<Response> => {
+        if (method === "batchGet" && readContention.length > 0) return contention(readContention.shift()!);
+        if (method === "batchGet" && readMalformed > 0) {
+          readMalformed -= 1;
+          return Response.json({});
+        }
+        if (method === "commit" && commitContention.length > 0) {
+          // A commit the server answers with contention is a transaction the server has discarded; the emulator's is
+          // rolled back here so the stand-in answer leaves the same state a real one would.
+          await fetch(url.replace(/:commit$/, ":rollback"), { ...init, body: JSON.stringify({ transaction: body.transaction }) });
+          return contention(commitContention.shift()!);
+        }
+        return await fetch(input, init);
+      };
+      const response = await answer();
+      calls.push({ body, method, response: await response.clone().text() });
+      return response;
+    }, { preconnect: fetch.preconnect });
+    const ledger = emulatorLedger(clock, fetcher);
+    const since = (from: number, method: string) => calls.slice(from).filter((call) => call.method === method);
+    const transactionOf = (call: { readonly response: string }): string => (JSON.parse(call.response) as { transaction: string }).transaction;
+    // Read stage: three contention answers, ABORTED and FAILED_PRECONDITION alike, then the write lands once.
+    let from = calls.length;
+    readContention = ["ABORTED", "FAILED_PRECONDITION", "ABORTED"];
+    await ledger.writeReconcileCursor("s-1");
+    expect(await ledger.readReconcileCursor()).toBe("s-1");
+    let begins = since(from, "beginTransaction");
+    expect(begins).toHaveLength(4);
+    expect(begins[0]!.body).toEqual({ options: { readWrite: {} } });
+    for (const [index, begin] of begins.slice(1).entries()) expect(begin.body).toEqual({ options: { readWrite: { retryTransaction: transactionOf(begins[index]!) } } });
+    expect(since(from, "rollback").map((call) => call.body.transaction)).toEqual(begins.slice(0, 3).map(transactionOf));
+    expect(since(from, "commit")).toHaveLength(1);
+    expect(since(from, "commit")[0]!.body.transaction).toBe(transactionOf(begins[3]!));
+    // Commit stage: two contention answers, then the write lands once; no rollback, the aborted transactions are gone.
+    from = calls.length;
+    commitContention = ["ABORTED", "FAILED_PRECONDITION"];
+    await ledger.writeReconcileCursor("s-2");
+    expect(await ledger.readReconcileCursor()).toBe("s-2");
+    begins = since(from, "beginTransaction");
+    expect(begins).toHaveLength(3);
+    for (const [index, begin] of begins.slice(1).entries()) expect(begin.body).toEqual({ options: { readWrite: { retryTransaction: transactionOf(begins[index]!) } } });
+    expect(since(from, "rollback")).toHaveLength(0);
+    expect(since(from, "commit")).toHaveLength(3);
+    // Malformed data is fatal on the first attempt: one begin, one rollback, no retry.
+    from = calls.length;
+    readMalformed = 1;
+    await expect(ledger.writeReconcileCursor("s-3")).rejects.toThrow("batchGet returned a non-array.");
+    expect(since(from, "beginTransaction")).toHaveLength(1);
+    expect(since(from, "rollback")).toHaveLength(1);
+    expect(since(from, "commit")).toHaveLength(0);
+    expect(await ledger.readReconcileCursor()).toBe("s-2");
+    // An invariant is fatal on the first attempt as well.
+    from = calls.length;
+    await expect(ledger.reserveActuator("missing", 1, "101010000000000000000")).rejects.toThrow("entry 1 is missing");
+    expect(since(from, "beginTransaction")).toHaveLength(1);
+    expect(since(from, "rollback")).toHaveLength(1);
+    // A read outside a transaction has no transaction to rerun: the contention status is the generic error it always was.
+    from = calls.length;
+    readContention = ["ABORTED"];
+    await expect(ledger.readShard("s")).rejects.toThrow("batchGet failed: ABORTED");
+    expect(since(from, "beginTransaction")).toHaveLength(0);
+    // Perpetual contention ends at the attempt bound, as unavailable, never as a hang or a generic error.
+    from = calls.length;
+    readContention = Array.from({ length: 1000 }, () => "ABORTED");
+    await expect(ledger.writeReconcileCursor("s-4")).rejects.toThrow("did not commit within its contention bound");
+    expect(since(from, "beginTransaction")).toHaveLength(128);
+    expect(since(from, "rollback")).toHaveLength(128);
+    expect(since(from, "commit")).toHaveLength(0);
+    readContention = [];
+    expect(await ledger.readReconcileCursor()).toBe("s-2");
+  }, 120_000);
 });

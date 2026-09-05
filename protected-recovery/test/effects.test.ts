@@ -1,15 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { type MintOutcome, type MintResult, type Policy, GoogleIssuanceProbe, deliveryBudgetSeconds, driveEffect, expectedSnapshot, observedSnapshot, planEffect, policyFromJson, verifyMemberCredential } from "../src/effects";
 import { Broker } from "../src/http";
-import { type Target, consumerPool, managedRole, probePermission, probePrerequisite, purposeForIdentity, scanReadiness, targetsFor } from "../src/model";
+import { type Target, consumerPool, inventoryHash, managedRole, parseRoundBody, probePermission, purposeForIdentity, scanReadiness, targetsFor } from "../src/model";
 import { entryEvidence } from "../src/outbox";
-import { type World, Clock, beginClose, consumerOf, deliver, deliverAll, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, memberEmail, memberPrincipal, needsOf, prime, proberPrincipal, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
+import { type World, Clock, beginClose, consumerOf, controlRound, deliver, deliverAll, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, memberEmail, memberPrincipal, needsOf, prime, proberPrincipal, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
 
 const pool = "projects/882468538648/locations/global/workloadIdentityPools/github-actions";
 const member = (sha: string) => `principalSet://iam.googleapis.com/${pool}/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@${sha}:${sha}:production:push`;
 const target: Target = { account: "gha-terraform", email: "gha-terraform@cdbentley.iam.gserviceaccount.com", members: [member("a".repeat(40)), member("b".repeat(40))], pool, resource: "projects/cdbentley/serviceAccounts/101080000000000000000", uniqueId: "101080000000000000000" };
 const policy = (bindings: Policy["bindings"], etag = "e1"): Policy => policyFromJson({ bindings, etag, version: 1 });
 // Every managed member of every target, in target order.
+const noControlRound = "no complete CONTROL round of cdbentley: every canonical job that is a managed member must deliver its credential to POST /v1/members into one round opened at POST /v1/rounds, and mint ALLOWED against every target it is bound to, before any quarantine";
 const membersOf = (targets: readonly Target[]) => targets.flatMap((candidate) => candidate.members.map((managed) => [candidate, managed] as const));
 // Every (target, member) pair in the order a delivery round records probes: member by member, each against its targets.
 const deliveryOrder = (targets: readonly Target[]) => [...new Set(targets.flatMap((candidate) => candidate.members))].sort().flatMap((managed) => targets.filter((candidate) => candidate.members.includes(managed)).map((candidate) => [candidate, managed] as const));
@@ -139,9 +140,11 @@ describe("issuance probe", () => {
     const issuance = googleIssuance(() => tokens, provider);
     const probe = new GoogleIssuanceProbe({ authority, endpoints, fetch: issuance.fetcher, now: clock.read });
     const principal = memberPrincipal(authority, consumer, "1000");
-    // Verification derives the exact member and the provider's numeric subject; never the raw GitHub subject.
+    // Verification derives the exact member and the provider's numeric subject, never the raw GitHub subject, and
+    // the run, attempt, and platform commit a round receipt records.
     const verified = await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, tokens.get(managed)!);
-    expect(verified).toEqual({ kind: "verified", consumer, expiresAt: new Date((nowSeconds + 300) * 1000).toISOString(), member: managed, principal });
+    expect(verified).toEqual({ kind: "verified", consumer, expiresAt: new Date((nowSeconds + 300) * 1000).toISOString(), member: managed, platformSha: managed.split("/attribute.authority/")[1]!.split(":")[2]!, principal, runAttempt: "1", runId: "1000" });
+    expect(await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, await signer.sign({ ...memberClaims(authority, consumer, managed, nowSeconds, "1000"), run_attempt: undefined }))).toEqual({ kind: "unavailable", reason: "the member credential lacks the run or the authority claims" });
     expect(principal).not.toContain("repo:");
     const credential = { consumer, member: managed, principal, token: tokens.get(managed)! };
     // One STS exchange, then one actual generateAccessToken per bound target: ALLOWED while every binding stands.
@@ -468,19 +471,64 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect((await readinessOf(u, "q")).blockers).toEqual(members.map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the quarantine acknowledgement`));
   }, 180_000);
 
-  test("a QUARANTINE is refused before acceptance, before any effect is prepared, and before a PREPARED effect is resumed while any member lacks a positive control, a maintenance ticket is open, or an inventory is not clean; the deliveries of the canonical jobs are what establish the controls", async () => {
+  test("a QUARANTINE is refused before acceptance, before any effect is prepared, and before a PREPARED effect is resumed without one complete, current CONTROL round, with a maintenance ticket open, or with an inventory not clean; the deliveries of the canonical jobs into the round are what establish the controls", async () => {
     const w = await setup();
     const { broker, iam, inventory, ledger, targets } = w;
     const purpose = isolate(w);
+    const cdbentley = consumerOf(w, "cdbentley");
     const members = membersOf(targets);
-    // No member has ever delivered: refused before acceptance, nothing journaled, nothing read or written.
+    const distinct = [...new Set(members.map(([, managed]) => managed))].sort();
+    // No round exists: refused before acceptance, nothing journaled, nothing read or written.
     const refused = await broker.handle(purpose, quarantine("q", "cdbentley", "k1"));
-    expect(refused).toEqual({ status: 409, body: { detail: members.map(([candidate, managed]) => `${candidate.account}/${managed}: ${probePrerequisite(managed)}`).join("; "), error: "PROBE_UNAVAILABLE" } });
+    expect(refused).toEqual({ status: 409, body: { detail: noControlRound, error: "PROBE_UNAVAILABLE" } });
     expect(await ledger.readShard("q")).toBeUndefined();
     expect(inventory.requests).toHaveLength(0);
     expect(iam.writes).toHaveLength(0);
-    // Every canonical job delivers once while the bindings stand: every member's positive control is recorded.
-    await deliverAll(w, "cdbentley");
+    // A CONTROL round is opened at exact coordinates by the consumer's QUARANTINE invoker alone, bound to every
+    // member, the platform pins, every target's identity, policy etag, and inventory hash, and the live Deny state.
+    const roundBody = { consumer: "cdbentley", key: "round/control-a", label: "control-a", phase: "CONTROL", shard: null };
+    expect(await broker.handle(purposeForIdentity(w.authority, invokerEmail("cdbentley", "RESTORE"))!, parseRoundBody(roundBody))).toEqual({ status: 403, body: { error: "FORBIDDEN" } });
+    expect(await broker.handle(purposeForIdentity(w.authority, invokerEmail("runsetta"))!, parseRoundBody(roundBody))).toEqual({ status: 403, body: { error: "FORBIDDEN" } });
+    const opened = await broker.handle(purpose, parseRoundBody(roundBody));
+    expect(opened.status).toBe(201);
+    const round = opened.body.round as Record<string, unknown>;
+    const roundKey = round.round as string;
+    expect(round).toMatchObject({ complete: false, completedAt: null, consumer: "cdbentley", label: "control-a", members: distinct, phase: "CONTROL", platformShas: [cdbentley.activeWorkflowSha, cdbentley.transitionWorkflowSha].filter((sha) => sha !== null), receipts: {}, shard: null, version: 1 });
+    expect(round.denyState).toEqual(inventory.summaryOf(targets[0]!, cdbentley).denyState);
+    for (const candidate of targets) {
+      expect((round.targets as Record<string, unknown>)[candidate.account]).toEqual({ inventoryHash: inventoryHash(inventory.summaryOf(candidate, cdbentley)), members: [...candidate.members], policyEtag: `sa-etag-${candidate.uniqueId}-0`, uniqueId: candidate.uniqueId });
+    }
+    expect((round.owed as unknown[]).length).toBe(members.length);
+    // The same coordinates replay the round; other coordinates open another.
+    expect(await broker.handle(purpose, parseRoundBody(roundBody))).toEqual({ status: 200, body: { round } });
+    // Every canonical job but one delivers: each delivery is a receipt in the open round, and the round stays owed the
+    // missing member's receipt, so the quarantine is still refused, naming exactly what is missing.
+    const last = distinct.at(-1)!;
+    for (const managed of distinct.slice(0, -1)) {
+      const response = await deliver(w, "cdbentley", managed);
+      expect(response.status).toBe(200);
+      expect(response.body.rounds).toEqual([{ complete: false, phase: "CONTROL", recorded: true, round: roundKey }]);
+    }
+    const partial = (await broker.handle(purpose, { kind: "round-read", round: roundKey })).body.round as Record<string, unknown>;
+    expect(Object.keys(partial.receipts as object).sort()).toEqual(distinct.slice(0, -1));
+    expect(partial.owed).toEqual(targets.filter((candidate) => candidate.members.includes(last)).map((candidate) => ({ account: candidate.account, member: last, reason: "the canonical job that is this member has not delivered to this round" })));
+    expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { detail: noControlRound, error: "PROBE_UNAVAILABLE" } });
+    expect((await ledger.readRoundPointer("cdbentley")).control).toBeNull();
+    // A receipt is admitted only from a bound member, from a run of a bound platform commit, minting against exactly
+    // the bound identities: anything else completes nothing.
+    const stray = { controls: {}, deliveredAt: w.clock.now.toISOString(), platformSha: "c".repeat(40), principal: memberPrincipal(w.authority, cdbentley), runAttempt: "1", runId: "1" };
+    expect(await ledger.recordReceipt(roundKey, last, stray)).toEqual({ kind: "refused", reason: `the delivery ran the platform at ${"c".repeat(40)}, which the round does not bind` });
+    expect(await ledger.recordReceipt(roundKey, "principalSet://elsewhere", { ...stray, platformSha: cdbentley.activeWorkflowSha! })).toEqual({ kind: "refused", reason: "the round expects no delivery from this member" });
+    expect(await ledger.recordReceipt(roundKey, last, { ...stray, controls: { [targets[0]!.account]: { observedAt: stray.deliveredAt, outcome: "ALLOWED", uniqueId: "999" } }, platformSha: cdbentley.activeWorkflowSha! })).toEqual({ kind: "refused", reason: `the delivery minted against 999, not the bound identity ${targets[0]!.uniqueId} of ${targets[0]!.account}` });
+    expect(await ledger.recordReceipt("f".repeat(64), last, stray)).toEqual({ kind: "refused", reason: "the round does not exist" });
+    expect((await ledger.readRound(roundKey))!.version).toBe(distinct.length);
+    // The last member delivers: the round completes and becomes the consumer's admitting round.
+    const completing = await deliver(w, "cdbentley", last);
+    expect(completing.body.rounds).toEqual([{ complete: true, phase: "CONTROL", recorded: true, round: roundKey }]);
+    expect(await ledger.readRoundPointer("cdbentley")).toEqual({ control: roundKey, open: [] });
+    expect((await ledger.readRound(roundKey))!.completedAt).toBe(w.clock.now.toISOString());
+    // A late delivery is not a receipt in a complete round.
+    expect((await deliver(w, "cdbentley", last)).body.rounds).toEqual([]);
     // A target with an alternate credential path: refused before acceptance, naming the path.
     inventory.findings.set(targets[2]!.uniqueId, ["key:projects/cdbentley/serviceAccounts/x/keys/k1"]);
     expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: [`${targets[2]!.account}: key:projects/cdbentley/serviceAccounts/x/keys/k1`], error: "INVENTORY_BLOCKED" } });
@@ -490,11 +538,18 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     inventory.setDenyForm("cdbentley", "deployment");
     expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: targets.map((candidate) => `${candidate.account}: deny-state:deployment`), error: "INVENTORY_BLOCKED" } });
     inventory.setDenyForm("cdbentley", "steady");
-    // Controls present, steady, and clean: accepted, against one fresh batch inventory of every target.
+    // Steady again, but the Deny policies moved since the round bound them: the round is stale, and only a new
+    // complete CONTROL round under the current state admits. Likewise for a target whose inventory moved.
+    expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: targets.flatMap((candidate) => [`${candidate.account}: the credential inventory changed since the CONTROL round ${roundKey} bound it`, `${candidate.account}: the live Deny state (steady) is not the state the CONTROL round ${roundKey} bound (steady)`]), error: "ROUND_STALE" } });
+    const second = await controlRound(w, "cdbentley");
+    inventory.change(targets[1]!.uniqueId);
+    expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: [`${targets[1]!.account}: the credential inventory changed since the CONTROL round ${second} bound it`, `${targets[1]!.account}: the allow policy of ${targets[1]!.resource} moved since the CONTROL round ${second} bound it`], error: "ROUND_STALE" } });
+    const third = await controlRound(w, "cdbentley");
+    // A round, steady, and clean: accepted, against one fresh batch inventory of every target, naming the round.
     const batches = inventory.batches.length;
     expect((await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).status).toBe(201);
     expect(inventory.batches.slice(batches)).toEqual([targets.map((candidate) => candidate.account)]);
-    expect((await ledger.readShard("q"))!.nextSequence).toBe(10);
+    expect((await ledger.readShard("q"))!).toMatchObject({ controlRound: third, nextSequence: 10 });
     // The Deny state leaves steady after acceptance: no RECORDED effect is prepared, no actuator taken, nothing written.
     inventory.setDenyForm("cdbentley", "bootstrap");
     const held = await broker.reconcileShard("q");
@@ -507,8 +562,12 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const requests = inventory.requests.length;
     expect((await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).status).toBe(200);
     expect(inventory.requests).toHaveLength(requests);
-    // Steady again: the first target is prepared, then the worker dies before its write; the rest are written.
+    // Steady again, under a new CONTROL round: the first target is prepared, then the worker dies before its write;
+    // the rest are written.
     inventory.setDenyForm("cdbentley", "steady");
+    expect(((await broker.reconcileShard("q")) as { notes: string[] }).notes[0]).toStartWith("1: pending; not prepared because ROUND_STALE;");
+    expect(iam.writes).toHaveLength(0);
+    await controlRound(w, "cdbentley");
     iam.beforeWrite = async () => {
       throw new Error("the worker died before the write");
     };
@@ -521,6 +580,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes).toHaveLength(0);
     expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "PREPARED", attempts: 1 });
     inventory.setDenyForm("cdbentley", "steady");
+    expect(((await broker.reconcileShard("q")) as { notes: string[] }).notes[0]).toStartWith("1: pending; not resumed because ROUND_STALE;");
+    expect(iam.writes).toHaveLength(0);
+    await controlRound(w, "cdbentley");
     await broker.reconcileShard("q");
     expect(iam.writes).toHaveLength(9);
     expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "ACKED", attempts: 2 });
@@ -534,12 +596,11 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const issuance = googleIssuance(() => tokens, provider);
     const production = new GoogleIssuanceProbe({ authority: p.authority, endpoints, fetch: issuance.fetcher, now: p.clock.read });
     const live = new Broker({ authority: p.authority, evidence: p.evidence, iam: p.iam, inventory: p.inventory, jwks: async () => p.signer.jwks, ledger: p.ledger, now: p.clock.read, probe: production });
-    const detail = members.map(([candidate, managed]) => `${candidate.account}/${managed}: ${probePrerequisite(managed)}`).join("; ");
-    expect(await live.handle(isolate(p), quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { detail, error: "PROBE_UNAVAILABLE" } });
+    expect(await live.handle(isolate(p), quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { detail: noControlRound, error: "PROBE_UNAVAILABLE" } });
     expect(await p.ledger.readShard("q")).toBeUndefined();
     expect((await p.ledger.append(quarantine("q", "cdbentley", "k1"), p.targets)).kind).toBe("accepted");
     const view = await live.reconcileShard("q");
-    expect((view as { notes: string[] }).notes).toEqual(p.targets.map((_, index) => `${index + 1}: pending; not prepared because PROBE_UNAVAILABLE; ${detail}`));
+    expect((view as { notes: string[] }).notes).toEqual(p.targets.map((_, index) => `${index + 1}: pending; not prepared because PROBE_UNAVAILABLE; ${noControlRound}`));
     expect(p.iam.writes).toHaveLength(0);
     p.clock.advance(7200);
     await live.reconcileShard("q");
@@ -551,16 +612,21 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const deliverer = purposeForIdentity(p.authority, memberEmail("cdbentley"))!;
     const other = purposeForIdentity(p.authority, memberEmail("runsetta"))!;
     const nowSeconds = Math.floor(p.clock.now.getTime() / 1000);
-    const distinct = [...new Set(members.map(([, managed]) => managed))].sort();
+    const liveRound = await live.handle(isolate(p), parseRoundBody({ consumer: "cdbentley", key: "round/live", label: "live", phase: "CONTROL", shard: null }));
+    expect(liveRound.status).toBe(201);
+    const liveRoundId = (liveRound.body.round as { round: string }).round;
     for (const [index, managed] of distinct.entries()) {
       const token = await p.signer.sign(memberClaims(p.authority, consumer, managed, nowSeconds, String(2000 + index)));
       tokens.set(managed, token);
       if (index === 0) expect(await live.handle(other, { kind: "deliver", token })).toEqual({ status: 409, body: { detail: "the member credential is not minted for the consumer provider audience", error: "MEMBER_UNVERIFIED" } });
       const bound = p.targets.filter((candidate) => candidate.members.includes(managed));
       const response = await live.handle(deliverer, { kind: "deliver", token });
-      expect(response).toEqual({ status: 200, body: { controls: Object.fromEntries(bound.map((candidate) => [candidate.account, "ALLOWED"])), member: managed, probes: [], unavailable: [] } });
+      expect(response).toEqual({ status: 200, body: { controls: Object.fromEntries(bound.map((candidate) => [candidate.account, "ALLOWED"])), member: managed, probes: [], rounds: [{ complete: index === distinct.length - 1, phase: "CONTROL", recorded: true, round: liveRoundId }], unavailable: [] } });
       expect(JSON.stringify(response.body)).not.toContain(token);
     }
+    const receipts = (await p.ledger.readRound(liveRoundId))!.receipts;
+    for (const [index, managed] of distinct.entries()) expect(receipts[managed]).toMatchObject({ platformSha: managed.split("/attribute.authority/")[1]!.split(":")[2], principal: memberPrincipal(p.authority, consumer, String(2000 + index)), runAttempt: "1", runId: String(2000 + index) });
+    expect(JSON.stringify(receipts)).not.toContain(tokens.get(distinct[0]!)!);
     const unbound = await p.signer.sign({ ...memberClaims(p.authority, consumer, distinct[0]!, nowSeconds), environment: "elsewhere" });
     expect(await live.handle(deliverer, { kind: "deliver", token: unbound })).toMatchObject({ status: 409, body: { detail: expect.stringContaining("binds to no target"), error: "MEMBER_UNVERIFIED" } });
     const callsBefore = issuance.calls.length;
@@ -824,8 +890,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "ACKED", attempts: 2 });
     expect((await ledger.readEntry("r", 1))!.progress).toMatchObject({ state: "ACKED", epoch: 2 });
     // A worker paused between its read and its PREPARE is equally stale. The restore put the bindings back, and a
-    // delivery round records the ALLOWED controls a second quarantine needs.
-    await deliverAll(w, "cdbentley");
+    // CONTROL round records the ALLOWED controls a second quarantine needs.
+    await controlRound(w, "cdbentley");
     expect((await ledger.append(quarantine("q2", "cdbentley", "k3"), targets)).kind).toBe("accepted");
     const pausedRead = gate();
     iam.beforeRead = pausedRead.wait;
@@ -884,9 +950,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(writes).toHaveLength(3);
     expect(writes.map((write) => write.bindings.some((binding) => binding.role === managedRole))).toEqual([false, true, false]);
     expect((await ledger.readEntry("q1", 1))!.progress).toMatchObject({ state: "ACKED", epoch: 3 });
-    // The rest of q1 completes once every member's control is fresh again after the restore.
+    // The rest of q1 completes once a CONTROL round is complete again after the restore.
     await broker.reconcileShard("r0");
-    await deliverAll(w, "cdbentley");
+    await controlRound(w, "cdbentley");
     await broker.reconcileShard("q1");
     expect((await entriesOf(w, "q1")).filter((entry) => entry.body.kind === "effect").every((entry) => entry.progress?.state === "ACKED")).toBe(true);
   }, 120_000);
