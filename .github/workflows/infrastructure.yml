@@ -425,6 +425,44 @@ jobs:
           test "$GITHUB_EVENT_NAME" = "push"
           test "$GITHUB_REF" = "refs/heads/main"
 
+      - name: Deliver this job's credential to the protected-recovery broker
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$RUNNER_TEMP/platform-recovery-source"
+          git_home="$RUNNER_TEMP/platform-recovery-git-home"
+          rm -rf -- "$destination" "$git_home"
+          install -d -m 0700 "$destination" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home"
+          unset GIT_CONFIG_SYSTEM GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+          git_safe() {
+            /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= \
+              -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false \
+              -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"
+          }
+          # The delivery never decides this job's outcome: a source that cannot be fetched delivers nothing and
+          # the broker's ledger names the delivery still owed. A source that fetched but is not the exact platform
+          # commit is another matter and stops the job.
+          if ! { git_safe -C "$destination" init --quiet &&
+            git_safe -C "$destination" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git" &&
+            git_safe -C "$destination" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA" &&
+            git_safe -C "$destination" checkout --quiet --detach FETCH_HEAD; }; then
+            echo "protected-recovery: the platform source at ${WORKFLOW_SHA} could not be fetched; nothing delivered." >&2
+            exit 0
+          fi
+          test "$(git_safe -C "$destination" rev-parse --verify HEAD^{commit})" = "$WORKFLOW_SHA"
+          for file in protected-recovery/deliver-member.sh protected-recovery/authority.json; do
+            test -f "$destination/$file" && test ! -L "$destination/$file"
+            test "$(git_safe -C "$destination" hash-object --no-filters "$destination/$file")" = "$(git_safe -C "$destination" rev-parse "${WORKFLOW_SHA}:${file}")"
+          done
+          rm -rf -- "$git_home"
+          PLATFORM_AUTHORITY="$destination/protected-recovery/authority.json" /bin/bash "$destination/protected-recovery/deliver-member.sh"
+
       - name: Reject a stale main-branch run after acquiring the production lock
         env:
           GH_TOKEN: ${{ github.token }}

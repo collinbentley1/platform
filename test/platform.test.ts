@@ -3326,12 +3326,12 @@ describe("platform scaffold and doctor", () => {
         "publish-canary":
           "github.event_name == 'pull_request_target' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.ref == 'refs/heads/main' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         publish:
-          "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish-canary.result == 'success' && needs.verify-image.result == 'success'",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         attest: "needs.publish.result == 'success'",
         deploy:
-          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
         invalidate:
-          "always() && needs.deploy.outputs.deployed-revision != '' && (needs.deploy.outputs.lifecycle-keep != 'true' || needs.deploy.outputs.admission-open != 'success')",
+          "always() && github.event_name == 'pull_request_target' && github.ref == 'refs/heads/main' && github.base_ref == 'main' && github.event.pull_request.head.repo.id == github.event.repository.id && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'User' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false",
       },
       "deploy-prod.yml": {
         "rerun-guard": null,
@@ -3339,10 +3339,11 @@ describe("platform scaffold and doctor", () => {
         build: "github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.prefetch-bases.result == 'success'",
         "verify-image": "needs.build.result == 'success' && needs.prefetch-bases.result == 'success'",
         canary: "github.event_name == 'push' && github.ref == 'refs/heads/main'",
-        publish: "always() && needs.canary.result == 'success' && needs.prefetch-bases.result == 'success' && needs.verify-image.result == 'success'",
+        publish:
+          "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
         attest: "needs.publish.result == 'success'",
         deploy:
-          "needs.attest.result == 'success' && needs.prefetch-bases.result == 'success' && needs.publish.result == 'success'",
+          "always() && github.event_name == 'push' && github.ref == 'refs/heads/main'",
       },
       "cleanup-preview.yml": {
         "rerun-guard": null,

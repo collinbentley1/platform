@@ -254,7 +254,7 @@ describe("workflow authority manifest", () => {
       text.replace("          service_account: ${{ steps.app.outputs.canary_service_account }}\n", "          service_account: ${{ vars.CANARY_SERVICE_ACCOUNT }}\n"),
     );
     expect(await failuresOf(root)).toEqual([
-      ".github/workflows/deploy-prod.yml: job canary step 2 service_account must resolve to one known gha-* account through a same-job step output.",
+      ".github/workflows/deploy-prod.yml: job canary step 3 service_account must resolve to one known gha-* account through a same-job step output.",
       ".github/workflows/deploy-prod.yml: job canary exchanges for [] but the manifest binds [gha-wif-canary].",
     ]);
   });
@@ -265,7 +265,7 @@ describe("workflow authority manifest", () => {
       text.replace("uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093", "uses: google-github-actions/auth@v3"),
     );
     expect(await failuresOf(root)).toEqual([
-      '.github/workflows/deploy-prod.yml: job canary step 2 uses "google-github-actions/auth@v3", which is not pinned to a full 40-hex commit SHA or sha256 image digest.',
+      '.github/workflows/deploy-prod.yml: job canary step 3 uses "google-github-actions/auth@v3", which is not pinned to a full 40-hex commit SHA or sha256 image digest.',
     ]);
   });
 
