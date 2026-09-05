@@ -1,9 +1,17 @@
 mock_provider "google" {}
+mock_provider "http" {}
 
 override_data {
   target = data.google_project.current
   values = {
     number = "123456789012"
+  }
+}
+
+override_data {
+  target = data.google_client_openid_userinfo.deployer
+  values = {
+    email = "cloud-root@cdbentley.com"
   }
 }
 
@@ -20,7 +28,11 @@ variables {
 # consumer -> direction -> invoker matrix, prove that neighbouring tuples bind
 # nothing, that every invoker holds run.invoker only, that the broker is the
 # only writer, and that broker authority over consumer accounts is absent
-# without evidence and refused for every evidence an offline input can produce.
+# without evidence and unreachable while the committed target identities are
+# null. The enabled path -- every identity recorded and verified, the Deny
+# canary evidence verified against the GitHub run, artifact, and attestation
+# records -- is exercised by enabled/enabled.tftest.hcl.in through
+# tools/ci/protected-recovery-enabled-test.sh against an isolated copy.
 # These are mocked plan-shape tests over strings: they cannot prove which
 # claims a real GitHub token carries. Decoding a real token from a
 # protected-recovery-invoke dispatch and exchanging it through one of these
@@ -182,11 +194,13 @@ run "invokers_hold_only_run_invoker_and_the_broker_is_the_only_writer" {
         [for grant in values(google_service_account_iam_member.invoker_authority) : grant.role],
         [for grant in values(google_cloud_run_v2_service_iam_member.invokers) : grant.role],
         [for grant in values(google_storage_bucket_iam_member.broker_evidence) : grant.role],
+        [for grant in values(google_project_iam_member.broker_inventory) : grant.role],
+        [for grant in google_organization_iam_member.broker_inventory : grant.role],
         [google_project_iam_member.broker_ledger.role],
       ) : role
-      if contains(["roles/iam.serviceAccountTokenCreator", "roles/iam.serviceAccountKeyAdmin", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/owner", "roles/editor", "roles/datastore.owner", "roles/storage.admin", "roles/run.admin"], role)
+      if contains(["roles/iam.serviceAccountTokenCreator", "roles/iam.serviceAccountKeyAdmin", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/iam.securityReviewer", "roles/owner", "roles/editor", "roles/viewer", "roles/datastore.owner", "roles/storage.admin", "roles/run.admin"], role)
     ]) == 0
-    error_message = "No grant may create tokens or keys, administer service accounts or pools, or hold a basic or admin role."
+    error_message = "No grant may create tokens or keys, administer service accounts or pools, or hold a basic, admin, or broad reviewer role."
   }
 
   assert {
@@ -203,14 +217,24 @@ run "invokers_hold_only_run_invoker_and_the_broker_is_the_only_writer" {
     condition     = { for env in google_cloud_run_v2_service.broker.template[0].containers[0].env : env.name => env.value if env.name != "EVIDENCE_BUCKET" && env.name != "FIRESTORE_DATABASE_ID" } == { BROKER_AUDIENCE = "https://protected-recovery-123456789012.us-east4.run.app", FIRESTORE_PROJECT_ID = "recovery-test" }
     error_message = "The broker must receive exactly its audience and ledger coordinates."
   }
+
+  assert {
+    condition     = !contains(local.required_services, "compute.googleapis.com") && !contains(local.required_services, "cloudbuild.googleapis.com")
+    error_message = "Attachment inventories are billed to the consumer projects; the broker project must not enable Compute or Cloud Build and their default service accounts."
+  }
 }
 
 run "broker_authority_over_consumer_accounts_is_absent_without_evidence" {
   command = plan
 
   assert {
-    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(data.google_project.consumer) == 0
-    error_message = "Without evidence the module must grant the broker nothing in any consumer project and must not even read the consumer projects."
+    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(data.google_service_account.target) == 0 && length(data.google_project.consumer) == 0
+    error_message = "Without evidence the module must grant the broker nothing in any consumer project and must not even read the consumer projects or their accounts."
+  }
+
+  assert {
+    condition     = length(google_project_iam_custom_role.inventory) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(data.http.canary_run) == 0 && length(data.http.canary_artifact) == 0 && length(data.http.canary_attestations) == 0
+    error_message = "Without evidence no inventory role exists anywhere and no GitHub record is read."
   }
 
   assert {
@@ -219,46 +243,81 @@ run "broker_authority_over_consumer_accounts_is_absent_without_evidence" {
   }
 }
 
-# Consistent with every offline-checkable binding: this plan's image digest
-# and active SHA, a successful canary at that SHA, the complete required
-# coverage with the broker excepted, and a live organization that (in these
-# mocked runs) parents every consumer project. Even this evidence grants
-# nothing, because the committed target identities are null.
-run "consistent_evidence_grants_nothing_while_target_identities_are_unrecorded" {
+# The exact Deny matrix this deployment requires, derived from its own
+# coordinates: every permission the approved brief names, at the broker
+# project and at every consumer project, each with its exact exception set.
+run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
+  command = plan
+
+  assert {
+    condition     = length(local.required_deny_matrix) == 33 + 4 * 16 && alltrue([for row in values(local.required_deny_matrix) : row.denied == ["principalSet://goog/public:all"]])
+    error_message = "The matrix must carry thirty-three broker-project rows and sixteen rows per consumer project, every one denying every principal."
+  }
+
+  assert {
+    condition = (
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getAccessToken"].exceptions == ["principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/*"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getOpenIdToken"].exceptions == ["principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.update"].exceptions == ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|storage.googleapis.com/objects.delete"].exceptions == [] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.signJwt"].exceptions == [] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.update"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions == ["principal://goog/subject/cloud-root@cdbentley.com"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/medlock-1025243085|iam.googleapis.com/serviceAccounts.setIamPolicy"].exceptions == ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/critical-history-16823277|iam.googleapis.com/serviceAccounts.delete"].exceptions == [] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/runsetta|iam.googleapis.com/workloadIdentityPools.undelete"].exceptions == [] &&
+      local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|cloudresourcemanager.googleapis.com/projects.setIamPolicy"].exceptions == []
+    )
+    error_message = "Each row's exception set must be exactly the principal this deployment derives for it: the broker for the ledger and evidence, the invoker pool for invoker federation, the Scheduler agent for the reconciler's token, the applying identity for deployment, the broker alone for consumer target policies, and nobody for keys, signing, delegation, evidence overwrite, project IAM, identity lifecycle, and federation replacement."
+  }
+
+  assert {
+    condition = alltrue([for permission in [
+      "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+      "iam.googleapis.com/serviceAccountKeys.create",
+      "iam.googleapis.com/serviceAccounts.create",
+      "iam.googleapis.com/serviceAccounts.delete",
+      "iam.googleapis.com/serviceAccounts.disable",
+      "iam.googleapis.com/serviceAccounts.enable",
+      "iam.googleapis.com/serviceAccounts.undelete",
+      "iam.googleapis.com/workloadIdentityPoolProviders.create",
+      "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+      "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+      "iam.googleapis.com/workloadIdentityPools.create",
+      "iam.googleapis.com/workloadIdentityPools.delete",
+      "iam.googleapis.com/workloadIdentityPools.undelete",
+      "run.googleapis.com/services.create",
+      "run.googleapis.com/services.delete",
+      ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/projects/recovery-test|${permission}")]) && alltrue([for permission in [
+      "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+      "iam.googleapis.com/serviceAccounts.create",
+      "iam.googleapis.com/serviceAccounts.delete",
+      "iam.googleapis.com/serviceAccounts.disable",
+      "iam.googleapis.com/serviceAccounts.enable",
+      "iam.googleapis.com/workloadIdentityPools.create",
+      "iam.googleapis.com/workloadIdentityPools.delete",
+      "iam.googleapis.com/workloadIdentityPools.undelete",
+      "iam.googleapis.com/workloadIdentityPoolProviders.create",
+      "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+      "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+    ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/projects/runsetta|${permission}")])
+    error_message = "Every supported mutation path the review named must be required: project IAM, service-account lifecycle, workload identity pool and provider lifecycle, and Cloud Run service lifecycle at the broker project, and identity, project IAM, and federation lifecycle at every consumer project."
+  }
+}
+
+# Consistent evidence names records that the mocked GitHub reads do not
+# return: even so, the committed target identities are null, so nothing is
+# read from any consumer account and nothing is granted.
+run "evidence_grants_nothing_while_target_identities_are_unrecorded" {
   command = plan
 
   variables {
     broker_authority_evidence = {
       organization_id = "100000000001"
-      platform_sha    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       deny_canary = {
         run_id          = "100000000002"
-        head_sha        = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        conclusion      = "success"
+        artifact_id     = "100000000003"
         artifact_sha256 = "abababababababababababababababababababababababababababababababab"
-        permissions = [
-          "artifactregistry.googleapis.com/repositories.uploadArtifacts",
-          "datastore.googleapis.com/entities.create",
-          "datastore.googleapis.com/entities.delete",
-          "datastore.googleapis.com/entities.update",
-          "iam.googleapis.com/serviceAccountKeys.create",
-          "iam.googleapis.com/serviceAccounts.actAs",
-          "iam.googleapis.com/serviceAccounts.getAccessToken",
-          "iam.googleapis.com/serviceAccounts.getOpenIdToken",
-          "iam.googleapis.com/serviceAccounts.implicitDelegation",
-          "iam.googleapis.com/serviceAccounts.setIamPolicy",
-          "iam.googleapis.com/serviceAccounts.signBlob",
-          "iam.googleapis.com/serviceAccounts.signJwt",
-          "iam.googleapis.com/workloadIdentityPoolProviders.update",
-          "iam.googleapis.com/workloadIdentityPools.update",
-          "run.googleapis.com/services.setIamPolicy",
-          "run.googleapis.com/services.update",
-          "storage.googleapis.com/objects.create",
-          "storage.googleapis.com/objects.delete",
-          "storage.googleapis.com/objects.update",
-        ]
-        exceptions = ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]
       }
     }
   }
@@ -289,35 +348,10 @@ run "reject_a_consumer_project_outside_the_evidenced_organization" {
   variables {
     broker_authority_evidence = {
       organization_id = "100000000001"
-      platform_sha    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       deny_canary = {
         run_id          = "100000000002"
-        head_sha        = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        conclusion      = "success"
+        artifact_id     = "100000000003"
         artifact_sha256 = "abababababababababababababababababababababababababababababababab"
-        permissions = [
-          "artifactregistry.googleapis.com/repositories.uploadArtifacts",
-          "datastore.googleapis.com/entities.create",
-          "datastore.googleapis.com/entities.delete",
-          "datastore.googleapis.com/entities.update",
-          "iam.googleapis.com/serviceAccountKeys.create",
-          "iam.googleapis.com/serviceAccounts.actAs",
-          "iam.googleapis.com/serviceAccounts.getAccessToken",
-          "iam.googleapis.com/serviceAccounts.getOpenIdToken",
-          "iam.googleapis.com/serviceAccounts.implicitDelegation",
-          "iam.googleapis.com/serviceAccounts.setIamPolicy",
-          "iam.googleapis.com/serviceAccounts.signBlob",
-          "iam.googleapis.com/serviceAccounts.signJwt",
-          "iam.googleapis.com/workloadIdentityPoolProviders.update",
-          "iam.googleapis.com/workloadIdentityPools.update",
-          "run.googleapis.com/services.setIamPolicy",
-          "run.googleapis.com/services.update",
-          "storage.googleapis.com/objects.create",
-          "storage.googleapis.com/objects.delete",
-          "storage.googleapis.com/objects.update",
-        ]
-        exceptions = ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]
       }
     }
   }
@@ -342,87 +376,16 @@ run "reject_a_consumer_project_outside_the_evidenced_organization" {
   expect_failures = [data.google_project.consumer, google_project_iam_custom_role.actuator]
 }
 
-run "reject_evidence_for_another_image" {
-  command = plan
-
-  variables {
-    broker_authority_evidence = {
-      organization_id = "100000000001"
-      platform_sha    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-      deny_canary = {
-        run_id          = "100000000002"
-        head_sha        = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        conclusion      = "success"
-        artifact_sha256 = "abababababababababababababababababababababababababababababababab"
-        permissions     = ["storage.googleapis.com/objects.create"]
-        exceptions      = ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]
-      }
-    }
-  }
-
-  expect_failures = [var.broker_authority_evidence]
-}
-
-run "reject_evidence_for_another_platform_revision" {
-  command = plan
-
-  variables {
-    broker_authority_evidence = {
-      organization_id = "100000000001"
-      platform_sha    = "cccccccccccccccccccccccccccccccccccccccc"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      deny_canary = {
-        run_id          = "100000000002"
-        head_sha        = "cccccccccccccccccccccccccccccccccccccccc"
-        conclusion      = "success"
-        artifact_sha256 = "abababababababababababababababababababababababababababababababab"
-        permissions     = ["storage.googleapis.com/objects.create"]
-        exceptions      = ["principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"]
-      }
-    }
-  }
-
-  expect_failures = [var.broker_authority_evidence]
-}
-
-run "reject_a_canary_that_did_not_succeed_or_covers_less_than_required" {
-  command = plan
-
-  variables {
-    broker_authority_evidence = {
-      organization_id = "100000000001"
-      platform_sha    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      deny_canary = {
-        run_id          = "100000000002"
-        head_sha        = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        conclusion      = "failure"
-        artifact_sha256 = "abababababababababababababababababababababababababababababababab"
-        permissions     = ["storage.googleapis.com/objects.create"]
-        exceptions      = []
-      }
-    }
-  }
-
-  expect_failures = [var.broker_authority_evidence]
-}
-
 run "reject_fabricated_evidence" {
   command = plan
 
   variables {
     broker_authority_evidence = {
       organization_id = "1"
-      platform_sha    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      broker_image    = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       deny_canary = {
         run_id          = "pending"
-        head_sha        = "TBD"
-        conclusion      = "success"
+        artifact_id     = "TBD"
         artifact_sha256 = "n/a"
-        permissions     = []
-        exceptions      = []
       }
     }
   }

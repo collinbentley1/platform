@@ -56,30 +56,29 @@ variable "transition_workflow_sha" {
 }
 
 # Evidence that enables the broker's authority over consumer accounts. It is
-# not a switch: every field is verified against this deployment. The image and
-# platform revision must be this plan's own inputs, the Deny canary must have
-# succeeded at that same revision and cover at least the module's required
-# permissions with the broker excepted, the organization must be the live
-# parent of every consumer project (data.google_project.consumer), and every
-# target unique ID must be recorded (google_project_iam_custom_role.actuator).
-# Null keeps the module without any authority over consumer accounts, which
-# is the only state offline inputs can reach: no organization exists, no Deny
-# canary has run, and the committed target identities are null. The run's
-# success, head SHA, and artifact digest are verified against the GitHub run
-# record by the activation review; nothing here can confirm them offline.
+# not a switch and it carries no claim: it names the reviewed organization and
+# one GitHub Actions run of the Deny canary workflow, its uploaded artifact,
+# and that artifact's digest. Everything the gate decides on is then read from
+# authenticated, immutable records rather than from these inputs: the run's
+# conclusion, attempt, head commit, workflow path, event, and repository from
+# the GitHub run record; the artifact's digest and run from the GitHub
+# artifact record; the canary's organization, broker image, every Deny policy
+# attachment point, denied principal set, exact exception set, denied
+# permission, per-permission DENIED observation, and unsupported permissions
+# from the artifact's attested predicate served by GitHub's attestation store
+# (see main.tf, locals evidence_checks and required_deny_matrix). Every check
+# must pass, the organization must be the live parent of every consumer
+# project, and every target's permanent unique ID must be recorded and resolve
+# live to its current email, or the plan fails; nothing supplied here can
+# widen a grant.
 variable "broker_authority_evidence" {
-  description = "Reviewed evidence, mechanically bound to this deployment, that the consumer projects sit under the named organization and that every exact IAM Deny permission and exception has been canaried at this platform revision against this broker image. Null keeps the broker without any authority over consumer accounts."
+  description = "The reviewed organization and the GitHub run, artifact ID, and artifact sha256 digest of the successful Deny canary at this platform revision against this broker image. Null keeps the broker without any authority over consumer accounts; every other field is verified against GitHub's run, artifact, and attestation records and the live consumer projects."
   type = object({
     organization_id = string
-    platform_sha    = string
-    broker_image    = string
     deny_canary = object({
       run_id          = string
-      head_sha        = string
-      conclusion      = string
+      artifact_id     = string
       artifact_sha256 = string
-      permissions     = list(string)
-      exceptions      = list(string)
     })
   })
   default = null
@@ -88,30 +87,10 @@ variable "broker_authority_evidence" {
     condition = var.broker_authority_evidence == null || try(
       can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.organization_id)) &&
       can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.deny_canary.run_id)) &&
-      can(regex("^[0-9a-f]{40}$", var.broker_authority_evidence.deny_canary.head_sha)) &&
-      can(regex("^[0-9a-f]{64}$", var.broker_authority_evidence.deny_canary.artifact_sha256)) &&
-      var.broker_authority_evidence.deny_canary.conclusion == "success",
+      can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.deny_canary.artifact_id)) &&
+      can(regex("^[0-9a-f]{64}$", var.broker_authority_evidence.deny_canary.artifact_sha256)),
       false,
     )
-    error_message = "broker_authority_evidence must carry a numeric organization_id, a numeric deny_canary.run_id, a full head_sha, a sha256 artifact digest, and conclusion \"success\"; never fabricated placeholders."
-  }
-
-  validation {
-    condition = var.broker_authority_evidence == null || try(
-      var.broker_authority_evidence.platform_sha == var.active_workflow_sha &&
-      var.broker_authority_evidence.deny_canary.head_sha == var.active_workflow_sha &&
-      var.broker_authority_evidence.broker_image == var.broker_image,
-      false,
-    )
-    error_message = "broker_authority_evidence must be bound to this deployment: platform_sha and deny_canary.head_sha must equal active_workflow_sha, and broker_image must equal the digest-pinned broker_image being deployed."
-  }
-
-  validation {
-    condition = var.broker_authority_evidence == null || try(
-      length(setsubtract(local.required_deny_coverage, toset(var.broker_authority_evidence.deny_canary.permissions))) == 0 &&
-      contains(var.broker_authority_evidence.deny_canary.exceptions, local.broker_principal),
-      false,
-    )
-    error_message = "broker_authority_evidence.deny_canary must cover every permission in the module's required Deny coverage and except exactly the broker principal; a canary of a smaller set cannot enable authority."
+    error_message = "broker_authority_evidence must carry a numeric organization_id, a numeric deny_canary.run_id, a numeric deny_canary.artifact_id, and a sha256 artifact digest; never fabricated placeholders."
   }
 }

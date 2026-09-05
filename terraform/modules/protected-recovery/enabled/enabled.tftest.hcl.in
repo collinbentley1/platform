@@ -1,0 +1,602 @@
+# The enabled path of the protected-recovery module: every target's permanent
+# unique ID recorded and verified live, and the Deny canary evidence verified
+# against GitHub's run, artifact, and attestation records. The committed
+# authority records no identity and no such records exist offline, so
+# tools/ci/protected-recovery-enabled-test.sh renders this template into an
+# isolated copy of the repository whose authority.json records a test identity
+# for each of the thirty-six targets, and whose mocked GitHub reads answer with
+# fixtures/deny-canary.json and its adversarial variants. A line consisting of
+# an ATTESTATION placeholder names the variant rendered there:
+#
+#   consistent           the fixture as attested
+#   extra-exception      one extra exception principal on one rule
+#   unrelated-resource   the broker-project rules attached to another project
+#   unsupported          a required permission reported unsupported and omitted
+#   missing-observation  a required permission listed but never observed DENIED
+#   other-image          a canary of another broker image
+#
+# and the ARTIFACT_SHA256 placeholder is the digest of the fixture bytes.
+# These are mocked plan-shape tests: they prove what the gate does with each
+# record, not that GitHub or Google answer as modelled. The identity of the
+# test accounts is 1 + consumer index + account index + sixteen zeros, in the
+# sorted order of protected-recovery/authority.json.
+
+mock_provider "google" {}
+mock_provider "http" {}
+
+override_data {
+  target = data.google_project.current
+  values = {
+    number = "123456789012"
+  }
+}
+
+override_data {
+  target = data.google_client_openid_userinfo.deployer
+  values = {
+    email = "cloud-root@cdbentley.com"
+  }
+}
+
+override_data {
+  target = data.google_project.consumer["cdbentley"]
+  values = { org_id = "100000000001" }
+}
+override_data {
+  target = data.google_project.consumer["critical-history"]
+  values = { org_id = "100000000001" }
+}
+override_data {
+  target = data.google_project.consumer["healthmcp"]
+  values = { org_id = "100000000001" }
+}
+override_data {
+  target = data.google_project.consumer["runsetta"]
+  values = { org_id = "100000000001" }
+}
+
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-deploy-parity"]
+  values = {
+    email     = "gha-deploy-parity@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-deploy-parity@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101010000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-preview-commit"]
+  values = {
+    email     = "gha-preview-commit@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-preview-commit@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101020000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-preview-deploy"]
+  values = {
+    email     = "gha-preview-deploy@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-preview-deploy@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101030000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-preview-operator"]
+  values = {
+    email     = "gha-preview-operator@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-preview-operator@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101040000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-preview-publish"]
+  values = {
+    email     = "gha-preview-publish@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-preview-publish@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101050000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-prod-deploy"]
+  values = {
+    email     = "gha-prod-deploy@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-prod-deploy@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101060000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-prod-publish"]
+  values = {
+    email     = "gha-prod-publish@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-prod-publish@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101070000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-terraform"]
+  values = {
+    email     = "gha-terraform@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-terraform@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101080000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["cdbentley/gha-wif-canary"]
+  values = {
+    email     = "gha-wif-canary@cdbentley.iam.gserviceaccount.com"
+    name      = "projects/cdbentley/serviceAccounts/gha-wif-canary@cdbentley.iam.gserviceaccount.com"
+    unique_id = "101090000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-deploy-parity"]
+  values = {
+    email     = "gha-deploy-parity@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-deploy-parity@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102010000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-preview-commit"]
+  values = {
+    email     = "gha-preview-commit@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-commit@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102020000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-preview-deploy"]
+  values = {
+    email     = "gha-preview-deploy@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-deploy@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102030000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-preview-operator"]
+  values = {
+    email     = "gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102040000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-preview-publish"]
+  values = {
+    email     = "gha-preview-publish@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-preview-publish@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102050000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-prod-deploy"]
+  values = {
+    email     = "gha-prod-deploy@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-prod-deploy@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102060000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-prod-publish"]
+  values = {
+    email     = "gha-prod-publish@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-prod-publish@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102070000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-terraform"]
+  values = {
+    email     = "gha-terraform@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-terraform@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102080000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["critical-history/gha-wif-canary"]
+  values = {
+    email     = "gha-wif-canary@critical-history-16823277.iam.gserviceaccount.com"
+    name      = "projects/critical-history-16823277/serviceAccounts/gha-wif-canary@critical-history-16823277.iam.gserviceaccount.com"
+    unique_id = "102090000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-deploy-parity"]
+  values = {
+    email     = "gha-deploy-parity@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-deploy-parity@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103010000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-preview-commit"]
+  values = {
+    email     = "gha-preview-commit@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-commit@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103020000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-preview-deploy"]
+  values = {
+    email     = "gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-deploy@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103030000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-preview-operator"]
+  values = {
+    email     = "gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103040000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-preview-publish"]
+  values = {
+    email     = "gha-preview-publish@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-preview-publish@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103050000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-prod-deploy"]
+  values = {
+    email     = "gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-prod-deploy@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103060000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-prod-publish"]
+  values = {
+    email     = "gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-prod-publish@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103070000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-terraform"]
+  values = {
+    email     = "gha-terraform@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-terraform@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103080000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["healthmcp/gha-wif-canary"]
+  values = {
+    email     = "gha-wif-canary@medlock-1025243085.iam.gserviceaccount.com"
+    name      = "projects/medlock-1025243085/serviceAccounts/gha-wif-canary@medlock-1025243085.iam.gserviceaccount.com"
+    unique_id = "103090000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-deploy-parity"]
+  values = {
+    email     = "gha-deploy-parity@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-deploy-parity@runsetta.iam.gserviceaccount.com"
+    unique_id = "104010000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-preview-commit"]
+  values = {
+    email     = "gha-preview-commit@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-preview-commit@runsetta.iam.gserviceaccount.com"
+    unique_id = "104020000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-preview-deploy"]
+  values = {
+    email     = "gha-preview-deploy@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-preview-deploy@runsetta.iam.gserviceaccount.com"
+    unique_id = "104030000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-preview-operator"]
+  values = {
+    email     = "gha-preview-operator@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-preview-operator@runsetta.iam.gserviceaccount.com"
+    unique_id = "104040000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-preview-publish"]
+  values = {
+    email     = "gha-preview-publish@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-preview-publish@runsetta.iam.gserviceaccount.com"
+    unique_id = "104050000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-prod-deploy"]
+  values = {
+    email     = "gha-prod-deploy@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-prod-deploy@runsetta.iam.gserviceaccount.com"
+    unique_id = "104060000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-prod-publish"]
+  values = {
+    email     = "gha-prod-publish@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-prod-publish@runsetta.iam.gserviceaccount.com"
+    unique_id = "104070000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-terraform"]
+  values = {
+    email     = "gha-terraform@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-terraform@runsetta.iam.gserviceaccount.com"
+    unique_id = "104080000000000000000"
+  }
+}
+override_data {
+  target = data.google_service_account.target["runsetta/gha-wif-canary"]
+  values = {
+    email     = "gha-wif-canary@runsetta.iam.gserviceaccount.com"
+    name      = "projects/runsetta/serviceAccounts/gha-wif-canary@runsetta.iam.gserviceaccount.com"
+    unique_id = "104090000000000000000"
+  }
+}
+
+# GitHub's records of the canary run, its artifact, and the artifact's attestation.
+override_data {
+  target = data.http.canary_run[0]
+  values = {
+    status_code   = 200
+    response_body = <<-JSON
+      {"id":100000000002,"run_attempt":1,"status":"completed","conclusion":"success","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","path":".github/workflows/protected-recovery-deny-canary.yml","event":"workflow_dispatch","repository":{"id":1255856466},"head_repository":{"id":1255856466}}
+    JSON
+  }
+}
+
+override_data {
+  target = data.http.canary_artifact[0]
+  values = {
+    status_code   = 200
+    response_body = <<-JSON
+      {"id":100000000003,"name":"deny-canary","digest":"sha256:@@ARTIFACT_SHA256@@","expired":false,"workflow_run":{"id":100000000002,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+    JSON
+  }
+}
+
+override_data {
+  target = data.http.canary_attestations[0]
+  values = {
+    status_code   = 200
+    response_body = <<-JSON
+      @@ATTESTATION:consistent@@
+    JSON
+  }
+}
+
+variables {
+  project_id          = "recovery-test"
+  broker_image        = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  active_workflow_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  broker_authority_evidence = {
+    organization_id = "100000000001"
+    deny_canary = {
+      run_id          = "100000000002"
+      artifact_id     = "100000000003"
+      artifact_sha256 = "@@ARTIFACT_SHA256@@"
+    }
+  }
+}
+
+run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actuators" {
+  command = plan
+
+  assert {
+    condition     = local.evidence_verified && length(local.evidence_failures) == 0 && length(local.unsatisfied_deny_rows) == 0 && length(local.unsupported_required) == 0
+    error_message = "Consistent records must pass every check with no unsatisfied Deny row and no unsupported required permission; failed checks [${join(", ", local.evidence_failures)}], unsatisfied rows [${join(", ", local.unsatisfied_deny_rows)}], unsupported [${join(", ", local.unsupported_required)}]."
+  }
+
+  assert {
+    condition     = length(data.google_service_account.target) == 36 && alltrue([for key, account in data.google_service_account.target : account.unique_id == local.target_identities[key].unique_id && account.email == local.target_identities[key].email])
+    error_message = "Every one of the thirty-six recorded identities must be read live and resolve to its recorded unique ID and email."
+  }
+
+  assert {
+    condition     = length(google_project_iam_custom_role.actuator) == 4 && length(google_service_account_iam_member.actuator) == 36
+    error_message = "Verified evidence and identities must plan exactly four actuator roles and thirty-six grants."
+  }
+
+  # The grant's member and role name are computed at apply; the account it
+  # addresses is the overridden data source and is checked exactly here.
+  assert {
+    condition = alltrue([
+      for key, grant in google_service_account_iam_member.actuator :
+      grant.service_account_id == "projects/${lookup({ cdbentley = "cdbentley", critical-history = "critical-history-16823277", healthmcp = "medlock-1025243085", runsetta = "runsetta" }, split("/", key)[0])}/serviceAccounts/${split("/", key)[1]}@${lookup({ cdbentley = "cdbentley", critical-history = "critical-history-16823277", healthmcp = "medlock-1025243085", runsetta = "runsetta" }, split("/", key)[0])}.iam.gserviceaccount.com" &&
+      !can(regex("/serviceAccounts/[0-9]", grant.service_account_id))
+    ]) && sort(keys(google_service_account_iam_member.actuator)) == sort(keys(local.target_identities))
+    error_message = "Each of the thirty-six grants must address its account by the email the provider accepts, in the account's own project; never by a bare unique ID."
+  }
+
+  assert {
+    condition = alltrue([for consumer, role in google_project_iam_custom_role.actuator : role.role_id == "protectedRecoveryActuator" && role.project == local.consumers[consumer].projectId]) && google_project_iam_custom_role.actuator["cdbentley"].permissions == toset(["iam.serviceAccountKeys.list", "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy", "iam.serviceAccounts.setIamPolicy"])
+    error_message = "One actuator role per consumer project, carrying exactly identity, key list, and allow-policy read and compare-and-set permissions."
+  }
+
+  assert {
+    condition = (
+      length(google_project_iam_custom_role.inventory) == 4 && length(google_project_iam_member.broker_inventory) == 4 &&
+      alltrue([for consumer, role in google_project_iam_custom_role.inventory : role.role_id == "protectedRecoveryInventory" && role.project == local.consumers[consumer].projectId && !contains(role.permissions, "iam.serviceAccounts.getAccessToken") && !contains(role.permissions, "iam.serviceAccounts.setIamPolicy")]) &&
+      alltrue([for consumer, grant in google_project_iam_member.broker_inventory : grant.project == local.consumers[consumer].projectId]) &&
+      length(google_organization_iam_custom_role.inventory) == 1 && google_organization_iam_custom_role.inventory[0].org_id == "100000000001" && google_organization_iam_custom_role.inventory[0].role_id == "protectedRecoveryInventory" &&
+      !contains(google_organization_iam_custom_role.inventory[0].permissions, "iam.serviceAccounts.getAccessToken") &&
+      length(google_organization_iam_member.broker_inventory) == 1 && google_organization_iam_member.broker_inventory[0].org_id == "100000000001"
+    )
+    error_message = "The broker must hold exactly the read-only inventory role in every consumer project and at the evidenced organization, and nothing that issues credentials or writes policies."
+  }
+}
+
+run "a_recreated_identity_at_the_same_address_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.google_service_account.target["cdbentley/gha-terraform"]
+    values = {
+      email     = "gha-terraform@cdbentley.iam.gserviceaccount.com"
+      name      = "projects/cdbentley/serviceAccounts/gha-terraform@cdbentley.iam.gserviceaccount.com"
+      unique_id = "199990000000000000000"
+    }
+  }
+
+  expect_failures = [data.google_service_account.target]
+}
+
+run "a_run_github_does_not_record_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_run[0]
+    values = {
+      status_code   = 404
+      response_body = "{\"message\":\"Not Found\"}"
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_run_of_another_head_or_workflow_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_run[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        {"id":100000000002,"run_attempt":1,"status":"completed","conclusion":"success","head_sha":"cccccccccccccccccccccccccccccccccccccccc","path":".github/workflows/protected-recovery-invoke.yml","event":"workflow_dispatch","repository":{"id":1255856466},"head_repository":{"id":1255856466}}
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_artifact_whose_recorded_digest_differs_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_artifact[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        {"id":100000000003,"name":"deny-canary","digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","expired":false,"workflow_run":{"id":100000000002,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_extra_exception_principal_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_attestations[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        @@ATTESTATION:extra-exception@@
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_canary_against_an_unrelated_resource_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_attestations[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        @@ATTESTATION:unrelated-resource@@
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_required_permission_the_canary_reports_unsupported_keeps_activation_blocked" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_attestations[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        @@ATTESTATION:unsupported@@
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_required_permission_never_observed_denied_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_attestations[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        @@ATTESTATION:missing-observation@@
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "evidence_of_another_broker_image_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.http.canary_attestations[0]
+    values = {
+      status_code   = 200
+      response_body = <<-JSON
+        @@ATTESTATION:other-image@@
+      JSON
+    }
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_consumer_project_outside_the_evidenced_organization_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.google_project.consumer["runsetta"]
+    values = { org_id = "200000000009" }
+  }
+
+  expect_failures = [data.google_project.consumer]
+}
+
+run "without_evidence_nothing_is_granted_even_with_every_identity_recorded" {
+  command = plan
+
+  variables {
+    broker_authority_evidence = null
+  }
+
+  assert {
+    condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0
+    error_message = "Recorded identities alone must grant nothing; only verified evidence enables authority."
+  }
+}

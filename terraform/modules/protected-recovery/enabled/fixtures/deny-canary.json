@@ -1,0 +1,876 @@
+{
+  "brokerImage": "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "organization": "organizations/100000000001",
+  "policies": [
+    {
+      "attachmentPoint": "cloudresourcemanager.googleapis.com/projects/recovery-test",
+      "etag": "deny-etag-recovery-test",
+      "name": "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Frecovery-test/denypolicies/protected-recovery-broker",
+      "rules": [
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "datastore.googleapis.com/entities.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "datastore.googleapis.com/entities.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "datastore.googleapis.com/entities.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "storage.googleapis.com/objects.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "datastore.googleapis.com/entities.create",
+            "datastore.googleapis.com/entities.delete",
+            "datastore.googleapis.com/entities.update",
+            "storage.googleapis.com/objects.create"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccountKeys.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.implicitDelegation",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.signBlob",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.signJwt",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "storage.googleapis.com/objects.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "storage.googleapis.com/objects.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccountKeys.create",
+            "iam.googleapis.com/serviceAccounts.implicitDelegation",
+            "iam.googleapis.com/serviceAccounts.signBlob",
+            "iam.googleapis.com/serviceAccounts.signJwt",
+            "storage.googleapis.com/objects.delete",
+            "storage.googleapis.com/objects.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.getAccessToken",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.getAccessToken"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/*"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.getOpenIdToken",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.getOpenIdToken"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "artifactregistry.googleapis.com/repositories.uploadArtifacts",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.actAs",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.enable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "artifactregistry.googleapis.com/repositories.uploadArtifacts",
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+            "iam.googleapis.com/serviceAccounts.actAs",
+            "iam.googleapis.com/serviceAccounts.create",
+            "iam.googleapis.com/serviceAccounts.delete",
+            "iam.googleapis.com/serviceAccounts.disable",
+            "iam.googleapis.com/serviceAccounts.enable",
+            "iam.googleapis.com/serviceAccounts.setIamPolicy",
+            "iam.googleapis.com/serviceAccounts.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.create",
+            "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.update",
+            "iam.googleapis.com/workloadIdentityPools.create",
+            "iam.googleapis.com/workloadIdentityPools.delete",
+            "iam.googleapis.com/workloadIdentityPools.undelete",
+            "iam.googleapis.com/workloadIdentityPools.update",
+            "run.googleapis.com/services.create",
+            "run.googleapis.com/services.delete",
+            "run.googleapis.com/services.setIamPolicy",
+            "run.googleapis.com/services.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com"
+          ]
+        }
+      ]
+    },
+    {
+      "attachmentPoint": "cloudresourcemanager.googleapis.com/projects/cdbentley",
+      "etag": "deny-etag-cdbentley",
+      "name": "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fcdbentley/denypolicies/protected-recovery-consumer",
+      "rules": [
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccountKeys.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.enable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+            "iam.googleapis.com/serviceAccountKeys.create",
+            "iam.googleapis.com/serviceAccounts.create",
+            "iam.googleapis.com/serviceAccounts.delete",
+            "iam.googleapis.com/serviceAccounts.disable",
+            "iam.googleapis.com/serviceAccounts.enable",
+            "iam.googleapis.com/serviceAccounts.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.create",
+            "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.update",
+            "iam.googleapis.com/workloadIdentityPools.create",
+            "iam.googleapis.com/workloadIdentityPools.delete",
+            "iam.googleapis.com/workloadIdentityPools.undelete",
+            "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        }
+      ]
+    },
+    {
+      "attachmentPoint": "cloudresourcemanager.googleapis.com/projects/critical-history-16823277",
+      "etag": "deny-etag-critical-history-16823277",
+      "name": "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fcritical-history-16823277/denypolicies/protected-recovery-consumer",
+      "rules": [
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccountKeys.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.enable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+            "iam.googleapis.com/serviceAccountKeys.create",
+            "iam.googleapis.com/serviceAccounts.create",
+            "iam.googleapis.com/serviceAccounts.delete",
+            "iam.googleapis.com/serviceAccounts.disable",
+            "iam.googleapis.com/serviceAccounts.enable",
+            "iam.googleapis.com/serviceAccounts.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.create",
+            "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.update",
+            "iam.googleapis.com/workloadIdentityPools.create",
+            "iam.googleapis.com/workloadIdentityPools.delete",
+            "iam.googleapis.com/workloadIdentityPools.undelete",
+            "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        }
+      ]
+    },
+    {
+      "attachmentPoint": "cloudresourcemanager.googleapis.com/projects/medlock-1025243085",
+      "etag": "deny-etag-medlock-1025243085",
+      "name": "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Fmedlock-1025243085/denypolicies/protected-recovery-consumer",
+      "rules": [
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccountKeys.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.enable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+            "iam.googleapis.com/serviceAccountKeys.create",
+            "iam.googleapis.com/serviceAccounts.create",
+            "iam.googleapis.com/serviceAccounts.delete",
+            "iam.googleapis.com/serviceAccounts.disable",
+            "iam.googleapis.com/serviceAccounts.enable",
+            "iam.googleapis.com/serviceAccounts.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.create",
+            "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.update",
+            "iam.googleapis.com/workloadIdentityPools.create",
+            "iam.googleapis.com/workloadIdentityPools.delete",
+            "iam.googleapis.com/workloadIdentityPools.undelete",
+            "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        }
+      ]
+    },
+    {
+      "attachmentPoint": "cloudresourcemanager.googleapis.com/projects/runsetta",
+      "etag": "deny-etag-runsetta",
+      "name": "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Frunsetta/denypolicies/protected-recovery-consumer",
+      "rules": [
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "iam.googleapis.com/serviceAccounts.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
+          ]
+        },
+        {
+          "canary": [
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccountKeys.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.enable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.delete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/workloadIdentityPools.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+            "iam.googleapis.com/serviceAccountKeys.create",
+            "iam.googleapis.com/serviceAccounts.create",
+            "iam.googleapis.com/serviceAccounts.delete",
+            "iam.googleapis.com/serviceAccounts.disable",
+            "iam.googleapis.com/serviceAccounts.enable",
+            "iam.googleapis.com/serviceAccounts.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.create",
+            "iam.googleapis.com/workloadIdentityPoolProviders.delete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
+            "iam.googleapis.com/workloadIdentityPoolProviders.update",
+            "iam.googleapis.com/workloadIdentityPools.create",
+            "iam.googleapis.com/workloadIdentityPools.delete",
+            "iam.googleapis.com/workloadIdentityPools.undelete",
+            "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        }
+      ]
+    }
+  ],
+  "run": {
+    "attempt": 1,
+    "event": "workflow_dispatch",
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "id": 100000000002,
+    "repositoryId": "1255856466",
+    "workflow": ".github/workflows/protected-recovery-deny-canary.yml"
+  },
+  "schema": "protected-recovery/deny-canary/v1",
+  "unsupported": []
+}
