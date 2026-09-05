@@ -35,6 +35,9 @@ import {
 //     200                             -> {"shards": [ShardView], "next": cursor | null}
 //   GET  /v1/shards/{shard}            the same invoker, reconciler
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
+//   POST /v1/members                   the consumer's member-delivery identity   {"token": "<GitHub OIDC token>"}
+//     200                             -> {"member", "expiresAt"}   the canonical job's own credential, verified and
+//                                                                  held until it expires, so the broker can probe as it
 //   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE
 //
 // No body carries evidence. Negative impersonation probes and credential
@@ -76,11 +79,15 @@ export type ProbeOutcome = (typeof probeOutcomes)[number];
 // The issuance probe is a real IAM Credentials request as the exact managed
 // member: the broker verifies the GitHub OIDC token of the one canonical job
 // that is that member, exchanges it at STS for the consumer pool, and observes
-// generateAccessToken against the target's permanent identity itself. No
-// consumer job delivers such a token to the broker yet, so the production
-// credential source reports every member unavailable and the broker refuses
-// every QUARANTINE before acceptance, before PREPARE, and before any mutation.
-export const probePrerequisite = "no canonical-member credential source is deployed: the issuance probe needs the GitHub OIDC token of the exact canonical job for each managed member, minted for the consumer pool's provider audience, and no consumer job delivers one to the broker; activation must supply that source before any QUARANTINE can be accepted";
+// generateAccessToken against the target's permanent identity itself. The
+// canonical job delivers that token through POST /v1/members (see
+// protected-recovery/deliver-member.sh); the broker holds it in the ledger
+// until it expires. A member whose canonical job has not delivered a live
+// credential cannot be probed, so every QUARANTINE that needs it is refused
+// before acceptance, before PREPARE, and before any mutation.
+export function probePrerequisite(member: string): string {
+  return `no live credential of the canonical job for ${member}: the issuance probe needs that job's GitHub OIDC token, minted for the consumer provider's audience and delivered to POST /v1/members before it expires`;
+}
 
 export class AuthorityError extends Error {}
 export class RequestError extends Error {}
@@ -128,7 +135,11 @@ export interface RecoveryAuthority {
 
 export type Purpose =
   | { readonly kind: "recovery"; readonly consumer: Consumer; readonly intent: Intent; readonly serviceAccount: string }
-  | { readonly kind: "reconciler"; readonly serviceAccount: string };
+  | { readonly kind: "reconciler"; readonly serviceAccount: string }
+  // The member-delivery identity of one consumer: the canonical jobs of that
+  // consumer reach it through the broker pool and may only deliver their own
+  // credential (POST /v1/members).
+  | { readonly kind: "member"; readonly consumer: Consumer; readonly serviceAccount: string };
 
 // One target service account of a consumer: its permanent numeric identity,
 // the IAM resource addressed by that identity, and the exact managed members
@@ -184,6 +195,19 @@ export interface InventoryRecord {
   readonly observedAt: string;
   readonly summary: InventorySummary;
   readonly uniqueId: string;
+}
+
+// The live credential of one managed member as delivered by its canonical
+// job and verified by the broker: the member it proves, the consumer whose
+// provider it is minted for, the federated principal STS will create for it,
+// and the token itself until it expires.
+export interface MemberCredentialRecord {
+  readonly consumer: string;
+  readonly deliveredAt: string;
+  readonly expiresAt: string;
+  readonly member: string;
+  readonly principal: string;
+  readonly token: string;
 }
 
 export type EntryBody =
@@ -252,29 +276,42 @@ export interface TargetEffect {
 
 // The current inventory baseline of one target: the hash first observed at
 // observedAt, re-verified unchanged at verifiedAt, after this many changes.
+// The summary is the preimage of the hash, kept in the committed state so the
+// terminal receipt carries it even when the observation that set it could not
+// be journaled as an entry.
 export interface ChainInventory {
   readonly changes: number;
   readonly findings: readonly string[];
   readonly hash: string;
   readonly observations: number;
   readonly observedAt: string;
+  readonly summary: InventorySummary;
   readonly verifiedAt: string;
 }
 
-// The probe chain of one target as committed state, not as a scan of entries:
-// the revocation probe (the earliest DENIED observation after the quarantine
-// acknowledgement, after the latest ALLOWED observation, and at or after the
-// inventory baseline), the post-horizon probe (a DENIED observation at or
-// after the token horizon), and the folded counts of every other observation.
-// Observations are journaled as entries while the shard has room and
-// otherwise counted as suppressed; the chain itself is always writable.
-export interface TargetChain {
+// The probe chain of one managed member of one target: the revocation probe
+// (the earliest DENIED observation of that member after the quarantine
+// acknowledgement, after the member's latest ALLOWED observation, and at or
+// after the inventory baseline), the post-horizon probe (a DENIED observation
+// of that member at or after its token horizon), and the folded counts of
+// every other observation of it.
+export interface MemberChain {
   readonly allowed: { readonly count: number; readonly lastObservedAt: string | null };
   readonly denied: number;
-  readonly inventory: ChainInventory | null;
-  readonly journaled: number;
   readonly post: ProbeRecord | null;
   readonly revocation: ProbeRecord | null;
+}
+
+// The chains of one target as committed state, not as a scan of entries: one
+// chain per exact managed member, keyed by the member, created when the
+// target is journaled so the set of members that must complete both phases
+// is fixed by the effect and can never shrink with the journal. Observations
+// are journaled as entries while the shard has room and otherwise counted as
+// suppressed; the chains themselves are always writable.
+export interface TargetChain {
+  readonly inventory: ChainInventory | null;
+  readonly journaled: number;
+  readonly members: Readonly<Record<string, MemberChain>>;
   readonly suppressed: number;
 }
 
@@ -355,7 +392,15 @@ export interface ReadRequest {
   readonly shard: string;
 }
 
-export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest;
+// A canonical job delivering its own credential: the GitHub OIDC token it
+// minted for the consumer provider's audience. Nothing else is in the body;
+// the member it proves is derived from the token's verified claims.
+export interface DeliverRequest {
+  readonly kind: "deliver";
+  readonly token: string;
+}
+
+export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest;
 
 export function intentOf(body: AppendBody): Intent {
   return body.kind === "restore" ? "RESTORE" : "QUARANTINE";
@@ -529,7 +574,8 @@ export function unrecordedIdentities(authority: RecoveryAuthority): readonly str
 
 // Purpose is derived only from the authenticated service-account identity in
 // the broker project: one recovery entry of the manifest -- one consumer and
-// one effect direction -- or the reconciler.
+// one effect direction -- the reconciler, or one consumer's member-delivery
+// identity.
 export function purposeForIdentity(authority: RecoveryAuthority, email: string): Purpose | undefined {
   const projectId = authority.broker.projectId;
   if (projectId === null) return undefined;
@@ -543,6 +589,8 @@ export function purposeForIdentity(authority: RecoveryAuthority, email: string):
     if (!consumer) return undefined;
     return { kind: "recovery", consumer, intent: entry.intent, serviceAccount: account };
   }
+  const member = authority.consumers.find((candidate) => memberDeliveryName(candidate.repository) === account);
+  if (member) return { kind: "member", consumer: member, serviceAccount: account };
   return undefined;
 }
 
@@ -675,7 +723,22 @@ export function parseReconcileBody(shard: string | null, body: unknown): Reconci
   return { kind: "reconcile", shard: shard === null ? null : parseShardId(shard) };
 }
 
-export const emptyChain: TargetChain = { allowed: { count: 0, lastObservedAt: null }, denied: 0, inventory: null, journaled: 0, post: null, revocation: null, suppressed: 0 };
+const memberToken = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+export function parseDeliverBody(body: unknown): DeliverRequest {
+  const source = requestRecord(body, "body");
+  requestKeys(source, ["token"]);
+  if (typeof source.token !== "string" || source.token.length > 6 * 1024 || !memberToken.test(source.token)) throw new RequestError("token must be one compact JWS");
+  return { kind: "deliver", token: source.token };
+}
+
+export const emptyMemberChain: MemberChain = { allowed: { count: 0, lastObservedAt: null }, denied: 0, post: null, revocation: null };
+
+// The chains of a target at journaling: one empty chain per exact managed
+// member of the journaled effect.
+export function emptyChain(members: readonly string[]): TargetChain {
+  return { inventory: null, journaled: 0, members: Object.fromEntries([...members].sort().map((member) => [member, emptyMemberChain])), suppressed: 0 };
+}
 
 export function horizonOf(revocation: ProbeRecord): number {
   return Date.parse(revocation.observedAt) + tokenHorizonSeconds * 1000;
@@ -693,61 +756,93 @@ export type Observation =
   | { readonly kind: "probe"; readonly probe: ProbeRecord }
   | { readonly kind: "inventory"; readonly inventory: InventoryRecord };
 
-// What an observation meant for the chain: it started it (REVOCATION), ended
-// it (HORIZON), broke it (ALLOWED or CHANGE), established the inventory
-// baseline (BASELINE), or repeated known facts (REDUNDANT).
-export type ChainRole = "ALLOWED" | "BASELINE" | "CHANGE" | "HORIZON" | "REDUNDANT" | "REVOCATION";
+// What an observation meant for the chain: it started a member's chain
+// (REVOCATION), ended it (HORIZON), broke it (ALLOWED), established the
+// inventory baseline (BASELINE), changed the inventory and voided the chains
+// built before the change (CHANGE), contradicted an inventory observed at the
+// same instant (CONFLICT), was older than the inventory already recorded
+// (STALE, never folded), or repeated known facts (REDUNDANT).
+export type ChainRole = "ALLOWED" | "BASELINE" | "CHANGE" | "CONFLICT" | "HORIZON" | "REDUNDANT" | "REVOCATION" | "STALE";
 
-// Apply one broker-recorded observation to a target's chain. Pure: the ledger
-// commits the result with the shard document. A later ALLOWED observation or
-// a changed inventory voids the revocation and post-horizon probes observed
-// before it, so a timer alone never ends a chain; a DENIED observation counts
-// as the revocation only after the acknowledgement, after the latest ALLOWED
-// observation, and at or after the inventory baseline; a DENIED observation
-// counts as the post-horizon probe only at or after the horizon.
+function voidBefore(members: Readonly<Record<string, MemberChain>>, instant: number): Readonly<Record<string, MemberChain>> {
+  return Object.fromEntries(Object.entries(members).map(([member, chain]) => {
+    const voided = chain.revocation !== null && Date.parse(chain.revocation.observedAt) < instant;
+    return [member, voided ? { ...chain, post: null, revocation: null } : chain];
+  }));
+}
+
+// Apply one broker-recorded observation to a target's chains. Pure: the
+// ledger commits the result with the shard document. Inventory observations
+// fold monotonically by their observation time: an observation older than
+// the latest one recorded is STALE and changes nothing, an equal-time
+// observation with another hash is a CONFLICT that voids every member's
+// chain and marks the inventory dirty until a strictly later observation
+// settles it, and a later observation with another hash is a CHANGE that
+// voids every member's chain built before it. A member's ALLOWED observation
+// voids that member's chain, so a timer alone never ends one; a DENIED
+// observation counts as the member's revocation only after the
+// acknowledgement, after the member's latest ALLOWED observation, and at or
+// after the inventory baseline; it counts as the post-horizon probe only at
+// or after that member's horizon.
 export function applyObservation(state: TargetState, observation: Observation): { readonly chain: TargetChain; readonly role: ChainRole } {
   const chain = state.chain;
   if (observation.kind === "inventory") {
-    const { findings, hash, observedAt } = observation.inventory;
+    const { findings, hash, observedAt, summary } = observation.inventory;
     if (chain.inventory === null) {
-      return { chain: { ...chain, inventory: { changes: 0, findings, hash, observations: 1, observedAt, verifiedAt: observedAt } }, role: "BASELINE" };
+      return { chain: { ...chain, inventory: { changes: 0, findings, hash, observations: 1, observedAt, summary, verifiedAt: observedAt } }, role: "BASELINE" };
     }
+    const observed = Date.parse(observedAt);
+    const latest = Date.parse(chain.inventory.verifiedAt);
+    if (observed < latest) return { chain, role: "STALE" };
     if (chain.inventory.hash === hash) {
-      const verifiedAt = Date.parse(observedAt) > Date.parse(chain.inventory.verifiedAt) ? observedAt : chain.inventory.verifiedAt;
-      return { chain: { ...chain, inventory: { ...chain.inventory, observations: chain.inventory.observations + 1, verifiedAt } }, role: "REDUNDANT" };
+      // A strictly later confirmation of the same hash settles any conflict marker.
+      const settled = observed > latest ? findings : chain.inventory.findings;
+      return { chain: { ...chain, inventory: { ...chain.inventory, findings: settled, observations: chain.inventory.observations + 1, verifiedAt: observedAt } }, role: "REDUNDANT" };
     }
-    const changed = Date.parse(observedAt);
-    const voided = chain.revocation !== null && Date.parse(chain.revocation.observedAt) < changed;
+    if (observed === latest) {
+      const conflict = `conflict:${chain.inventory.hash}!=${hash}@${observedAt}`;
+      const merged = [...new Set([...chain.inventory.findings, ...findings, conflict])].sort();
+      return {
+        chain: {
+          ...chain,
+          inventory: { changes: chain.inventory.changes + 1, findings: merged, hash, observations: chain.inventory.observations + 1, observedAt, summary, verifiedAt: observedAt },
+          members: voidBefore(chain.members, observed + 1),
+        },
+        role: "CONFLICT",
+      };
+    }
     return {
       chain: {
         ...chain,
-        inventory: { changes: chain.inventory.changes + 1, findings, hash, observations: chain.inventory.observations + 1, observedAt, verifiedAt: observedAt },
-        post: voided ? null : chain.post,
-        revocation: voided ? null : chain.revocation,
+        inventory: { changes: chain.inventory.changes + 1, findings, hash, observations: chain.inventory.observations + 1, observedAt, summary, verifiedAt: observedAt },
+        members: voidBefore(chain.members, observed),
       },
       role: "CHANGE",
     };
   }
   const probe = observation.probe;
+  const member = chain.members[probe.member];
+  if (member === undefined) return { chain, role: "REDUNDANT" };
   const observed = Date.parse(probe.observedAt);
+  const withMember = (next: MemberChain): TargetChain => ({ ...chain, members: { ...chain.members, [probe.member]: next } });
   if (probe.outcome === "ALLOWED") {
-    const last = chain.allowed.lastObservedAt;
+    const last = member.allowed.lastObservedAt;
     const lastObservedAt = last === null || observed > Date.parse(last) ? probe.observedAt : last;
-    const voided = chain.revocation !== null && Date.parse(chain.revocation.observedAt) <= observed;
+    const voided = member.revocation !== null && Date.parse(member.revocation.observedAt) <= observed;
     return {
-      chain: { ...chain, allowed: { count: chain.allowed.count + 1, lastObservedAt }, post: voided ? null : chain.post, revocation: voided ? null : chain.revocation },
+      chain: withMember({ ...member, allowed: { count: member.allowed.count + 1, lastObservedAt }, post: voided ? null : member.post, revocation: voided ? null : member.revocation }),
       role: "ALLOWED",
     };
   }
-  const counted = { ...chain, denied: chain.denied + 1 };
-  if (chain.inventory === null) return { chain: counted, role: "REDUNDANT" };
-  if (chain.revocation === null) {
-    const afterAllowed = chain.allowed.lastObservedAt === null || observed > Date.parse(chain.allowed.lastObservedAt);
-    if (observed >= chainFloor(state) && afterAllowed) return { chain: { ...counted, revocation: probe }, role: "REVOCATION" };
-    return { chain: counted, role: "REDUNDANT" };
+  const counted = { ...member, denied: member.denied + 1 };
+  if (chain.inventory === null) return { chain: withMember(counted), role: "REDUNDANT" };
+  if (member.revocation === null) {
+    const afterAllowed = member.allowed.lastObservedAt === null || observed > Date.parse(member.allowed.lastObservedAt);
+    if (observed >= chainFloor(state) && afterAllowed) return { chain: withMember({ ...counted, revocation: probe }), role: "REVOCATION" };
+    return { chain: withMember(counted), role: "REDUNDANT" };
   }
-  if (chain.post === null && observed >= horizonOf(chain.revocation)) return { chain: { ...counted, post: probe }, role: "HORIZON" };
-  return { chain: counted, role: "REDUNDANT" };
+  if (member.post === null && observed >= horizonOf(member.revocation)) return { chain: withMember({ ...counted, post: probe }), role: "HORIZON" };
+  return { chain: withMember(counted), role: "REDUNDANT" };
 }
 
 export interface ScanReadiness {
@@ -776,14 +871,21 @@ function sortedTargets(shard: Shard): ReadonlyArray<readonly [string, TargetStat
     .map((account) => [account, shard.targets[account]!] as const);
 }
 
+function sortedMembers(chain: TargetChain): ReadonlyArray<readonly [string, MemberChain]> {
+  return Object.keys(chain.members)
+    .sort()
+    .map((member) => [member, chain.members[member]!] as const);
+}
+
 // Scan-ready is a pure judgement over the committed shard state: every target
 // of a QUARANTINE shard acknowledged with no alternate issuer in its policy
-// and no alternate credential path in its recorded inventory, a
-// broker-recorded DENIED probe of a managed member against the exact target
-// identity after that target's acknowledgement and inventory baseline, the
-// one-hour token horizon drained since that probe, and another DENIED probe
-// after the horizon. A fixed propagation timer alone never satisfies it, and
-// nothing a caller submits contributes to it.
+// and no alternate credential path in its recorded inventory, and for every
+// exact managed member of every target a broker-recorded DENIED probe of that
+// member against the exact target identity after the target's
+// acknowledgement and inventory baseline, the one-hour token horizon drained
+// since that probe, and another DENIED probe of the same member after the
+// horizon. A fixed propagation timer alone never satisfies it, and nothing a
+// caller submits contributes to it.
 export function scanReadiness(shard: Shard, now: Date): ScanReadiness {
   const blockers: string[] = [];
   if (shard.intent !== "QUARANTINE") return { blockers: ["shard intent is RESTORE"], horizonAt: null, ready: false };
@@ -805,28 +907,36 @@ export function scanReadiness(shard: Shard, now: Date): ScanReadiness {
       continue;
     }
     if (chain.inventory.findings.length > 0) blockers.push(`${account}: alternate credential paths ${chain.inventory.findings.join(", ")}`);
-    if (chain.revocation === null) {
-      blockers.push(`${account}: no DENIED impersonation probe after the quarantine acknowledgement`);
+    const members = sortedMembers(chain);
+    if (members.length === 0) {
+      blockers.push(`${account}: no managed member is journaled`);
       horizonKnown = false;
       continue;
     }
-    const targetHorizon = horizonOf(chain.revocation);
-    horizon = Math.max(horizon, targetHorizon);
-    if (now.getTime() < targetHorizon) {
-      blockers.push(`${account}: token horizon drains at ${new Date(targetHorizon).toISOString()}`);
-      continue;
+    for (const [member, memberChain] of members) {
+      if (memberChain.revocation === null) {
+        blockers.push(`${account}: no DENIED impersonation probe of ${member} after the quarantine acknowledgement`);
+        horizonKnown = false;
+        continue;
+      }
+      const memberHorizon = horizonOf(memberChain.revocation);
+      horizon = Math.max(horizon, memberHorizon);
+      if (now.getTime() < memberHorizon) {
+        blockers.push(`${account}: token horizon of ${member} drains at ${new Date(memberHorizon).toISOString()}`);
+        continue;
+      }
+      if (memberChain.post === null) blockers.push(`${account}: no DENIED impersonation probe of ${member} after the token horizon ${new Date(memberHorizon).toISOString()}`);
     }
-    if (chain.post === null) blockers.push(`${account}: no DENIED impersonation probe after the token horizon ${new Date(targetHorizon).toISOString()}`);
   }
   return { blockers, horizonAt: horizonKnown && horizon > 0 ? new Date(horizon).toISOString() : null, ready: blockers.length === 0 };
 }
 
-// The probes the broker should record for an OPEN QUARANTINE shard now: a
-// revocation probe for every acknowledged, inventoried, clean target without
-// one, and a post-horizon probe for every target whose horizon has drained
-// without one. Targets with an alternate issuer or an alternate credential
-// path are never ready in this shard, so they are not probed. The member
-// tried is the target's first managed member.
+// The probes the broker should record for an OPEN QUARANTINE shard now: for
+// every exact managed member of every acknowledged, inventoried, clean
+// target, a revocation probe while that member has none, and a post-horizon
+// probe once that member's horizon has drained without one. Targets with an
+// alternate issuer or an alternate credential path are never ready in this
+// shard, so they are not probed.
 export function probesNeeded(shard: Shard, now: Date, members: (account: string) => Target | undefined): readonly ProbeNeed[] {
   if (shard.phase !== "OPEN" || shard.intent !== "QUARANTINE") return [];
   const needs: ProbeNeed[] = [];
@@ -835,14 +945,16 @@ export function probesNeeded(shard: Shard, now: Date, members: (account: string)
     const chain = state.chain;
     if (chain.inventory === null || chain.inventory.findings.length > 0) continue;
     const target = members(account);
-    const member = target?.members[0];
-    if (!target || member === undefined) continue;
-    const base = { account, email: target.email, member, resource: target.resource, uniqueId: target.uniqueId };
-    if (chain.revocation === null) {
-      const floor = Math.max(chainFloor(state), chain.allowed.lastObservedAt === null ? 0 : Date.parse(chain.allowed.lastObservedAt) + 1);
-      needs.push({ ...base, notBefore: new Date(floor).toISOString(), phase: "REVOCATION" });
-    } else if (chain.post === null && now.getTime() >= horizonOf(chain.revocation)) {
-      needs.push({ ...base, notBefore: new Date(horizonOf(chain.revocation)).toISOString(), phase: "HORIZON" });
+    if (!target) continue;
+    for (const [member, memberChain] of sortedMembers(chain)) {
+      if (!target.members.includes(member)) continue;
+      const base = { account, email: target.email, member, resource: target.resource, uniqueId: target.uniqueId };
+      if (memberChain.revocation === null) {
+        const floor = Math.max(chainFloor(state), memberChain.allowed.lastObservedAt === null ? 0 : Date.parse(memberChain.allowed.lastObservedAt) + 1);
+        needs.push({ ...base, notBefore: new Date(floor).toISOString(), phase: "REVOCATION" });
+      } else if (memberChain.post === null && now.getTime() >= horizonOf(memberChain.revocation)) {
+        needs.push({ ...base, notBefore: new Date(horizonOf(memberChain.revocation)).toISOString(), phase: "HORIZON" });
+      }
     }
   }
   return needs;
@@ -857,8 +969,9 @@ export interface FreshInventory {
 }
 
 // The blockers a gate raises when the freshly observed inventory of a target
-// is unavailable, dirty, or differs from the baseline the chain was built on:
-// the quarantine/close interval is protected exactly by this equality.
+// is unavailable, dirty, older than the inventory already recorded, or
+// differs from the baseline the chain was built on: the quarantine/close
+// interval is protected exactly by this equality.
 export function inventoryDrift(shard: Shard, fresh: Readonly<Record<string, FreshInventory>>): readonly string[] {
   const blockers: string[] = [];
   for (const [account, state] of sortedTargets(shard)) {
@@ -869,13 +982,14 @@ export function inventoryDrift(shard: Shard, fresh: Readonly<Record<string, Fres
       continue;
     }
     if (current.findings.length > 0) blockers.push(`${account}: alternate credential paths at the gate ${current.findings.join(", ")}`);
+    if (Date.parse(current.observedAt) < Date.parse(state.chain.inventory.verifiedAt)) blockers.push(`${account}: the credential inventory observed at the gate is older than the inventory recorded at ${state.chain.inventory.verifiedAt}`);
     if (current.hash !== state.chain.inventory.hash) blockers.push(`${account}: credential inventory changed since ${state.chain.inventory.observedAt}`);
   }
   return blockers;
 }
 
 export function probeKey(probe: ProbeRecord): string {
-  return `probe/${probe.account}/${probe.phase}/${probe.observedAt}`;
+  return `probe/${probe.account}/${probe.phase}/${sha256Hex(probe.member).slice(0, 16)}/${probe.observedAt}`;
 }
 
 export function inventoryKey(inventory: InventoryRecord): string {

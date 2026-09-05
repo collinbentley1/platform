@@ -2,8 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { driveEffect } from "../src/effects";
 import { boundedFetch } from "../src/http";
 import { LedgerUnavailable } from "../src/ledger";
-import { type ProbeRecord, maxEntriesPerShard, probePermission, scanReadiness, targetsFor } from "../src/model";
+import { type InventoryRecord, type ProbeRecord, type Target, emptyChain, inventoryHash, maxEntriesPerShard, probeKey, probePermission, scanReadiness, targetsFor } from "../src/model";
+import { inventoryFindings } from "../src/inventory";
 import { Clock, beginClose, close, emulatorHost, emulatorLedger, freshOf, makeReady, proberPrincipal, quarantine, restore, seedTargets, testAuthority, world } from "./support";
+
+const membersOf = (targets: readonly Target[]) => targets.flatMap((target) => target.members.map((member) => [target, member] as const));
 
 const cdbentley = async (clock = new Clock(), fetcher: typeof fetch = fetch, deadlines?: { readonly requestMs: number; readonly shardMs: number }) => {
   const w = await world(clock, fetcher, deadlines);
@@ -25,7 +28,10 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     const shard = (await ledger.readShard("q"))!;
     expect(shard).toMatchObject({ consumer: "cdbentley", intent: "QUARANTINE", nextSequence: 10, pendingEffects: 9, pendingOutbox: 9, phase: "OPEN", source: null });
     expect(Object.keys(shard.targets)).toHaveLength(9);
-    expect(shard.targets[targets[0]!.account]).toEqual({ chain: { allowed: { count: 0, lastObservedAt: null }, denied: 0, inventory: null, journaled: 0, post: null, revocation: null, suppressed: 0 }, effect: { ackedAt: null, alternateIssuers: [], state: "RECORDED" }, sequence: 1 });
+    // Every managed member of the target gets its own empty chain at journaling: the members that must complete are fixed here.
+    expect(shard.targets[targets[0]!.account]).toEqual({ chain: emptyChain(targets[0]!.members), effect: { ackedAt: null, alternateIssuers: [], state: "RECORDED" }, sequence: 1 });
+    expect(Object.keys(shard.targets[targets[0]!.account]!.chain.members).sort()).toEqual([...targets[0]!.members].sort());
+    expect(targets[0]!.members.length).toBeGreaterThan(1);
     const replay = await ledger.append(quarantine("q", "cdbentley", "k1"), targets);
     expect(replay).toEqual({ kind: "replayed", result: first.result });
     expect((await ledger.readShard("q"))!.nextSequence).toBe(10);
@@ -134,11 +140,13 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     expect(await ledger.recordProbe("q", probe({ observedAt: "yesterday" }))).toEqual({ kind: "refused", reason: "observedAt must be an ISO-8601 UTC instant" });
     expect(await ledger.recordProbe("q", probe({ observedAt: new Date(clock.now.getTime() + 1000).toISOString() }))).toEqual({ kind: "refused", reason: "the observation is in the ledger's future" });
     expect(await ledger.recordProbe("missing", probe())).toEqual({ kind: "refused", reason: "the shard does not exist" });
-    // Without an inventory baseline a DENIED observation is journaled but starts no chain.
+    // Without an inventory baseline a DENIED observation is journaled but starts no chain; it counts for its member alone.
     const recorded = await ledger.recordProbe("q", probe());
-    expect(recorded).toMatchObject({ kind: "recorded", entry: { key: `probe/${target.account}/REVOCATION/${clock.now.toISOString()}`, progress: null, sequence: 10 }, role: "REDUNDANT" });
+    expect(recorded).toMatchObject({ kind: "recorded", entry: { key: probeKey(probe()), progress: null, sequence: 10 }, role: "REDUNDANT" });
+    expect(probeKey(probe())).toMatch(/^probe\/gha-deploy-parity\/REVOCATION\/[0-9a-f]{16}\/2026-/);
+    expect(probeKey(probe())).not.toBe(probeKey(probe({ member: target.members[1]! })));
     expect((await ledger.readShard("q"))!).toMatchObject({ nextSequence: 11, pendingEffects: 8, pendingOutbox: 10 });
-    expect((await ledger.readShard("q"))!.targets[target.account]!.chain).toMatchObject({ denied: 1, journaled: 1, revocation: null });
+    expect((await ledger.readShard("q"))!.targets[target.account]!.chain).toMatchObject({ journaled: 1, members: { [target.members[0]!]: { denied: 1, revocation: null }, [target.members[1]!]: { denied: 0, revocation: null } } });
     // An inventory whose hash does not match its summary, or another identity's inventory, is refused.
     const summary = { ancestry: ["projects/882468538648"], attachments: [], grants: [], keys: [], lifetimeExtension: null, policies: [{ etag: "e", resource: target.resource }], services: [] };
     expect(await ledger.recordInventory("q", { account: target.account, email: target.email, findings: [], hash: "0".repeat(64), observedAt: clock.now.toISOString(), summary, uniqueId: target.uniqueId })).toEqual({ kind: "refused", reason: "the inventory hash does not match its summary" });
@@ -229,17 +237,19 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     expect((await ledger.readShard("q"))!.nextSequence).toBe(10);
   });
 
-  test("a shard at its journal ceiling still records the DENIED chain, closes, and is restorable: observations beyond capacity fold into the chain and the receipt keeps the audit", async () => {
+  test("a shard at its journal ceiling still records every member's DENIED chain and a changed inventory with its summary, closes, and is restorable: observations beyond capacity fold into the chains and the receipt keeps the audit", async () => {
     const w = await cdbentley();
-    const { broker, clock, evidence, ledger, probe, targets } = w;
-    const first = targets[0]!;
-    probe.outcomes.set(first.uniqueId, "ALLOWED");
+    const { broker, clock, evidence, inventory, ledger, probe, targets } = w;
+    const members = membersOf(targets);
+    const [first, second] = [targets[0]!, targets[1]!];
+    const lingering = first.members[0]!;
+    probe.outcomes.set(`${first.uniqueId}|${lingering}`, "ALLOWED");
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const firstPassAt = clock.now.getTime();
     await broker.reconcileShard("q");
-    expect((await ledger.readShard("q"))!.nextSequence).toBe(28);
-    // The first target keeps being ALLOWED until the journal is full.
-    const allowed = (observedAt: string): ProbeRecord => ({ account: first.account, email: first.email, member: first.members[0]!, observedAt, outcome: "ALLOWED", permission: probePermission, phase: "REVOCATION", principal: proberPrincipal, uniqueId: first.uniqueId });
+    expect((await ledger.readShard("q"))!.nextSequence).toBe(19 + members.length);
+    // The lingering member keeps being ALLOWED until the journal is full.
+    const allowed = (observedAt: string): ProbeRecord => ({ account: first.account, email: first.email, member: lingering, observedAt, outcome: "ALLOWED", permission: probePermission, phase: "REVOCATION", principal: proberPrincipal, uniqueId: first.uniqueId });
     let spam = 0;
     while ((await ledger.readShard("q"))!.nextSequence <= maxEntriesPerShard) {
       clock.advance(1);
@@ -248,39 +258,105 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
       expect(recorded.kind === "recorded" && recorded.entry !== null).toBe(true);
       spam += 1;
     }
-    expect(spam).toBe(maxEntriesPerShard - 27);
+    expect(spam).toBe(maxEntriesPerShard - 18 - members.length);
     const full = (await ledger.readShard("q"))!;
     expect(full.nextSequence).toBe(maxEntriesPerShard + 1);
-    expect(full.targets[first.account]!.chain).toMatchObject({ allowed: { count: spam + 1, lastObservedAt: clock.now.toISOString() }, revocation: null, suppressed: 0 });
-    // Revocation is finally observed: no entry remains, the chain records it anyway.
-    probe.outcomes.delete(first.uniqueId);
+    expect(full.targets[first.account]!.chain).toMatchObject({ members: { [lingering]: { allowed: { count: spam + 1, lastObservedAt: clock.now.toISOString() }, revocation: null }, [first.members[1]!]: { allowed: { count: 0 }, revocation: { outcome: "DENIED" } } }, suppressed: 0 });
+    // Revocation of the lingering member is finally observed: no entry remains, its chain records it anyway.
+    probe.outcomes.delete(`${first.uniqueId}|${lingering}`);
     clock.advance(1);
     await broker.reconcileShard("q");
     const revoked = (await ledger.readShard("q"))!;
     expect(revoked.nextSequence).toBe(maxEntriesPerShard + 1);
-    expect(revoked.targets[first.account]!.chain).toMatchObject({ post: null, revocation: { observedAt: clock.now.toISOString(), outcome: "DENIED", phase: "REVOCATION", principal: proberPrincipal }, suppressed: 1 });
-    expect(scanReadiness(revoked, clock.now).blockers).toEqual([
-      `${first.account}: token horizon drains at ${new Date(clock.now.getTime() + 3600 * 1000).toISOString()}`,
-      ...targets.slice(1).map((target) => `${target.account}: token horizon drains at ${new Date(firstPassAt + 3600 * 1000).toISOString()}`),
-    ]);
-    // The post-horizon probes of every target are likewise folded in, and the shard is ready, closes, and restores.
+    expect(revoked.targets[first.account]!.chain).toMatchObject({ members: { [lingering]: { post: null, revocation: { member: lingering, observedAt: clock.now.toISOString(), outcome: "DENIED", phase: "REVOCATION", principal: proberPrincipal } } }, suppressed: 1 });
+    const lateHorizon = new Date(clock.now.getTime() + 3600 * 1000).toISOString();
+    expect(scanReadiness(revoked, clock.now).blockers).toEqual(members.map(([target, member]) => `${target.account}: token horizon of ${member} drains at ${target === first && member === lingering ? lateHorizon : new Date(firstPassAt + 3600 * 1000).toISOString()}`));
+    // The second target's inventory changes while no entry can be written: the change folds into its chain with the
+    // complete new summary, voids its members' chains, and a new baseline starts.
+    const baseline = revoked.targets[second.account]!.chain.inventory!;
+    inventory.change(second.uniqueId);
+    clock.advance(1);
+    await broker.reconcileShard("q");
+    const changed = (await ledger.readShard("q"))!;
+    expect(changed.nextSequence).toBe(maxEntriesPerShard + 1);
+    const changedSummary = inventory.summaryOf(second);
+    expect(changed.targets[second.account]!.chain.inventory).toMatchObject({ changes: 1, findings: [], hash: inventoryHash(changedSummary), observedAt: clock.now.toISOString(), summary: changedSummary });
+    expect(changed.targets[second.account]!.chain.inventory!.hash).not.toBe(baseline.hash);
+    for (const member of second.members) expect(changed.targets[second.account]!.chain.members[member]).toMatchObject({ post: null, revocation: { observedAt: clock.now.toISOString(), outcome: "DENIED" } });
+    // The post-horizon probes of every member are likewise folded in, and the shard is ready, closes, and restores.
     clock.advance(3600);
     await broker.reconcileShard("q");
     const ready = (await ledger.readShard("q"))!;
     expect(ready.nextSequence).toBe(maxEntriesPerShard + 1);
     expect(scanReadiness(ready, clock.now)).toEqual({ blockers: [], horizonAt: clock.now.toISOString(), ready: true });
-    expect(ready.targets[first.account]!.chain).toMatchObject({ post: { outcome: "DENIED", phase: "HORIZON" }, suppressed: 2 });
-    expect(targets.slice(1).every((target) => ready.targets[target.account]!.chain.suppressed === 1)).toBe(true);
+    expect(ready.targets[first.account]!.chain).toMatchObject({ members: { [lingering]: { post: { member: lingering, outcome: "DENIED", phase: "HORIZON" } } }, suppressed: 1 + first.members.length });
+    expect(ready.targets[second.account]!.chain.suppressed).toBe(1 + 2 * second.members.length);
+    expect(targets.slice(2).every((target) => ready.targets[target.account]!.chain.suppressed === target.members.length)).toBe(true);
     expect(await beginClose(w, "q", "c")).toMatchObject({ kind: "closing", shard: { closeHighWater: maxEntriesPerShard } });
     expect(await broker.reconcileShard("q")).toMatchObject({ phase: "CLOSED", terminal: { state: "PROJECTED" } });
     const closed = await ledger.readShard("q");
     if (closed?.phase !== "CLOSED") throw new Error();
-    const receipt = JSON.parse(closed.terminal.receipt) as { closeHighWater: number; entries: unknown[]; targets: Record<string, { chain: { allowed: { count: number }; denied: number; journaled: number; post: { principal: string }; revocation: { principal: string }; suppressed: number } }> };
+    const receipt = JSON.parse(closed.terminal.receipt) as { closeHighWater: number; entries: Array<{ body: { kind: string; account?: string } }>; targets: Record<string, { chain: { inventory: { changes: number; hash: string; summary: unknown }; journaled: number; members: Record<string, { allowed: { count: number }; denied: number; post: { principal: string }; revocation: { principal: string } }>; suppressed: number } }> };
     expect(receipt.closeHighWater).toBe(maxEntriesPerShard);
     expect(receipt.entries).toHaveLength(maxEntriesPerShard);
-    expect(receipt.targets[first.account]!.chain).toMatchObject({ allowed: { count: spam + 1 }, denied: 2, journaled: spam + 2, post: { principal: proberPrincipal }, revocation: { principal: proberPrincipal }, suppressed: 2 });
+    expect(receipt.targets[first.account]!.chain).toMatchObject({ journaled: 1 + first.members.length + spam, members: { [lingering]: { allowed: { count: spam + 1 }, denied: 2, post: { principal: proberPrincipal }, revocation: { principal: proberPrincipal } } }, suppressed: 1 + first.members.length });
+    // No entry carries the second target's changed inventory, so the receipt itself carries the preimage of the hash
+    // that authorized its close: the complete summary, equal to the folded chain state.
+    expect(receipt.entries.filter((entry) => entry.body.kind === "inventory" && entry.body.account === second.account)).toHaveLength(1);
+    expect(receipt.targets[second.account]!.chain.inventory).toEqual({ ...ready.targets[second.account]!.chain.inventory!, summary: changedSummary });
+    expect(inventoryHash(receipt.targets[second.account]!.chain.inventory.summary as InventoryRecord["summary"])).toBe(receipt.targets[second.account]!.chain.inventory.hash);
+    expect(inventoryFindings(receipt.targets[second.account]!.chain.inventory.summary as InventoryRecord["summary"])).toEqual([]);
     expect(evidence.objects.size).toBe(maxEntriesPerShard + 1);
     expect((await ledger.append(restore("r", "cdbentley", "k2", "q"), targets, await freshOf(w, "q"))).kind).toBe("accepted");
+  }, 180_000);
+
+  test("inventory folding is monotonic by observation time: an older observation never replaces newer state, an equal-time conflict fails closed, and a strictly later confirmation settles it", async () => {
+    const { clock, iam, inventory, ledger, targets } = await cdbentley();
+    const target = targets[0]!;
+    expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
+    expect((await driveEffect(ledger, iam, "q", (await ledger.readEntry("q", 1))!, target)).kind).toBe("acked");
+    const at = (minutes: number, seconds = 0) => new Date(clock.now.getTime() + minutes * 60_000 + seconds * 1000).toISOString();
+    const summaryAt = (findings: readonly string[]): InventoryRecord["summary"] => ({ ...inventory.summaryOf(target), keys: findings.filter((finding) => finding.startsWith("key:")).map((finding) => finding.slice(4)) });
+    const record = (observedAt: string, findings: readonly string[] = []): InventoryRecord => {
+      const summary = summaryAt(findings);
+      return { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt, summary, uniqueId: target.uniqueId };
+    };
+    const probe = (member: string, phase: ProbeRecord["phase"], observedAt: string): ProbeRecord => ({ account: target.account, email: target.email, member, observedAt, outcome: "DENIED", permission: probePermission, phase, principal: proberPrincipal, uniqueId: target.uniqueId });
+    const blockersOf = async () => scanReadiness((await ledger.readShard("q"))!, clock.now).blockers.filter((blocker) => blocker.startsWith(`${target.account}:`));
+    // The exact reproduction: clean at +10, DENIED at +60 and +120 for every member, then a dirty observation from +50.
+    const clean = record(at(10));
+    clock.advance(3 * 3600);
+    expect(await ledger.recordInventory("q", clean)).toMatchObject({ kind: "recorded", role: "BASELINE" });
+    for (const member of target.members) expect(await ledger.recordProbe("q", probe(member, "REVOCATION", at(-120)))).toMatchObject({ kind: "recorded", role: "REVOCATION" });
+    for (const member of target.members) expect(await ledger.recordProbe("q", probe(member, "HORIZON", at(-60)))).toMatchObject({ kind: "recorded", role: "HORIZON" });
+    expect(await blockersOf()).toEqual([]);
+    const dirty = record(at(-130), ["key:leaked"]);
+    expect(await ledger.recordInventory("q", dirty)).toMatchObject({ kind: "recorded", role: "CHANGE" });
+    expect(await blockersOf()).toEqual([`${target.account}: alternate credential paths key:leaked`]);
+    // A delayed clean observation from one second before the dirty one is refused; it replaces nothing.
+    const delayed = record(new Date(Date.parse(dirty.observedAt) - 1000).toISOString());
+    expect(await ledger.recordInventory("q", delayed)).toEqual({ kind: "refused", reason: `the observation at ${delayed.observedAt} is older than the inventory recorded at ${dirty.observedAt}` });
+    let chain = (await ledger.readShard("q"))!.targets[target.account]!.chain;
+    expect(chain.inventory).toMatchObject({ changes: 1, findings: ["key:leaked"], hash: dirty.hash, observedAt: dirty.observedAt, verifiedAt: dirty.observedAt });
+    for (const member of target.members) expect(chain.members[member]).toMatchObject({ post: { phase: "HORIZON" }, revocation: { phase: "REVOCATION" } });
+    expect(await blockersOf()).toEqual([`${target.account}: alternate credential paths key:leaked`]);
+    // A clean observation at exactly the dirty one's instant contradicts it: the conflict is recorded, marked, and every
+    // chain built at or before it is voided; readiness fails closed until a strictly later observation settles the fact.
+    const conflicting = record(dirty.observedAt);
+    expect(await ledger.recordInventory("q", conflicting)).toMatchObject({ kind: "recorded", role: "CONFLICT" });
+    chain = (await ledger.readShard("q"))!.targets[target.account]!.chain;
+    expect(chain.inventory).toMatchObject({ changes: 2, findings: [`conflict:${dirty.hash}!=${conflicting.hash}@${dirty.observedAt}`, "key:leaked"], hash: conflicting.hash, observedAt: dirty.observedAt });
+    expect((await blockersOf())[0]).toContain("conflict:");
+    const later = record(at(-30));
+    expect(await ledger.recordInventory("q", later)).toMatchObject({ kind: "recorded", role: "REDUNDANT" });
+    chain = (await ledger.readShard("q"))!.targets[target.account]!.chain;
+    expect(chain.inventory).toMatchObject({ changes: 2, findings: [], hash: later.hash, observations: 4, verifiedAt: later.observedAt });
+    expect(await blockersOf()).toEqual([]);
+    // A gate whose fresh observation is older than the recorded inventory is refused as well.
+    const stale = { [target.account]: { findings: [], hash: later.hash, observedAt: at(-45) } };
+    expect((await ledger.beginClose(close("q", "c"), "cdbentley", "QUARANTINE", stale)).kind === "rejected").toBe(true);
+    const rejection = await ledger.beginClose(close("q", "c2"), "cdbentley", "QUARANTINE", stale);
+    expect(rejection).toMatchObject({ kind: "rejected", rejection: { blockers: expect.arrayContaining([`${target.account}: the credential inventory observed at the gate is older than the inventory recorded at ${later.observedAt}`]), reason: "NOT_READY" } });
   }, 120_000);
 
   test("the fleet sweep pages through the complete reconcilable set across invocations even when the first shards are terminally stuck", async () => {

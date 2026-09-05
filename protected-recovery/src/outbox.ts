@@ -88,7 +88,15 @@ export class GoogleEvidenceStore implements EvidenceStore {
     } catch (error) {
       return { kind: "lost", reason: String(error) };
     }
-    const text = await response.text();
+    // A body that stalls after the headers arrived is aborted by the bounded
+    // fetch; that abort is a lost answer of this call, never an error that
+    // escapes the caller's classification.
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      return { kind: "lost", reason: `upload response body lost: ${String(error)}` };
+    }
     if (response.status === 412) return { kind: "exists" };
     if (!response.ok) return { kind: "lost", reason: `HTTP ${response.status}` };
     let body: unknown;
@@ -131,7 +139,12 @@ export class GoogleEvidenceStore implements EvidenceStore {
     } catch (error) {
       return { kind: "unavailable", reason: String(error) };
     }
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await response.arrayBuffer());
+    } catch (error) {
+      return { kind: "unavailable", reason: `object body lost: ${String(error)}` };
+    }
     if (response.status === 404) return { kind: "missing" };
     if (!response.ok) return { kind: "unavailable", reason: `HTTP ${response.status}` };
     if (bytes.byteLength > maxObjectBytes) return { kind: "unavailable", reason: "object exceeded its size bound" };

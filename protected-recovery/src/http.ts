@@ -8,10 +8,11 @@ import {
   type ServiceAccountIam,
   GoogleIssuanceProbe,
   GoogleServiceAccountIam,
+  LedgerMemberCredentials,
   cachedJwks,
   driveEffect,
   githubJwksUrl,
-  undeployedMemberCredentials,
+  verifyMemberCredential,
   verifyRs256Jwt,
 } from "./effects";
 import { type CredentialInventory, GoogleCredentialInventory } from "./inventory";
@@ -32,6 +33,7 @@ import {
   maxBodyBytes,
   parseAppendBody,
   parseCloseBody,
+  parseDeliverBody,
   parseReconcileBody,
   parseShardId,
   probePermission,
@@ -71,6 +73,8 @@ export interface BrokerDependencies {
   readonly evidence: EvidenceStore;
   readonly iam: ServiceAccountIam;
   readonly inventory: CredentialInventory;
+  // GitHub's JWKS, against which a delivered member credential is verified.
+  readonly jwks: () => Promise<readonly Jwk[]>;
   readonly ledger: Ledger;
   readonly now: () => Date;
   readonly probe: ImpersonationProbe;
@@ -232,6 +236,17 @@ export class Broker {
         if (!allowed(purpose, shard)) return forbidden();
         const entries = await ledger.readEntries(request.shard, shard.nextSequence - 1);
         return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), scanReady: scanReadiness(shard, this.#deps.now()) } } };
+      }
+      case "deliver": {
+        // A canonical job delivers its own credential through its consumer's
+        // member-delivery identity. The broker verifies it exactly as the
+        // consumer provider would, binds it to that consumer, and keeps it
+        // only until it expires; the token itself is never in any reply.
+        if (purpose.kind !== "member") return forbidden();
+        const verified = await verifyMemberCredential({ authority, jwks: this.#deps.jwks, now: this.#deps.now }, request.token, purpose.consumer);
+        if (verified.kind === "unavailable") return { status: 409, body: { detail: verified.reason, error: "MEMBER_UNVERIFIED" } };
+        await ledger.putMemberCredential({ consumer: verified.consumer.repository, deliveredAt: this.#deps.now().toISOString(), expiresAt: verified.expiresAt, member: verified.member, principal: verified.principal, token: request.token });
+        return { status: 200, body: { expiresAt: verified.expiresAt, member: verified.member } };
       }
     }
   }
@@ -439,9 +454,10 @@ function describe(body: Record<string, unknown>): string {
 }
 
 // A purpose may touch only the shards of its own consumer and its own
-// direction; the reconciler may touch any recorded shard.
+// direction; the reconciler may touch any recorded shard; a member-delivery
+// identity touches no shard at all.
 function allowed(purpose: Purpose, shard: Shard): boolean {
-  return purpose.kind === "reconciler" || (purpose.consumer.repository === shard.consumer && purpose.intent === shard.intent);
+  return purpose.kind === "reconciler" || (purpose.kind === "recovery" && purpose.consumer.repository === shard.consumer && purpose.intent === shard.intent);
 }
 
 function forbidden(): BrokerResponse {
@@ -494,6 +510,7 @@ function entryView(entry: Entry): Record<string, unknown> {
 const routes = {
   append: /^\/v1\/shards\/([^/]+)\/entries$/,
   close: /^\/v1\/shards\/([^/]+)\/close$/,
+  members: /^\/v1\/members$/,
   read: /^\/v1\/shards\/([^/]+)$/,
   reconcileAll: /^\/v1\/reconcile$/,
   reconcileShard: /^\/v1\/shards\/([^/]+)\/reconcile$/,
@@ -555,6 +572,7 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
   match = routes.reconcileShard.exec(path);
   if (match) return parseReconcileBody(decode(match[1]!), body);
   if (routes.reconcileAll.test(path)) return parseReconcileBody(null, body);
+  if (routes.members.test(path)) return parseDeliverBody(body);
   throw new NotFound();
 }
 
@@ -697,17 +715,20 @@ if (import.meta.main) {
   const fetcher = boundedFetch(fetch);
   const token = configuration.firestoreEmulator ? async (): Promise<string> => "owner" : metadataToken(fetcher, now);
   const ledger = new Ledger({ fetch: fetcher, firestore: configuration.firestore, now, token });
+  const githubJwks = cachedJwks(githubJwksUrl, fetcher, now);
   const broker = new Broker({
     authority,
     evidence: new GoogleEvidenceStore({ bucket: configuration.evidenceBucket, fetch: fetcher, token }),
     iam: new GoogleServiceAccountIam({ fetch: fetcher, token }),
     inventory: new GoogleCredentialInventory({ authority, fetch: fetcher, now, token }),
+    jwks: githubJwks,
     ledger,
     now,
-    // The real issuance probe, whose member credentials no consumer job
-    // delivers yet: every preflight is unavailable, so every QUARANTINE is
-    // refused before acceptance and before any effect is prepared.
-    probe: new GoogleIssuanceProbe({ authority, credentials: undeployedMemberCredentials, fetch: fetcher, jwks: cachedJwks(githubJwksUrl, fetcher, now), now }),
+    // The real issuance probe over the credentials the canonical jobs deliver
+    // through POST /v1/members: a member whose job has not delivered a live
+    // credential is unavailable, so every QUARANTINE that needs it is refused
+    // before acceptance and before any effect is prepared.
+    probe: new GoogleIssuanceProbe({ authority, credentials: new LedgerMemberCredentials(ledger, now), fetch: fetcher, jwks: githubJwks, now }),
   });
   const verifier = new GoogleIdentityVerifier({ audience: configuration.audience, jwks: cachedJwks(googleJwksUrl, fetcher, now), now });
   const server = Bun.serve({

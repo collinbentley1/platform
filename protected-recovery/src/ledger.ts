@@ -13,6 +13,8 @@ import {
   type InventoryRecord,
   type InventorySummary,
   type KeyRecord,
+  type MemberChain,
+  type MemberCredentialRecord,
   type Observation,
   type ObservedSnapshot,
   type OutboxProgress,
@@ -217,7 +219,7 @@ export class Ledger {
       const targetsJournaled: Record<string, TargetState> = {};
       const entries: Entry[] = bodies.map((body, index) => {
         const sequence = shard.nextSequence + index;
-        if (body.kind === "effect") targetsJournaled[body.account] = { chain: emptyChain, effect: { ackedAt: null, alternateIssuers: [], state: "RECORDED" }, sequence };
+        if (body.kind === "effect") targetsJournaled[body.account] = { chain: emptyChain(body.members), effect: { ackedAt: null, alternateIssuers: [], state: "RECORDED" }, sequence };
         return {
           acceptedAt: nowText,
           body,
@@ -287,7 +289,7 @@ export class Ledger {
       if (effect.body.uniqueId !== named.uniqueId || effect.body.email !== named.email) return refuse("the observation names a different identity than the journaled target");
       if (observation.kind === "probe") {
         const probe = observation.probe;
-        if (!effect.body.members.includes(probe.member)) return refuse("the probed member is not a managed member of the target");
+        if (!effect.body.members.includes(probe.member) || state.chain.members[probe.member] === undefined) return refuse("the probed member is not a managed member of the target");
         if (probe.permission !== probePermission) return refuse(`the probed permission is not ${probePermission}`);
         if (!(probePhases as readonly string[]).includes(probe.phase) || !(probeOutcomes as readonly string[]).includes(probe.outcome)) return refuse("unknown probe phase or outcome");
         if (probe.principal.length === 0) return refuse("the probe names no principal");
@@ -300,7 +302,10 @@ export class Ledger {
       if (observedAt < Date.parse(state.effect.ackedAt)) return refuse("the observation precedes the quarantine acknowledgement");
       if (observedAt > now.getTime()) return refuse("the observation is in the ledger's future");
       const applied = applyObservation(state, observation);
-      const journal = observation.kind === "probe" || applied.role === "BASELINE" || applied.role === "CHANGE";
+      // Inventory folding is monotonic by observation time: a delayed older
+      // observation never replaces the newer state, whatever its hash.
+      if (applied.role === "STALE") return refuse(`the observation at ${named.observedAt} is older than the inventory recorded at ${state.chain.inventory?.verifiedAt ?? ""}`);
+      const journal = observation.kind === "probe" || applied.role === "BASELINE" || applied.role === "CHANGE" || applied.role === "CONFLICT";
       const room = shard.nextSequence <= maxEntriesPerShard;
       let entry: Entry | null = null;
       if (journal && room) {
@@ -572,14 +577,16 @@ export class Ledger {
   // One page of shards with recorded pending work, in document-name order,
   // starting after the named shard. The reconciler may act only on what this
   // returns; the equality filter with the implicit name order needs no
-  // composite index, and the cursor lets a sweep continue past shards that
-  // can make no progress.
+  // composite index, the projection to the name alone keeps a page bounded
+  // whatever the shards carry, and the cursor lets a sweep continue past
+  // shards that can make no progress.
   async listReconcilable(limit: number, after: string | null): Promise<readonly string[]> {
     const body = await this.#call("runQuery", {
       structuredQuery: {
         from: [{ collectionId: "shards" }],
         limit,
         orderBy: [{ direction: "ASCENDING", field: { fieldPath: "__name__" } }],
+        select: { fields: [{ fieldPath: "__name__" }] },
         ...(after === null ? {} : { startAt: { before: false, values: [{ referenceValue: this.#shardName(after) }] } }),
         where: { fieldFilter: { field: { fieldPath: "reconcile" }, op: "EQUAL", value: { booleanValue: true } } },
       },
@@ -609,6 +616,33 @@ export class Ledger {
       const [doc] = await tx.get([name]);
       tx.put(name, { after, updatedAt: this.#deps.now().toISOString() }, doc);
     });
+  }
+
+  // The live credential of one managed member, as delivered by its canonical
+  // job and verified by the broker: one document per member, replaced by
+  // each delivery, meaningful only until the credential expires. The ledger
+  // database is the broker's alone (its allow policy and the evidenced Deny
+  // matrix admit no other principal), and the credential is the same
+  // short-lived token the job hands to STS; nothing here extends its life.
+  async putMemberCredential(record: MemberCredentialRecord): Promise<void> {
+    const name = this.#memberName(record.member);
+    await this.#transact(name, async (tx) => {
+      const [doc] = await tx.get([name]);
+      tx.put(name, { consumer: record.consumer, deliveredAt: record.deliveredAt, expiresAt: record.expiresAt, member: record.member, principal: record.principal, token: record.token }, doc);
+    });
+  }
+
+  async readMemberCredential(member: string): Promise<MemberCredentialRecord | undefined> {
+    const [doc] = await this.#batchGet([this.#memberName(member)], undefined);
+    if (!doc) return undefined;
+    const json = decodeFields(doc.fields);
+    const record = { consumer: str(json, "consumer"), deliveredAt: str(json, "deliveredAt"), expiresAt: str(json, "expiresAt"), member: str(json, "member"), principal: str(json, "principal"), token: str(json, "token") };
+    if (record.member !== member) throw new LedgerError("Stored member credential names another member.");
+    return record;
+  }
+
+  #memberName(member: string): string {
+    return `${this.#documents}/members/${sha256Hex(member)}`;
   }
 
   async #entriesIn(tx: Transaction, shardId: string, upTo: number): Promise<readonly Entry[]> {
@@ -902,14 +936,15 @@ function samePreparation(progress: PreparedFacts, facts: EffectFacts): boolean {
   return progress.effectId === facts.effectId && progress.epoch === facts.epoch;
 }
 
-// An OPEN QUARANTINE shard has recorded work as long as any acknowledged
-// target with no alternate issuer or credential path still lacks a complete
-// probe chain: the reconciler records the inventories and probes it needs on
-// every sweep until the chain completes, so readiness never depends on a
-// caller remembering to reconcile after the horizon.
+// An OPEN QUARANTINE shard has recorded work as long as any managed member of
+// any acknowledged target with no alternate issuer or credential path still
+// lacks a complete probe chain: the reconciler records the inventories and
+// probes it needs on every sweep until every chain completes, so readiness
+// never depends on a caller remembering to reconcile after the horizon.
 function awaitingChain(shard: Shard): boolean {
   return shard.phase === "OPEN" && shard.intent === "QUARANTINE" && Object.values(shard.targets).some((state) =>
-    state.effect.state === "ACKED" && state.effect.alternateIssuers.length === 0 && (state.chain.inventory === null || state.chain.inventory.findings.length === 0) && (state.chain.revocation === null || state.chain.post === null),
+    state.effect.state === "ACKED" && state.effect.alternateIssuers.length === 0 && (state.chain.inventory === null || state.chain.inventory.findings.length === 0) &&
+    Object.values(state.chain.members).some((member) => member.revocation === null || member.post === null),
   );
 }
 
@@ -992,30 +1027,54 @@ function effectFromJson(json: Record<string, Json>): TargetEffect {
 
 function chainToJson(chain: TargetChain): Record<string, Json> {
   return {
-    allowed: { count: chain.allowed.count, lastObservedAt: chain.allowed.lastObservedAt },
-    denied: chain.denied,
-    inventory: chain.inventory === null ? null : { changes: chain.inventory.changes, findings: [...chain.inventory.findings], hash: chain.inventory.hash, observations: chain.inventory.observations, observedAt: chain.inventory.observedAt, verifiedAt: chain.inventory.verifiedAt },
+    inventory: chain.inventory === null ? null : {
+      changes: chain.inventory.changes,
+      findings: [...chain.inventory.findings],
+      hash: chain.inventory.hash,
+      observations: chain.inventory.observations,
+      observedAt: chain.inventory.observedAt,
+      summary: inventorySummaryJson(chain.inventory.summary) as Record<string, Json>,
+      verifiedAt: chain.inventory.verifiedAt,
+    },
     journaled: chain.journaled,
-    post: chain.post === null ? null : probeToJson(chain.post),
-    revocation: chain.revocation === null ? null : probeToJson(chain.revocation),
+    members: Object.fromEntries(Object.keys(chain.members).sort().map((member) => [member, memberChainToJson(chain.members[member]!)])),
     suppressed: chain.suppressed,
   };
 }
 
 function chainFromJson(json: Record<string, Json>): TargetChain {
-  const allowed = obj(json, "allowed");
   const inventory: ChainInventory | null = json.inventory === null ? null : (() => {
     const raw = obj(json, "inventory");
-    return { changes: int(raw, "changes"), findings: strings(raw, "findings"), hash: str(raw, "hash"), observations: int(raw, "observations"), observedAt: str(raw, "observedAt"), verifiedAt: str(raw, "verifiedAt") };
+    const summary = summaryFromJson(obj(raw, "summary"));
+    const hash = str(raw, "hash");
+    if (hash !== inventoryHash(summary)) throw new LedgerError("Stored chain inventory hash does not match its summary.");
+    return { changes: int(raw, "changes"), findings: strings(raw, "findings"), hash, observations: int(raw, "observations"), observedAt: str(raw, "observedAt"), summary, verifiedAt: str(raw, "verifiedAt") };
   })();
+  const members = obj(json, "members");
+  return {
+    inventory,
+    journaled: int(json, "journaled"),
+    members: Object.fromEntries(Object.keys(members).sort().map((member) => [member, memberChainFromJson(obj(members, member))])),
+    suppressed: int(json, "suppressed"),
+  };
+}
+
+function memberChainToJson(chain: MemberChain): Record<string, Json> {
+  return {
+    allowed: { count: chain.allowed.count, lastObservedAt: chain.allowed.lastObservedAt },
+    denied: chain.denied,
+    post: chain.post === null ? null : probeToJson(chain.post),
+    revocation: chain.revocation === null ? null : probeToJson(chain.revocation),
+  };
+}
+
+function memberChainFromJson(json: Record<string, Json>): MemberChain {
+  const allowed = obj(json, "allowed");
   return {
     allowed: { count: int(allowed, "count"), lastObservedAt: nullableStr(allowed, "lastObservedAt") },
     denied: int(json, "denied"),
-    inventory,
-    journaled: int(json, "journaled"),
     post: json.post === null ? null : probeFromJson(obj(json, "post")),
     revocation: json.revocation === null ? null : probeFromJson(obj(json, "revocation")),
-    suppressed: int(json, "suppressed"),
   };
 }
 

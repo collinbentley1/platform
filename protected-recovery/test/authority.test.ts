@@ -103,11 +103,18 @@ describe("recovery authority", () => {
     const restorer = purposeForIdentity(authority, invokerEmail("cdbentley", "RESTORE"));
     expect(restorer).toMatchObject({ kind: "recovery", intent: "RESTORE", serviceAccount: "gha-restore-cdbentley" });
     expect(purposeForIdentity(authority, reconcilerEmail)).toEqual({ kind: "reconciler", serviceAccount: "recovery-reconciler" });
+    // The member-delivery identity of one consumer delivers that consumer's credentials and holds no direction.
+    const member = purposeForIdentity(authority, "gha-member-cdbentley@recovery-test.iam.gserviceaccount.com");
+    expect(member).toMatchObject({ kind: "member", serviceAccount: "gha-member-cdbentley" });
+    if (member?.kind !== "member") throw new Error("expected a member purpose");
+    expect(member.consumer.repository).toBe("cdbentley");
     for (const forged of [
       "gha-isolate-cdbentley@cdbentley.iam.gserviceaccount.com",
       "gha-recovery-cdbentley@recovery-test.iam.gserviceaccount.com",
       "gha-terraform@recovery-test.iam.gserviceaccount.com",
       "gha-isolate-other@recovery-test.iam.gserviceaccount.com",
+      "gha-member-other@recovery-test.iam.gserviceaccount.com",
+      "gha-member-cdbentley@cdbentley.iam.gserviceaccount.com",
       "gha-deny-canary@recovery-test.iam.gserviceaccount.com",
       "recovery-broker@recovery-test.iam.gserviceaccount.com",
       "collin@example.com",
@@ -205,6 +212,19 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     expect((await call("POST", "/v1/shards/s/entries", isolate, { consumer: "cdbentley", intent: "RESTORE", key: "k", source: "q" })).status).toBe(403);
     expect((await call("POST", "/v1/shards/s/entries", restorer, { consumer: "cdbentley", intent: "QUARANTINE", key: "k" })).status).toBe(403);
     expect((await call("POST", "/v1/reconcile", isolate, {})).status).toBe(403);
+    // Only a consumer's member-delivery identity may deliver a credential, and it may do nothing else; an
+    // unverifiable token is refused with nothing recorded.
+    const member = "gha-member-cdbentley@recovery-test.iam.gserviceaccount.com";
+    const compact = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln";
+    expect((await call("POST", "/v1/members", isolate, { token: compact })).status).toBe(403);
+    expect((await call("POST", "/v1/members", reconcilerEmail, { token: compact })).status).toBe(403);
+    expect((await call("POST", "/v1/members", member, { token: compact, member: "principalSet://x" })).status).toBe(400);
+    expect((await call("POST", "/v1/members", member, { token: "not a jws" })).status).toBe(400);
+    const unverified = await call("POST", "/v1/members", member, { token: compact });
+    expect(unverified.status).toBe(409);
+    expect(await unverified.json()).toEqual({ detail: "the member credential is not a GitHub-signed RS256 token", error: "MEMBER_UNVERIFIED" });
+    expect((await call("POST", "/v1/shards/s/entries", member, { consumer: "cdbentley", intent: "QUARANTINE", key: "k" })).status).toBe(403);
+    expect((await call("GET", "/v1/shards/s", member)).status).toBe(404);
     expect((await call("POST", "/v1/shards/s/close", isolate, { key: "k" })).status).toBe(404);
     expect((await call("GET", "/v1/shards/s", isolate)).status).toBe(404);
     expect((await call("GET", "/v1/shards/Bad", isolate)).status).toBe(404);
@@ -214,7 +234,9 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     const accepted = await call("POST", "/v1/shards/s/entries", isolate, { consumer: "cdbentley", intent: "QUARANTINE", key: "k" });
     expect(accepted.status).toBe(201);
     expect((await accepted.json() as { sequences: number[] }).sequences).toHaveLength(9);
-    // Another consumer's invoker, and this consumer's other-direction invoker, can neither read, reconcile, nor close this shard; the reconciler can read and reconcile it.
+    // Another consumer's invoker, this consumer's other-direction invoker, and the member-delivery identity can neither read, reconcile, nor close this shard; the reconciler can read and reconcile it.
+    expect((await call("GET", "/v1/shards/s", member)).status).toBe(403);
+    expect((await call("POST", "/v1/shards/s/reconcile", member, {})).status).toBe(403);
     expect((await call("GET", "/v1/shards/s", invokerEmail("runsetta"))).status).toBe(403);
     expect((await call("POST", "/v1/shards/s/close", invokerEmail("runsetta"), { key: "c" })).status).toBe(403);
     expect((await call("GET", "/v1/shards/s", restorer)).status).toBe(403);

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type RecoveryIntent, manifestPath, recoveryInvokerName } from "../../tools/ci/workflow-authority";
-import { type IdentityOutcome, type ImpersonationProbe, type Policy, type PolicyBinding, type PreflightOutcome, type ProbeRequest, type ProbeResult, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
+import { type IdentityOutcome, type ImpersonationProbe, type Jwk, type Policy, type PolicyBinding, type PreflightOutcome, type ProbeRequest, type ProbeResult, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
 import { Broker, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
 import { type CredentialInventory, type InventoryOutcome, inventoryFindings } from "../src/inventory";
 import { type Fresh, Ledger } from "../src/ledger";
@@ -15,10 +15,10 @@ import { type EvidenceStore, type GetOutcome, type PutOutcome } from "../src/out
 // stand-ins is emulator coverage: the live canary must verify the actual
 // returned etag behaviour of setIamPolicy, the ifGenerationMatch behaviour of
 // GCS, the identity that serviceAccounts.get returns for a unique-ID resource,
-// and the real answers of the inventory APIs; and no consumer job delivers a
-// member credential to the production probe yet (see probePrerequisite), so
-// the probe stand-in only exercises the broker's readiness logic over
-// evidence it would record from the real source.
+// and the real answers of the inventory APIs; the probe stand-in exercises
+// the broker's readiness logic over evidence it would record from the real
+// source, whose member credentials the canonical jobs deliver (see
+// probePrerequisite and the delivery tests in effects.test.ts).
 
 export const repoRoot = resolve(import.meta.dir, "..", "..");
 export const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
@@ -229,9 +229,10 @@ export class FakeEvidence implements EvidenceStore {
 
 // In-memory stand-in for the issuance probe source: every request and every
 // preflight is logged, the preflight is operational unless made unavailable,
-// the outcome is DENIED unless the target's unique ID is set to ALLOWED, and
-// the observation time is the clock's. Production has no member credential
-// source yet, so its real adapter refuses every preflight.
+// the outcome is DENIED unless the target's unique ID, or the exact target
+// and member (`${uniqueId}|${member}`, since one member tuple is commonly
+// bound to several targets), is set to ALLOWED, and the observation time is
+// the clock's.
 export class FakeProbe implements ImpersonationProbe {
   readonly requests: ProbeRequest[] = [];
   readonly preflights: Array<readonly Target[]> = [];
@@ -250,7 +251,7 @@ export class FakeProbe implements ImpersonationProbe {
       this.preflightUnavailable -= 1;
       return { kind: "unavailable", reason: "the probe source cannot act as the managed members" };
     }
-    return { kind: "operational", principals: Object.fromEntries(targets.map((target) => [target.account, proberPrincipal])) };
+    return { kind: "operational", principals: Object.fromEntries(targets.map((target) => [target.account, Object.fromEntries(target.members.map((member) => [member, proberPrincipal]))])) };
   }
 
   async probe(request: ProbeRequest): Promise<ProbeResult> {
@@ -259,19 +260,21 @@ export class FakeProbe implements ImpersonationProbe {
       this.unavailable -= 1;
       return { kind: "unavailable", reason: "the probe source is unreachable" };
     }
-    return { kind: "observed", observedAt: this.#clock.now.toISOString(), outcome: this.outcomes.get(request.uniqueId) ?? "DENIED", principal: proberPrincipal };
+    return { kind: "observed", observedAt: this.#clock.now.toISOString(), outcome: this.outcomes.get(`${request.uniqueId}|${request.member}`) ?? this.outcomes.get(request.uniqueId) ?? "DENIED", principal: proberPrincipal };
   }
 }
 
 // In-memory stand-in for the credential inventory: every target is clean
 // with a stable summary unless findings are set for its unique ID, the
 // summary's etags move when a target is marked changed, and the observation
-// time is the clock's.
+// time is the clock's. A one-shot afterObserve hook runs after a read has
+// produced its record, to model a change landing right after the read.
 export class FakeInventory implements CredentialInventory {
   readonly requests: Target[] = [];
   readonly findings = new Map<string, readonly string[]>();
   readonly versions = new Map<string, number>();
   unavailable = 0;
+  afterObserve: ((target: Target) => void) | undefined;
   readonly #clock: Clock;
 
   constructor(clock: Clock) {
@@ -308,7 +311,13 @@ export class FakeInventory implements CredentialInventory {
       return { kind: "unavailable", reason: "the inventory source is unreachable" };
     }
     const summary = this.summaryOf(target);
-    return { kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: this.#clock.now.toISOString(), summary, uniqueId: target.uniqueId } };
+    const record: InventoryOutcome = { kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: this.#clock.now.toISOString(), summary, uniqueId: target.uniqueId } };
+    const hook = this.afterObserve;
+    if (hook) {
+      this.afterObserve = undefined;
+      hook(target);
+    }
+    return record;
   }
 }
 
@@ -334,19 +343,68 @@ export interface World {
   readonly anotherInstance: () => { readonly broker: Broker; readonly ledger: Ledger };
 }
 
-export async function world(clock = new Clock(), fetcher: typeof fetch = fetch, deadlines?: Deadlines): Promise<World> {
+export interface WorldOverrides {
+  // The evidence store the broker projects to; the in-memory stand-in by default.
+  readonly evidence?: EvidenceStore;
+  // GitHub's JWKS as the broker sees it; empty by default, so no delivered credential verifies.
+  readonly jwks?: () => Promise<readonly Jwk[]>;
+  // The ledger fetcher, distinct from the evidence store's own.
+  readonly ledgerFetch?: typeof fetch;
+}
+
+export async function world(clock = new Clock(), fetcher: typeof fetch = fetch, deadlines?: Deadlines, overrides: WorldOverrides = {}): Promise<World> {
   const authority = await testAuthority();
   const project = freshProject();
   const iam = new FakeIam();
   const evidence = new FakeEvidence();
   const probe = new FakeProbe(clock);
   const inventory = new FakeInventory(clock);
+  const jwks = overrides.jwks ?? (async (): Promise<readonly Jwk[]> => []);
   const instance = () => {
-    const ledger = emulatorLedger(clock, fetcher, project);
-    return { broker: new Broker({ authority, ...(deadlines ? { deadlines } : {}), evidence, iam, inventory, ledger, now: clock.read, probe }), ledger };
+    const ledger = emulatorLedger(clock, overrides.ledgerFetch ?? fetcher, project);
+    return { broker: new Broker({ authority, ...(deadlines ? { deadlines } : {}), evidence: overrides.evidence ?? evidence, iam, inventory, jwks, ledger, now: clock.read, probe }), ledger };
   };
   const first = instance();
   return { authority, broker: first.broker, clock, evidence, iam, inventory, ledger: first.ledger, probe, anotherInstance: instance };
+}
+
+// A GitHub-style RS256 signer with its JWKS entry, for member credentials
+// the tests mint themselves.
+export async function githubSigner(kid = "gh1"): Promise<{ readonly jwks: readonly Jwk[]; readonly sign: (payload: Record<string, unknown>) => Promise<string>; readonly signWith: (payload: Record<string, unknown>, key: CryptoKey) => Promise<string> }> {
+  const keys = await crypto.subtle.generateKey({ hash: "SHA-256", modulusLength: 2048, name: "RSASSA-PKCS1-v1_5", publicExponent: new Uint8Array([1, 0, 1]) }, true, ["sign", "verify"]);
+  const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const signWith = async (payload: Record<string, unknown>, key: CryptoKey): Promise<string> => {
+    const signingInput = `${encode({ alg: "RS256", kid })}.${encode(payload)}`;
+    const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, Buffer.from(signingInput));
+    return `${signingInput}.${Buffer.from(signature).toString("base64url")}`;
+  };
+  return { jwks: [{ e: jwk.e!, kid, kty: "RSA", n: jwk.n! }], sign: (payload) => signWith(payload, keys.privateKey), signWith };
+}
+
+// The claims of the canonical job that is one managed member, minted for the
+// consumer provider's audience: the five authority claims the provider
+// composes, the numeric identity claims its subject mapping uses, and a
+// normal GitHub subject, which the provider never uses as the principal.
+export function memberClaims(authority: RecoveryAuthority, consumer: Consumer, member: string, nowSeconds: number, runId = "4242"): Record<string, unknown> {
+  const pool = `projects/${consumer.projectNumber}/locations/global/workloadIdentityPools/${authority.broker.workloadIdentityPoolId}`;
+  const composite = member.slice(`principalSet://iam.googleapis.com/${pool}/attribute.authority/`.length).split(":");
+  return {
+    aud: `https://iam.googleapis.com/${pool}/providers/${authority.broker.workloadIdentityProviderId}`,
+    environment: composite[3],
+    event_name: composite[4],
+    exp: nowSeconds + 300,
+    iat: nowSeconds - 10,
+    iss: "https://token.actions.githubusercontent.com",
+    job_workflow_ref: composite[1],
+    job_workflow_sha: composite[2],
+    repository_id: consumer.repositoryId,
+    repository_owner_id: authority.githubOwnerId,
+    run_id: runId,
+    runner_environment: "github-hosted",
+    sub: `repo:${authority.githubOwner}/${consumer.repository}:environment:${composite[3]}`,
+    workflow_ref: composite[0],
+  };
 }
 
 export const unrelatedBindings: readonly PolicyBinding[] = [
