@@ -254,8 +254,8 @@ run "broker_authority_over_consumer_accounts_is_absent_without_evidence" {
   }
 
   assert {
-    condition     = length(google_project_iam_custom_role.inventory) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_deny_reviewer) == 0 && length(data.external.canary_verification) == 0 && length(data.external.deny_state) == 0 && length(data.external.service_state) == 0 && length(terraform_data.authority_gate) == 0
-    error_message = "Without evidence no inventory or deny-reviewer role exists anywhere, no GitHub record is read, no attestation is verified, no live Deny policy or service state is read, and no apply-time gate exists."
+    condition     = length(google_project_iam_custom_role.inventory) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_deny_reviewer) == 0 && length(data.external.canary_verification) == 0 && length(data.external.deny_state) == 0 && length(data.external.service_state) == 0 && length(data.external.allow_state) == 0 && length(terraform_data.authority_gate) == 0
+    error_message = "Without evidence no inventory or deny-reviewer role exists anywhere, no GitHub record is read, no attestation is verified, no live Deny policy, service state, or allow policy is read, and no apply-time gate exists."
   }
 
   assert {
@@ -277,8 +277,8 @@ run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
   command = plan
 
   assert {
-    condition     = length(local.required_deny_matrix) == 35 + 4 * 28 + 5 && alltrue([for row in values(local.required_deny_matrix) : row.denied == ["principalSet://goog/public:all"]]) && length([for row in values(local.required_deny_matrix) : row if startswith(row.attachment, "cloudresourcemanager.googleapis.com/organizations/")]) == 5
-    error_message = "The steady matrix must carry thirty-five broker-project rows, twenty-eight rows per consumer project, and five organization rows, every one denying every principal."
+    condition     = length(local.required_deny_matrix) == 35 + 4 * 29 + 10 && alltrue([for row in values(local.required_deny_matrix) : row.denied == ["principalSet://goog/public:all"]]) && length([for row in values(local.required_deny_matrix) : row if startswith(row.attachment, "cloudresourcemanager.googleapis.com/organizations/")]) == 10
+    error_message = "The steady matrix must carry thirty-five broker-project rows, twenty-nine rows per consumer project, and ten organization rows, every one denying every principal."
   }
 
   assert {
@@ -303,10 +303,15 @@ run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
       length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/services.update"].exceptions) == 0 &&
       length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/workerpools.update"].exceptions) == 0 &&
       length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|serviceusage.googleapis.com/services.disable"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/cdbentley|serviceusage.googleapis.com/services.enable"].exceptions) == 0 &&
       length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|iam.googleapis.com/roles.update"].exceptions) == 0 &&
-      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|orgpolicy.googleapis.com/policy.set"].exceptions) == 0
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|orgpolicy.googleapis.com/policy.set"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|orgpolicy.googleapis.com/policies.update"].exceptions) == 0 &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/organizations/unrecorded|cloudresourcemanager.googleapis.com/projects.move"].exceptions) == 0 &&
+      length(local.matrices.maintenance["cloudresourcemanager.googleapis.com/organizations/unrecorded|cloudresourcemanager.googleapis.com/projects.move"].exceptions) == 0 &&
+      length(local.matrices.maintenance["cloudresourcemanager.googleapis.com/organizations/unrecorded|cloudresourcemanager.googleapis.com/projects.update"].exceptions) == 0
     )
-    error_message = "Each steady row's exception set must be exactly the principals this deployment derives for it: the broker for the ledger and evidence; the exact invoker and canary tuples, never a pool wildcard, for access tokens; the Scheduler agent, the exact invoker tuples, and the exact member tuples for ID tokens; the broker alone for consumer target policies; and nobody -- no applying identity, no deploy identity -- for the broker deployment, consumer project IAM, keys, signing, delegation, evidence overwrite, identity lifecycle, federation replacement, workload attachment, deployment, API disablement, role definitions, and organization policy."
+    error_message = "Each steady row's exception set must be exactly the principals this deployment derives for it: the broker for the ledger and evidence; the exact invoker and canary tuples, never a pool wildcard, for access tokens; the Scheduler agent, the exact invoker tuples, and the exact member tuples for ID tokens; the broker alone for consumer target policies; and nobody -- no applying identity, no deploy identity -- for the broker deployment, consumer project IAM, keys, signing, delegation, evidence overwrite, identity lifecycle, federation replacement, workload attachment, deployment, API disablement and enablement, role definitions, organization policy through both APIs, and project movement, which no form excepts."
   }
 
   assert {
@@ -354,14 +359,20 @@ run "the_required_deny_matrix_is_exact_and_derived_from_this_deployment" {
       "run.googleapis.com/workerpools.create",
       "run.googleapis.com/workerpools.update",
       "serviceusage.googleapis.com/services.disable",
+      "serviceusage.googleapis.com/services.enable",
       ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/projects/runsetta|${permission}")]) && alltrue([for permission in [
+      "cloudresourcemanager.googleapis.com/projects.move",
+      "cloudresourcemanager.googleapis.com/projects.update",
       "iam.googleapis.com/roles.create",
       "iam.googleapis.com/roles.delete",
       "iam.googleapis.com/roles.undelete",
       "iam.googleapis.com/roles.update",
+      "orgpolicy.googleapis.com/policies.create",
+      "orgpolicy.googleapis.com/policies.delete",
+      "orgpolicy.googleapis.com/policies.update",
       "orgpolicy.googleapis.com/policy.set",
     ] : contains(keys(local.required_deny_matrix), "cloudresourcemanager.googleapis.com/organizations/unrecorded|${permission}")])
-    error_message = "Every supported mutation path the review named must be required: project IAM, service-account lifecycle, workload identity pool and provider lifecycle, Cloud Run service lifecycle, image upload, and ledger reads at the broker project; identity, project IAM, federation lifecycle, workload attachment (actAs, Compute, Cloud Run services, jobs, and worker pools, Cloud Build), and API disablement at every consumer project; and role definitions and organization policy at the organization."
+    error_message = "Every supported mutation path the review named must be required: project IAM, service-account lifecycle, workload identity pool and provider lifecycle, Cloud Run service lifecycle, image upload, and ledger reads at the broker project; identity, project IAM, federation lifecycle, workload attachment (actAs, Compute, Cloud Run services, jobs, and worker pools, Cloud Build), and API disablement and enablement at every consumer project; and role definitions, organization policy through the v1 and v2 APIs, and project movement at the organization."
   }
 
   # The deployment form widens exactly the consumer's deploy rows to its two
@@ -405,6 +416,12 @@ run "evidence_grants_nothing_while_target_identities_are_unrecorded" {
         artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
         archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
       }
+      deny_cleanup = {
+        run_id          = "100000000005"
+        artifact_id     = "100000000006"
+        artifact_sha256 = "2323232323232323232323232323232323232323232323232323232323232323"
+        archive_sha256  = "4545454545454545454545454545454545454545454545454545454545454545"
+      }
     }
   }
 
@@ -428,6 +445,10 @@ run "evidence_grants_nothing_while_target_identities_are_unrecorded" {
   expect_failures = [google_project_iam_custom_role.actuator]
 }
 
+# The consumer ancestry read sits behind the apply-time fence, so a project
+# outside the evidenced organization is refused at apply (exercised by the
+# enabled-path harness); at plan the unrecorded identities alone refuse the
+# grant.
 run "reject_a_consumer_project_outside_the_evidenced_organization" {
   command = plan
 
@@ -445,6 +466,12 @@ run "reject_a_consumer_project_outside_the_evidenced_organization" {
         artifact_id     = "100000000004"
         artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
         archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+      deny_cleanup = {
+        run_id          = "100000000005"
+        artifact_id     = "100000000006"
+        artifact_sha256 = "2323232323232323232323232323232323232323232323232323232323232323"
+        archive_sha256  = "4545454545454545454545454545454545454545454545454545454545454545"
       }
     }
   }
@@ -466,7 +493,7 @@ run "reject_a_consumer_project_outside_the_evidenced_organization" {
     values = { org_id = "200000000009" }
   }
 
-  expect_failures = [data.google_project.consumer, google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator]
 }
 
 run "reject_fabricated_evidence" {
@@ -482,6 +509,12 @@ run "reject_fabricated_evidence" {
         archive_sha256  = "n/a"
       }
       deny_canary = {
+        run_id          = "pending"
+        artifact_id     = "TBD"
+        artifact_sha256 = "n/a"
+        archive_sha256  = "n/a"
+      }
+      deny_cleanup = {
         run_id          = "pending"
         artifact_id     = "TBD"
         artifact_sha256 = "n/a"
@@ -512,6 +545,42 @@ run "reject_evidence_whose_archive_and_raw_digests_are_one_value" {
         artifact_id     = "100000000004"
         artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
         archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+      deny_cleanup = {
+        run_id          = "100000000005"
+        artifact_id     = "100000000006"
+        artifact_sha256 = "2323232323232323232323232323232323232323232323232323232323232323"
+        archive_sha256  = "4545454545454545454545454545454545454545454545454545454545454545"
+      }
+    }
+  }
+
+  expect_failures = [var.broker_authority_evidence]
+}
+
+run "reject_evidence_whose_cleanup_run_is_another_phase_s_run" {
+  command = plan
+
+  variables {
+    broker_authority_evidence = {
+      organization_id = "100000000001"
+      deny_control = {
+        run_id          = "100000000001"
+        artifact_id     = "100000000002"
+        artifact_sha256 = "abababababababababababababababababababababababababababababababab"
+        archive_sha256  = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      }
+      deny_canary = {
+        run_id          = "100000000003"
+        artifact_id     = "100000000004"
+        artifact_sha256 = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        archive_sha256  = "0101010101010101010101010101010101010101010101010101010101010101"
+      }
+      deny_cleanup = {
+        run_id          = "100000000003"
+        artifact_id     = "100000000006"
+        artifact_sha256 = "2323232323232323232323232323232323232323232323232323232323232323"
+        archive_sha256  = "4545454545454545454545454545454545454545454545454545454545454545"
       }
     }
   }

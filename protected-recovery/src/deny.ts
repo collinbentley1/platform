@@ -34,7 +34,9 @@ import { type Consumer, type RecoveryAuthority, brokerServiceAccountId, canonica
 //   maintenance  the maintenance principals on the consumer IAM, federation,
 //                lifecycle, role, organization-policy, and API rows, for
 //                infrastructure work under an open ticket. Authority disabled
-//                everywhere; bootstrap and maintenance never combine.
+//                everywhere; bootstrap and maintenance never combine. Project
+//                movement and the key, deploy, and attachment paths stay
+//                frozen for everyone under every form.
 //
 // Anything else the live state carries -- an exception outside these forms, a
 // missing row, a conditioned or permission-excepted rule -- is drift, and
@@ -124,10 +126,20 @@ const consumerFreezePermissions = [
   "run.googleapis.com/workerpools.create",
   "run.googleapis.com/workerpools.update",
 ];
-const consumerServiceUsagePermissions = ["serviceusage.googleapis.com/services.disable"];
+// Disabling an inventory API hides its resources from the inventory; enabling
+// one runs whatever was retained through a disable at once.
+const consumerServiceUsagePermissions = ["serviceusage.googleapis.com/services.disable", "serviceusage.googleapis.com/services.enable"];
 const organizationRolePermissions = ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.undelete", "iam.googleapis.com/roles.update"];
 const organizationBootstrapRolePermissions = ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.update"];
-const organizationPolicyPermissions = ["orgpolicy.googleapis.com/policy.set"];
+// The organization-policy write paths of both APIs: policy.set governs the
+// v1 API alone and does not stop the v2 API, whose write permissions are
+// policies.create, policies.update, and policies.delete.
+const organizationPolicyPermissions = ["orgpolicy.googleapis.com/policies.create", "orgpolicy.googleapis.com/policies.delete", "orgpolicy.googleapis.com/policies.update", "orgpolicy.googleapis.com/policy.set"];
+// Moving a project changes which organization-level Deny and role policies
+// it inherits, and the v1 update path can carry a parent as well; both are
+// frozen for every principal in every form, at the organization that
+// governs every consumer as a descendant.
+const organizationMovementPermissions = ["cloudresourcemanager.googleapis.com/projects.move", "cloudresourcemanager.googleapis.com/projects.update"];
 
 export function brokerAttachment(authority: RecoveryAuthority): string {
   return `cloudresourcemanager.googleapis.com/projects/${recorded(authority).projectId}`;
@@ -263,6 +275,7 @@ export function denyMatrix(authority: RecoveryAuthority, coordinates: DenyCoordi
   add(organization, organizationRolePermissions, maintenance);
   add(organization, organizationBootstrapRolePermissions, [...bootstrap, ...maintenance]);
   add(organization, organizationPolicyPermissions, maintenance);
+  add(organization, organizationMovementPermissions, []);
   return Object.fromEntries(Object.keys(rows).sort().map((key) => [key, rows[key]!]));
 }
 

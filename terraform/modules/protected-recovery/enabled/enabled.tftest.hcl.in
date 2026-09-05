@@ -1,15 +1,17 @@
 # The enabled path of the protected-recovery module: every target's permanent
-# unique ID recorded and verified live, both phases of the Deny canary
+# unique ID recorded and verified live, all three phases of the Deny canary
 # verified and bound to their signer and to each other, the live Deny state
-# bound to the attested one, and the consumer attachment rows that rest on a
-# disabled API bound to a live read of that API. The committed authority
+# bound to the attested one, the consumer attachment rows that rest on a
+# disabled API bound to a live read of that API, the canary's temporary
+# Allows bound in both exercise phases and read retired live, and every one
+# of those reads made at apply behind the fence. The committed authority
 # records no identity and no such records exist offline, so
 # tools/ci/protected-recovery-enabled-test.sh renders this template into an
 # isolated copy of the repository whose authority.json records a test
 # identity for each of the thirty-six targets and the active platform commit
 # for every consumer (plus a transition commit for runsetta), and whose
-# mocked reads answer with the two predicates the canary producer's own shape
-# renders (tools/ci/protected-recovery-canary-fixture.ts) and their
+# mocked reads answer with the three predicates the canary producer's own
+# shape renders (tools/ci/protected-recovery-canary-fixture.ts) and their
 # adversarial variants. A line consisting of one of these placeholders (each
 # wrapped in double at-signs) names the record rendered there:
 #
@@ -20,9 +22,11 @@
 #       consistent, unverified, other-workflow, other-run, other-head,
 #       other-repository, self-hosted (the certificate), extra-exception,
 #       unrelated-resource, missing-observation, other-image, other-phase,
-#       other-control, request-mismatch, missing-cause, unexercised (the
+#       other-control, request-mismatch, digest-mismatch, pre-state-mismatch,
+#       pre-state-unknown, operation-error, allow-etag-moved, allow-missing,
+#       actas-unisolated, missing-cause, unexercised, cleanup-leftover (the
 #       predicate), run-missing, run-other-head, artifact-digest,
-#       control-after-deny (the records)
+#       control-after-deny, cleanup-before-deny (the records)
 #   LIVE_DENY_STATE   the live deny policies of every attachment point,
 #       listed and read, exactly as the deny phase attested them
 #   LIVE_DENY_POLICY:<variant>   the broker project's live policy with one
@@ -34,14 +38,21 @@
 #       API read, disabled
 #   LIVE_SERVICE_STATE:<project>:<service>:<state>   one such read with the
 #       given state
+#   LIVE_ALLOW_STATE   the canary's roles at every attachment point, read
+#       live: none anywhere
+#   LIVE_ALLOW_STATE:<project>:<variant>   one such read: standing (a role
+#       still bound) or unread
 #
 # and the RAW_<phase> and ARCHIVE_<phase> placeholders are the digests of each
-# phase's fixture bytes and of its archive. These are mocked plan-shape and
-# apply-shape tests: they prove what the gate does with each record and that
-# the activation sequence is permitted by the matrix it requires, not that
-# GitHub, gh, or Google answer as modelled. The identity of the test accounts
-# is 1 + consumer index + account index + sixteen zeros, in the sorted order
-# of protected-recovery/authority.json.
+# phase's fixture bytes and of its archive. These are mocked apply-shape
+# tests: they prove what the gate does with each record at the mutation
+# boundary and that the activation sequence is permitted by the matrix it
+# requires, not that GitHub, gh, or Google answer as modelled. Because every
+# live read sits behind the fence, which every apply replaces, an
+# adversarial record is judged by a mocked apply that must refuse the grant
+# and leave the standing grants as they are. The identity of the test
+# accounts is 1 + consumer index + account index + sixteen zeros, in the
+# sorted order of protected-recovery/authority.json.
 
 # The mocked apply of the activation sequence needs the computed names the
 # dependent IAM resources validate to be well-formed; the values are shapes,
@@ -100,8 +111,8 @@ override_data {
 
 @@TARGET_IDENTITIES@@
 
-# Both phases of the canary, verified: the run and artifact records, the two
-# digests, the certificate, and the statement carrying the predicate.
+# All three phases of the canary, verified: the run and artifact records,
+# the two digests, the certificate, and the statement carrying the predicate.
 override_data {
   target = data.external.canary_verification["control"]
   @@VERIFICATION:control:consistent@@
@@ -110,10 +121,16 @@ override_data {
   target = data.external.canary_verification["deny"]
   @@VERIFICATION:deny:consistent@@
 }
+override_data {
+  target = data.external.canary_verification["cleanup"]
+  @@VERIFICATION:cleanup:consistent@@
+}
 
 @@LIVE_DENY_STATE@@
 
 @@LIVE_SERVICE_STATE@@
+
+@@LIVE_ALLOW_STATE@@
 
 variables {
   project_id          = "recovery-test"
@@ -133,6 +150,12 @@ variables {
       artifact_sha256 = "@@RAW_deny@@"
       archive_sha256  = "@@ARCHIVE_deny@@"
     }
+    deny_cleanup = {
+      run_id          = "100000000005"
+      artifact_id     = "100000000006"
+      artifact_sha256 = "@@RAW_cleanup@@"
+      archive_sha256  = "@@ARCHIVE_cleanup@@"
+    }
   }
 }
 
@@ -140,13 +163,12 @@ variables {
 # providers and state carried from run to run: the broker project alone
 # without evidence (this run), the evidenced grants once the Deny state stands
 # and every mutation the apply makes is permitted its principal (the next
-# run), every adversarial record refused with the grants left exactly as they
-# stand (the runs after it), and revocation of the grants when the evidence is
-# withdrawn (the last run). The Deny state and the service states are read
-# through the apply-time fence, which every apply that changes the grants
-# replaces; once the evidenced apply stands, the adversarial records leave the
-# fence in place, so each of them is judged by a plan that reads the live
-# state and refuses the grant there.
+# run), every adversarial record refused at apply with the grants left exactly
+# as they stand (the runs after it), and revocation of the grants when the
+# evidence is withdrawn (the last run). Every live read is made behind the
+# apply-time fence, which every apply replaces, so each adversarial record is
+# judged by an apply that reads the live state at the mutation boundary and
+# refuses the grant there.
 run "activation_step_one_installs_the_broker_project_alone" {
   command = apply
 
@@ -174,27 +196,42 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
   }
 
   assert {
-    condition     = local.verified.control && local.verified.deny && local.certificate_bound.control && local.certificate_bound.deny && local.certificates.deny.buildSignerURI == "https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main" && local.certificates.control.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000001/attempts/1" && local.certificates.deny.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000003/attempts/1" && local.certificates.deny.sourceRepositoryDigest == var.active_workflow_sha
+    condition     = local.verified.control && local.verified.deny && local.verified.cleanup && local.certificate_bound.control && local.certificate_bound.deny && local.certificate_bound.cleanup && local.certificates.deny.buildSignerURI == "https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main" && local.certificates.control.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000001/attempts/1" && local.certificates.deny.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000003/attempts/1" && local.certificates.cleanup.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000005/attempts/1" && local.certificates.deny.sourceRepositoryDigest == var.active_workflow_sha
     error_message = "Each phase's verified certificate must bind its predicate to the deny-canary workflow at the active commit, the phase's own run, and the platform repository."
   }
 
   assert {
-    condition     = local.predicates.control.phase == "control" && local.predicates.deny.phase == "deny" && tostring(local.predicates.deny.controlRunId) == "100000000001" && local.evidence_checks.control_before_deny
-    error_message = "The deny phase must name the control run and follow it in time."
+    condition     = local.predicates.control.phase == "control" && local.predicates.deny.phase == "deny" && local.predicates.cleanup.phase == "cleanup" && tostring(local.predicates.deny.controlRunId) == "100000000001" && tostring(local.predicates.cleanup.controlRunId) == "100000000001" && local.evidence_checks.control_before_deny && local.evidence_checks.cleanup_after_deny && local.evidence_checks.cleanup_predicate_bound
+    error_message = "The deny phase must name the control run and follow it in time, and the cleanup must name the control run, follow the deny run, and have left nothing over."
   }
 
   # Every required row is proven by the pair -- a DENIED observation naming
-  # the row's permission beside an ALLOWED observation of the byte-identical
-  # request -- except the sixteen consumer Compute and Cloud Build rows, which
-  # rest on the identical request answering SERVICE_DISABLED in both phases
-  # beside the live read proving each API disabled.
+  # the row's permission beside an ALLOWED observation of the request of the
+  # same digest in the same pre-state -- except the sixteen consumer Compute
+  # and Cloud Build rows, which rest on the identical request answering
+  # SERVICE_DISABLED in both phases beside the live read proving each API
+  # disabled.
   assert {
-    condition     = length([for key, satisfied in local.deny_pair_satisfied : key if satisfied]) == 35 + 5 + 4 * 24 && local.unserviceable_rows == sort(flatten([for attachment in values(local.consumer_attachments) : [for permission in keys(local.unserviceable_permissions) : "${attachment}|${permission}"]])) && length(local.unserviceable_rows) == 16 && length(data.external.service_state) == 8 && length(local.service_reads) == 8
+    condition     = length([for key, satisfied in local.deny_pair_satisfied : key if satisfied]) == 35 + 10 + 4 * 25 && local.unserviceable_rows == sort(flatten([for attachment in values(local.consumer_attachments) : [for permission in keys(local.unserviceable_permissions) : "${attachment}|${permission}"]])) && length(local.unserviceable_rows) == 16 && length(data.external.service_state) == 8 && length(local.service_reads) == 8
     error_message = "Exactly the consumer Compute and Cloud Build rows may rest on a disabled API, each beside its live read; every other row must be proven by the paired denial."
   }
 
+  # The twenty-seven rows whose request needs a second denied permission --
+  # every Cloud Run write (actAs) and the implicit-delegation chain (the
+  # delegate's getAccessToken) -- are proven beside the isolated proof of
+  # that permission's own row; every other row is proven on its own.
   assert {
-    condition     = local.live_matches_canary && length(data.external.deny_state) == 6 && length(local.live_rules) == 13 && length(local.required_deny_matrix) == 35 + 4 * 28 + 5 && local.live_overlay == "steady"
+    condition     = length(local.co_denied_rows) == 27 && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.create") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.implicitDelegation") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/workerpools.update") && !contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs") && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs"] && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getAccessToken"] && alltrue(values(local.isolation_satisfied))
+    error_message = "The Cloud Run writes and the delegation chain are the co-denied rows; actAs and getAccessToken are proven in isolation, so every co-denied row is satisfied."
+  }
+
+  assert {
+    condition     = local.allow_bound && local.evidence_checks.allows_bound && local.canary_allows_retired && length(data.external.allow_state) == 6 && length(local.allow_reads) == 6 && length(keys(local.canary_allows.control)) == 8 && length(local.canary_allows.control["organizations/100000000001"].canary) > 0 && length(local.canary_allows.control["projects/recovery-test/serviceAccounts/deny-canary-100000000001@recovery-test.iam.gserviceaccount.com"].delegate) == 1
+    error_message = "Both exercise phases must record the same Allows at every attachment point and on the throwaway accounts, and the live read at every attachment point must find the canary's roles gone."
+  }
+
+  assert {
+    condition     = local.live_matches_canary && length(data.external.deny_state) == 6 && length(local.live_rules) == 13 && length(local.required_deny_matrix) == 35 + 4 * 29 + 10 && local.live_overlay == "steady"
     error_message = "Every attachment point's live deny policies must be read and be exactly the attested ones, the whole matrix must be carried by them, and the live overlay must be steady."
   }
 
@@ -264,8 +301,13 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
   }
 }
 
+# Every adversarial run below applies: the reads that judge it are behind
+# the fence and happen at apply, where every fenced authority resource that
+# does not wait on another refuses -- the actuator roles, the inventory
+# roles, the deny-reviewer grant; the grants that depend on a refused role
+# are never reached -- and the grants that stand are untouched.
 run "a_recreated_identity_at_the_same_address_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.google_service_account.target["cdbentley/gha-terraform"]
@@ -279,44 +321,45 @@ run "a_recreated_identity_at_the_same_address_is_refused" {
   expect_failures = [data.google_service_account.target]
 }
 
-# The records of either phase: a run GitHub does not record, a run of another
+# The records of any phase: a run GitHub does not record, a run of another
 # head, an artifact whose recorded digest differs from the downloaded bytes,
-# and a control run that did not finish before the deny run began.
+# a control run that did not finish before the deny run began, and a cleanup
+# run that did not begin after the deny run finished.
 run "a_run_github_does_not_record_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:run-missing@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_control_run_of_another_head_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
     @@VERIFICATION:control:run-other-head@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_artifact_whose_recorded_digest_differs_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:artifact-digest@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_control_run_that_did_not_precede_the_deny_run_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
@@ -328,117 +371,165 @@ run "a_control_run_that_did_not_precede_the_deny_run_is_refused" {
     error_message = "A control run updated after the deny run began must fail control_before_deny."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
-# The attestation of either phase: unverifiable, or signed by another
+run "a_cleanup_run_that_did_not_follow_the_deny_run_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["cleanup"]
+    @@VERIFICATION:cleanup:cleanup-before-deny@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "cleanup_after_deny")
+    error_message = "A cleanup run created before the deny run finished must fail cleanup_after_deny."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_cleanup_with_a_leftover_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["cleanup"]
+    @@VERIFICATION:cleanup:cleanup-leftover@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "cleanup_predicate_bound")
+    error_message = "A cleanup predicate with a leftover must fail cleanup_predicate_bound."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+# The attestation of any phase: unverifiable, or signed by another
 # workflow, run, head, repository, or runner.
 run "an_attestation_gh_cannot_verify_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:unverified@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_unverifiable_control_attestation_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
     @@VERIFICATION:control:unverified@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "an_unverifiable_cleanup_attestation_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["cleanup"]
+    @@VERIFICATION:cleanup:unverified@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_attestation_signed_by_another_workflow_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:other-workflow@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_attestation_signed_by_another_run_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
     @@VERIFICATION:control:other-run@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_attestation_signed_at_another_head_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:other-head@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_attestation_signed_from_another_repository_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:other-repository@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_attestation_signed_on_a_self_hosted_runner_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
     @@VERIFICATION:control:self-hosted@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
-# The predicate of either phase: an exception outside the form, an unrelated
-# resource, a permission never observed, another image, a phase that is not
-# what it claims, a deny run naming another control run, a deny request that
-# is not the control request, a refusal without an IAM cause, and a
-# permission the producer never exercised.
+# The predicate of either exercise phase: an exception outside the form, an
+# unrelated resource, a permission never observed, another image, a phase
+# that is not what it claims, a deny run naming another control run, a deny
+# request that is not the control request by its components or by its
+# digest, a control request made against another pre-state, a deny pre-state
+# unknown outside the ledger rows, a control operation that ended in error,
+# an allow policy that moved between the phases or names no canary role at
+# an attachment point, a co-denied permission whose own row is not isolated,
+# a refusal without an IAM cause, and a permission the producer never
+# exercised.
 run "an_extra_exception_principal_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:extra-exception@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_canary_against_an_unrelated_resource_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:unrelated-resource@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_required_permission_never_observed_denied_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
@@ -450,11 +541,11 @@ run "a_required_permission_never_observed_denied_is_refused" {
     error_message = "A row whose denial was never observed must be named unsatisfied and fail coverage_complete."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_required_permission_never_observed_allowed_in_the_control_phase_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
@@ -466,33 +557,33 @@ run "a_required_permission_never_observed_allowed_in_the_control_phase_is_refuse
     error_message = "A denial with no successful control of the same request is not evidence of the rule."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "evidence_of_another_broker_image_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["control"]
     @@VERIFICATION:control:other-image@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_predicate_of_the_other_phase_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
     @@VERIFICATION:deny:other-phase@@
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_deny_run_naming_another_control_run_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
@@ -504,11 +595,11 @@ run "a_deny_run_naming_another_control_run_is_refused" {
     error_message = "A deny predicate that names another control run must fail control_before_deny."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_denial_of_another_request_than_the_control_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
@@ -520,11 +611,123 @@ run "a_denial_of_another_request_than_the_control_is_refused" {
     error_message = "A denial of a request other than the one the control phase succeeded with proves nothing about the rule."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_denial_whose_digest_is_not_the_control_request_s_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:digest-mismatch@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create")
+    error_message = "A denial whose canonical request digest is not the control request's is not the same request."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_control_request_made_against_another_pre_state_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:pre-state-mismatch@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create")
+    error_message = "A control success against a resource in another state than the request requires proves nothing about the deny request."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_deny_pre_state_unknown_outside_the_ledger_rows_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:pre-state-unknown@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create") && !contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|datastore.googleapis.com/entities.get")
+    error_message = "An unknown pre-state is accepted only for the ledger rows, whose read is itself denied."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_control_operation_that_ended_in_error_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:operation-error@@
+  }
+
+  assert {
+    condition     = contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/workloadIdentityPools.create")
+    error_message = "A control request whose operation ended in error is not a positive control."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "an_allow_policy_that_moved_between_the_phases_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:allow-etag-moved@@
+  }
+
+  assert {
+    condition     = !local.allow_bound && contains(local.evidence_failures, "allows_bound")
+    error_message = "An allow policy at another etag in the deny phase than at the end of the control phase must fail allows_bound."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_phase_without_a_canary_allow_at_an_attachment_point_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:allow-missing@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "allows_bound")
+    error_message = "An attachment point whose allow policy names no canary role in either phase must fail allows_bound."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_co_denied_row_without_an_isolated_proof_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:actas-unisolated@@
+  }
+
+  assert {
+    condition     = contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs") && contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.create") && !contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccountKeys.create") && contains(local.evidence_failures, "coverage_complete")
+    error_message = "When the actAs exercise itself needs a second denied permission, every row that rests on an isolated actAs proof is unsatisfied and coverage fails; rows proven on their own stand."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_refusal_without_an_iam_cause_naming_the_permission_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
@@ -536,11 +739,11 @@ run "a_refusal_without_an_iam_cause_naming_the_permission_is_refused" {
     error_message = "A 403 that carries no IAM permission denial naming the row's permission is not a Deny observation."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_predicate_with_an_unexercised_permission_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.external.canary_verification["deny"]
@@ -552,14 +755,14 @@ run "a_predicate_with_an_unexercised_permission_is_refused" {
     error_message = "A predicate whose unexercised list is not empty must fail deny_predicate_bound."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 # The live Deny state is bound to the attested one on every apply: a policy
 # changed, widened, conditioned, narrowed, or deleted since the canary
-# refuses the plan although the canary records are untouched.
+# refuses the apply although the canary records are untouched.
 run "a_live_policy_whose_etag_moved_since_the_canary_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_DENY_POLICY:etag-moved@@
 
@@ -568,11 +771,11 @@ run "a_live_policy_whose_etag_moved_since_the_canary_is_refused" {
     error_message = "A live policy at another etag than the attested one must fail deny_state_current."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_live_exception_widened_since_the_canary_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_DENY_POLICY:exception-widened@@
 
@@ -581,11 +784,11 @@ run "a_live_exception_widened_since_the_canary_is_refused" {
     error_message = "A live rule with an extra exception principal must leave its rows unsatisfied by the live state."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_live_condition_added_since_the_canary_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_DENY_POLICY:condition-added@@
 
@@ -594,11 +797,11 @@ run "a_live_condition_added_since_the_canary_is_refused" {
     error_message = "A live rule narrowed by a denial condition must leave its rows unsatisfied by the live state."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_required_permission_the_live_state_does_not_deny_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_DENY_POLICY:permission-missing@@
 
@@ -607,11 +810,11 @@ run "a_required_permission_the_live_state_does_not_deny_is_refused" {
     error_message = "A required permission no live rule denies must be reported as missing and block activation."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "a_live_policy_deleted_since_the_canary_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_DENY_LISTING:missing@@
 
@@ -620,13 +823,13 @@ run "a_live_policy_deleted_since_the_canary_is_refused" {
     error_message = "An attested policy the live state no longer lists must fail deny_state_current."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 # A consumer attachment row rests on a disabled API only while the API is
 # disabled: an enabled Compute API turns its three rows into unproven rows.
 run "an_unserviceable_row_whose_api_is_live_enabled_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_SERVICE_STATE:runsetta:compute.googleapis.com:ENABLED@@
 
@@ -635,11 +838,11 @@ run "an_unserviceable_row_whose_api_is_live_enabled_is_refused" {
     error_message = "A SERVICE_DISABLED observation beside a live read that says the API is enabled must leave the row unsatisfied."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
 run "an_unserviceable_row_whose_api_cannot_be_read_is_refused" {
-  command = plan
+  command = apply
 
   @@LIVE_SERVICE_STATE:cdbentley:cloudbuild.googleapis.com:unread@@
 
@@ -648,11 +851,42 @@ run "an_unserviceable_row_whose_api_cannot_be_read_is_refused" {
     error_message = "A service state that cannot be read must fail services_read and leave the row unsatisfied."
   }
 
-  expect_failures = [google_project_iam_custom_role.actuator]
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }
 
+# The canary's temporary Allows must be gone live at every attachment point
+# before the broker gains authority; a role still bound, or a policy that
+# cannot be read, refuses the apply.
+run "a_canary_allow_still_standing_live_is_refused" {
+  command = apply
+
+  @@LIVE_ALLOW_STATE:recovery-test:standing@@
+
+  assert {
+    condition     = !local.canary_allows_retired && contains(local.evidence_failures, "canary_allows_retired") && !contains(local.evidence_failures, "allows_read")
+    error_message = "A canary role still bound live at an attachment point must fail canary_allows_retired."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "an_allow_policy_that_cannot_be_read_live_is_refused" {
+  command = apply
+
+  @@LIVE_ALLOW_STATE:cdbentley:unread@@
+
+  assert {
+    condition     = contains(local.evidence_failures, "allows_read") && contains(local.evidence_failures, "canary_allows_retired")
+    error_message = "An allow policy that cannot be read live must fail allows_read and canary_allows_retired."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+# The consumer ancestry is read at apply behind the fence: a project moved
+# out of the evidenced organization is refused at the moment of the grant.
 run "a_consumer_project_outside_the_evidenced_organization_is_refused" {
-  command = plan
+  command = apply
 
   override_data {
     target = data.google_project.consumer["runsetta"]
@@ -670,11 +904,13 @@ run "without_evidence_nothing_is_granted_even_with_every_identity_recorded" {
   }
 
   assert {
-    condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(data.external.service_state) == 0
+    condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0 && length(data.external.service_state) == 0 && length(data.external.allow_state) == 0
     error_message = "Recorded identities alone must grant nothing; only verified evidence enables authority."
   }
 }
 
+# Every adversarial apply above left the evidenced grants exactly as step two
+# made them; withdrawing the evidence revokes them.
 run "activation_step_three_revokes_authority_when_evidence_is_withdrawn" {
   command = apply
 

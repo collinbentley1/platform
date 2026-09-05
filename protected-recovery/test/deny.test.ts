@@ -7,15 +7,15 @@ const bootstrapPrincipal = "principal://goog/subject/cloud-root@cdbentley.com";
 const maintenancePrincipal = "principal://iam.googleapis.com/projects/-/serviceAccounts/gha-terraform@cdbentley.iam.gserviceaccount.com";
 
 describe("the required Deny matrix", () => {
-  test("steady: thirty-five broker rows, twenty-eight per consumer, five at the organization, every row denying every principal with exactly the modeled exceptions", async () => {
+  test("steady: thirty-five broker rows, twenty-nine per consumer, ten at the organization, every row denying every principal with exactly the modeled exceptions", async () => {
     const authority = await testAuthority();
     const matrix = denyMatrix(authority, coordinates, steadyFlags);
     const broker = brokerAttachment(authority);
     const organization = organizationAttachment(authority);
     const rows = Object.values(matrix);
-    expect(rows).toHaveLength(35 + 4 * 28 + 5);
+    expect(rows).toHaveLength(35 + 4 * 29 + 10);
     expect(rows.filter((row) => row.attachment === broker)).toHaveLength(35);
-    expect(rows.filter((row) => row.attachment === organization)).toHaveLength(5);
+    expect(rows.filter((row) => row.attachment === organization)).toHaveLength(10);
     expect(rows.every((row) => row.denied.length === 1 && row.denied[0] === "principalSet://goog/public:all")).toBe(true);
     expect(Object.keys(matrix)).toEqual([...Object.keys(matrix)].sort());
     const brokerMember = "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com";
@@ -38,10 +38,11 @@ describe("the required Deny matrix", () => {
     expect(matrix[`${cdbentley}|iam.googleapis.com/serviceAccounts.setIamPolicy`]!.exceptions).toEqual([brokerMember]);
     expect(matrix[`${cdbentley}|cloudresourcemanager.googleapis.com/projects.setIamPolicy`]!.exceptions).toEqual([]);
     // Steady freezes the deploy path too: no deploy identity is excepted until the consumer is in deployment form.
-    for (const permission of ["iam.googleapis.com/serviceAccounts.actAs", "run.googleapis.com/services.create", "run.googleapis.com/services.update", "run.googleapis.com/workerpools.create", "run.googleapis.com/workerpools.update", "run.googleapis.com/jobs.create", "cloudbuild.googleapis.com/builds.create", "compute.googleapis.com/instances.setServiceAccount", "serviceusage.googleapis.com/services.disable", "iam.googleapis.com/serviceAccountKeys.create"]) {
+    for (const permission of ["iam.googleapis.com/serviceAccounts.actAs", "run.googleapis.com/services.create", "run.googleapis.com/services.update", "run.googleapis.com/workerpools.create", "run.googleapis.com/workerpools.update", "run.googleapis.com/jobs.create", "cloudbuild.googleapis.com/builds.create", "compute.googleapis.com/instances.setServiceAccount", "serviceusage.googleapis.com/services.disable", "serviceusage.googleapis.com/services.enable", "iam.googleapis.com/serviceAccountKeys.create"]) {
       expect(matrix[`${cdbentley}|${permission}`]!.exceptions, permission).toEqual([]);
     }
-    for (const permission of ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.undelete", "iam.googleapis.com/roles.update", "orgpolicy.googleapis.com/policy.set"]) {
+    // Both organization-policy APIs and project movement are frozen at the organization.
+    for (const permission of ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.undelete", "iam.googleapis.com/roles.update", "orgpolicy.googleapis.com/policies.create", "orgpolicy.googleapis.com/policies.delete", "orgpolicy.googleapis.com/policies.update", "orgpolicy.googleapis.com/policy.set", "cloudresourcemanager.googleapis.com/projects.move", "cloudresourcemanager.googleapis.com/projects.update"]) {
       expect(matrix[`${organization}|${permission}`]!.exceptions, permission).toEqual([]);
     }
   });
@@ -90,7 +91,10 @@ describe("the required Deny matrix", () => {
     const changed = Object.keys(matrix).filter((key) => JSON.stringify(matrix[key]) !== JSON.stringify(steady[key]));
     const broker = brokerAttachment(authority);
     expect(changed.some((key) => key.startsWith(`${broker}|`))).toBe(false);
-    expect(changed.filter((key) => key.startsWith(`${organizationAttachment(authority)}|`))).toHaveLength(5);
+    // The four role rows and the four organization-policy rows; project movement stays frozen for everyone.
+    expect(changed.filter((key) => key.startsWith(`${organizationAttachment(authority)}|`))).toHaveLength(8);
+    expect(matrix[`${organizationAttachment(authority)}|cloudresourcemanager.googleapis.com/projects.move`]!.exceptions).toEqual([]);
+    expect(matrix[`${organizationAttachment(authority)}|cloudresourcemanager.googleapis.com/projects.update`]!.exceptions).toEqual([]);
     const cdbentley = consumerAttachment(authority.consumers[0]!);
     const consumerRows = changed.filter((key) => key.startsWith(`${cdbentley}|`)).map((key) => key.slice(cdbentley.length + 1));
     expect(consumerRows).toEqual([
@@ -110,6 +114,7 @@ describe("the required Deny matrix", () => {
       "iam.googleapis.com/workloadIdentityPools.undelete",
       "iam.googleapis.com/workloadIdentityPools.update",
       "serviceusage.googleapis.com/services.disable",
+      "serviceusage.googleapis.com/services.enable",
     ]);
     // Keys, the deploy path, and every other attachment path stay frozen for everyone under maintenance too.
     expect(matrix[`${cdbentley}|iam.googleapis.com/serviceAccountKeys.create`]!.exceptions).toEqual([]);

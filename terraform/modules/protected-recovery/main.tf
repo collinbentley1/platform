@@ -184,26 +184,37 @@ locals {
 
 # Broker authority over consumer accounts is enabled only by evidence that this
 # module verifies mechanically against authenticated, immutable records (see
-# variables.tf for what the input names): two GitHub Actions runs of the Deny
-# canary workflow -- the control phase, in which every exercised request
-# succeeded with the canary principal excepted from every rule, and the deny
-# phase, in which the very same requests were refused with an IAM permission
-# denial under the exact rules -- each with its run record, its artifact
-# record, its archive and raw digests, and its attestation verified
-# cryptographically by gh attestation verify (tools/ci/protected-recovery-
-# verify-canary.sh), whose signing certificate binds the predicate to the
-# exact signer workflow, repository, ref, head commit, trigger, runner, and
-# run invocation. The evidence is then bound to the current Deny state: the
+# variables.tf for what the input names): three GitHub Actions runs of the
+# Deny canary workflow -- the control phase, in which every exercised request
+# succeeded (and every operation it started ended without error) with the
+# canary principal excepted from every rule; the deny phase, in which the
+# very same requests, against the same resources in the same pre-state, were
+# refused with an IAM permission denial naming each row's own permission
+# under the exact rules; and the cleanup phase, in which every throwaway
+# resource of the control run was removed with nothing left over -- each
+# with its run record, its artifact record, its archive and raw digests, and
+# its attestation verified cryptographically by gh attestation verify
+# (tools/ci/protected-recovery-verify-canary.sh), whose signing certificate
+# binds the predicate to the exact signer workflow, repository, ref, head
+# commit, trigger, runner, and run invocation. The two exercise phases are
+# paired row by row on the canonical digest of each request and on its
+# pre-state, both phases must record the same allow policies -- etag and the
+# canary's roles -- at every attachment point, and a row whose request needs
+# a second denied permission is proven only beside an isolated proof of that
+# permission's own row.
+#
+# The evidence is then bound to the live state at the mutation boundary: the
 # live deny policies at every attachment point -- the broker project, the
-# organization, and every consumer project -- are read through a credential-
-# free external reader (tools/ci/protected-recovery-deny-state.sh) at plan,
-# and again at apply whenever this apply would change what the broker is
-# granted, and must carry the required matrix in an accepted form. Every
-# consumer project and the broker project must sit live under the evidenced
-# organization, every target's permanent unique ID must be recorded and
-# resolve live, and until all of that verifies the module grants nothing
-# outside its project. Offline no such records exist and the committed
-# identities are null, so no offline input can produce a grant.
+# organization, and every consumer project -- the enablement of the
+# attachment APIs the unserviceable rows rest on, the allow policies at every
+# attachment point (which must no longer name the canary), the ancestry of
+# every consumer project, and the permanent identity of every target are all
+# read at apply, on every apply, through the fence below, and must carry the
+# required matrix in an accepted form, the evidenced organization, the
+# recorded identities, and no canary Allow. Until all of that verifies the
+# module grants nothing outside its project. Offline no such records exist
+# and the committed identities are null, so no offline input can produce a
+# grant.
 #
 # The matrix has one steady form and three exact, composable widenings (see
 # protected-recovery/src/deny.ts, whose derivation the enabled-path harness
@@ -231,33 +242,44 @@ locals {
 # broker project, the organization, and every consumer project in its
 # bootstrap form, excepting the bootstrap principal on exactly the rows step
 # (3) mutates; (3) run the Deny canary in its control phase with the canary
-# principal excepted, then in its deny phase with the exact rules, and apply
-# with both runs as evidence, which is refused unless the live Deny state
-# carries the matrix in the bootstrap or steady form and every mutation this
-# apply makes is one the bootstrap form permits the applying identity, and
-# only then creates the inventory and actuator grants; (4) the root retires
-# the bootstrap exception -- the broker itself refuses every quarantine until
-# it reads the steady form live, so the exception expires before authority is
-# usable, without another apply. A later change of the active commit or of
-# the deployment invalidates the evidence and the next apply is refused until
-# a new canary is attested; an apply with null evidence revokes the grants.
+# principal excepted, then in its deny phase with the exact rules, then its
+# cleanup phase, retire the canary's temporary Allows, and apply with all
+# three runs as evidence, which is refused unless the live Deny state carries
+# the matrix in the bootstrap or steady form, no attachment point's allow
+# policy names the canary any more, and every mutation this apply makes is
+# one the bootstrap form permits the applying identity, and only then creates
+# the inventory and actuator grants; (4) the root retires the bootstrap
+# exception -- the broker itself refuses every quarantine until it reads the
+# steady form live, so the exception expires before authority is usable,
+# without another apply. A later change of the active commit or of the
+# deployment invalidates the evidence and the next apply is refused until a
+# new canary is attested; an apply with null evidence revokes the grants.
 locals {
   evidence          = var.broker_authority_evidence
   authority_enabled = local.evidence != null
   broker_principal  = "principal://iam.googleapis.com/projects/-/serviceAccounts/${local.broker_email}"
-  canary_principal  = "principal://iam.googleapis.com/projects/-/serviceAccounts/${local.deny_canary_id}@${var.project_id}.iam.gserviceaccount.com"
+  canary_email      = "${local.deny_canary_id}@${var.project_id}.iam.gserviceaccount.com"
+  canary_principal  = "principal://iam.googleapis.com/projects/-/serviceAccounts/${local.canary_email}"
 
-  # The one workflow whose runs may evidence the canary, the one artifact name
-  # it uploads, and the predicate type and schema it attests.
-  deny_canary_workflow       = ".github/workflows/protected-recovery-deny-canary.yml"
-  deny_canary_artifact       = "deny-canary"
-  deny_canary_predicate_type = "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v2"
-  deny_canary_schema         = "protected-recovery/deny-canary/v2"
-  deny_canary_signer         = "https://github.com/${local.platform_repository}/${local.deny_canary_workflow}@refs/heads/main"
-  canary_phases              = { control = "control", deny = "deny" }
+  # The one workflow whose runs may evidence the canary, the artifact each
+  # phase uploads, and the predicate type and schema each attests.
+  deny_canary_workflow        = ".github/workflows/protected-recovery-deny-canary.yml"
+  deny_canary_artifact        = "deny-canary"
+  deny_canary_predicate_type  = "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v3"
+  deny_canary_schema          = "protected-recovery/deny-canary/v3"
+  deny_cleanup_artifact       = "deny-canary-cleanup"
+  deny_cleanup_predicate_type = "https://github.com/collinbentley1/platform/protected-recovery/deny-canary-cleanup/v3"
+  deny_cleanup_schema         = "protected-recovery/deny-canary-cleanup/v3"
+  deny_canary_signer          = "https://github.com/${local.platform_repository}/${local.deny_canary_workflow}@refs/heads/main"
+  canary_phases = {
+    control = { artifact = local.deny_canary_artifact, predicate_type = local.deny_canary_predicate_type }
+    deny    = { artifact = local.deny_canary_artifact, predicate_type = local.deny_canary_predicate_type }
+    cleanup = { artifact = local.deny_cleanup_artifact, predicate_type = local.deny_cleanup_predicate_type }
+  }
+  exercise_phases = ["control", "deny"]
 }
 
-# The two canary runs, verified on the applying machine: the script fetches
+# The three canary runs, verified on the applying machine: the script fetches
 # the run and artifact records through gh, downloads the artifact, computes
 # the archive digest and the extracted raw digest, requires both to be the
 # evidenced ones, runs gh attestation verify against the platform repository
@@ -269,24 +291,27 @@ data "external" "canary_verification" {
 
   program = ["bash", "${path.module}/../../../tools/ci/protected-recovery-verify-canary.sh"]
   query = {
-    archive_sha256  = each.key == "control" ? local.evidence.deny_control.archive_sha256 : local.evidence.deny_canary.archive_sha256
-    artifact_id     = each.key == "control" ? local.evidence.deny_control.artifact_id : local.evidence.deny_canary.artifact_id
-    artifact_name   = local.deny_canary_artifact
-    artifact_sha256 = each.key == "control" ? local.evidence.deny_control.artifact_sha256 : local.evidence.deny_canary.artifact_sha256
-    predicate_type  = local.deny_canary_predicate_type
+    archive_sha256  = local.phase_evidence[each.key].archive_sha256
+    artifact_id     = local.phase_evidence[each.key].artifact_id
+    artifact_name   = each.value.artifact
+    artifact_sha256 = local.phase_evidence[each.key].artifact_sha256
+    predicate_type  = each.value.predicate_type
     repository      = local.platform_repository
-    run_id          = each.key == "control" ? local.evidence.deny_control.run_id : local.evidence.deny_canary.run_id
+    run_id          = local.phase_evidence[each.key].run_id
     signer_workflow = "${local.platform_repository}/${local.deny_canary_workflow}"
   }
 }
 
-# The apply-time fence. Whenever this apply would change what the broker is
-# granted -- the evidence, the image, the active commit, the recorded
-# identities, or the consumer set -- this resource is replaced, and every
-# live Deny read that depends on it is deferred from plan to apply, so the
-# preconditions on the grants below are judged against the policies that
-# stand at the moment of the grant, not against a plan saved earlier. When
-# nothing changes the reads happen at plan.
+# The apply-time fence. Its nonce is unknown until apply, so every apply
+# replaces this resource, and every live read that depends on it -- the Deny
+# state, the service states, the allow policies, the consumer ancestry, and
+# the target identities -- is deferred from plan to apply on every apply,
+# not only when the evidence inputs change. A repair apply that would
+# recreate an actuator role or grant deleted out of band therefore judges
+# its preconditions against the state that stands at the moment of the
+# grant, never against a plan saved earlier: the reads are the version fence
+# the mutation consumes, and the plan shows them as known after apply. The
+# fingerprint records what the evidence was bound to.
 resource "terraform_data" "authority_gate" {
   count = local.authority_enabled ? 1 : 0
 
@@ -299,6 +324,7 @@ resource "terraform_data" "authority_gate" {
       identities              = local.target_identities
       transition_workflow_sha = var.transition_workflow_sha
     }))
+    nonce = timestamp()
   }
 }
 
@@ -322,8 +348,8 @@ data "external" "deny_state" {
 # canary cannot reach through IAM when they are disabled: a Compute or Cloud
 # Build row whose identical request answered SERVICE_DISABLED in both canary
 # phases is accepted only beside this read proving the API disabled now, at
-# plan and again at apply (locals unserviceable_row_satisfied). Read through
-# the same credential-free reader pattern as the Deny state.
+# apply (locals unserviceable_row_satisfied). Read through the same
+# credential-free reader pattern as the Deny state.
 data "external" "service_state" {
   for_each = local.authority_enabled ? local.service_reads : {}
 
@@ -331,6 +357,23 @@ data "external" "service_state" {
   query = {
     project = each.value.project
     service = each.value.service
+  }
+
+  depends_on = [terraform_data.authority_gate]
+}
+
+# The roles the canary identity holds live in the allow policy of every
+# attachment point: the Allows the root granted it for the canary must be
+# retired before the broker gains authority, and the retirement is read at
+# apply through the same credential-free reader pattern, never attested by
+# the canary itself.
+data "external" "allow_state" {
+  for_each = local.authority_enabled ? local.allow_reads : {}
+
+  program = ["bash", "${path.module}/../../../tools/ci/protected-recovery-allow-state.sh"]
+  query = {
+    principal = local.canary_email
+    resource  = each.value
   }
 
   depends_on = [terraform_data.authority_gate]
@@ -344,10 +387,11 @@ data "external" "service_state" {
 # deployment, its federation, and its image; each consumer project protects
 # every path that could recreate a target identity, re-grant its
 # credentials, replace its federation, attach it to a workload, deploy it,
-# disable the APIs the inventory reads, or bypass the broker as the one
-# writer of target policies; the organization protects the definitions of
-# every role and the organization policy that could stretch a token's
-# lifetime. Exceptions are derived from this deployment alone: the broker
+# disable or enable the APIs the inventory reads, or bypass the broker as the
+# one writer of target policies; the organization protects the definitions of
+# every role, the organization policy that could stretch a token's lifetime
+# through either policy API, and the position of every project in the
+# hierarchy. Exceptions are derived from this deployment alone: the broker
 # for what the broker does; the exact recovery invoker tuples, member-
 # delivery tuples, and canary tuple for their own federation; the Scheduler
 # service agent for the reconciler's ID token; the bootstrap principal, the
@@ -432,10 +476,19 @@ locals {
     "run.googleapis.com/workerpools.create",
     "run.googleapis.com/workerpools.update",
   ]
-  consumer_serviceusage_permissions = ["serviceusage.googleapis.com/services.disable"]
+  # Disabling an inventory API hides its resources; enabling one runs whatever
+  # was retained through a disable at once.
+  consumer_serviceusage_permissions = ["serviceusage.googleapis.com/services.disable", "serviceusage.googleapis.com/services.enable"]
   organization_role_permissions     = ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.undelete", "iam.googleapis.com/roles.update"]
   organization_bootstrap_roles      = ["iam.googleapis.com/roles.create", "iam.googleapis.com/roles.delete", "iam.googleapis.com/roles.update"]
-  organization_policy_permissions   = ["orgpolicy.googleapis.com/policy.set"]
+  # Both organization-policy write paths: policy.set governs the v1 API alone
+  # and does not stop the v2 API, whose write permissions are policies.create,
+  # policies.update, and policies.delete.
+  organization_policy_permissions = ["orgpolicy.googleapis.com/policies.create", "orgpolicy.googleapis.com/policies.delete", "orgpolicy.googleapis.com/policies.update", "orgpolicy.googleapis.com/policy.set"]
+  # Project movement changes which organization-level policies a consumer
+  # inherits; frozen for every principal in every form at the organization,
+  # which governs every consumer as a descendant.
+  organization_movement_permissions = ["cloudresourcemanager.googleapis.com/projects.move", "cloudresourcemanager.googleapis.com/projects.update"]
 
   # The four exported forms: no flag; the bootstrap principal; the maintenance
   # principals; every consumer in deployment form.
@@ -464,6 +517,7 @@ locals {
         )]),
         [for permission in local.organization_role_permissions : { attachment = local.organization_attachment, permission = permission, exceptions = concat(contains(local.organization_bootstrap_roles, permission) && flags.bootstrap ? local.bootstrap_exception : [], flags.maintenance ? local.maintenance_principals : []) }],
         [for permission in local.organization_policy_permissions : { attachment = local.organization_attachment, permission = permission, exceptions = flags.maintenance ? local.maintenance_principals : [] }],
+        [for permission in local.organization_movement_permissions : { attachment = local.organization_attachment, permission = permission, exceptions = [] }],
         ) : "${row.attachment}|${row.permission}" => {
         attachment = row.attachment
         denied     = [local.all_principals]
@@ -495,6 +549,13 @@ locals {
       if contains(keys(local.unserviceable_permissions), row.permission) && contains(values(local.consumer_attachments), row.attachment)
     ]) : "${read.project}|${read.service}" => read
   }
+  # The allow policy resource of every attachment point, read live for the
+  # canary's retirement and recorded by both canary phases.
+  allow_reads = { for attachment, id in local.deny_attachments : attachment => startswith(attachment, "cloudresourcemanager.googleapis.com/organizations/") ? "organizations/${id}" : "projects/${id}" }
+  # The rows whose pre-state read is itself a denied row -- a ledger
+  # document's, read by datastore entities.get -- so the deny phase records
+  # its pre-state as unknown, and only there is unknown accepted.
+  unobservable_prestate = ["datastore.googleapis.com/entities.create", "datastore.googleapis.com/entities.delete", "datastore.googleapis.com/entities.get", "datastore.googleapis.com/entities.update"]
 }
 
 # The evidence, decoded from the authenticated records and the verified
@@ -512,33 +573,57 @@ locals {
   phase_evidence = {
     control = local.authority_enabled ? local.evidence.deny_control : null
     deny    = local.authority_enabled ? local.evidence.deny_canary : null
+    cleanup = local.authority_enabled ? local.evidence.deny_cleanup : null
   }
 
-  # The attested rules of each phase: attachment, denied and exception sets,
-  # permissions, and every observation with its request and response.
+  # The attested rules of each exercise phase: attachment, denied and
+  # exception sets, permissions, and every observation with its request
+  # digest and components, its pre-state, the permissions its request needs,
+  # whether the operation it started ended well, and its response.
   canary_rules = {
-    for phase, predicate in local.predicates : phase => flatten([
-      for policy in try(predicate.policies, []) : [
+    for phase in local.exercise_phases : phase => flatten([
+      for policy in try(local.predicates[phase].policies, []) : [
         for rule in try(policy.rules, []) : {
           attachment  = try(tostring(policy.attachmentPoint), "")
           denied      = try([for principal in rule.deniedPrincipals : tostring(principal)], [])
           exceptions  = try([for principal in rule.exceptionPrincipals : tostring(principal)], [])
           permissions = try([for permission in rule.deniedPermissions : tostring(permission)], [])
           observed = try([for observation in rule.canary : {
-            outcome    = tostring(observation.outcome)
-            permission = tostring(observation.permission)
-            principal  = tostring(observation.principal)
-            request    = "${tostring(observation.request.method)} ${tostring(observation.request.url)}"
-            reason     = try(tostring(observation.response.reason), "")
-            denied     = try(tostring(observation.response.permission), "")
-            service    = try(tostring(observation.response.service), "")
+            outcome      = tostring(observation.outcome)
+            permission   = tostring(observation.permission)
+            principal    = tostring(observation.principal)
+            digest       = try(tostring(observation.digest), "")
+            method       = try(tostring(observation.request.method), "")
+            url          = try(tostring(observation.request.url), "")
+            content_type = try(tostring(observation.request.contentType), "")
+            body         = try(tostring(observation.request.bodySha256), "")
+            pre_resource = try(tostring(observation.preState.resource), "")
+            pre_expected = try(tostring(observation.preState.expected), "")
+            pre_observed = try(tostring(observation.preState.observed), "")
+            pre_detail   = try(tostring(observation.preState.detail), "")
+            requires     = try([for permission in observation.requires : tostring(permission)], [])
+            operation_ok = try(observation.operation == null, false) || try(observation.operation.done == true && observation.operation.error == null, false)
+            reason       = try(tostring(observation.response.reason), "")
+            denied       = try(tostring(observation.response.permission), "")
+            service      = try(tostring(observation.response.service), "")
           }], [])
         }
       ]
     ])
   }
   canary_policies = {
-    for phase, predicate in local.predicates : phase => [for policy in try(predicate.policies, []) : { attachment = try(tostring(policy.attachmentPoint), ""), etag = try(tostring(policy.etag), ""), name = try(tostring(policy.name), "") }]
+    for phase in local.exercise_phases : phase => [for policy in try(local.predicates[phase].policies, []) : { attachment = try(tostring(policy.attachmentPoint), ""), etag = try(tostring(policy.etag), ""), name = try(tostring(policy.name), "") }]
+  }
+  # The allow policies each exercise phase recorded: by resource, the etag
+  # and the roles bound to the canary and to the delegate.
+  canary_allows = {
+    for phase in local.exercise_phases : phase => {
+      for allow in try(local.predicates[phase].allowPolicies, []) : tostring(allow.resource) => {
+        etag     = try(tostring(allow.etag), "")
+        canary   = sort(try([for role in allow.canaryRoles : tostring(role)], []))
+        delegate = sort(try([for role in allow.delegateRoles : tostring(role)], []))
+      }
+    }
   }
 
   # The live Deny state: every policy listed at every attachment point, read
@@ -562,6 +647,12 @@ locals {
   # Each live policy by name and etag: the identity the canary attested, which
   # any later change of the policy moves.
   live_policy_identities = { for attachment, policies in local.live_states : attachment => sort([for policy in coalesce(policies, []) : "${tostring(policy.name)}@${tostring(policy.etag)}"]) }
+
+  # The roles the canary holds live at every attachment point: read, and
+  # every one of them gone.
+  live_allows           = { for attachment, read in data.external.allow_state : attachment => { status = try(read.result.status, ""), roles = try(jsondecode(read.result.roles), null) } }
+  allows_read           = length(data.external.allow_state) == length(local.allow_reads) && alltrue([for attachment, live in local.live_allows : live.status == "200" && live.roles != null])
+  canary_allows_retired = local.allows_read && alltrue([for attachment, live in local.live_allows : length(coalesce(live.roles, ["unread"])) == 0])
 
   # Row satisfaction by the live state, per form: a rule at exactly the row's
   # attachment point, unconditioned and without permission exceptions,
@@ -594,11 +685,21 @@ locals {
   # Row satisfaction by the canary. The deny phase must carry a rule with
   # exactly the row's exception set (in the steady or bootstrap form, deploy
   # rows in either state) and an observation DENIED for the permission by
-  # the canary principal with an IAM permission denial naming that
-  # permission; the control phase must carry the same rule with the canary
-  # principal added to its exceptions and an observation ALLOWED for the same
-  # request. The pairing is what attributes the denial to the rule rather
-  # than to a missing allow.
+  # the canary principal with an IAM permission denial naming exactly that
+  # permission, made against the resource in the pre-state the request
+  # requires; the control phase must carry the same rule with the canary
+  # principal added to its exceptions and an observation ALLOWED for the
+  # request of the same canonical digest -- the same method, URL, content
+  # type, canonical body, and required pre-state -- against the same
+  # pre-state, whose operation, if it started one, ended without error. The
+  # pairing is what attributes the denial to the rule rather than to a
+  # missing allow, a changed request, or a changed resource.
+  #
+  # Pre-state: the observed state must be the required one; `inactive`
+  # (the create rows of kinds whose deletion keeps the name for thirty days)
+  # is met by absent or deleted; `none` needs no read; and a ledger
+  # document's pre-state, whose read is itself the denied get row, is
+  # accepted as unknown in the deny phase alone.
   canary_exceptions = {
     for form in ["steady", "bootstrap", "deployment"] : form => { for key, row in local.matrices[form] : key => sort(row.exceptions) }
   }
@@ -616,7 +717,13 @@ locals {
           observation.outcome == "DENIED" &&
           observation.principal == local.canary_principal &&
           observation.reason == "IAM_PERMISSION_DENIED" &&
-          observation.denied == row.permission
+          observation.denied == row.permission &&
+          (
+            observation.pre_expected == "none" ||
+            observation.pre_observed == observation.pre_expected ||
+            (observation.pre_expected == "inactive" && contains(["absent", "deleted"], observation.pre_observed)) ||
+            (contains(local.unobservable_prestate, row.permission) && observation.pre_observed == "unknown")
+          )
         ]
       ]
     ])[0], null)
@@ -633,7 +740,13 @@ locals {
           contains(rule.permissions, row.permission) &&
           observation.permission == row.permission &&
           observation.outcome == "ALLOWED" &&
-          observation.principal == local.canary_principal
+          observation.principal == local.canary_principal &&
+          observation.operation_ok &&
+          (
+            observation.pre_expected == "none" ||
+            observation.pre_observed == observation.pre_expected ||
+            (observation.pre_expected == "inactive" && contains(["absent", "deleted"], observation.pre_observed))
+          )
         ]
       ]
     ])[0], null)
@@ -642,9 +755,53 @@ locals {
     for key, row in local.required_deny_matrix : key => (
       local.deny_observation[key] != null &&
       local.control_observation[key] != null &&
-      try(local.deny_observation[key].request == local.control_observation[key].request, false)
+      try(
+        local.deny_observation[key].digest != "" &&
+        local.deny_observation[key].digest == local.control_observation[key].digest &&
+        local.deny_observation[key].method == local.control_observation[key].method &&
+        local.deny_observation[key].url == local.control_observation[key].url &&
+        local.deny_observation[key].content_type == local.control_observation[key].content_type &&
+        local.deny_observation[key].body == local.control_observation[key].body &&
+        local.deny_observation[key].pre_resource == local.control_observation[key].pre_resource &&
+        local.deny_observation[key].pre_expected == local.control_observation[key].pre_expected &&
+        local.deny_observation[key].pre_detail == local.control_observation[key].pre_detail,
+        false,
+      )
     )
   }
+  # Isolation. The permissions a deny observation's request needs beside the
+  # row's own that the matrix denies at the same attachment: a row with none
+  # is proven by its own denial; a row with any is proven only beside an
+  # isolated proof of every such permission's own row, so the refusal is
+  # attributed by the permission the API named and every permission the
+  # request could have failed on is proven denied on its own.
+  co_denied = {
+    for key, row in local.required_deny_matrix : key => try([
+      for permission in local.deny_observation[key].requires : permission
+      if permission != row.permission && contains(keys(local.required_deny_matrix), "${row.attachment}|${permission}")
+    ], [])
+  }
+  deny_row_isolated = { for key, row in local.required_deny_matrix : key => length(local.co_denied[key]) == 0 }
+  isolation_satisfied = {
+    for key, row in local.required_deny_matrix : key => alltrue([
+      for permission in local.co_denied[key] : try(local.deny_pair_satisfied["${row.attachment}|${permission}"] && local.deny_row_isolated["${row.attachment}|${permission}"], false)
+    ])
+  }
+  co_denied_rows = sort([for key, isolated in local.deny_row_isolated : key if !isolated && local.deny_observation[key] != null])
+
+  # The Allows both phases stood under: the same resources, each with the
+  # same etag and the same canary and delegate roles at the end of the
+  # control phase and at the start of the deny phase, and a canary role at
+  # every attachment point.
+  allow_bound = (
+    length(keys(local.canary_allows.control)) > 0 &&
+    sort(keys(local.canary_allows.control)) == sort(keys(local.canary_allows.deny)) &&
+    alltrue([
+      for resource, control in local.canary_allows.control :
+      try(control.etag != "" && control.etag == local.canary_allows.deny[resource].etag && control.canary == local.canary_allows.deny[resource].canary && control.delegate == local.canary_allows.deny[resource].delegate, false)
+    ]) &&
+    alltrue([for resource in values(local.allow_reads) : try(length(local.canary_allows.control[resource].canary) > 0, false)])
+  )
 
   # A consumer attachment row the canary could not reach through IAM: the
   # identical request answered SERVICE_DISABLED naming the row's API in the
@@ -698,11 +855,19 @@ locals {
       contains(values(local.consumer_attachments), row.attachment) &&
       local.unserviceable_observation[key] != null &&
       local.control_unserviceable_observation[key] != null &&
-      try(local.unserviceable_observation[key].request == local.control_unserviceable_observation[key].request, false) &&
+      try(
+        local.unserviceable_observation[key].digest != "" &&
+        local.unserviceable_observation[key].digest == local.control_unserviceable_observation[key].digest &&
+        local.unserviceable_observation[key].method == local.control_unserviceable_observation[key].method &&
+        local.unserviceable_observation[key].url == local.control_unserviceable_observation[key].url &&
+        local.unserviceable_observation[key].content_type == local.control_unserviceable_observation[key].content_type &&
+        local.unserviceable_observation[key].body == local.control_unserviceable_observation[key].body,
+        false,
+      ) &&
       try(local.service_states["${local.deny_attachments[row.attachment]}|${local.unserviceable_permissions[row.permission]}"] == "DISABLED", false)
     )
   }
-  deny_row_satisfied    = { for key, row in local.required_deny_matrix : key => local.deny_pair_satisfied[key] || local.unserviceable_row_satisfied[key] }
+  deny_row_satisfied    = { for key, row in local.required_deny_matrix : key => (local.deny_pair_satisfied[key] && local.isolation_satisfied[key]) || local.unserviceable_row_satisfied[key] }
   unsatisfied_deny_rows = sort([for key, satisfied in local.deny_row_satisfied : key if !satisfied])
   # The rows that rest on a disabled API rather than on a proven denial, so
   # the evidence says so by name.
@@ -737,30 +902,38 @@ locals {
   }
 
   phase_checks = local.authority_enabled ? merge([
-    for phase in keys(local.canary_phases) : {
+    for phase, contract in local.canary_phases : {
       "${phase}_run_recorded"         = try(local.verifications[phase].run_status, "") == "200"
       "${phase}_run_succeeded"        = try(local.runs[phase].status == "completed" && local.runs[phase].conclusion == "success" && local.runs[phase].run_attempt == 1, false)
       "${phase}_run_is_the_canary"    = try(local.runs[phase].path == local.deny_canary_workflow && local.runs[phase].event == "workflow_dispatch" && tostring(local.runs[phase].repository.id) == local.platform_repository_id && tostring(local.runs[phase].head_repository.id) == local.platform_repository_id, false)
       "${phase}_run_at_this_head"     = try(local.runs[phase].head_sha == var.active_workflow_sha, false)
       "${phase}_artifact_recorded"    = try(local.verifications[phase].artifact_status, "") == "200"
-      "${phase}_artifact_of_run"      = try(tostring(local.artifacts[phase].workflow_run.id) == local.phase_evidence[phase].run_id && local.artifacts[phase].workflow_run.head_sha == var.active_workflow_sha && local.artifacts[phase].name == local.deny_canary_artifact && local.artifacts[phase].expired == false, false)
+      "${phase}_artifact_of_run"      = try(tostring(local.artifacts[phase].workflow_run.id) == local.phase_evidence[phase].run_id && local.artifacts[phase].workflow_run.head_sha == var.active_workflow_sha && local.artifacts[phase].name == contract.artifact && local.artifacts[phase].expired == false, false)
       "${phase}_archive_digest"       = try(local.artifacts[phase].digest == "sha256:${local.phase_evidence[phase].archive_sha256}" && local.verifications[phase].archive_sha256 == local.phase_evidence[phase].archive_sha256, false)
       "${phase}_raw_digest"           = try(local.verifications[phase].raw_sha256 == local.phase_evidence[phase].artifact_sha256 && local.phase_evidence[phase].artifact_sha256 != local.phase_evidence[phase].archive_sha256, false)
       "${phase}_attestation_verified" = local.verified[phase] && local.statements[phase] != null
       "${phase}_signer_is_the_canary" = local.certificate_bound[phase]
-      "${phase}_attests_artifact"     = try(local.statements[phase].predicateType == local.deny_canary_predicate_type && length(local.statements[phase].subject) == 1 && local.statements[phase].subject[0].digest.sha256 == local.phase_evidence[phase].artifact_sha256, false)
-      "${phase}_predicate_bound"      = try(local.predicates[phase].schema == local.deny_canary_schema && local.predicates[phase].phase == phase && tostring(local.predicates[phase].run.id) == local.phase_evidence[phase].run_id && local.predicates[phase].run.headSha == var.active_workflow_sha && local.predicates[phase].brokerImage == var.broker_image && local.predicates[phase].organization == "organizations/${local.evidence.organization_id}" && length(local.predicates[phase].unexercised) == 0, false)
+      "${phase}_attests_artifact"     = try(local.statements[phase].predicateType == contract.predicate_type && length(local.statements[phase].subject) == 1 && local.statements[phase].subject[0].digest.sha256 == local.phase_evidence[phase].artifact_sha256, false)
+      "${phase}_predicate_bound" = (
+        phase == "cleanup"
+        ? try(local.predicates[phase].schema == local.deny_cleanup_schema && local.predicates[phase].phase == phase && tostring(local.predicates[phase].controlRunId) == local.evidence.deny_control.run_id && tostring(local.predicates[phase].run.id) == local.phase_evidence[phase].run_id && local.predicates[phase].run.headSha == var.active_workflow_sha && local.predicates[phase].brokerImage == var.broker_image && local.predicates[phase].organization == "organizations/${local.evidence.organization_id}" && length(local.predicates[phase].leftovers) == 0 && length(local.predicates[phase].removed) > 0, false)
+        : try(local.predicates[phase].schema == local.deny_canary_schema && local.predicates[phase].phase == phase && tostring(local.predicates[phase].run.id) == local.phase_evidence[phase].run_id && local.predicates[phase].run.headSha == var.active_workflow_sha && local.predicates[phase].brokerImage == var.broker_image && local.predicates[phase].organization == "organizations/${local.evidence.organization_id}" && length(local.predicates[phase].unexercised) == 0 && length(local.predicates[phase].failures) == 0, false)
+      )
     }
   ]...) : {}
 
   evidence_checks = local.authority_enabled ? merge(local.phase_checks, {
     control_before_deny    = try(tostring(local.predicates.deny.controlRunId) == local.evidence.deny_control.run_id && local.evidence.deny_control.run_id != local.evidence.deny_canary.run_id && timecmp(local.runs.control.updated_at, local.runs.deny.created_at) < 0, false)
+    cleanup_after_deny     = try(local.evidence.deny_cleanup.run_id != local.evidence.deny_canary.run_id && local.evidence.deny_cleanup.run_id != local.evidence.deny_control.run_id && timecmp(local.runs.deny.updated_at, local.runs.cleanup.created_at) < 0, false)
     coverage_complete      = length(local.unsatisfied_deny_rows) == 0
+    allows_bound           = local.allow_bound
     organization_recorded  = local.organization_recorded == local.evidence.organization_id
     broker_in_organization = tostring(data.google_project.current.org_id) == local.evidence.organization_id
     bootstrap_declared     = local.bootstrap_principal != null
     deny_state_read        = local.live_read && length(data.external.deny_state) == length(local.deny_attachments)
     services_read          = length(data.external.service_state) == length(local.service_reads) && alltrue([for key, read in data.external.service_state : try(read.result.status, "") == "200" && contains(["DISABLED", "ENABLED"], try(read.result.state, ""))])
+    allows_read            = local.allows_read
+    canary_allows_retired  = local.canary_allows_retired
     deny_state_current     = local.live_matches_canary
     deny_state_required    = contains(["steady", "bootstrap"], local.live_overlay) && local.live_deploy_rows_ok
     supported              = length(local.missing_live_permissions) == 0
@@ -769,6 +942,7 @@ locals {
   }) : {}
   evidence_failures = sort([for name, passed in local.evidence_checks : name if !passed])
   evidence_verified = local.authority_enabled && length(local.evidence_failures) == 0
+  evidence_refusal  = "broker_authority_evidence does not verify against the GitHub run and artifact records of the three canary phases, their verified attestations and digests, the live Deny, service, allow, ancestry, and identity state, and this deployment's required Deny matrix: failed checks [${join(", ", local.evidence_failures)}]; attestation verification: ${local.reasons}; unsatisfied Deny rows [${join(", ", local.unsatisfied_deny_rows)}]; co-denied rows whose other permission lacks an isolated proof [${join(", ", [for key in local.co_denied_rows : key if !local.isolation_satisfied[key]])}]; live overlay ${local.live_overlay}; live rows not as required [${join(", ", local.live_unsatisfied_rows)}]; required permissions the live state does not deny [${join(", ", local.missing_live_permissions)}]; mutations of this apply the bootstrap form would deny [${join(", ", local.activation_blocked)}]."
 
   # Every mutation this module's own apply makes, as (attachment, permission,
   # principal); a row of the bootstrap form that denies one of them without
@@ -1143,7 +1317,9 @@ resource "google_storage_bucket_iam_member" "broker_evidence" {
 }
 
 # Organization ancestry is verified live, per consumer project, against the
-# evidenced organization, and only once evidence is supplied at all.
+# evidenced organization, only once evidence is supplied at all, and at
+# apply, behind the fence: a project moved since the plan is refused at the
+# moment of the grant.
 data "google_project" "consumer" {
   for_each = local.authority_enabled ? local.consumers : {}
 
@@ -1155,14 +1331,17 @@ data "google_project" "consumer" {
       error_message = "Consumer project ${each.value.projectId} is not parented directly by the evidenced organization; its live ancestry must match broker_authority_evidence.organization_id before the broker gains authority over its accounts."
     }
   }
+
+  depends_on = [terraform_data.authority_gate]
 }
 
 # The live account each recorded permanent identity currently has: the grant
 # below addresses the account by the email the provider requires, and this
-# read refuses the plan unless that email resolves right now to exactly the
-# reviewed unique ID. A deleted and recreated account at the same address has
-# a different unique ID and is refused here; the broker refuses it again at
-# runtime before every read and write.
+# read, made at apply behind the fence, refuses the apply unless that email
+# resolves right then to exactly the reviewed unique ID. A deleted and
+# recreated account at the same address has a different unique ID and is
+# refused here; the broker refuses it again at runtime before every read and
+# write.
 data "google_service_account" "target" {
   for_each = local.authority_enabled && local.identities_recorded ? local.target_identities : {}
 
@@ -1175,6 +1354,8 @@ data "google_service_account" "target" {
       error_message = "The account at ${each.value.email} has unique ID ${self.unique_id}, not the reviewed permanent identity ${each.value.unique_id}; a recreated account at the same address receives no authority."
     }
   }
+
+  depends_on = [terraform_data.authority_gate]
 }
 
 # The only cross-project authority: read the identity, keys, and allow policy
@@ -1203,7 +1384,7 @@ resource "google_project_iam_custom_role" "actuator" {
 
     precondition {
       condition     = local.evidence_verified
-      error_message = "broker_authority_evidence does not verify against the GitHub run and artifact records of both canary phases, their verified attestations and digests, the live Deny state, and this deployment's required Deny matrix: failed checks [${join(", ", local.evidence_failures)}]; attestation verification: ${local.reasons}; unsatisfied Deny rows [${join(", ", local.unsatisfied_deny_rows)}]; live overlay ${local.live_overlay}; live rows not as required [${join(", ", local.live_unsatisfied_rows)}]; required permissions the live state does not deny [${join(", ", local.missing_live_permissions)}]; mutations of this apply the bootstrap form would deny [${join(", ", local.activation_blocked)}]."
+      error_message = local.evidence_refusal
     }
   }
 
@@ -1221,6 +1402,13 @@ resource "google_service_account_iam_member" "actuator" {
     precondition {
       condition     = data.google_service_account.target[each.key].unique_id == each.value.unique_id
       error_message = "The grant for ${each.key} must address the account whose live unique ID is the reviewed ${each.value.unique_id}."
+    }
+
+    # Every grant is fenced on its own: a repair apply that recreates one
+    # grant judges the live state at that grant's own mutation boundary.
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
     }
   }
 }
@@ -1256,6 +1444,13 @@ resource "google_project_iam_custom_role" "inventory" {
     "serviceusage.services.use",
   ]
 
+  lifecycle {
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
+    }
+  }
+
   depends_on = [terraform_data.authority_gate]
 }
 
@@ -1265,6 +1460,13 @@ resource "google_project_iam_member" "broker_inventory" {
   project = each.value.projectId
   role    = google_project_iam_custom_role.inventory[each.key].name
   member  = "serviceAccount:${google_service_account.broker.email}"
+
+  lifecycle {
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
+    }
+  }
 }
 
 # The same inventory above the projects: folder and organization allow
@@ -1286,6 +1488,13 @@ resource "google_organization_iam_custom_role" "inventory" {
     "resourcemanager.organizations.getIamPolicy",
   ]
 
+  lifecycle {
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
+    }
+  }
+
   depends_on = [terraform_data.authority_gate]
 }
 
@@ -1295,6 +1504,13 @@ resource "google_organization_iam_member" "broker_inventory" {
   org_id = local.evidence.organization_id
   role   = google_organization_iam_custom_role.inventory[0].name
   member = "serviceAccount:${google_service_account.broker.email}"
+
+  lifecycle {
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
+    }
+  }
 }
 
 # The broker reads the live Deny policies at the broker project, the
@@ -1307,4 +1523,13 @@ resource "google_organization_iam_member" "broker_deny_reviewer" {
   org_id = local.evidence.organization_id
   role   = "roles/iam.denyReviewer"
   member = "serviceAccount:${google_service_account.broker.email}"
+
+  lifecycle {
+    precondition {
+      condition     = local.evidence_verified
+      error_message = local.evidence_refusal
+    }
+  }
+
+  depends_on = [terraform_data.authority_gate]
 }

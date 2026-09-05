@@ -1,15 +1,17 @@
 #!/bin/bash
 # Exercise the protected-recovery Terraform module's enabled path -- every
-# target's permanent unique ID recorded and verified live, both phases of the
-# Deny canary verified and bound to their signer and to each other, the live
-# Deny state bound to the attested one, the consumer attachment rows that
-# rest on a disabled API bound to a live read of that API, the module's Deny
-# matrix equal to the broker runtime's in every form, and the activation
-# sequence applied with mock providers -- against an isolated copy of the
-# repository. The committed authority records no identity or consumer commit
-# and no such records exist offline, so the copy records a test identity for
-# each of the thirty-six targets and the active commit for every consumer,
-# the two phases' predicates are rendered by the canary producer's own shape
+# target's permanent unique ID recorded and verified live, all three phases
+# of the Deny canary verified and bound to their signer and to each other,
+# the live Deny state bound to the attested one, the consumer attachment
+# rows that rest on a disabled API bound to a live read of that API, the
+# canary's Allows bound in both exercise phases and read retired live, the
+# module's Deny matrix equal to the broker runtime's in every form, and the
+# activation sequence applied with mock providers behind the apply-time
+# fence -- against an isolated copy of the repository. The committed
+# authority records no identity or consumer commit and no such records exist
+# offline, so the copy records a test identity for each of the thirty-six
+# targets and the active commit for every consumer, the three phases'
+# predicates are rendered by the canary producer's own shape
 # (tools/ci/protected-recovery-canary-fixture.ts), the matrices by the
 # runtime's derivation (tools/ci/protected-recovery-matrix.ts), and every
 # mocked read is rendered from them into enabled/enabled.tftest.hcl.in. The
@@ -63,9 +65,15 @@ consumers="$(jq -r '[.consumers[].repository] | join(",")' "$authority")"
 (cd "$root" && bun --no-env-file run tools/ci/protected-recovery-matrix.ts "$authority" "$active" steady "deployment=${consumers}" > "$fixtures/matrix-deployment.json")
 (cd "$root" && bun --no-env-file run tools/ci/protected-recovery-canary-fixture.ts "$authority" "$active" control 100000000001 100000000001 "$image" > "$fixtures/control.json")
 (cd "$root" && bun --no-env-file run tools/ci/protected-recovery-canary-fixture.ts "$authority" "$active" deny 100000000001 100000000003 "$image" > "$fixtures/deny.json")
-test "$(jq 'length' "$fixtures/matrix-steady.json")" = "$((35 + 4 * 28 + 5))"
-test "$(jq '[.policies[].rules[].canary[]] | length' "$fixtures/deny.json")" = "$((35 + 4 * 28 + 5))"
+(cd "$root" && bun --no-env-file run tools/ci/protected-recovery-canary-fixture.ts "$authority" "$active" cleanup 100000000001 100000000005 "$image" > "$fixtures/cleanup.json")
+test "$(jq 'length' "$fixtures/matrix-steady.json")" = "$((35 + 4 * 29 + 10))"
+test "$(jq '[.policies[].rules[].canary[]] | length' "$fixtures/deny.json")" = "$((35 + 4 * 29 + 10))"
 test "$(jq '[.policies[].rules[].canary[] | select(.outcome == "UNSERVICEABLE")] | length' "$fixtures/deny.json")" = 16
+test "$(jq '[.policies[].rules[].canary[] | select(.requires | length > 1)] | length' "$fixtures/deny.json")" = 27
+test "$(jq '.allowPolicies | length' "$fixtures/deny.json")" = 8
+test "$(jq '.leftovers | length' "$fixtures/cleanup.json")" = 0
+# The two exercise phases pair on every row's digest.
+test "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.digest)"] | sort | join("\n")' "$fixtures/control.json" | openssl dgst -sha256 -r | cut -d' ' -f1)" = "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.digest)"] | sort | join("\n")' "$fixtures/deny.json" | openssl dgst -sha256 -r | cut -d' ' -f1)"
 
 # The digests each phase's evidence names: the raw digest of the fixture
 # bytes the attestation signs, and a distinct archive digest GitHub would
@@ -73,14 +81,18 @@ test "$(jq '[.policies[].rules[].canary[] | select(.outcome == "UNSERVICEABLE")]
 digest() { openssl dgst -sha256 -r "$1" | cut -d' ' -f1; }
 raw_control="$(digest "$fixtures/control.json")"
 raw_deny="$(digest "$fixtures/deny.json")"
+raw_cleanup="$(digest "$fixtures/cleanup.json")"
 archive_control="$(printf '%s archive' "$raw_control" | openssl dgst -sha256 -r | cut -d' ' -f1)"
 archive_deny="$(printf '%s archive' "$raw_deny" | openssl dgst -sha256 -r | cut -d' ' -f1)"
-[[ "$raw_control" =~ ^[0-9a-f]{64}$ ]] && [[ "$raw_deny" =~ ^[0-9a-f]{64}$ ]]
+archive_cleanup="$(printf '%s archive' "$raw_cleanup" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+[[ "$raw_control" =~ ^[0-9a-f]{64}$ ]] && [[ "$raw_deny" =~ ^[0-9a-f]{64}$ ]] && [[ "$raw_cleanup" =~ ^[0-9a-f]{64}$ ]]
 
-run_id() { case "$1" in control) echo 100000000001 ;; deny) echo 100000000003 ;; esac; }
-artifact_id() { case "$1" in control) echo 100000000002 ;; deny) echo 100000000004 ;; esac; }
-raw_of() { case "$1" in control) echo "$raw_control" ;; deny) echo "$raw_deny" ;; esac; }
-archive_of() { case "$1" in control) echo "$archive_control" ;; deny) echo "$archive_deny" ;; esac; }
+run_id() { case "$1" in control) echo 100000000001 ;; deny) echo 100000000003 ;; cleanup) echo 100000000005 ;; esac; }
+artifact_id() { case "$1" in control) echo 100000000002 ;; deny) echo 100000000004 ;; cleanup) echo 100000000006 ;; esac; }
+raw_of() { case "$1" in control) echo "$raw_control" ;; deny) echo "$raw_deny" ;; cleanup) echo "$raw_cleanup" ;; esac; }
+archive_of() { case "$1" in control) echo "$archive_control" ;; deny) echo "$archive_deny" ;; cleanup) echo "$archive_cleanup" ;; esac; }
+artifact_name() { case "$1" in cleanup) echo deny-canary-cleanup ;; *) echo deny-canary ;; esac; }
+predicate_type() { case "$1" in cleanup) echo "https://github.com/collinbentley1/platform/protected-recovery/deny-canary-cleanup/v3" ;; *) echo "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v3" ;; esac; }
 
 signer="https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main"
 
@@ -123,12 +135,16 @@ certificate() {
 }
 
 # The predicate of one phase, exactly as rendered, or with one deviation. The
-# broker's key-creation row is the one every observation-level deviation
-# touches, so the assertions can name it.
+# broker's key-creation row is the one most observation-level deviations
+# touch, so the assertions can name it; the pool-creation row carries the
+# operation deviation, and the actAs row the isolation deviation.
 predicate() {
   local phase="$1" variant="$2"
   local key="iam.googleapis.com/serviceAccountKeys.create"
+  local pool="iam.googleapis.com/workloadIdentityPools.create"
+  local act_as="iam.googleapis.com/serviceAccounts.actAs"
   local broker="cloudresourcemanager.googleapis.com/projects/recovery-test"
+  local row='(.policies[] | select(.attachmentPoint == $broker) | .rules[].canary[] | select(.permission == $key))'
   case "$variant" in
     extra-exception) jq -c '.policies[0].rules[0].exceptionPrincipals += ["principalSet://goog/group/daily-humans@example.com"]' "$fixtures/$phase.json" ;;
     unrelated-resource) jq -c '.policies[0].attachmentPoint = "cloudresourcemanager.googleapis.com/projects/unrelated-project"' "$fixtures/$phase.json" ;;
@@ -136,9 +152,17 @@ predicate() {
     other-image) jq -c '.brokerImage = "us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"' "$fixtures/$phase.json" ;;
     other-phase) jq -c '.phase = (if .phase == "deny" then "control" else "deny" end)' "$fixtures/$phase.json" ;;
     other-control) jq -c '.controlRunId = "100000000009"' "$fixtures/$phase.json" ;;
-    request-mismatch) jq -c --arg key "$key" --arg broker "$broker" '(.policies[] | select(.attachmentPoint == $broker) | .rules[].canary[] | select(.permission == $key) | .request.url) |= (. + "?attempt=2")' "$fixtures/$phase.json" ;;
-    missing-cause) jq -c --arg key "$key" --arg broker "$broker" '(.policies[] | select(.attachmentPoint == $broker) | .rules[].canary[] | select(.permission == $key) | .response) |= (.reason = "" | .permission = "" | .rawPermission = "")' "$fixtures/$phase.json" ;;
+    request-mismatch) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .request.url) |= (. + \"?attempt=2\")" "$fixtures/$phase.json" ;;
+    digest-mismatch) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .digest) |= \"0000000000000000000000000000000000000000000000000000000000000000\"" "$fixtures/$phase.json" ;;
+    pre-state-mismatch) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .preState.observed) |= \"absent\"" "$fixtures/$phase.json" ;;
+    pre-state-unknown) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .preState.observed) |= \"unknown\"" "$fixtures/$phase.json" ;;
+    operation-error) jq -c --arg key "$pool" --arg broker "$broker" "(${row} | .operation) |= {name: \"operations/deny-canary-failed\", done: true, error: {code: 13, message: \"internal error\"}}" "$fixtures/$phase.json" ;;
+    allow-etag-moved) jq -c '.allowPolicies[0].etag |= (. + "-moved")' "$fixtures/$phase.json" ;;
+    allow-missing) jq -c '(.allowPolicies[] | select(.resource == "projects/recovery-test") | .canaryRoles) |= []' "$fixtures/$phase.json" ;;
+    actas-unisolated) jq -c --arg key "$act_as" --arg broker "$broker" "(${row} | .requires) |= (. + [\"run.googleapis.com/services.create\"])" "$fixtures/$phase.json" ;;
+    missing-cause) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .response) |= (.reason = \"\" | .permission = \"\" | .rawPermission = \"\")" "$fixtures/$phase.json" ;;
     unexercised) jq -c --arg key "$key" --arg broker "$broker" '.unexercised = [$broker + "|" + $key]' "$fixtures/$phase.json" ;;
+    cleanup-leftover) jq -c '.leftovers = ["account deny-canary-100000000001 of recovery-test: HTTP 403 The caller does not have permission"]' "$fixtures/$phase.json" ;;
     *) jq -c '.' "$fixtures/$phase.json" ;;
   esac
 }
@@ -150,16 +174,18 @@ run_record() {
   case "$phase" in
     control) created="2026-09-05T00:00:00Z"; updated="2026-09-05T00:30:00Z" ;;
     deny) created="2026-09-05T01:00:00Z"; updated="2026-09-05T01:30:00Z" ;;
+    cleanup) created="2026-09-05T02:00:00Z"; updated="2026-09-05T02:30:00Z" ;;
   esac
   jq -cn --argjson id "$(run_id "$phase")" --arg head "$active" --arg created "$created" --arg updated "$updated" '{id: $id, run_attempt: 1, status: "completed", conclusion: "success", head_sha: $head, path: ".github/workflows/protected-recovery-deny-canary.yml", event: "workflow_dispatch", repository: {id: 1255856466}, head_repository: {id: 1255856466}, created_at: $created, updated_at: $updated}' | case "$variant" in
     run-other-head) jq -c '.head_sha = "cccccccccccccccccccccccccccccccccccccccc"' ;;
     control-after-deny) jq -c '.updated_at = "2026-09-05T02:00:00Z"' ;;
+    cleanup-before-deny) jq -c '.created_at = "2026-09-05T01:10:00Z"' ;;
     *) cat ;;
   esac
 }
 artifact_record() {
   local phase="$1" variant="$2"
-  jq -cn --argjson id "$(artifact_id "$phase")" --argjson run "$(run_id "$phase")" --arg head "$active" --arg archive "$(archive_of "$phase")" '{id: $id, name: "deny-canary", digest: ("sha256:" + $archive), expired: false, workflow_run: {id: $run, head_sha: $head}}' | case "$variant" in
+  jq -cn --argjson id "$(artifact_id "$phase")" --argjson run "$(run_id "$phase")" --arg head "$active" --arg archive "$(archive_of "$phase")" --arg name "$(artifact_name "$phase")" '{id: $id, name: $name, digest: ("sha256:" + $archive), expired: false, workflow_run: {id: $run, head_sha: $head}}' | case "$variant" in
     artifact-digest) jq -c '.digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' ;;
     *) cat ;;
   esac
@@ -183,10 +209,10 @@ verification() {
     # argument's size on Linux (MAX_ARG_STRLEN), so it reaches jq as a file
     # rather than as argv.
     predicate "$phase" "$variant" > "$copy/predicate.json"
-    statement="$(jq -cn --arg sha "$(raw_of "$phase")" --slurpfile predicate "$copy/predicate.json" '{
+    statement="$(jq -cn --arg sha "$(raw_of "$phase")" --arg type "$(predicate_type "$phase")" --arg name "$(artifact_name "$phase").json" --slurpfile predicate "$copy/predicate.json" '{
       "_type": "https://in-toto.io/Statement/v1",
-      predicateType: "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v2",
-      subject: [{ name: "deny-canary.json", digest: { sha256: $sha } }],
+      predicateType: $type,
+      subject: [{ name: $name, digest: { sha256: $sha } }],
       predicate: $predicate[0]
     }' | jq -R -r '@json')"
   else
@@ -214,7 +240,7 @@ live_policies() {
 }
 override_deny_state() {
   local attachment="$1" variant="${2:-consistent}"
-  printf 'override_data {\n  target          = data.external.deny_state["%s"]\n  override_during = plan\n  values          = { result = { status = "200", reason = "", policies = %s } }\n}\n' "$attachment" "$(live_policies "$attachment" "$variant" | jq -R -r '@json')"
+  printf 'override_data {\n  target = data.external.deny_state["%s"]\n  values = { result = { status = "200", reason = "", policies = %s } }\n}\n' "$attachment" "$(live_policies "$attachment" "$variant" | jq -R -r '@json')"
 }
 broker_attachment="cloudresourcemanager.googleapis.com/projects/recovery-test"
 live_deny_state() {
@@ -229,9 +255,9 @@ live_deny_state() {
 override_service_state() {
   local project="$1" service="$2" state="$3"
   if [ "$state" = unread ]; then
-    printf 'override_data {\n  target          = data.external.service_state["%s|%s"]\n  override_during = plan\n  values          = { result = { status = "503", state = "", reason = "reading the service answered HTTP 503" } }\n}\n' "$project" "$service"
+    printf 'override_data {\n  target = data.external.service_state["%s|%s"]\n  values = { result = { status = "503", state = "", reason = "reading the service answered HTTP 503" } }\n}\n' "$project" "$service"
   else
-    printf 'override_data {\n  target          = data.external.service_state["%s|%s"]\n  override_during = plan\n  values          = { result = { status = "200", state = "%s", reason = "" } }\n}\n' "$project" "$service" "$state"
+    printf 'override_data {\n  target = data.external.service_state["%s|%s"]\n  values = { result = { status = "200", state = "%s", reason = "" } }\n}\n' "$project" "$service" "$state"
   fi
 }
 live_service_state() {
@@ -241,6 +267,29 @@ live_service_state() {
       override_service_state "$project" "$service" DISABLED
     done
   done < <(jq -r '.consumers[].projectId' "$authority")
+}
+
+# The live allow reads of every attachment point as the credential-free
+# reader answers them: the canary's roles, none anywhere once retired, or
+# one read with a role still standing or that cannot be read.
+override_allow_state() {
+  local attachment="$1" variant="${2:-retired}"
+  case "$variant" in
+    retired) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "200", etag = "allow-etag-retired", roles = "[]", reason = "" } }\n}\n' "$attachment" ;;
+    standing) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "200", etag = "allow-etag-standing", roles = %s, reason = "" } }\n}\n' "$attachment" "$(jq -cn '["roles/run.admin"]' | jq -R -r '@json')" ;;
+    unread) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "503", etag = "", roles = "[]", reason = "reading the allow policy answered HTTP 503" } }\n}\n' "$attachment" ;;
+    *) echo "unknown live allow variant $variant" >&2; exit 1 ;;
+  esac
+}
+live_allow_state() {
+  local attachment
+  while IFS= read -r attachment; do
+    override_allow_state "$attachment" retired
+  done < <(jq -r '.policies[].attachmentPoint' "$fixtures/deny.json")
+}
+attachment_of_project() {
+  local project="$1"
+  if [ "$project" = 100000000001 ]; then printf 'cloudresourcemanager.googleapis.com/organizations/%s\n' "$project"; else printf 'cloudresourcemanager.googleapis.com/projects/%s\n' "$project"; fi
 }
 
 # The thirty-six live account reads, each resolving to its recorded identity.
@@ -285,11 +334,19 @@ while IFS= read -r line; do
       rest="${spec#*:}"
       override_service_state "$project" "${rest%%:*}" "${rest#*:}" | sed 's/^/  /'
       ;;
+    @@LIVE_ALLOW_STATE@@)
+      live_allow_state
+      ;;
+    @@LIVE_ALLOW_STATE:*@@)
+      spec="${trimmed#@@LIVE_ALLOW_STATE:}"
+      spec="${spec%@@}"
+      override_allow_state "$(attachment_of_project "${spec%%:*}")" "${spec#*:}" | sed 's/^/  /'
+      ;;
     *)
       printf '%s\n' "$line"
       ;;
   esac
-done < "$template" | sed -e "s/@@RAW_control@@/$raw_control/g" -e "s/@@ARCHIVE_control@@/$archive_control/g" -e "s/@@RAW_deny@@/$raw_deny/g" -e "s/@@ARCHIVE_deny@@/$archive_deny/g" > "$rendered"
+done < "$template" | sed -e "s/@@RAW_control@@/$raw_control/g" -e "s/@@ARCHIVE_control@@/$archive_control/g" -e "s/@@RAW_deny@@/$raw_deny/g" -e "s/@@ARCHIVE_deny@@/$archive_deny/g" -e "s/@@RAW_cleanup@@/$raw_cleanup/g" -e "s/@@ARCHIVE_cleanup@@/$archive_cleanup/g" > "$rendered"
 if grep -q '@@' "$rendered"; then
   echo "The rendered enabled-path test still carries a placeholder." >&2
   grep -n '@@' "$rendered" | head -5 >&2

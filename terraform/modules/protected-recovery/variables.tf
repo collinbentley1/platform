@@ -57,26 +57,29 @@ variable "transition_workflow_sha" {
 
 # Evidence that enables the broker's authority over consumer accounts. It is
 # not a switch and it carries no claim: it names the reviewed organization and
-# two GitHub Actions runs of the Deny canary workflow -- the control phase and
-# the deny phase -- each with its uploaded artifact and that artifact's two
-# digests: the sha256 of the raw deny-canary.json the attestation signs, and
-# the sha256 of the archive GitHub records for the artifact. Everything the
-# gate decides on is then read from authenticated, immutable records rather
-# than from these inputs: each run's conclusion, attempt, head commit,
-# workflow path, event, repository, and timing from the GitHub run record;
-# each artifact's digest and run from the GitHub artifact record and from
-# the downloaded bytes; the canary's phase, organization, broker image, every
-# Deny policy attachment point, denied principal set, exact exception set,
-# denied permission, per-permission ALLOWED (control) and DENIED (deny)
-# observation with its request and its IAM denial, and unexercised
-# permissions from each artifact's attested predicate served by GitHub's
-# attestation store (see main.tf, locals evidence_checks and matrices). Every
-# check must pass, the organization must be the live parent of every consumer
-# project and of the broker project, and every target's permanent unique ID
-# must be recorded and resolve live to its current email, or the plan fails;
-# nothing supplied here can widen a grant.
+# three GitHub Actions runs of the Deny canary workflow -- the control phase,
+# the deny phase, and the cleanup that followed them -- each with its uploaded
+# artifact and that artifact's two digests: the sha256 of the raw predicate
+# file the attestation signs, and the sha256 of the archive GitHub records
+# for the artifact. Everything the gate decides on is then read from
+# authenticated, immutable records rather than from these inputs: each run's
+# conclusion, attempt, head commit, workflow path, event, repository, and
+# timing from the GitHub run record; each artifact's digest and run from the
+# GitHub artifact record and from the downloaded bytes; the canary's phase,
+# organization, broker image, the allow policies it recorded, every Deny
+# policy attachment point, denied principal set, exact exception set, denied
+# permission, per-permission ALLOWED (control) and DENIED (deny) observation
+# with its request digest, pre-state, required permissions, operation, and
+# IAM denial, the cleanup's leftovers, and unexercised permissions from each
+# artifact's attested predicate served by GitHub's attestation store (see
+# main.tf, locals evidence_checks and matrices). Every check must pass, the
+# organization must be the live parent of every consumer project and of the
+# broker project, every target's permanent unique ID must be recorded and
+# resolve live to its current email, and the canary's temporary Allows must
+# be gone from every attachment point live, or the apply fails; nothing
+# supplied here can widen a grant.
 variable "broker_authority_evidence" {
-  description = "The reviewed organization and, for the control phase and the deny phase of the Deny canary at this platform revision against this broker image, the GitHub run, artifact ID, raw artifact sha256 digest, and archive sha256 digest. Null keeps the broker without any authority over consumer accounts; every other field is verified against GitHub's run, artifact, and attestation records and the live Deny state."
+  description = "The reviewed organization and, for the control phase, the deny phase, and the cleanup phase of the Deny canary at this platform revision against this broker image, the GitHub run, artifact ID, raw artifact sha256 digest, and archive sha256 digest. Null keeps the broker without any authority over consumer accounts; every other field is verified against GitHub's run, artifact, and attestation records and the live Deny and allow state."
   type = object({
     organization_id = string
     deny_control = object({
@@ -91,21 +94,28 @@ variable "broker_authority_evidence" {
       artifact_sha256 = string
       archive_sha256  = string
     })
+    deny_cleanup = object({
+      run_id          = string
+      artifact_id     = string
+      artifact_sha256 = string
+      archive_sha256  = string
+    })
   })
   default = null
 
   validation {
     condition = var.broker_authority_evidence == null || try(
       can(regex("^[1-9][0-9]*$", var.broker_authority_evidence.organization_id)) &&
-      alltrue([for phase in [var.broker_authority_evidence.deny_control, var.broker_authority_evidence.deny_canary] :
+      alltrue([for phase in [var.broker_authority_evidence.deny_control, var.broker_authority_evidence.deny_canary, var.broker_authority_evidence.deny_cleanup] :
         can(regex("^[1-9][0-9]*$", phase.run_id)) &&
         can(regex("^[1-9][0-9]*$", phase.artifact_id)) &&
         can(regex("^[0-9a-f]{64}$", phase.artifact_sha256)) &&
         can(regex("^[0-9a-f]{64}$", phase.archive_sha256)) &&
         phase.artifact_sha256 != phase.archive_sha256
-      ]),
+      ]) &&
+      length(distinct([var.broker_authority_evidence.deny_control.run_id, var.broker_authority_evidence.deny_canary.run_id, var.broker_authority_evidence.deny_cleanup.run_id])) == 3,
       false,
     )
-    error_message = "broker_authority_evidence must carry a numeric organization_id and, for each canary phase, a numeric run_id, a numeric artifact_id, a sha256 raw artifact digest, and a distinct sha256 archive digest; never fabricated placeholders."
+    error_message = "broker_authority_evidence must carry a numeric organization_id and, for each of the three canary phases, a numeric run_id distinct from the other phases', a numeric artifact_id, a sha256 raw artifact digest, and a distinct sha256 archive digest; never fabricated placeholders."
   }
 }

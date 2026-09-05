@@ -74,13 +74,17 @@ output "deployment_deny_matrix" {
 }
 
 output "deny_canary_contract" {
-  description = "What the Deny canary must produce for its result to be admissible: the workflow whose runs are named, the two attested phases, the artifact each phase uploads, the attestation predicate type and schema the module decodes, the canary principal every observation must name, and the consumer attachment rows that may rest on a SERVICE_DISABLED answer beside a live read of the API's state."
+  description = "What the Deny canary must produce for its result to be admissible: the workflow whose runs are named, the three attested phases, the artifact each phase uploads, the attestation predicate types and schemas the module decodes, the canary principal every observation must name, the consumer attachment rows that may rest on a SERVICE_DISABLED answer beside a live read of the API's state, and the rows whose pre-state the deny phase may record as unknown."
   value = {
     artifact                  = local.deny_canary_artifact
     canary                    = local.canary_principal
+    cleanup_artifact          = local.deny_cleanup_artifact
+    cleanup_predicate_type    = local.deny_cleanup_predicate_type
+    cleanup_schema            = local.deny_cleanup_schema
     phases                    = sort(keys(local.canary_phases))
     predicate_type            = local.deny_canary_predicate_type
     schema                    = local.deny_canary_schema
+    unobservable_prestate     = local.unobservable_prestate
     unserviceable_permissions = local.unserviceable_permissions
     workflow                  = local.deny_canary_workflow
   }
@@ -89,4 +93,9 @@ output "deny_canary_contract" {
 output "unserviceable_rows" {
   description = "Required consumer attachment rows whose evidence is the identical request answering SERVICE_DISABLED in both canary phases beside a live read proving the API disabled, rather than a proven denial; empty when every row is proven denied, and empty without evidence."
   value       = local.authority_enabled ? local.unserviceable_rows : []
+}
+
+output "co_denied_rows" {
+  description = "Required rows whose deny-phase request needs a second permission the matrix denies at the same attachment point (Cloud Run writes need actAs beside their own permission; the implicit-delegation chain needs the delegate's getAccessToken), so each is proven by the denial naming its own permission beside an isolated proof of the other; empty without evidence."
+  value       = local.authority_enabled ? local.co_denied_rows : []
 }
