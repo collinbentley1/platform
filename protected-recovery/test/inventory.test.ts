@@ -587,6 +587,15 @@ describe("credential inventory", () => {
     expect(await findingsOf()).toEqual([`grant:projects/882468538648|roles/run.serviceAgent|${runAgent}`, "attachment:run.googleapis.com/projects/cdbentley/locations/us-east4/workerPools/pool"]);
     expect((await recordOf()).summary.neutralized).toEqual([`projects/882468538648|roles/cloudscheduler.serviceAgent|${schedulerAgent}|frozen:cloudscheduler.googleapis.com`]);
     fixture.run.regions = { "us-east4": emptyRun };
+    // A disabled Scheduler API enumerates nothing and proves nothing: a job retained through the disable would run
+    // as soon as the API is enabled again, so the Scheduler agent's grant stays a finding, recorded beside the
+    // disabled service, until the API is enabled and the enumeration finds no job.
+    fixture.scheduler = { ...fixture.scheduler, status: 403 };
+    expect(await findingsOf()).toEqual([`grant:projects/882468538648|roles/cloudscheduler.serviceAgent|${schedulerAgent}`]);
+    expect((await recordOf()).summary.neutralized).toEqual([`projects/882468538648|roles/run.serviceAgent|${runAgent}|frozen:run.googleapis.com`]);
+    expect((await recordOf()).summary.services).toContain("cloudscheduler.googleapis.com:disabled");
+    fixture.scheduler = { ...fixture.scheduler, status: 200 };
+    expect(await findingsOf()).toEqual([]);
     // The consumer's deployment form leaves its attachment paths open: neither agent is neutralized.
     fixture.deny.documents = denyDocuments(authority, { ...steadyFlags, deployment: ["cdbentley"] });
     expect(await findingsOf()).toEqual(["deny-state:deployment", `grant:projects/882468538648|roles/cloudscheduler.serviceAgent|${schedulerAgent}`, `grant:projects/882468538648|roles/run.serviceAgent|${runAgent}`]);

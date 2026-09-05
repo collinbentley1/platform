@@ -54,9 +54,16 @@ import {
 //                    account. That grant is neutralized -- recorded, not
 //                    hidden -- exactly when the live Deny state is the steady
 //                    form (every attachment path of that service frozen for
-//                    every principal, service agents included) and this
-//                    inventory found no attachment of that service running as
-//                    the target; otherwise it is a grant finding
+//                    every principal, service agents included), the service's
+//                    API is enabled so that this inventory enumerated its
+//                    workloads, and the enumeration found no attachment of
+//                    that service running as the target; otherwise it is a
+//                    grant finding. A disabled API is never proof of absence:
+//                    disabling an API deletes none of its resources, and a
+//                    Scheduler job retained through a disable runs as soon as
+//                    the API is enabled again (which the steady form freezes
+//                    too), so the grant stays a finding until the API is
+//                    enabled and the enumeration establishes deletion
 //
 // One batch reads one consumer project's shared state once and every target
 // against it; the record of each target spans the interval from the batch's
@@ -273,6 +280,15 @@ export class GoogleCredentialInventory implements CredentialInventory {
       roles.set(binding.role, await this.#role(binding.role, bearer));
     }
     const attachments = [...new Set([...computeAttachments(target, consumer, snapshot), ...runAttachments(target, snapshot), ...buildAttachments(target, consumer, snapshot), ...schedulerAttachments(target, snapshot)])].sort();
+    // The services whose workloads this batch actually enumerated: an API
+    // that answered SERVICE_DISABLED hosted no enumeration, and its
+    // resources, if any, are unseen rather than absent.
+    const enumerated = new Set<string>([
+      ...(snapshot.build === "disabled" ? [] : ["cloudbuild.googleapis.com"]),
+      ...(snapshot.scheduler === "disabled" ? [] : ["cloudscheduler.googleapis.com"]),
+      ...(snapshot.compute === "disabled" ? [] : ["compute.googleapis.com"]),
+      ...(snapshot.run === "disabled" ? [] : ["run.googleapis.com"]),
+    ]);
     const grants = new Set<string>();
     const neutralized: string[] = [];
     const poolPrefixes = [`principalSet://iam.googleapis.com/${target.pool}/`, `principal://iam.googleapis.com/${target.pool}/`];
@@ -290,7 +306,7 @@ export class GoogleCredentialInventory implements CredentialInventory {
           if (resource === target.resource && binding.condition === null && binding.role === actuatorRole && member === broker && permissions.every((permission) => actuatorPermissions.includes(permission))) continue;
           if (!capable && !federated) continue;
           const agent = serviceAgents.find((candidate) => candidate.role === binding.role && member === `serviceAccount:service-${consumer.projectNumber}@${candidate.domain}`);
-          if (agent && resource === projectResource && binding.condition === null && snapshot.denyState.form === "steady" && !attachments.some((attachment) => attachment.startsWith(agent.prefix))) {
+          if (agent && resource === projectResource && binding.condition === null && snapshot.denyState.form === "steady" && enumerated.has(agent.service) && !attachments.some((attachment) => attachment.startsWith(agent.prefix))) {
             neutralized.push(`${label}|${member}|frozen:${agent.service}`);
             continue;
           }
