@@ -1,28 +1,59 @@
 # The enabled path of the protected-recovery module: every target's permanent
-# unique ID recorded and verified live, and the Deny canary evidence verified
-# against GitHub's run, artifact, and attestation records. The committed
-# authority records no identity and no such records exist offline, so
-# tools/ci/protected-recovery-enabled-test.sh renders this template into an
-# isolated copy of the repository whose authority.json records a test identity
-# for each of the thirty-six targets, and whose mocked GitHub reads answer with
-# fixtures/deny-canary.json and its adversarial variants. A line consisting of
-# an ATTESTATION placeholder names the variant rendered there:
+# unique ID recorded and verified live, the Deny canary's attestation
+# verified and bound to its signer, and the live Deny state bound to the
+# attested one. The committed authority records no identity and no such
+# records exist offline, so tools/ci/protected-recovery-enabled-test.sh
+# renders this template into an isolated copy of the repository whose
+# authority.json records a test identity for each of the thirty-six targets
+# and the active platform commit for every consumer (plus a transition commit
+# for runsetta), and whose mocked reads answer with fixtures/deny-canary.json
+# and its adversarial variants. A line consisting of one of these placeholders
+# (each wrapped in double at-signs) names the record rendered there:
 #
-#   consistent           the fixture as attested
-#   extra-exception      one extra exception principal on one rule
-#   unrelated-resource   the broker-project rules attached to another project
-#   unsupported          a required permission reported unsupported and omitted
-#   missing-observation  a required permission listed but never observed DENIED
-#   other-image          a canary of another broker image
+#   VERIFICATION:<certificate>:<predicate>   the verified attestation, as
+#       tools/ci/protected-recovery-verify-canary.sh answers it; certificate
+#       variants consistent, other-workflow, other-run, other-head,
+#       other-repository, self-hosted; predicate variants consistent,
+#       extra-exception, unrelated-resource, missing-observation,
+#       other-image, and unverified (verification refused outright)
+#   LIVE_DENY_STATE   the live deny policies of every attachment point,
+#       listed and read, exactly as attested
+#   LIVE_DENY_POLICY:<variant>   the broker project's live policy with
+#       one deviation: etag-moved, exception-widened, condition-added,
+#       permission-missing
+#   LIVE_DENY_LISTING:missing   the broker project's listing without its
+#       policy
 #
 # and the ARTIFACT_SHA256 placeholder is the digest of the fixture bytes.
-# These are mocked plan-shape tests: they prove what the gate does with each
-# record, not that GitHub or Google answer as modelled. The identity of the
-# test accounts is 1 + consumer index + account index + sixteen zeros, in the
-# sorted order of protected-recovery/authority.json.
+# These are mocked plan-shape and apply-shape tests: they prove what the gate
+# does with each record and that the activation sequence is permitted by the
+# matrix it requires, not that GitHub, gh, or Google answer as modelled. The
+# identity of the test accounts is 1 + consumer index + account index +
+# sixteen zeros, in the sorted order of protected-recovery/authority.json.
 
-mock_provider "google" {}
+# The mocked apply of the activation sequence needs the computed names the
+# dependent IAM resources validate to be well-formed; the values are shapes,
+# not identities.
+mock_provider "google" {
+  mock_resource "google_service_account" {
+    defaults = {
+      email = "mocked@recovery-test.iam.gserviceaccount.com"
+      name  = "projects/recovery-test/serviceAccounts/mocked@recovery-test.iam.gserviceaccount.com"
+    }
+  }
+  mock_resource "google_project_iam_custom_role" {
+    defaults = {
+      name = "projects/recovery-test/roles/mocked"
+    }
+  }
+  mock_resource "google_organization_iam_custom_role" {
+    defaults = {
+      name = "organizations/100000000001/roles/mocked"
+    }
+  }
+}
 mock_provider "http" {}
+mock_provider "external" {}
 
 override_data {
   target = data.google_project.current
@@ -365,15 +396,13 @@ override_data {
   }
 }
 
+# gh attestation verify's answer for the artifact, and the live Deny state.
 override_data {
-  target = data.http.canary_attestations[0]
-  values = {
-    status_code   = 200
-    response_body = <<-JSON
-      @@ATTESTATION:consistent@@
-    JSON
-  }
+  target = data.external.canary_verification[0]
+  @@VERIFICATION:consistent:consistent@@
 }
+
+@@LIVE_DENY_STATE@@
 
 variables {
   project_id          = "recovery-test"
@@ -393,8 +422,32 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
   command = plan
 
   assert {
-    condition     = local.evidence_verified && length(local.evidence_failures) == 0 && length(local.unsatisfied_deny_rows) == 0 && length(local.unsupported_required) == 0
-    error_message = "Consistent records must pass every check with no unsatisfied Deny row and no unsupported required permission; failed checks [${join(", ", local.evidence_failures)}], unsatisfied rows [${join(", ", local.unsatisfied_deny_rows)}], unsupported [${join(", ", local.unsupported_required)}]."
+    condition     = local.evidence_verified && length(local.evidence_failures) == 0 && length(local.unsatisfied_deny_rows) == 0 && length(local.live_unsatisfied_rows) == 0 && length(local.missing_live_permissions) == 0 && length(local.activation_blocked) == 0
+    error_message = "Consistent records must pass every check with no unsatisfied Deny row, every live row as required, no required permission the live state does not deny, and no blocked activation mutation; failed checks [${join(", ", local.evidence_failures)}], unsatisfied rows [${join(", ", local.unsatisfied_deny_rows)}], live rows [${join(", ", local.live_unsatisfied_rows)}], missing [${join(", ", local.missing_live_permissions)}], blocked [${join(", ", local.activation_blocked)}]."
+  }
+
+  assert {
+    condition     = local.canary_verified && local.certificate_bound && local.canary_certificate.buildSignerURI == "https://github.com/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main" && local.canary_certificate.runInvocationURI == "https://github.com/collinbentley1/platform/actions/runs/100000000002/attempts/1" && local.canary_certificate.sourceRepositoryDigest == var.active_workflow_sha
+    error_message = "The verified certificate must bind the predicate to the deny-canary workflow at the active commit, the named run, and the platform repository."
+  }
+
+  assert {
+    condition     = local.live_matches_canary && length(data.http.deny_policies) == 5 && length(data.http.deny_policy) == 5 && length(local.live_rules) == 5 + 4 * 4 && length(local.required_deny_matrix) == 33 + 4 * 26
+    error_message = "Every attachment point's live deny policies must be read and be exactly the attested ones, and the whole matrix must be carried by them."
+  }
+
+  assert {
+    condition     = length(google_service_account_iam_member.member_authority) == 61 && length(local.member_tuples) == 61 && length(local.invoker_tuples) == 8 && length(local.canary_tuples) == 1 && length(google_cloud_run_v2_service_iam_member.invokers) == 13
+    error_message = "With every consumer commit recorded, exactly the sixty-one canonical consumer job tuples (fourteen per consumer, plus runsetta's five transition tuples) are bound to their member-delivery identities, and the identities, invokers, and reconciler hold run.invoker."
+  }
+
+  assert {
+    condition = (
+      sort(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getOpenIdToken"].exceptions) == sort(concat(["principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com"], local.invoker_tuples, local.member_tuples)) &&
+      length(local.required_deny_matrix["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getOpenIdToken"].exceptions) == 1 + 8 + 61 &&
+      alltrue([for tuple in local.member_tuples : startswith(tuple, "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/") && !strcontains(tuple, "*")])
+    )
+    error_message = "The ID-token exception set must be exactly the Scheduler agent and the exact invoker and member tuples in the broker pool, never a wildcard."
   }
 
   assert {
@@ -497,17 +550,78 @@ run "an_artifact_whose_recorded_digest_differs_is_refused" {
   expect_failures = [google_project_iam_custom_role.actuator]
 }
 
+run "an_attestation_gh_cannot_verify_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:consistent:unverified@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_attestation_signed_by_another_workflow_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:other-workflow:consistent@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_attestation_signed_by_another_run_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:other-run:consistent@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_attestation_signed_at_another_head_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:other-head:consistent@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_attestation_signed_from_another_repository_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:other-repository:consistent@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "an_attestation_signed_on_a_self_hosted_runner_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:self-hosted:consistent@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
 run "an_extra_exception_principal_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_attestations[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        @@ATTESTATION:extra-exception@@
-      JSON
-    }
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:consistent:extra-exception@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -517,29 +631,8 @@ run "a_canary_against_an_unrelated_resource_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_attestations[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        @@ATTESTATION:unrelated-resource@@
-      JSON
-    }
-  }
-
-  expect_failures = [google_project_iam_custom_role.actuator]
-}
-
-run "a_required_permission_the_canary_reports_unsupported_keeps_activation_blocked" {
-  command = plan
-
-  override_data {
-    target = data.http.canary_attestations[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        @@ATTESTATION:unsupported@@
-      JSON
-    }
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:consistent:unrelated-resource@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -549,13 +642,8 @@ run "a_required_permission_never_observed_denied_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_attestations[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        @@ATTESTATION:missing-observation@@
-      JSON
-    }
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:consistent:missing-observation@@
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -565,13 +653,76 @@ run "evidence_of_another_broker_image_is_refused" {
   command = plan
 
   override_data {
-    target = data.http.canary_attestations[0]
-    values = {
-      status_code   = 200
-      response_body = <<-JSON
-        @@ATTESTATION:other-image@@
-      JSON
-    }
+    target = data.external.canary_verification[0]
+    @@VERIFICATION:consistent:other-image@@
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+# The live Deny state is bound to the attested one on every apply: a policy
+# changed, widened, conditioned, narrowed, or deleted since the canary
+# refuses the plan although the canary records are untouched.
+run "a_live_policy_whose_etag_moved_since_the_canary_is_refused" {
+  command = plan
+
+  @@LIVE_DENY_POLICY:etag-moved@@
+
+  assert {
+    condition     = !local.live_matches_canary && contains(local.evidence_failures, "deny_state_current")
+    error_message = "A live policy at another etag than the attested one must fail deny_state_current."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_live_exception_widened_since_the_canary_is_refused" {
+  command = plan
+
+  @@LIVE_DENY_POLICY:exception-widened@@
+
+  assert {
+    condition     = contains(local.evidence_failures, "deny_state_required") && length(local.live_unsatisfied_rows) > 0
+    error_message = "A live rule with an extra exception principal must leave its rows unsatisfied by the live state."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_live_condition_added_since_the_canary_is_refused" {
+  command = plan
+
+  @@LIVE_DENY_POLICY:condition-added@@
+
+  assert {
+    condition     = contains(local.evidence_failures, "deny_state_required")
+    error_message = "A live rule narrowed by a denial condition must leave its rows unsatisfied by the live state."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_required_permission_the_live_state_does_not_deny_is_refused" {
+  command = plan
+
+  @@LIVE_DENY_POLICY:permission-missing@@
+
+  assert {
+    condition     = local.missing_live_permissions == tolist(["cloudresourcemanager.googleapis.com/projects/recovery-test|cloudresourcemanager.googleapis.com/projects.setIamPolicy"]) && contains(local.evidence_failures, "supported")
+    error_message = "A required permission no live rule denies must be reported as missing and block activation."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator]
+}
+
+run "a_live_policy_deleted_since_the_canary_is_refused" {
+  command = plan
+
+  @@LIVE_DENY_LISTING:missing@@
+
+  assert {
+    condition     = !local.live_matches_canary && length(data.http.deny_policy) == 4
+    error_message = "An attested policy the live state no longer lists must fail deny_state_current."
   }
 
   expect_failures = [google_project_iam_custom_role.actuator]
@@ -598,5 +749,50 @@ run "without_evidence_nothing_is_granted_even_with_every_identity_recorded" {
   assert {
     condition     = local.identities_recorded && length(data.google_service_account.target) == 0 && length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_custom_role.inventory) == 0 && length(google_organization_iam_custom_role.inventory) == 0
     error_message = "Recorded identities alone must grant nothing; only verified evidence enables authority."
+  }
+}
+
+# The activation sequence from an empty broker project, applied with mock
+# providers and state carried from run to run: the broker project alone
+# without evidence, the evidenced grants once the Deny state stands and every
+# mutation the apply makes is permitted its principal, and revocation of the
+# grants when the evidence is withdrawn.
+run "activation_step_one_installs_the_broker_project_alone" {
+  command = apply
+
+  variables {
+    broker_authority_evidence = null
+  }
+
+  assert {
+    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(data.google_project.consumer) == 0
+    error_message = "Step one must create nothing in any consumer project and read none."
+  }
+
+  assert {
+    condition     = length(google_service_account_iam_member.invoker_authority) == 8 && length(google_service_account_iam_member.member_authority) == 61 && length(google_service_account_iam_member.canary_authority) == 1 && length(google_cloud_run_v2_service_iam_member.invokers) == 13 && google_iam_workload_identity_pool_provider.members.workload_identity_pool_provider_id == "github-members"
+    error_message = "Step one must create the broker project's identities and their bindings: invokers, member-delivery identities, and the Deny canary, so the canary can run before any grant exists."
+  }
+}
+
+run "activation_step_two_grants_authority_under_the_evidenced_deny_state" {
+  command = apply
+
+  assert {
+    condition     = local.evidence_verified && length(local.activation_blocked) == 0 && length(google_project_iam_custom_role.actuator) == 4 && length(google_service_account_iam_member.actuator) == 36 && length(google_project_iam_member.broker_inventory) == 4 && length(google_organization_iam_member.broker_inventory) == 1
+    error_message = "Step two must grant exactly the four actuator roles, thirty-six actuator grants, four inventory grants, and one organization inventory grant, every one a mutation the matrix permits the applying identity."
+  }
+}
+
+run "activation_step_three_revokes_authority_when_evidence_is_withdrawn" {
+  command = apply
+
+  variables {
+    broker_authority_evidence = null
+  }
+
+  assert {
+    condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(google_service_account_iam_member.member_authority) == 61
+    error_message = "Withdrawing the evidence must revoke every cross-project grant and keep the broker project's own identities."
   }
 }

@@ -18,18 +18,27 @@ locals {
   consumers = { for consumer in local.authority.consumers : consumer.repository => consumer }
 
   # The one inventory of federated authority, shared with terraform/modules/bootstrap
-  # and tools/ci/workflow-authority.ts. This module binds only recovery-domain
-  # entries -- one per consumer and effect direction, keyed "<consumer>/<intent>",
-  # each naming its own direction-bound invoker -- and the consumer-domain
-  # entries are bound by each consumer's bootstrap.
+  # and tools/ci/workflow-authority.ts. This module binds the recovery-domain
+  # entries: one invoker per consumer and effect direction, keyed
+  # "<consumer>/<intent>", and the one Deny canary job. The consumer-domain
+  # entries are bound by each consumer's bootstrap to the consumer's own
+  # accounts; here the same entries, at the platform commits each consumer
+  # records in protected-recovery/authority.json, bind the consumer's
+  # canonical jobs to that consumer's member-delivery identity so each job
+  # can deliver its own credential to the broker (POST /v1/members).
   workflow_authority = jsondecode(file("${path.module}/../bootstrap/workflow-authority.json"))
   recovery_entries   = { for entry in local.workflow_authority : "${entry.consumer}/${entry.intent}" => entry if entry.trustDomain == "recovery" && entry.purpose == "recovery" }
-  target_accounts    = sort(distinct(flatten([for entry in local.workflow_authority : entry.serviceAccounts if entry.trustDomain == "consumer" && entry.purpose == "gcp"])))
+  deny_canary_entry  = one([for entry in local.workflow_authority : entry if entry.trustDomain == "recovery" && entry.purpose == "deny-canary"])
+  consumer_entries   = [for entry in local.workflow_authority : entry if entry.trustDomain == "consumer" && entry.purpose == "gcp"]
+  target_accounts    = sort(distinct(flatten([for entry in local.consumer_entries : entry.serviceAccounts])))
   # One credential per direction: "gha-quarantine-<consumer>" would exceed the
   # 30-character service account ID limit, so QUARANTINE is named "isolate".
   invoker_prefixes = { QUARANTINE = "gha-isolate-", RESTORE = "gha-restore-" }
+  member_prefix    = "gha-member-"
+  deny_canary_id   = "gha-deny-canary"
 
   authority_delimiter    = ":"
+  github_owner           = local.authority.githubOwner
   github_owner_id        = local.authority.githubOwnerId
   platform_repository    = local.authority.platformRepository
   platform_repository_id = local.authority.platformRepositoryId
@@ -92,6 +101,59 @@ locals {
     })
   }
 
+  # The Deny canary's own exact tuple, at the active commit only: the one
+  # principal that may exchange for the canary identity.
+  canary_bindings = local.deny_canary_entry == null ? {} : {
+    for binding in flatten([
+      for caller in local.deny_canary_entry.callers : [
+        for event in caller.events : {
+          key = "${local.deny_canary_entry.job}:${event}@${var.active_workflow_sha}"
+          authority = join(local.authority_delimiter, [
+            "${local.platform_repository}/${caller.workflow}@${caller.ref}",
+            var.active_workflow_sha,
+            local.deny_canary_entry.environment,
+            event,
+          ])
+        }
+      ]
+      ]) : binding.key => merge(binding, {
+      member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"
+    })
+  }
+
+  # Every canonical consumer job -- exactly the managed members the broker
+  # actuates, derived from the same entries and the commits each consumer
+  # records -- bound through the member provider of this pool to that
+  # consumer's member-delivery identity. The composite is the consumer
+  # provider's five-claim tuple, so a job that is a managed member of a
+  # consumer is, and only is, a deliverer for that consumer. Null consumer
+  # commits bind nothing.
+  member_bindings = {
+    for binding in flatten([
+      for consumer in values(local.consumers) : [
+        for entry in local.consumer_entries : [
+          for caller in entry.callers : [
+            for event in caller.events : [
+              for sha in compact([consumer.activeWorkflowSha, entry.transitionEligible ? consumer.transitionWorkflowSha : null]) : {
+                consumer = consumer.repository
+                key      = "${consumer.repository}/${trimprefix(entry.workflow, ".github/workflows/")}:${entry.job}/${trimprefix(caller.workflow, ".github/workflows/")}:${event}@${sha}"
+                authority = join(local.authority_delimiter, [
+                  "${local.github_owner}/${consumer.repository}/${caller.workflow}@${caller.ref}",
+                  "${local.platform_repository}/${entry.workflow}@${sha}",
+                  sha,
+                  entry.environment,
+                  event,
+                ])
+              }
+            ]
+          ]
+        ]
+      ]
+      ]) : binding.key => merge(binding, {
+      member = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/attribute.authority/${binding.authority}"
+    })
+  }
+
   # Every (consumer, target account) pair with the permanent identity the
   # authority records for it. A grant is made to the account the current email
   # resolves to only after that live account's unique ID is verified to be the
@@ -112,13 +174,36 @@ locals {
 # Broker authority over consumer accounts is enabled only by evidence that this
 # module verifies mechanically against authenticated, immutable records (see
 # variables.tf for what the input names): the GitHub run record of the Deny
-# canary, the GitHub artifact record, and the artifact's attested predicate
-# from GitHub's attestation store, each read here and checked below. Every
-# consumer project must sit live under the evidenced organization, every
-# target's permanent unique ID must be recorded and resolve live, and until
-# all of that verifies the module grants nothing outside its project. Offline
-# no such records exist and the committed identities are null, so no offline
-# input can produce a grant.
+# canary, the GitHub artifact record, and the artifact's attestation verified
+# cryptographically by gh attestation verify (tools/ci/protected-recovery-
+# verify-canary.sh), whose signing certificate binds the predicate to the
+# exact signer workflow, repository, ref, head commit, trigger, runner, and
+# run invocation. The evidence is then bound to the current Deny state: the
+# live deny policies at every attachment point are read on every plan, must
+# be exactly the policies the canary observed (by name and etag), and must
+# themselves satisfy the required matrix. Every consumer project must sit
+# live under the evidenced organization, every target's permanent unique ID
+# must be recorded and resolve live, and until all of that verifies the
+# module grants nothing outside its project. Offline no such records exist
+# and the committed identities are null, so no offline input can produce a
+# grant.
+#
+# Activation sequence, from an empty broker project (exercised with mock
+# providers by enabled/enabled.tftest.hcl.in, and live by the activation
+# rehearsal): (1) apply with broker_authority_evidence = null, which creates
+# the broker project alone -- service, ledger, bucket, pool, providers,
+# invoker, member-delivery, and canary identities and their bindings -- and
+# nothing in any consumer project; (2) install the required Deny matrix
+# (output required_deny_matrix) at the broker project and every consumer
+# project, excepting exactly the principals it names, which includes the
+# identity that applies this module for the grants step (3) makes; (3) run
+# the Deny canary workflow at this commit and apply with its evidence, which
+# is refused unless the live Deny state is the attested one, and only then
+# creates the inventory and actuator grants -- every one of them a mutation
+# the matrix permits the applying identity (local.activation_blocked). A
+# later change of the Deny state, of the active commit, or of the deployment
+# invalidates the evidence: the next apply is refused until a new canary is
+# attested, and an apply with null evidence revokes the grants.
 locals {
   evidence          = var.broker_authority_evidence
   authority_enabled = local.evidence != null
@@ -132,6 +217,7 @@ locals {
   deny_canary_artifact       = "deny-canary"
   deny_canary_predicate_type = "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v1"
   deny_canary_schema         = "protected-recovery/deny-canary/v1"
+  deny_canary_signer         = "https://github.com/${local.platform_repository}/${local.deny_canary_workflow}@refs/heads/main"
 }
 
 data "http" "canary_run" {
@@ -150,36 +236,78 @@ data "http" "canary_artifact" {
   request_timeout_ms = 15000
 }
 
-data "http" "canary_attestations" {
+# The attestation, verified cryptographically on the applying machine: the
+# script fetches the named artifact, requires its digest, runs gh attestation
+# verify against the platform repository and the deny-canary signer workflow,
+# and answers with the verified certificate summary and statement. Nothing in
+# the predicate is trusted before the certificate below is checked.
+data "external" "canary_verification" {
   count = local.authority_enabled ? 1 : 0
 
-  url                = "${local.github_api}/attestations/sha256:${local.evidence.deny_canary.artifact_sha256}"
-  request_headers    = local.github_headers
+  program = ["bash", "${path.module}/../../../tools/ci/protected-recovery-verify-canary.sh"]
+  query = {
+    artifact_id     = local.evidence.deny_canary.artifact_id
+    artifact_sha256 = local.evidence.deny_canary.artifact_sha256
+    predicate_type  = local.deny_canary_predicate_type
+    repository      = local.platform_repository
+    run_id          = local.evidence.deny_canary.run_id
+    signer_workflow = "${local.platform_repository}/${local.deny_canary_workflow}"
+  }
+}
+
+# The live Deny state, read on every plan as the applying identity: the deny
+# policies attached to the broker project and to every consumer project, by
+# name, then each policy with its etag and rules.
+data "google_client_config" "current" {}
+
+data "http" "deny_policies" {
+  for_each = local.authority_enabled ? toset(keys(local.deny_attachments)) : toset([])
+
+  url                = "https://iam.googleapis.com/v2/policies/${urlencode(each.value)}/denypolicies"
+  request_headers    = { Authorization = "Bearer ${data.google_client_config.current.access_token}" }
   request_timeout_ms = 15000
 }
 
-# The exact IAM Deny matrix the canary must have proven, in deny-policy
-# permission form: every row is one attachment point, one permission, the
-# denied principal set (every principal), and the exact exception set. The
-# broker project protects the ledger, the evidence bucket, the broker's own
-# credentials, its deployment, its federation, and its image; each consumer
-# project protects every path that could recreate a target identity, re-grant
-# its credentials, replace its federation, or bypass the broker as the one
-# writer of target policies. Exceptions are derived from this deployment
-# alone: the broker for what the broker does, the invoker pool for the
-# invokers' own federation, the Scheduler service agent for the reconciler's
-# ID token, and the identity applying this configuration for deployment. A
-# canary against any other resource, principal set, or exception set cannot
-# satisfy a row, and a required permission the canary reports unsupported
-# blocks activation rather than shrinking this set. The matrix is exported
+data "http" "deny_policy" {
+  for_each = toset(flatten([
+    for attachment, listing in data.http.deny_policies : [
+      for policy in try(jsondecode(listing.response_body).policies, []) : policy.name
+    ]
+  ]))
+
+  url                = "https://iam.googleapis.com/v2/${each.value}"
+  request_headers    = { Authorization = "Bearer ${data.google_client_config.current.access_token}" }
+  request_timeout_ms = 15000
+}
+
+# The exact IAM Deny matrix the canary must have proven and the live state
+# must carry, in deny-policy permission form: every row is one attachment
+# point, one permission, the denied principal set (every principal), and the
+# exact exception set. The broker project protects the ledger, the evidence
+# bucket, the broker's own credentials, its deployment, its federation, and
+# its image; each consumer project protects every path that could recreate a
+# target identity, re-grant its credentials, replace its federation, attach
+# it to a workload, disable the APIs the inventory reads, or bypass the
+# broker as the one writer of target policies. Exceptions are derived from
+# this deployment alone: the broker for what the broker does; the exact
+# recovery invoker tuples, member-delivery tuples, and canary tuple for their
+# own federation; the Scheduler service agent for the reconciler's ID token;
+# and the identity applying this configuration for the mutations its own
+# apply makes (local.activation_blocked proves that set sufficient). A canary
+# against any other resource, principal set, or exception set cannot satisfy
+# a row, and a required permission the live state does not carry blocks
+# activation rather than shrinking this set. The matrix is exported
 # (outputs.tf) for the canary to exercise, so it has one definition.
 locals {
   all_principals     = "principalSet://goog/public:all"
   deployer_email     = data.google_client_openid_userinfo.deployer.email
   deployer_principal = endswith(local.deployer_email, ".gserviceaccount.com") ? "principal://iam.googleapis.com/projects/-/serviceAccounts/${local.deployer_email}" : "principal://goog/subject/${local.deployer_email}"
-  invoker_pool       = "principalSet://iam.googleapis.com/${local.workload_identity_pool}/*"
+  invoker_tuples     = sort([for binding in values(local.invoker_bindings) : binding.member])
+  member_tuples      = sort([for binding in values(local.member_bindings) : binding.member])
+  canary_tuples      = sort([for binding in values(local.canary_bindings) : binding.member])
   scheduler_agent    = "principal://iam.googleapis.com/projects/-/serviceAccounts/service-${data.google_project.current.number}@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
   broker_attachment  = "cloudresourcemanager.googleapis.com/projects/${var.project_id}"
+  deny_attachments   = merge({ (local.broker_attachment) = var.project_id }, { for consumer in values(local.consumers) : "cloudresourcemanager.googleapis.com/projects/${consumer.projectId}" => consumer.projectId })
 
   broker_deny_rules = [
     {
@@ -191,11 +319,16 @@ locals {
       permissions = ["iam.googleapis.com/serviceAccountKeys.create", "iam.googleapis.com/serviceAccounts.implicitDelegation", "iam.googleapis.com/serviceAccounts.signBlob", "iam.googleapis.com/serviceAccounts.signJwt", "storage.googleapis.com/objects.delete", "storage.googleapis.com/objects.update"]
     },
     {
-      exceptions  = [local.invoker_pool]
+      # The exact tuples that mint an access token as their own identity: the
+      # recovery invokers and the Deny canary.
+      exceptions  = sort(concat(local.invoker_tuples, local.canary_tuples))
       permissions = ["iam.googleapis.com/serviceAccounts.getAccessToken"]
     },
     {
-      exceptions  = [local.scheduler_agent]
+      # The exact tuples that mint a broker-audience ID token: the Scheduler
+      # agent for the reconciler, the recovery invokers, and every canonical
+      # consumer job for its member-delivery identity.
+      exceptions  = sort(concat([local.scheduler_agent], local.invoker_tuples, local.member_tuples))
       permissions = ["iam.googleapis.com/serviceAccounts.getOpenIdToken"]
     },
     {
@@ -228,13 +361,19 @@ locals {
 
   consumer_deny_rules = [
     {
-      exceptions  = [local.broker_principal]
+      # The broker is the one writer of target policies; the applying identity
+      # installs the broker's actuator grants on them (activation step 3).
+      exceptions  = sort([local.broker_principal, local.deployer_principal])
       permissions = ["iam.googleapis.com/serviceAccounts.setIamPolicy"]
+    },
+    {
+      # The applying identity installs the broker's inventory role grant.
+      exceptions  = [local.deployer_principal]
+      permissions = ["cloudresourcemanager.googleapis.com/projects.setIamPolicy"]
     },
     {
       exceptions = []
       permissions = [
-        "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
         "iam.googleapis.com/serviceAccountKeys.create",
         "iam.googleapis.com/serviceAccounts.create",
         "iam.googleapis.com/serviceAccounts.delete",
@@ -249,6 +388,26 @@ locals {
         "iam.googleapis.com/workloadIdentityPools.delete",
         "iam.googleapis.com/workloadIdentityPools.undelete",
         "iam.googleapis.com/workloadIdentityPools.update",
+      ]
+    },
+    {
+      # The freeze: no principal may attach a target to a workload, create the
+      # workloads that would carry its credentials, or disable the APIs the
+      # broker's inventory and probes read, while this state stands -- which
+      # is every principal, the consumers' own deployment identities included,
+      # for the lifetime of the evidenced Deny state.
+      exceptions = []
+      permissions = [
+        "cloudbuild.googleapis.com/builds.create",
+        "compute.googleapis.com/instanceTemplates.create",
+        "compute.googleapis.com/instances.create",
+        "compute.googleapis.com/instances.setServiceAccount",
+        "iam.googleapis.com/serviceAccounts.actAs",
+        "run.googleapis.com/jobs.create",
+        "run.googleapis.com/jobs.update",
+        "run.googleapis.com/services.create",
+        "run.googleapis.com/services.update",
+        "serviceusage.googleapis.com/services.disable",
       ]
     },
   ]
@@ -270,20 +429,28 @@ locals {
   required_deny_matrix = { for row in local.required_deny_rows : "${row.attachment}|${row.permission}" => row }
 }
 
-# The evidence, decoded from the three authenticated records, and every check
-# the gate makes on it. A check that cannot be evaluated is a failed check.
+# The evidence, decoded from the authenticated records and the verified
+# attestation, the live Deny state, and every check the gate makes on them. A
+# check that cannot be evaluated is a failed check.
 locals {
-  canary_run          = try(jsondecode(one(data.http.canary_run).response_body), {})
-  canary_artifact     = try(jsondecode(one(data.http.canary_artifact).response_body), {})
-  canary_attestations = try(jsondecode(one(data.http.canary_attestations).response_body).attestations, [])
-  canary_statements = [
-    for attestation in local.canary_attestations : jsondecode(base64decode(attestation.bundle.dsseEnvelope.payload))
-    if try(attestation.bundle.dsseEnvelope.payloadType, "") == "application/vnd.in-toto+json" && can(jsondecode(base64decode(attestation.bundle.dsseEnvelope.payload)))
-  ]
-  canary_matching  = [for statement in local.canary_statements : statement if try(statement.predicateType, "") == local.deny_canary_predicate_type]
-  canary_statement = length(local.canary_matching) == 1 ? local.canary_matching[0] : null
-  canary           = try(local.canary_statement.predicate, null)
+  canary_run      = try(jsondecode(one(data.http.canary_run).response_body), {})
+  canary_artifact = try(jsondecode(one(data.http.canary_artifact).response_body), {})
+  # The verification result: verified only when gh attestation verify said so
+  # and handed back a certificate summary and a statement.
+  verification        = try(one(data.external.canary_verification).result, {})
+  canary_verified     = try(local.verification.verified, "false") == "true"
+  canary_certificate  = local.canary_verified ? try(jsondecode(local.verification.certificate), {}) : {}
+  canary_statement    = local.canary_verified ? try(jsondecode(local.verification.statement), null) : null
+  verification_reason = try(local.verification.reason, "no verification result")
+  canary              = try(local.canary_statement.predicate, null)
 
+  canary_policies = [
+    for policy in try(local.canary.policies, []) : {
+      attachment = try(tostring(policy.attachmentPoint), "")
+      etag       = try(tostring(policy.etag), "")
+      name       = try(tostring(policy.name), "")
+    }
+  ]
   canary_rules = flatten([
     for policy in try(local.canary.policies, []) : [
       for rule in try(policy.rules, []) : {
@@ -296,10 +463,36 @@ locals {
     ]
   ])
 
-  # A row is satisfied only by a rule at exactly its attachment point, denying
-  # exactly every principal, excepting exactly the row's exception set, that
-  # lists the permission and was observed DENIED for it by a principal outside
-  # the exception set.
+  # The live Deny state: every policy listed at every attachment point, read
+  # by name; a listing or policy that cannot be read makes the state unread.
+  live_listings_read = alltrue([for attachment, listing in data.http.deny_policies : listing.status_code == 200 && can(jsondecode(listing.response_body))])
+  live_policy_names = {
+    for attachment, listing in data.http.deny_policies : attachment => sort([for policy in try(jsondecode(listing.response_body).policies, []) : tostring(policy.name)])
+  }
+  live_policies_read = alltrue([for name, policy in data.http.deny_policy : policy.status_code == 200 && can(jsondecode(policy.response_body))])
+  live_policies = {
+    for name, policy in data.http.deny_policy : name => {
+      attachment = one([for attachment, names in local.live_policy_names : attachment if contains(names, name)])
+      etag       = try(tostring(jsondecode(policy.response_body).etag), "")
+      rules = [
+        for rule in try(jsondecode(policy.response_body).rules, []) : {
+          condition   = try(rule.denyRule.denialCondition, null)
+          denied      = try([for principal in rule.denyRule.deniedPrincipals : tostring(principal)], [])
+          exceptions  = try([for principal in rule.denyRule.exceptionPrincipals : tostring(principal)], [])
+          excepted    = try([for permission in rule.denyRule.exceptionPermissions : tostring(permission)], [])
+          permissions = try([for permission in rule.denyRule.deniedPermissions : tostring(permission)], [])
+        } if can(rule.denyRule)
+      ]
+    }
+  }
+  live_rules = flatten([for name, policy in local.live_policies : [for rule in policy.rules : merge(rule, { attachment = policy.attachment })]])
+
+  # A row is satisfied by the canary only by a rule at exactly its attachment
+  # point, denying exactly every principal, excepting exactly the row's
+  # exception set, that lists the permission and was observed DENIED for it
+  # by a principal outside the exception set; and by the live state only by
+  # such a rule, unconditioned and without permission exceptions, that stands
+  # now.
   deny_row_satisfied = {
     for key, row in local.required_deny_matrix : key => anytrue([
       for rule in local.canary_rules :
@@ -310,25 +503,110 @@ locals {
       anytrue([for observation in rule.observed : observation.permission == row.permission && observation.outcome == "DENIED" && !contains(row.exceptions, observation.principal)])
     ])
   }
+  deny_row_live = {
+    for key, row in local.required_deny_matrix : key => anytrue([
+      for rule in local.live_rules :
+      rule.attachment == row.attachment &&
+      rule.condition == null &&
+      length(rule.excepted) == 0 &&
+      sort(distinct(rule.denied)) == sort(row.denied) &&
+      sort(distinct(rule.exceptions)) == sort(row.exceptions) &&
+      contains(rule.permissions, row.permission)
+    ])
+  }
   unsatisfied_deny_rows = sort([for key, satisfied in local.deny_row_satisfied : key if !satisfied])
-  unsupported_required  = sort(setintersection(toset(try([for permission in local.canary.unsupported : tostring(permission)], [])), toset([for row in local.required_deny_rows : row.permission])))
+  # Required permissions the live state does not deny at all: unsupported by
+  # the API, or never installed.
+  missing_live_permissions = sort(distinct([for key, row in local.required_deny_matrix : "${row.attachment}|${row.permission}" if !anytrue([for rule in local.live_rules : rule.attachment == row.attachment && contains(rule.permissions, row.permission)])]))
+  live_unsatisfied_rows    = sort([for key, live in local.deny_row_live : key if !live])
+  # The canary observed exactly the policies that stand now: the same names at
+  # every attachment point, each at the same etag.
+  live_matches_canary = (
+    length(local.canary_policies) > 0 &&
+    alltrue([for attachment in keys(local.deny_attachments) : sort([for policy in local.canary_policies : policy.name if policy.attachment == attachment]) == try(local.live_policy_names[attachment], [])]) &&
+    alltrue([for policy in local.canary_policies : try(local.live_policies[policy.name].etag, "") == policy.etag && policy.etag != ""])
+  )
+
+  # The certificate binds the predicate to its producer: every value below is
+  # set by GitHub's OIDC token at signing time and cannot be written by the
+  # workflow.
+  certificate_bound = try(
+    local.canary_certificate.issuer == "https://token.actions.githubusercontent.com" &&
+    tostring(local.canary_certificate.sourceRepositoryIdentifier) == local.platform_repository_id &&
+    tostring(local.canary_certificate.sourceRepositoryOwnerIdentifier) == local.github_owner_id &&
+    local.canary_certificate.sourceRepositoryURI == "https://github.com/${local.platform_repository}" &&
+    local.canary_certificate.sourceRepositoryRef == "refs/heads/main" &&
+    local.canary_certificate.sourceRepositoryDigest == var.active_workflow_sha &&
+    local.canary_certificate.buildSignerURI == local.deny_canary_signer &&
+    local.canary_certificate.buildTrigger == "workflow_dispatch" &&
+    local.canary_certificate.runnerEnvironment == "github-hosted" &&
+    local.canary_certificate.runInvocationURI == "https://github.com/${local.platform_repository}/actions/runs/${local.evidence.deny_canary.run_id}/attempts/1",
+    false,
+  )
 
   evidence_checks = local.authority_enabled ? {
-    run_recorded      = try(one(data.http.canary_run).status_code, 0) == 200
-    run_succeeded     = try(local.canary_run.status == "completed" && local.canary_run.conclusion == "success" && local.canary_run.run_attempt == 1, false)
-    run_is_the_canary = try(local.canary_run.path == local.deny_canary_workflow && local.canary_run.event == "workflow_dispatch" && tostring(local.canary_run.repository.id) == local.platform_repository_id && tostring(local.canary_run.head_repository.id) == local.platform_repository_id, false)
-    run_at_this_head  = try(local.canary_run.head_sha == var.active_workflow_sha, false)
-    artifact_recorded = try(one(data.http.canary_artifact).status_code, 0) == 200
-    artifact_of_run   = try(tostring(local.canary_artifact.workflow_run.id) == local.evidence.deny_canary.run_id && local.canary_artifact.workflow_run.head_sha == var.active_workflow_sha && local.canary_artifact.name == local.deny_canary_artifact && local.canary_artifact.expired == false, false)
-    artifact_digest   = try(local.canary_artifact.digest == "sha256:${local.evidence.deny_canary.artifact_sha256}", false)
-    attested_once     = try(one(data.http.canary_attestations).status_code, 0) == 200 && local.canary_statement != null
-    attests_artifact  = try(length(local.canary_statement.subject) == 1 && local.canary_statement.subject[0].digest.sha256 == local.evidence.deny_canary.artifact_sha256, false)
-    predicate_bound   = try(local.canary.schema == local.deny_canary_schema && tostring(local.canary.run.id) == local.evidence.deny_canary.run_id && local.canary.run.headSha == var.active_workflow_sha && local.canary.brokerImage == var.broker_image && local.canary.organization == "organizations/${local.evidence.organization_id}", false)
-    coverage_complete = length(local.unsatisfied_deny_rows) == 0
-    supported         = length(local.unsupported_required) == 0
+    run_recorded         = try(one(data.http.canary_run).status_code, 0) == 200
+    run_succeeded        = try(local.canary_run.status == "completed" && local.canary_run.conclusion == "success" && local.canary_run.run_attempt == 1, false)
+    run_is_the_canary    = try(local.canary_run.path == local.deny_canary_workflow && local.canary_run.event == "workflow_dispatch" && tostring(local.canary_run.repository.id) == local.platform_repository_id && tostring(local.canary_run.head_repository.id) == local.platform_repository_id, false)
+    run_at_this_head     = try(local.canary_run.head_sha == var.active_workflow_sha, false)
+    artifact_recorded    = try(one(data.http.canary_artifact).status_code, 0) == 200
+    artifact_of_run      = try(tostring(local.canary_artifact.workflow_run.id) == local.evidence.deny_canary.run_id && local.canary_artifact.workflow_run.head_sha == var.active_workflow_sha && local.canary_artifact.name == local.deny_canary_artifact && local.canary_artifact.expired == false, false)
+    artifact_digest      = try(local.canary_artifact.digest == "sha256:${local.evidence.deny_canary.artifact_sha256}", false)
+    attestation_verified = local.canary_verified && local.canary_statement != null
+    signer_is_the_canary = local.certificate_bound
+    attests_artifact     = try(local.canary_statement.predicateType == local.deny_canary_predicate_type && length(local.canary_statement.subject) == 1 && local.canary_statement.subject[0].digest.sha256 == local.evidence.deny_canary.artifact_sha256, false)
+    predicate_bound      = try(local.canary.schema == local.deny_canary_schema && tostring(local.canary.run.id) == local.evidence.deny_canary.run_id && local.canary.run.headSha == var.active_workflow_sha && local.canary.brokerImage == var.broker_image && local.canary.organization == "organizations/${local.evidence.organization_id}", false)
+    coverage_complete    = length(local.unsatisfied_deny_rows) == 0
+    deny_state_read      = local.live_listings_read && local.live_policies_read && length(data.http.deny_policies) == length(local.deny_attachments)
+    deny_state_current   = local.live_matches_canary
+    deny_state_required  = length(local.live_unsatisfied_rows) == 0
+    supported            = length(local.missing_live_permissions) == 0
+    activation_permitted = length(local.activation_blocked) == 0
   } : {}
   evidence_failures = sort([for name, passed in local.evidence_checks : name if !passed])
   evidence_verified = local.authority_enabled && length(local.evidence_failures) == 0
+
+  # Every mutation this module's own apply makes under the evidenced state,
+  # as (attachment, permission, principal); a row of the matrix that denies
+  # one of them without excepting its principal blocks activation. The
+  # sequence is provable, not assumed: the grants of step 3 are exactly these.
+  activation_mutations = concat(
+    [
+      for permission in [
+        "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
+        "iam.googleapis.com/serviceAccounts.create",
+        "iam.googleapis.com/serviceAccounts.setIamPolicy",
+        "iam.googleapis.com/workloadIdentityPoolProviders.create",
+        "iam.googleapis.com/workloadIdentityPoolProviders.update",
+        "iam.googleapis.com/workloadIdentityPools.create",
+        "iam.googleapis.com/workloadIdentityPools.update",
+        "run.googleapis.com/services.create",
+        "run.googleapis.com/services.setIamPolicy",
+        "run.googleapis.com/services.update",
+      ] : { attachment = local.broker_attachment, permission = permission, principal = local.deployer_principal }
+    ],
+    flatten([
+      for consumer in values(local.consumers) : [
+        for permission in ["cloudresourcemanager.googleapis.com/projects.setIamPolicy", "iam.googleapis.com/serviceAccounts.setIamPolicy"] : {
+          attachment = "cloudresourcemanager.googleapis.com/projects/${consumer.projectId}"
+          permission = permission
+          principal  = local.deployer_principal
+        }
+      ]
+    ]),
+    [for tuple in local.invoker_tuples : { attachment = local.broker_attachment, permission = "iam.googleapis.com/serviceAccounts.getOpenIdToken", principal = tuple }],
+    [for tuple in local.invoker_tuples : { attachment = local.broker_attachment, permission = "iam.googleapis.com/serviceAccounts.getAccessToken", principal = tuple }],
+    [for tuple in local.member_tuples : { attachment = local.broker_attachment, permission = "iam.googleapis.com/serviceAccounts.getOpenIdToken", principal = tuple }],
+    [for tuple in local.canary_tuples : { attachment = local.broker_attachment, permission = "iam.googleapis.com/serviceAccounts.getAccessToken", principal = tuple }],
+    [{ attachment = local.broker_attachment, permission = "iam.googleapis.com/serviceAccounts.getOpenIdToken", principal = local.scheduler_agent }],
+    [{ attachment = local.broker_attachment, permission = "datastore.googleapis.com/entities.create", principal = local.broker_principal }],
+    [{ attachment = local.broker_attachment, permission = "storage.googleapis.com/objects.create", principal = local.broker_principal }],
+    [for consumer in values(local.consumers) : { attachment = "cloudresourcemanager.googleapis.com/projects/${consumer.projectId}", permission = "iam.googleapis.com/serviceAccounts.setIamPolicy", principal = local.broker_principal }],
+  )
+  activation_blocked = sort(distinct([
+    for mutation in local.activation_mutations : "${mutation.attachment}|${mutation.permission}|${mutation.principal}"
+    if contains(keys(local.required_deny_matrix), "${mutation.attachment}|${mutation.permission}") && !contains(local.required_deny_matrix["${mutation.attachment}|${mutation.permission}"].exceptions, mutation.principal)
+  ]))
 }
 
 resource "google_project_service" "required" {
@@ -416,6 +694,32 @@ resource "google_service_account" "invoker" {
   depends_on = [google_project_service.required]
 }
 
+# One member-delivery identity per consumer: its canonical jobs impersonate
+# it through the member provider to deliver their own credentials, and it
+# holds run.invoker on the broker and nothing else.
+resource "google_service_account" "member" {
+  for_each = local.consumers
+
+  project      = var.project_id
+  account_id   = "${local.member_prefix}${each.key}"
+  display_name = "Protected Recovery Member Delivery (${each.key})"
+  description  = "Member-delivery identity for ${each.key}: reachable only by that consumer's canonical jobs, permitted only to deliver their credentials to the broker (POST /v1/members)."
+
+  depends_on = [google_project_service.required]
+}
+
+# The Deny canary identity: bound to the canary job's exact tuple, granted
+# nothing by this module. The deployer grants it the administrative allow
+# roles it exercises immediately before a canary run and removes them after.
+resource "google_service_account" "deny_canary" {
+  project      = var.project_id
+  account_id   = local.deny_canary_id
+  display_name = "Protected Recovery Deny Canary"
+  description  = "Exercises the required Deny matrix from the deny-canary workflow; holds no standing authority from this module."
+
+  depends_on = [google_project_service.required]
+}
+
 resource "google_iam_workload_identity_pool" "platform" {
   project                   = var.project_id
   workload_identity_pool_id = local.authority.broker.workloadIdentityPoolId
@@ -451,6 +755,45 @@ resource "google_iam_workload_identity_pool_provider" "platform" {
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com/"
   }
+}
+
+# The member provider: the consumers' canonical jobs, which call the platform
+# reusable workflows, mapped exactly as each consumer's own provider maps
+# them (the five-claim authority composite), admitted only from the declared
+# consumer repositories on GitHub-hosted runners.
+resource "google_iam_workload_identity_pool_provider" "members" {
+  project                            = var.project_id
+  workload_identity_pool_id          = google_iam_workload_identity_pool.platform.workload_identity_pool_id
+  workload_identity_pool_provider_id = local.authority.broker.memberWorkloadIdentityProviderId
+  display_name                       = "GitHub consumer jobs"
+  description                        = "OIDC provider restricted to the canonical jobs of the declared consumer repositories, for member-credential delivery."
+
+  attribute_mapping = {
+    "google.subject"      = "assertion.repository_owner_id + ':' + assertion.repository_id + ':' + assertion.runner_environment + ':' + assertion.run_id"
+    "attribute.authority" = "assertion.workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_ref + '${local.authority_delimiter}' + assertion.job_workflow_sha + '${local.authority_delimiter}' + assertion.environment + '${local.authority_delimiter}' + assertion.event_name"
+  }
+
+  attribute_condition = "google.subject.startsWith('${local.github_owner_id}:') && assertion.runner_environment == 'github-hosted' && assertion.repository_id in [${join(", ", [for consumer in values(local.consumers) : "'${consumer.repositoryId}'"])}]"
+
+  oidc {
+    issuer_uri = "https://token.actions.githubusercontent.com/"
+  }
+}
+
+resource "google_service_account_iam_member" "member_authority" {
+  for_each = local.member_bindings
+
+  service_account_id = google_service_account.member[each.value.consumer].name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = each.value.member
+}
+
+resource "google_service_account_iam_member" "canary_authority" {
+  for_each = local.canary_bindings
+
+  service_account_id = google_service_account.deny_canary.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = each.value.member
 }
 
 resource "google_service_account_iam_member" "invoker_authority" {
@@ -534,6 +877,7 @@ resource "google_cloud_run_v2_service" "broker" {
 resource "google_cloud_run_v2_service_iam_member" "invokers" {
   for_each = merge(
     { for invoker, account in google_service_account.invoker : invoker => account.email },
+    { for consumer, account in google_service_account.member : "member/${consumer}" => account.email },
     { reconciler = google_service_account.reconciler.email },
   )
 
@@ -651,7 +995,7 @@ resource "google_project_iam_custom_role" "actuator" {
 
     precondition {
       condition     = local.evidence_verified
-      error_message = "broker_authority_evidence does not verify against the GitHub run, artifact, and attestation records and this deployment's required Deny matrix: failed checks [${join(", ", local.evidence_failures)}]; unsatisfied Deny rows [${join(", ", local.unsatisfied_deny_rows)}]; required permissions the canary reports unsupported [${join(", ", local.unsupported_required)}]."
+      error_message = "broker_authority_evidence does not verify against the GitHub run and artifact records, the verified attestation, the live Deny state, and this deployment's required Deny matrix: failed checks [${join(", ", local.evidence_failures)}]; attestation verification: ${local.verification_reason}; unsatisfied Deny rows [${join(", ", local.unsatisfied_deny_rows)}]; live rows not as required [${join(", ", local.live_unsatisfied_rows)}]; required permissions the live state does not deny [${join(", ", local.missing_live_permissions)}]; mutations of this apply the matrix would deny [${join(", ", local.activation_blocked)}]."
     }
   }
 }
@@ -691,7 +1035,10 @@ resource "google_project_iam_custom_role" "inventory" {
     "orgpolicy.policy.get",
     "resourcemanager.projects.get",
     "resourcemanager.projects.getIamPolicy",
+    "run.executions.list",
     "run.jobs.list",
+    "run.locations.list",
+    "run.revisions.list",
     "run.services.list",
     "serviceusage.services.use",
   ]

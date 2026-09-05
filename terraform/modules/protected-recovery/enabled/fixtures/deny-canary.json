@@ -10,24 +10,40 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'datastore.googleapis.com/entities.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "datastore.googleapis.com/entities.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'datastore.googleapis.com/entities.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "datastore.googleapis.com/entities.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'datastore.googleapis.com/entities.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "datastore.googleapis.com/entities.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'storage.googleapis.com/objects.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "storage.googleapis.com/objects.create",
@@ -50,36 +66,60 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccountKeys.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccountKeys.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.implicitDelegation' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.implicitDelegation",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.signBlob' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.signBlob",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.signJwt' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.signJwt",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'storage.googleapis.com/objects.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "storage.googleapis.com/objects.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'storage.googleapis.com/objects.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "storage.googleapis.com/objects.update",
@@ -102,6 +142,10 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.getAccessToken' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.getAccessToken",
@@ -115,12 +159,24 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
-            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/*"
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-deny-canary.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:protected-recovery-deny-canary:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-cdbentley-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-cdbentley-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-critical-history-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-critical-history-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-healthmcp-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-healthmcp-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-runsetta-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-runsetta-restore:workflow_dispatch"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.getOpenIdToken' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.getOpenIdToken",
@@ -134,132 +190,285 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
-            "principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com"
+            "principal://iam.googleapis.com/projects/-/serviceAccounts/service-123456789012@gcp-sa-cloudscheduler.iam.gserviceaccount.com",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/cleanup-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-canary:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-publish:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:schedule",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/cdbentley/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/cleanup-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-canary:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-publish:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:schedule",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/critical-history/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/cleanup-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-canary:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-publish:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:schedule",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/healthmcp/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-cdbentley-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-cdbentley-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-critical-history-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-critical-history-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-healthmcp-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-healthmcp-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-runsetta-quarantine:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/platform/.github/workflows/protected-recovery-invoke.yml@refs/heads/main:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:recovery-runsetta-restore:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/cleanup-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/cleanup-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/cleanup-preview.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-cloud:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish-canary:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-preview.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-publish:pull_request_target",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-canary:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production-publish:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/deploy-prod.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:production:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:schedule",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:preview-operations:workflow_dispatch",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:preview-operations:push",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:preview-operations:schedule",
+            "principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/github-actions/attribute.authority/collinbentley1/runsetta/.github/workflows/reconcile-previews.yml@refs/heads/main:collinbentley1/platform/.github/workflows/reconcile-previews.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:preview-operations:workflow_dispatch"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'artifactregistry.googleapis.com/repositories.uploadArtifacts' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "artifactregistry.googleapis.com/repositories.uploadArtifacts",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'cloudresourcemanager.googleapis.com/projects.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.actAs' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.actAs",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.disable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.disable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.enable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.enable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "run.googleapis.com/services.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "run.googleapis.com/services.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "run.googleapis.com/services.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "run.googleapis.com/services.update",
@@ -306,6 +515,10 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
@@ -319,96 +532,170 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com",
             "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'cloudresourcemanager.googleapis.com/projects.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
-            },
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com"
+          ]
+        },
+        {
+          "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccountKeys.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccountKeys.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.disable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.disable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.enable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.enable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.update",
@@ -416,7 +703,6 @@
             }
           ],
           "deniedPermissions": [
-            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
             "iam.googleapis.com/serviceAccountKeys.create",
             "iam.googleapis.com/serviceAccounts.create",
             "iam.googleapis.com/serviceAccounts.delete",
@@ -431,6 +717,126 @@
             "iam.googleapis.com/workloadIdentityPools.delete",
             "iam.googleapis.com/workloadIdentityPools.undelete",
             "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        },
+        {
+          "canary": [
+            {
+              "detail": {
+                "message": "Permission 'cloudbuild.googleapis.com/builds.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudbuild.googleapis.com/builds.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instanceTemplates.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instanceTemplates.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.setServiceAccount' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.setServiceAccount",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.actAs' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.actAs",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'serviceusage.googleapis.com/services.disable' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "serviceusage.googleapis.com/services.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudbuild.googleapis.com/builds.create",
+            "compute.googleapis.com/instanceTemplates.create",
+            "compute.googleapis.com/instances.create",
+            "compute.googleapis.com/instances.setServiceAccount",
+            "iam.googleapis.com/serviceAccounts.actAs",
+            "run.googleapis.com/jobs.create",
+            "run.googleapis.com/jobs.update",
+            "run.googleapis.com/services.create",
+            "run.googleapis.com/services.update",
+            "serviceusage.googleapis.com/services.disable"
           ],
           "deniedPrincipals": [
             "principalSet://goog/public:all"
@@ -447,6 +853,10 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
@@ -460,96 +870,170 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com",
             "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'cloudresourcemanager.googleapis.com/projects.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
-            },
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com"
+          ]
+        },
+        {
+          "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccountKeys.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccountKeys.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.disable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.disable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.enable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.enable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.update",
@@ -557,7 +1041,6 @@
             }
           ],
           "deniedPermissions": [
-            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
             "iam.googleapis.com/serviceAccountKeys.create",
             "iam.googleapis.com/serviceAccounts.create",
             "iam.googleapis.com/serviceAccounts.delete",
@@ -572,6 +1055,126 @@
             "iam.googleapis.com/workloadIdentityPools.delete",
             "iam.googleapis.com/workloadIdentityPools.undelete",
             "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        },
+        {
+          "canary": [
+            {
+              "detail": {
+                "message": "Permission 'cloudbuild.googleapis.com/builds.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudbuild.googleapis.com/builds.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instanceTemplates.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instanceTemplates.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.setServiceAccount' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.setServiceAccount",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.actAs' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.actAs",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'serviceusage.googleapis.com/services.disable' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "serviceusage.googleapis.com/services.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudbuild.googleapis.com/builds.create",
+            "compute.googleapis.com/instanceTemplates.create",
+            "compute.googleapis.com/instances.create",
+            "compute.googleapis.com/instances.setServiceAccount",
+            "iam.googleapis.com/serviceAccounts.actAs",
+            "run.googleapis.com/jobs.create",
+            "run.googleapis.com/jobs.update",
+            "run.googleapis.com/services.create",
+            "run.googleapis.com/services.update",
+            "serviceusage.googleapis.com/services.disable"
           ],
           "deniedPrincipals": [
             "principalSet://goog/public:all"
@@ -588,6 +1191,10 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
@@ -601,96 +1208,170 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com",
             "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'cloudresourcemanager.googleapis.com/projects.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
-            },
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com"
+          ]
+        },
+        {
+          "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccountKeys.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccountKeys.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.disable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.disable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.enable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.enable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.update",
@@ -698,7 +1379,6 @@
             }
           ],
           "deniedPermissions": [
-            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
             "iam.googleapis.com/serviceAccountKeys.create",
             "iam.googleapis.com/serviceAccounts.create",
             "iam.googleapis.com/serviceAccounts.delete",
@@ -718,6 +1398,126 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": []
+        },
+        {
+          "canary": [
+            {
+              "detail": {
+                "message": "Permission 'cloudbuild.googleapis.com/builds.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudbuild.googleapis.com/builds.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instanceTemplates.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instanceTemplates.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.setServiceAccount' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.setServiceAccount",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.actAs' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.actAs",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'serviceusage.googleapis.com/services.disable' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "serviceusage.googleapis.com/services.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudbuild.googleapis.com/builds.create",
+            "compute.googleapis.com/instanceTemplates.create",
+            "compute.googleapis.com/instances.create",
+            "compute.googleapis.com/instances.setServiceAccount",
+            "iam.googleapis.com/serviceAccounts.actAs",
+            "run.googleapis.com/jobs.create",
+            "run.googleapis.com/jobs.update",
+            "run.googleapis.com/services.create",
+            "run.googleapis.com/services.update",
+            "serviceusage.googleapis.com/services.disable"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
         }
       ]
     },
@@ -729,6 +1529,10 @@
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.setIamPolicy",
@@ -742,96 +1546,170 @@
             "principalSet://goog/public:all"
           ],
           "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com",
             "principal://iam.googleapis.com/projects/-/serviceAccounts/recovery-broker@recovery-test.iam.gserviceaccount.com"
           ]
         },
         {
           "canary": [
             {
+              "detail": {
+                "message": "Permission 'cloudresourcemanager.googleapis.com/projects.setIamPolicy' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
-            },
+            }
+          ],
+          "deniedPermissions": [
+            "cloudresourcemanager.googleapis.com/projects.setIamPolicy"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": [
+            "principal://goog/subject/cloud-root@cdbentley.com"
+          ]
+        },
+        {
+          "canary": [
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccountKeys.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccountKeys.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.disable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.disable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.enable' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.enable",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/serviceAccounts.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPoolProviders.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPoolProviders.update",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.create' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.create",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.delete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.delete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.undelete' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.undelete",
               "principal": "principal://goog/subject/canary-daily@cdbentley.com"
             },
             {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/workloadIdentityPools.update' denied by IAM deny policy",
+                "status": "403"
+              },
               "observedAt": "2026-09-05T00:00:00Z",
               "outcome": "DENIED",
               "permission": "iam.googleapis.com/workloadIdentityPools.update",
@@ -839,7 +1717,6 @@
             }
           ],
           "deniedPermissions": [
-            "cloudresourcemanager.googleapis.com/projects.setIamPolicy",
             "iam.googleapis.com/serviceAccountKeys.create",
             "iam.googleapis.com/serviceAccounts.create",
             "iam.googleapis.com/serviceAccounts.delete",
@@ -854,6 +1731,126 @@
             "iam.googleapis.com/workloadIdentityPools.delete",
             "iam.googleapis.com/workloadIdentityPools.undelete",
             "iam.googleapis.com/workloadIdentityPools.update"
+          ],
+          "deniedPrincipals": [
+            "principalSet://goog/public:all"
+          ],
+          "exceptionPrincipals": []
+        },
+        {
+          "canary": [
+            {
+              "detail": {
+                "message": "Permission 'cloudbuild.googleapis.com/builds.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "cloudbuild.googleapis.com/builds.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instanceTemplates.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instanceTemplates.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'compute.googleapis.com/instances.setServiceAccount' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "compute.googleapis.com/instances.setServiceAccount",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'iam.googleapis.com/serviceAccounts.actAs' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "iam.googleapis.com/serviceAccounts.actAs",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/jobs.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/jobs.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.create' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.create",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'run.googleapis.com/services.update' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "run.googleapis.com/services.update",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            },
+            {
+              "detail": {
+                "message": "Permission 'serviceusage.googleapis.com/services.disable' denied by IAM deny policy",
+                "status": "403"
+              },
+              "observedAt": "2026-09-05T00:00:00Z",
+              "outcome": "DENIED",
+              "permission": "serviceusage.googleapis.com/services.disable",
+              "principal": "principal://goog/subject/canary-daily@cdbentley.com"
+            }
+          ],
+          "deniedPermissions": [
+            "cloudbuild.googleapis.com/builds.create",
+            "compute.googleapis.com/instanceTemplates.create",
+            "compute.googleapis.com/instances.create",
+            "compute.googleapis.com/instances.setServiceAccount",
+            "iam.googleapis.com/serviceAccounts.actAs",
+            "run.googleapis.com/jobs.create",
+            "run.googleapis.com/jobs.update",
+            "run.googleapis.com/services.create",
+            "run.googleapis.com/services.update",
+            "serviceusage.googleapis.com/services.disable"
           ],
           "deniedPrincipals": [
             "principalSet://goog/public:all"
@@ -872,5 +1869,5 @@
     "workflow": ".github/workflows/protected-recovery-deny-canary.yml"
   },
   "schema": "protected-recovery/deny-canary/v1",
-  "unsupported": []
+  "unexercised": []
 }
