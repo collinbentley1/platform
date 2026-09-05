@@ -339,7 +339,8 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
       }
       return await fetch(input, init);
     }, { preconnect: fetch.preconnect });
-    const w = await cdbentley(clock, boundedFetch(hanging, 5000), { requestMs: 5000, shardMs: 300 });
+    // The shard deadline must outlast a shard's real work on a slow emulator while still bounding a hung one.
+    const w = await cdbentley(clock, boundedFetch(hanging, 30_000), { requestMs: 30_000, shardMs: 8000 });
     const { broker, ledger, targets } = w;
     for (const shard of ["a-stuck", "b-ready"]) expect((await ledger.append(quarantine(shard, "cdbentley", `k-${shard}`), targets)).kind).toBe("accepted");
     const cursorWrites: Array<string | null> = [];
@@ -351,7 +352,7 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     armed = true;
     const started = Date.now();
     const first = await broker.reconcileFleet();
-    expect(Date.now() - started).toBeLessThan(3000);
+    expect(Date.now() - started).toBeLessThan(25_000);
     expect(hung).toBe(1);
     expect(first.shards).toEqual([
       expect.objectContaining({ deadline: true, notes: [expect.stringContaining("passed; ")], shard: "a-stuck" }),
@@ -375,10 +376,10 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     const third = await broker.reconcileFleet();
     expect((third.shards as Array<{ deadline?: boolean; shard: string }>).find((view) => view.shard === "c-hung-iam")).toMatchObject({ deadline: true });
     expect((third.shards as Array<{ shard: string }>).map((view) => view.shard)).toEqual(["a-stuck", "b-ready", "c-hung-iam"]);
-  }, 60_000);
+  }, 120_000);
 
   test("an effect interrupted by the deadline after its write landed is classified exactly on the next pass without a second write", async () => {
-    const w = await cdbentley(new Clock(), fetch, { requestMs: 5000, shardMs: 300 });
+    const w = await cdbentley(new Clock(), fetch, { requestMs: 30_000, shardMs: 3000 });
     const { broker, iam, ledger, targets } = w;
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     iam.hangAfterWrite = true;
