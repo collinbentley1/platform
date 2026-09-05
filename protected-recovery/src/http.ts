@@ -6,10 +6,11 @@ import {
   type ImpersonationProbe,
   type Jwk,
   type ServiceAccountIam,
+  ExternalUnavailable,
   GoogleIssuanceProbe,
   GoogleServiceAccountIam,
-  LedgerMemberCredentials,
   cachedJwks,
+  deliveryBudgetSeconds,
   driveEffect,
   githubJwksUrl,
   verifyMemberCredential,
@@ -21,6 +22,8 @@ import {
   type Consumer,
   type Entry,
   type InventoryRecord,
+  type MemberControl,
+  type MemberControlRecord,
   type ParsedRequest,
   type Purpose,
   type RecoveryAuthority,
@@ -28,15 +31,19 @@ import {
   type Target,
   RequestError,
   consumerNamed,
+  controlValiditySeconds,
+  deliveryOwed,
   intentOf,
   loadRecoveryAuthority,
   maxBodyBytes,
   parseAppendBody,
   parseCloseBody,
   parseDeliverBody,
+  parseMaintenanceBody,
   parseReconcileBody,
   parseShardId,
   probePermission,
+  probePrerequisite,
   probesNeeded,
   purposeForIdentity,
   scanReadiness,
@@ -77,6 +84,7 @@ export interface BrokerDependencies {
   readonly jwks: () => Promise<readonly Jwk[]>;
   readonly ledger: Ledger;
   readonly now: () => Date;
+  // The issuance probe a delivered credential is exercised through, at once.
   readonly probe: ImpersonationProbe;
 }
 
@@ -235,20 +243,65 @@ export class Broker {
         if (!shard) return notFound();
         if (!allowed(purpose, shard)) return forbidden();
         const entries = await ledger.readEntries(request.shard, shard.nextSequence - 1);
-        return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), scanReady: scanReadiness(shard, this.#deps.now()) } } };
+        const consumer = consumerNamed(authority, shard.consumer);
+        const owed = consumer ? probesNeeded(shard, this.#deps.now(), targetLookup(authority, consumer, entries)).map((need) => ({ account: need.account, member: need.member, notBefore: need.notBefore, phase: need.phase })) : [];
+        return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), deliveriesOwed: owed, scanReady: scanReadiness(shard, this.#deps.now()) } } };
       }
-      case "deliver": {
-        // A canonical job delivers its own credential through its consumer's
-        // member-delivery identity. The broker verifies it exactly as the
-        // consumer provider would, binds it to that consumer, and keeps it
-        // only until it expires; the token itself is never in any reply.
-        if (purpose.kind !== "member") return forbidden();
-        const verified = await verifyMemberCredential({ authority, jwks: this.#deps.jwks, now: this.#deps.now }, request.token, purpose.consumer);
-        if (verified.kind === "unavailable") return { status: 409, body: { detail: verified.reason, error: "MEMBER_UNVERIFIED" } };
-        await ledger.putMemberCredential({ consumer: verified.consumer.repository, deliveredAt: this.#deps.now().toISOString(), expiresAt: verified.expiresAt, member: verified.member, principal: verified.principal, token: request.token });
-        return { status: 200, body: { expiresAt: verified.expiresAt, member: verified.member } };
+      case "deliver":
+        return await this.#deliver(purpose, request.token);
+      case "maintenance": {
+        // The maintenance ticket is the RESTORE direction's: it is the
+        // return to ordinary operation that infrastructure work belongs to.
+        if (purpose.kind !== "recovery" || purpose.intent !== "RESTORE") return forbidden();
+        const outcome = request.action === "open" ? await ledger.openMaintenance(request.key, purpose.serviceAccount) : await ledger.closeMaintenance(request.key);
+        if (outcome.kind === "refused") return { status: 409, body: { detail: outcome.detail, error: outcome.reason } };
+        return { status: 200, body: { action: request.action, ticket: outcome.ticket } };
       }
     }
+  }
+
+  // A canonical job delivers its own credential through its consumer's
+  // member-delivery identity. The broker verifies it exactly as the consumer
+  // provider would, binds it to that consumer, requires enough remaining life
+  // for the whole delivery, exchanges it at STS once, and mints as the member
+  // against every target it is bound to, right now: each outcome is the
+  // member's positive control for that target, and the revocation or
+  // post-horizon probe of every OPEN QUARANTINE shard that needs it. The
+  // bearer is discarded with the request; no reply and no document carries
+  // it.
+  async #deliver(purpose: Purpose, token: string): Promise<BrokerResponse> {
+    const { authority, ledger, now, probe } = this.#deps;
+    if (purpose.kind !== "member") return forbidden();
+    const verified = await verifyMemberCredential({ authority, jwks: this.#deps.jwks, now }, token, purpose.consumer);
+    if (verified.kind === "unavailable") return { status: 409, body: { detail: verified.reason, error: "MEMBER_UNVERIFIED" } };
+    const bound = targetsFor(authority, verified.consumer);
+    if (!bound) return { status: 409, body: { detail: "the consumer's workflow SHA pins or target identities are not recorded", error: "PINS_UNRECORDED" } };
+    const targets = bound.filter((target) => target.members.includes(verified.member));
+    const remaining = Math.floor((Date.parse(verified.expiresAt) - now().getTime()) / 1000);
+    const budget = deliveryBudgetSeconds(targets.length);
+    if (remaining < budget) return { status: 409, body: { detail: `the member credential expires in ${remaining}s; a delivery to ${targets.length} targets needs ${budget}s`, error: "MEMBER_EXPIRING" } };
+    const minted = await probe.mint({ consumer: verified.consumer, member: verified.member, principal: verified.principal, token }, targets);
+    if (minted.kind === "unavailable") return { status: 409, body: { detail: minted.reason, error: "MINT_UNAVAILABLE" } };
+    const controls: Record<string, MemberControl> = {};
+    const unavailable: string[] = [];
+    for (const result of minted.results) {
+      if (result.kind === "observed") controls[result.target.account] = { observedAt: result.observedAt, outcome: result.outcome, uniqueId: result.target.uniqueId };
+      else unavailable.push(`${result.target.account}: ${result.reason}`);
+    }
+    await ledger.putMemberControl({ consumer: verified.consumer.repository, deliveredAt: now().toISOString(), expiresAt: verified.expiresAt, member: verified.member, principal: minted.principal, targets: controls });
+    const probes: Record<string, unknown>[] = [];
+    const byAccount = new Map(targets.map((target) => [target.account, target]));
+    for (const shardId of await ledger.listOpenQuarantines(verified.consumer.repository)) {
+      const shard = await ledger.readShard(shardId);
+      if (!shard) continue;
+      for (const need of probesNeeded(shard, now(), (account) => byAccount.get(account))) {
+        const control = controls[need.account];
+        if (need.member !== verified.member || !control) continue;
+        const recorded = await ledger.recordProbe(shardId, { account: need.account, email: need.email, member: need.member, observedAt: control.observedAt, outcome: control.outcome, permission: probePermission, phase: need.phase, principal: minted.principal, uniqueId: need.uniqueId });
+        probes.push({ account: need.account, phase: need.phase, shard: shardId, ...(recorded.kind === "recorded" ? { role: recorded.role } : { refused: recorded.reason }) });
+      }
+    }
+    return { status: 200, body: { controls: Object.fromEntries(Object.keys(controls).sort().map((account) => [account, controls[account]!.outcome])), member: verified.member, probes, unavailable } };
   }
 
   // Sweep the complete reconcilable set in document-name order, one page at a
@@ -298,15 +351,16 @@ export class Broker {
     return { next, shards: views };
   }
 
-  // One shard under its deadline: a shard whose work exceeds it, or whose
-  // ledger is unavailable or malformed, is reported and passed; anything
+  // One shard under its deadline: a shard whose work exceeds it, whose
+  // ledger is unavailable or malformed, or whose bounded external
+  // dependency answered with a failure, is reported and passed; anything
   // else is a broker defect and propagates.
   async #reconcileBounded(shardId: string): Promise<Record<string, unknown> | undefined> {
     try {
       return await withDeadline(this.#deadlines.shardMs, () => this.reconcileShard(shardId));
     } catch (error) {
       if (error instanceof DeadlineExceeded) return { deadline: true, notes: [`passed; ${error.message}`], shard: shardId };
-      if (error instanceof LedgerUnavailable || error instanceof LedgerError) return { deadline: false, notes: [`passed; ${error.message}`], shard: shardId };
+      if (error instanceof LedgerUnavailable || error instanceof LedgerError || error instanceof ExternalUnavailable) return { deadline: false, notes: [`passed; ${error.message}`], shard: shardId };
       throw error;
     }
   }
@@ -314,13 +368,15 @@ export class Broker {
   // Drive every recorded pending step of one shard and finish the close only
   // when nothing remains. Every step is idempotent and conditional, so any
   // number of instances (or zero, followed by one) reaches the same state.
-  // A RECORDED QUARANTINE effect is prepared only while the probe source is
-  // operational against its target and the target's inventory is clean, so
-  // no binding is removed unless the observations that end the quarantine
-  // can be made. For an OPEN QUARANTINE shard the broker then records the
-  // inventories and probes its targets need from its own sources.
+  // A QUARANTINE effect is prepared, and a PREPARED one resumed to its write,
+  // only while admission holds right now: the live Deny state is the steady
+  // form, every managed member of every pending target has a recorded
+  // positive control, and every such target's inventory is clean. A RESTORE
+  // effect is written only under the steady form. For an OPEN QUARANTINE
+  // shard the broker then records the inventories its targets need from its
+  // own source and names every delivery its probes still await.
   async reconcileShard(shardId: string): Promise<Record<string, unknown> | undefined> {
-    const { authority, evidence, iam, ledger, now, probe } = this.#deps;
+    const { authority, evidence, iam, inventory, ledger, now } = this.#deps;
     let shard = await ledger.readShard(shardId);
     if (!shard) return undefined;
     const notes: string[] = [];
@@ -334,11 +390,15 @@ export class Broker {
       const consumer = consumerNamed(authority, shard.consumer);
       const entries = await ledger.readEntries(shardId, shard.nextSequence - 1);
       let admission: string | undefined;
-      if (shard.intent === "QUARANTINE" && consumer) {
-        const recorded = entries.flatMap((entry) => (entry.body.kind === "effect" && entry.progress?.state === "RECORDED" ? [targetOfEffect(authority, consumer, entry.body)] : []));
-        if (recorded.length > 0) {
-          const refusal = await this.#admissible(consumer, recorded);
+      const pending = entries.flatMap((entry) => (entry.body.kind === "effect" && (entry.progress?.state === "RECORDED" || entry.progress?.state === "PREPARED") && consumer ? [targetOfEffect(authority, consumer, entry.body)] : []));
+      if (pending.length > 0 && consumer) {
+        if (shard.intent === "QUARANTINE") {
+          const refusal = await this.#admissible(consumer, pending);
           if (refusal) admission = `${String(refusal.body.error)}; ${describe(refusal.body)}`;
+        } else {
+          const deny = await inventory.denyState(consumer);
+          if (deny.kind === "unavailable") admission = `DENY_STATE_UNAVAILABLE; ${deny.reason}`;
+          else if (deny.state.form !== "steady") admission = `DENY_STATE_NOT_STEADY; ${deny.state.form}`;
         }
       }
       for (const initial of entries) {
@@ -348,8 +408,8 @@ export class Broker {
             notes.push(`${entry.sequence}: pending; consumer ${shard.consumer} is not declared`);
             continue;
           }
-          if (entry.progress.state === "RECORDED" && admission !== undefined) {
-            notes.push(`${entry.sequence}: pending; not prepared because ${admission}`);
+          if (admission !== undefined) {
+            notes.push(`${entry.sequence}: pending; not ${entry.progress.state === "RECORDED" ? "prepared" : "resumed"} because ${admission}`);
             continue;
           }
           const driven = await driveEffect(ledger, iam, shardId, entry, targetOfEffect(authority, consumer, entry.body));
@@ -366,7 +426,6 @@ export class Broker {
       shard = await ledger.readShard(shardId);
       if (!shard) return undefined;
       if (shard.phase === "OPEN" && shard.intent === "QUARANTINE" && consumer) {
-        const targets = new Map(entries.flatMap((entry) => (entry.body.kind === "effect" ? [[entry.body.account, targetOfEffect(authority, consumer, entry.body)] as const] : [])));
         const observed = await this.#observe(shardId, shard, consumer, entries);
         notes.push(...observed.unavailable.map((reason) => `credential inventory unavailable; ${reason}`));
         for (const record of observed.records) {
@@ -376,22 +435,9 @@ export class Broker {
         }
         shard = await ledger.readShard(shardId);
         if (!shard) return undefined;
-        for (const need of probesNeeded(shard, now(), (account) => targets.get(account))) {
-          const result = await probe.probe({ email: need.email, member: need.member, permission: probePermission, resource: need.resource, uniqueId: need.uniqueId });
-          if (result.kind === "unavailable") {
-            notes.push(`${need.account}: ${need.phase} probe unavailable; ${result.reason}`);
-            continue;
-          }
-          const { notBefore: _notBefore, resource: _resource, ...identity } = need;
-          const recorded = await ledger.recordProbe(shardId, { ...identity, observedAt: result.observedAt, outcome: result.outcome, permission: probePermission, principal: result.principal });
-          if (recorded.kind === "refused") {
-            notes.push(`${need.account}: ${need.phase} probe refused; ${recorded.reason}`);
-            continue;
-          }
-          if (recorded.entry) await projectEntry(recorded.entry);
-        }
-        shard = await ledger.readShard(shardId);
-        if (!shard) return undefined;
+        // Probes are recorded when the member's canonical job delivers its
+        // credential (POST /v1/members); the sweep names what is still owed.
+        for (const need of probesNeeded(shard, now(), targetLookup(authority, consumer, entries))) notes.push(`${need.account}: ${deliveryOwed(need.member, need.phase)}`);
       }
       if (shard.phase === "CLOSING") {
         const fresh = shard.intent === "QUARANTINE" && consumer ? (await this.#observe(shardId, shard, consumer, entries)).fresh : undefined;
@@ -409,42 +455,71 @@ export class Broker {
     return { ...shardView(shardId, shard), notes };
   }
 
-  // Whether a QUARANTINE of these targets may be accepted or prepared right
-  // now: the probe source must be operational against every target, and
-  // every target's inventory must be observed and clean. Otherwise the
-  // refusal names exactly what is missing, and nothing has been mutated.
+  // Whether a QUARANTINE of these targets may be accepted, prepared, or
+  // resumed right now: no maintenance ticket is open, every managed member
+  // of every target has a recorded positive control (its canonical job
+  // delivered and minted as it), and every target's inventory -- the live
+  // Deny state included -- is observed and clean. Otherwise the refusal names
+  // exactly what is missing, and nothing has been mutated.
   async #admissible(consumer: Consumer, targets: readonly Target[]): Promise<BrokerResponse | undefined> {
-    const preflight = await this.#deps.probe.preflight(targets);
-    if (preflight.kind === "unavailable") return { status: 409, body: { detail: preflight.reason, error: "PROBE_UNAVAILABLE" } };
-    const blockers: string[] = [];
+    const { inventory, ledger } = this.#deps;
+    const ticket = await ledger.readMaintenance();
+    if (ticket) return { status: 409, body: { detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}`, error: "MAINTENANCE_OPEN" } };
+    const controls = new Map<string, MemberControlRecord | undefined>();
+    const missing: string[] = [];
+    const earliest = this.#deps.now().getTime() - controlValiditySeconds * 1000;
     for (const target of targets) {
-      const outcome = await this.#deps.inventory.inventory(target, consumer);
-      if (outcome.kind === "unavailable") blockers.push(`${target.account}: credential inventory unavailable; ${outcome.reason}`);
+      if (target.members.length === 0) missing.push(`${target.account}: no managed member`);
+      for (const member of target.members) {
+        if (!controls.has(member)) controls.set(member, await ledger.readMemberControl(member));
+        const control = controls.get(member)?.targets[target.account];
+        if (!control || control.outcome !== "ALLOWED" || control.uniqueId !== target.uniqueId) missing.push(`${target.account}/${member}: ${probePrerequisite(member)}`);
+        else if (Date.parse(control.observedAt) < earliest) missing.push(`${target.account}/${member}: the positive control of ${control.observedAt} is older than ${controlValiditySeconds}s; ${probePrerequisite(member)}`);
+      }
+    }
+    if (missing.length > 0) return { status: 409, body: { detail: missing.join("; "), error: "PROBE_UNAVAILABLE" } };
+    const blockers: string[] = [];
+    const outcomes = await inventory.inventoryAll(targets, consumer);
+    for (const [index, target] of targets.entries()) {
+      const outcome = outcomes[index];
+      if (!outcome || outcome.kind === "unavailable") blockers.push(`${target.account}: credential inventory unavailable; ${outcome?.reason ?? "no outcome"}`);
       else if (outcome.inventory.findings.length > 0) blockers.push(`${target.account}: ${outcome.inventory.findings.join(", ")}`);
     }
     return blockers.length === 0 ? undefined : { status: 409, body: { blockers, error: "INVENTORY_BLOCKED" } };
   }
 
-  // The freshly observed inventory of every acknowledged target of a shard.
+  // The freshly observed inventory of every acknowledged target of a shard,
+  // from one batch snapshot.
   async #observe(shardId: string, shard: Shard, consumer: Consumer, entries?: readonly Entry[]): Promise<Observed> {
-    const fresh: Record<string, InventoryRecord> = {};
-    const records: InventoryRecord[] = [];
-    const unavailable: string[] = [];
+    const targets: Array<{ readonly account: string; readonly target: Target }> = [];
     for (const account of Object.keys(shard.targets).sort()) {
       const state = shard.targets[account]!;
       if (state.effect.state !== "ACKED") continue;
       const entry = entries?.find((candidate) => candidate.sequence === state.sequence) ?? (await this.#deps.ledger.readEntry(shardId, state.sequence));
       if (!entry || entry.body.kind !== "effect") continue;
-      const outcome = await this.#deps.inventory.inventory(targetOfEffect(this.#deps.authority, consumer, entry.body), consumer);
-      if (outcome.kind === "unavailable") {
-        unavailable.push(`${account}: ${outcome.reason}`);
+      targets.push({ account, target: targetOfEffect(this.#deps.authority, consumer, entry.body) });
+    }
+    const fresh: Record<string, InventoryRecord> = {};
+    const records: InventoryRecord[] = [];
+    const unavailable: string[] = [];
+    const outcomes = targets.length === 0 ? [] : await this.#deps.inventory.inventoryAll(targets.map((entry) => entry.target), consumer);
+    for (const [index, { account }] of targets.entries()) {
+      const outcome = outcomes[index];
+      if (!outcome || outcome.kind === "unavailable") {
+        unavailable.push(`${account}: ${outcome?.reason ?? "no outcome"}`);
         continue;
       }
       records.push(outcome.inventory);
       fresh[account] = outcome.inventory;
     }
-    return { fresh: Object.fromEntries(Object.entries(fresh).map(([account, record]) => [account, { findings: record.findings, hash: record.hash, observedAt: record.observedAt }])), records, unavailable };
+    return { fresh: Object.fromEntries(Object.entries(fresh).map(([account, record]) => [account, { findings: record.findings, hash: record.hash, observedAt: record.observedAt, observedUntil: record.observedUntil }])), records, unavailable };
   }
+}
+
+// The journaled target of every effect entry of a shard, by account.
+function targetLookup(authority: RecoveryAuthority, consumer: Consumer, entries: readonly Entry[]): (account: string) => Target | undefined {
+  const targets = new Map(entries.flatMap((entry) => (entry.body.kind === "effect" ? [[entry.body.account, targetOfEffect(authority, consumer, entry.body)] as const] : [])));
+  return (account) => targets.get(account);
 }
 
 function describe(body: Record<string, unknown>): string {
@@ -510,6 +585,7 @@ function entryView(entry: Entry): Record<string, unknown> {
 const routes = {
   append: /^\/v1\/shards\/([^/]+)\/entries$/,
   close: /^\/v1\/shards\/([^/]+)\/close$/,
+  maintenance: /^\/v1\/maintenance$/,
   members: /^\/v1\/members$/,
   read: /^\/v1\/shards\/([^/]+)$/,
   reconcileAll: /^\/v1\/reconcile$/,
@@ -524,7 +600,13 @@ export interface ServiceDependencies {
 
 // One request, in order: identity, purpose, grammar, permission, work.
 export async function handleRequest(deps: ServiceDependencies, request: Request): Promise<Response> {
-  const identity = await deps.verifier.verify(request.headers.get("authorization"));
+  let identity: Identity | undefined;
+  try {
+    identity = await deps.verifier.verify(request.headers.get("authorization"));
+  } catch (error) {
+    if (error instanceof ExternalUnavailable) return json(503, { detail: error.message, error: "DEPENDENCY_UNAVAILABLE" });
+    throw error;
+  }
   if (!identity) return json(401, { error: "UNAUTHENTICATED" });
   const purpose = purposeForIdentity(deps.authority, identity.email);
   if (!purpose) return json(403, { error: "FORBIDDEN" });
@@ -542,6 +624,7 @@ export async function handleRequest(deps: ServiceDependencies, request: Request)
     return json(response.status, response.body);
   } catch (error) {
     if (error instanceof LedgerUnavailable) return json(503, { error: "LEDGER_UNAVAILABLE" });
+    if (error instanceof ExternalUnavailable) return json(503, { detail: error.message, error: "DEPENDENCY_UNAVAILABLE" });
     throw error;
   }
 }
@@ -573,6 +656,7 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
   if (match) return parseReconcileBody(decode(match[1]!), body);
   if (routes.reconcileAll.test(path)) return parseReconcileBody(null, body);
   if (routes.members.test(path)) return parseDeliverBody(body);
+  if (routes.maintenance.test(path)) return parseMaintenanceBody(body);
   throw new NotFound();
 }
 
@@ -648,14 +732,24 @@ export function metadataToken(fetcher: typeof fetch, now: () => Date): () => Pro
   let cached: { readonly token: string; readonly until: number } | undefined;
   return async () => {
     if (cached && cached.until > now().getTime()) return cached.token;
-    const response = await fetcher("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", {
-      headers: { "Metadata-Flavor": "Google" },
-      redirect: "error",
-    });
-    if (!response.ok) throw new Error(`Metadata token request failed with HTTP ${response.status}.`);
-    const body = JSON.parse(await response.text()) as unknown;
+    let response: Response;
+    try {
+      response = await fetcher("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", {
+        headers: { "Metadata-Flavor": "Google" },
+        redirect: "error",
+      });
+    } catch (error) {
+      throw new ExternalUnavailable(`the metadata server is unreachable: ${String(error)}`);
+    }
+    if (!response.ok) throw new ExternalUnavailable(`the metadata server answered HTTP ${response.status}`);
+    let body: unknown;
+    try {
+      body = JSON.parse(await response.text()) as unknown;
+    } catch (error) {
+      throw new ExternalUnavailable(`the metadata server answered malformed JSON: ${String(error)}`);
+    }
     if (typeof body !== "object" || body === null || Array.isArray(body) || typeof (body as Record<string, unknown>).access_token !== "string" || typeof (body as Record<string, unknown>).expires_in !== "number") {
-      throw new Error("Metadata token response is malformed.");
+      throw new ExternalUnavailable("the metadata server answered a malformed token");
     }
     const { access_token: token, expires_in: expiresIn } = body as { access_token: string; expires_in: number };
     cached = { token, until: now().getTime() + Math.max(0, expiresIn - 120) * 1000 };
@@ -681,6 +775,9 @@ export function configurationFromEnvironment(env: Readonly<Record<string, string
   const unrecorded = unrecordedIdentities(authority);
   if (unrecorded.length > 0) {
     throw new Error(`protected-recovery/authority.json records no unique ID for ${unrecorded.join(", ")}; the service refuses to start.`);
+  }
+  if (authority.organizationId === null) {
+    throw new Error("protected-recovery/authority.json records no organization; the service refuses to start.");
   }
   const required = (name: string): string => {
     const value = env[name];
@@ -724,11 +821,12 @@ if (import.meta.main) {
     jwks: githubJwks,
     ledger,
     now,
-    // The real issuance probe over the credentials the canonical jobs deliver
-    // through POST /v1/members: a member whose job has not delivered a live
-    // credential is unavailable, so every QUARANTINE that needs it is refused
-    // before acceptance and before any effect is prepared.
-    probe: new GoogleIssuanceProbe({ authority, credentials: new LedgerMemberCredentials(ledger, now), fetch: fetcher, jwks: githubJwks, now }),
+    // The real issuance probe, exercised at once with each credential a
+    // canonical job delivers through POST /v1/members: a member whose job has
+    // never delivered and minted has no positive control, so every QUARANTINE
+    // that needs it is refused before acceptance and before any effect is
+    // prepared or resumed.
+    probe: new GoogleIssuanceProbe({ authority, fetch: fetcher, now }),
   });
   const verifier = new GoogleIdentityVerifier({ audience: configuration.audience, jwks: cachedJwks(googleJwksUrl, fetcher, now), now });
   const server = Bun.serve({

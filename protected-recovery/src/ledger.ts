@@ -13,8 +13,10 @@ import {
   type InventoryRecord,
   type InventorySummary,
   type KeyRecord,
+  type MaintenanceTicket,
   type MemberChain,
-  type MemberCredentialRecord,
+  type MemberControl,
+  type MemberControlRecord,
   type Observation,
   type ObservedSnapshot,
   type OutboxProgress,
@@ -39,6 +41,7 @@ import {
   inventoryKey,
   inventorySummaryJson,
   isRecord,
+  maintenanceTicketSeconds,
   maxEntriesPerShard,
   probeKey,
   probeOutcomes,
@@ -48,6 +51,11 @@ import {
   sha256Hex,
   terminalObjectName,
 } from "./model";
+
+export type MaintenanceOutcome =
+  | { readonly kind: "opened"; readonly ticket: MaintenanceTicket }
+  | { readonly kind: "closed"; readonly ticket: MaintenanceTicket | null }
+  | { readonly kind: "refused"; readonly reason: "MAINTENANCE_OPEN" | "QUARANTINE_ACTIVE"; readonly detail: string };
 
 // The ledger is Firestore, spoken through its REST API so the broker carries no
 // dependencies. Every state change is one transaction over the shard document
@@ -80,7 +88,7 @@ export interface LedgerDependencies {
 export type Rejection =
   | { readonly reason: "SHARD_NOT_OPEN"; readonly phase: Shard["phase"] }
   | { readonly reason: "NOT_READY"; readonly blockers: readonly string[] }
-  | { readonly reason: "NOT_FOUND" | "PINS_UNRECORDED" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
+  | { readonly reason: "MAINTENANCE_OPEN" | "NOT_FOUND" | "PINS_UNRECORDED" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
 
 export type AppendOutcome =
   | { readonly kind: "accepted"; readonly entries: readonly Entry[]; readonly result: string }
@@ -192,6 +200,9 @@ export class Ledger {
       let bodies: EntryBody[];
       if (request.body.kind === "quarantine") {
         if (!targets) return reject({ reason: "PINS_UNRECORDED", detail: "the consumer's workflow SHA pins or target identities are not recorded" });
+        const [ticketDoc] = await tx.get([this.#maintenanceName()]);
+        const ticket = ticketDoc ? maintenanceFromDocument(ticketDoc) : undefined;
+        if (ticket && ticket.open && Date.parse(ticket.expiresAt) > now.getTime()) return reject({ reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}` });
         bodies = targets.map((target) => ({ kind: "effect", account: target.account, email: target.email, intent: "QUARANTINE", members: target.members, resource: target.resource, uniqueId: target.uniqueId }));
       } else {
         const sourceId = request.body.source;
@@ -301,6 +312,14 @@ export class Ledger {
       if (Number.isNaN(observedAt) || new Date(observedAt).toISOString() !== named.observedAt) return refuse("observedAt must be an ISO-8601 UTC instant");
       if (observedAt < Date.parse(state.effect.ackedAt)) return refuse("the observation precedes the quarantine acknowledgement");
       if (observedAt > now.getTime()) return refuse("the observation is in the ledger's future");
+      if (observation.kind === "inventory") {
+        // An inventory spans an interval that must lie between the
+        // acknowledgement and now, ordered start before end.
+        const observedUntil = Date.parse(observation.inventory.observedUntil);
+        if (Number.isNaN(observedUntil) || new Date(observedUntil).toISOString() !== observation.inventory.observedUntil) return refuse("observedUntil must be an ISO-8601 UTC instant");
+        if (observedUntil < observedAt) return refuse("the inventory interval ends before it begins");
+        if (observedUntil > now.getTime()) return refuse("the observation is in the ledger's future");
+      }
       const applied = applyObservation(state, observation);
       // Inventory folding is monotonic by observation time: a delayed older
       // observation never replaces the newer state, whatever its hash.
@@ -618,31 +637,126 @@ export class Ledger {
     });
   }
 
-  // The live credential of one managed member, as delivered by its canonical
-  // job and verified by the broker: one document per member, replaced by
-  // each delivery, meaningful only until the credential expires. The ledger
-  // database is the broker's alone (its allow policy and the evidenced Deny
-  // matrix admit no other principal), and the credential is the same
-  // short-lived token the job hands to STS; nothing here extends its life.
-  async putMemberCredential(record: MemberCredentialRecord): Promise<void> {
+  // What one managed member's deliveries proved: one document per member,
+  // never carrying the bearer, merged by each delivery so a target whose
+  // mint could not be observed this time keeps the control an earlier
+  // delivery established. The ledger database is the broker's alone: the
+  // evidenced Deny matrix denies every other principal its reads and writes.
+  async putMemberControl(record: MemberControlRecord): Promise<MemberControlRecord> {
     const name = this.#memberName(record.member);
-    await this.#transact(name, async (tx) => {
+    return await this.#transact(name, async (tx) => {
       const [doc] = await tx.get([name]);
-      tx.put(name, { consumer: record.consumer, deliveredAt: record.deliveredAt, expiresAt: record.expiresAt, member: record.member, principal: record.principal, token: record.token }, doc);
+      const previous = doc ? memberControlFromDocument(doc) : undefined;
+      if (previous && previous.member !== record.member) throw new LedgerError("Stored member control names another member.");
+      const merged: MemberControlRecord = { ...record, targets: { ...previous?.targets, ...record.targets } };
+      tx.put(name, memberControlToJson(merged), doc);
+      return merged;
     });
   }
 
-  async readMemberCredential(member: string): Promise<MemberCredentialRecord | undefined> {
+  async readMemberControl(member: string): Promise<MemberControlRecord | undefined> {
     const [doc] = await this.#batchGet([this.#memberName(member)], undefined);
     if (!doc) return undefined;
-    const json = decodeFields(doc.fields);
-    const record = { consumer: str(json, "consumer"), deliveredAt: str(json, "deliveredAt"), expiresAt: str(json, "expiresAt"), member: str(json, "member"), principal: str(json, "principal"), token: str(json, "token") };
-    if (record.member !== member) throw new LedgerError("Stored member credential names another member.");
+    const record = memberControlFromDocument(doc);
+    if (record.member !== member) throw new LedgerError("Stored member control names another member.");
     return record;
   }
 
   #memberName(member: string): string {
     return `${this.#documents}/members/${sha256Hex(member)}`;
+  }
+
+  // The OPEN QUARANTINE shards of one consumer, in document-name order: the
+  // shards a delivered credential may record a probe into.
+  async listOpenQuarantines(consumer: string): Promise<readonly string[]> {
+    return await this.#shardQuery([
+      { fieldFilter: { field: { fieldPath: "consumer" }, op: "EQUAL", value: { stringValue: consumer } } },
+      { fieldFilter: { field: { fieldPath: "intent" }, op: "EQUAL", value: { stringValue: "QUARANTINE" } } },
+      { fieldFilter: { field: { fieldPath: "phase" }, op: "EQUAL", value: { stringValue: "OPEN" } } },
+    ]);
+  }
+
+  // Every QUARANTINE shard of any consumer that is not CLOSED.
+  async listActiveQuarantines(): Promise<readonly string[]> {
+    return await this.#shardQuery([
+      { fieldFilter: { field: { fieldPath: "intent" }, op: "EQUAL", value: { stringValue: "QUARANTINE" } } },
+      { fieldFilter: { field: { fieldPath: "phase" }, op: "IN", value: { arrayValue: { values: [{ stringValue: "OPEN" }, { stringValue: "CLOSING" }, { stringValue: "FINALIZING" }] } } } },
+    ]);
+  }
+
+  async #shardQuery(filters: readonly unknown[]): Promise<readonly string[]> {
+    const body = await this.#call("runQuery", {
+      structuredQuery: {
+        from: [{ collectionId: "shards" }],
+        limit: 1000,
+        orderBy: [{ direction: "ASCENDING", field: { fieldPath: "__name__" } }],
+        select: { fields: [{ fieldPath: "__name__" }] },
+        where: { compositeFilter: { filters, op: "AND" } },
+      },
+    });
+    if (!Array.isArray(body)) throw new LedgerError("runQuery returned a non-array.");
+    const ids: string[] = [];
+    for (const item of body) {
+      if (!isRecord(item) || !isRecord(item.document) || typeof item.document.name !== "string") continue;
+      ids.push(item.document.name.slice(item.document.name.lastIndexOf("/") + 1));
+    }
+    return ids;
+  }
+
+  // The maintenance ticket. Open refuses while any QUARANTINE shard is not
+  // CLOSED or another key holds an open ticket; the same key replays. Close
+  // marks the open ticket closed; closing an absent or closed ticket is
+  // idempotent. Both read every active quarantine inside the transaction
+  // that writes the ticket, and append reads the ticket inside the
+  // transaction that accepts a QUARANTINE, so neither can overlap the other.
+  async readMaintenance(): Promise<MaintenanceTicket | null> {
+    const [doc] = await this.#batchGet([this.#maintenanceName()], undefined);
+    if (!doc) return null;
+    const ticket = maintenanceFromDocument(doc);
+    return ticket.open && Date.parse(ticket.expiresAt) > this.#deps.now().getTime() ? ticket : null;
+  }
+
+  async openMaintenance(key: string, openedBy: string): Promise<MaintenanceOutcome> {
+    const active = await this.listActiveQuarantines();
+    return await this.#transact(this.#maintenanceName(), async (tx) => {
+      const name = this.#maintenanceName();
+      const [doc] = await tx.get([name]);
+      const now = this.#deps.now();
+      const current = doc ? maintenanceFromDocument(doc) : undefined;
+      if (current && current.open && Date.parse(current.expiresAt) > now.getTime()) {
+        if (current.key === key) {
+          const { open: _open, ...ticket } = current;
+          return { kind: "opened", ticket };
+        }
+        return { kind: "refused", reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${current.openedAt} by ${current.openedBy} is open until ${current.expiresAt}` };
+      }
+      const shards = (await tx.get(active.map((shard) => this.#shardName(shard)))).flatMap((candidate) => (candidate ? [shardFromDocument(candidate)] : []));
+      const blocking = active.filter((_, index) => shards[index] !== undefined && shards[index]!.intent === "QUARANTINE" && shards[index]!.phase !== "CLOSED");
+      if (blocking.length > 0) return { kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${blocking.join(", ")}` };
+      const ticket: MaintenanceTicket = { expiresAt: new Date(now.getTime() + maintenanceTicketSeconds * 1000).toISOString(), key, openedAt: now.toISOString(), openedBy };
+      tx.put(name, { ...ticket, open: true }, doc);
+      return { kind: "opened", ticket };
+    });
+  }
+
+  async closeMaintenance(key: string): Promise<MaintenanceOutcome> {
+    return await this.#transact(this.#maintenanceName(), async (tx) => {
+      const name = this.#maintenanceName();
+      const [doc] = await tx.get([name]);
+      if (!doc) return { kind: "closed", ticket: null };
+      const current = maintenanceFromDocument(doc);
+      if (!current.open) return { kind: "closed", ticket: null };
+      if (current.key !== key && Date.parse(current.expiresAt) > this.#deps.now().getTime()) {
+        return { kind: "refused", reason: "MAINTENANCE_OPEN", detail: `the open ticket was opened with another key at ${current.openedAt} by ${current.openedBy}` };
+      }
+      const { open: _open, ...ticket } = current;
+      tx.put(name, { ...ticket, closedAt: this.#deps.now().toISOString(), open: false }, doc);
+      return { kind: "closed", ticket };
+    });
+  }
+
+  #maintenanceName(): string {
+    return `${this.#documents}/maintenance/ticket`;
   }
 
   async #entriesIn(tx: Transaction, shardId: string, upTo: number): Promise<readonly Entry[]> {
@@ -919,11 +1033,11 @@ function verifyInventory<S extends Shard>(shard: S, fresh: Fresh): S {
   for (const [account, state] of Object.entries(shard.targets)) {
     const current = fresh[account];
     const inventory = state.chain.inventory;
-    if (!current || inventory === null || current.hash !== inventory.hash || Date.parse(current.observedAt) <= Date.parse(inventory.verifiedAt)) {
+    if (!current || inventory === null || current.hash !== inventory.hash || Date.parse(current.observedUntil) <= Date.parse(inventory.verifiedAt)) {
       targets[account] = state;
       continue;
     }
-    targets[account] = { ...state, chain: { ...state.chain, inventory: { ...inventory, verifiedAt: current.observedAt } } };
+    targets[account] = { ...state, chain: { ...state.chain, inventory: { ...inventory, verifiedAt: current.observedUntil } } };
   }
   return { ...shard, targets };
 }
@@ -1031,8 +1145,10 @@ function chainToJson(chain: TargetChain): Record<string, Json> {
       changes: chain.inventory.changes,
       findings: [...chain.inventory.findings],
       hash: chain.inventory.hash,
+      horizonSeconds: chain.inventory.horizonSeconds,
       observations: chain.inventory.observations,
       observedAt: chain.inventory.observedAt,
+      observedUntil: chain.inventory.observedUntil,
       summary: inventorySummaryJson(chain.inventory.summary) as Record<string, Json>,
       verifiedAt: chain.inventory.verifiedAt,
     },
@@ -1048,7 +1164,7 @@ function chainFromJson(json: Record<string, Json>): TargetChain {
     const summary = summaryFromJson(obj(raw, "summary"));
     const hash = str(raw, "hash");
     if (hash !== inventoryHash(summary)) throw new LedgerError("Stored chain inventory hash does not match its summary.");
-    return { changes: int(raw, "changes"), findings: strings(raw, "findings"), hash, observations: int(raw, "observations"), observedAt: str(raw, "observedAt"), summary, verifiedAt: str(raw, "verifiedAt") };
+    return { changes: int(raw, "changes"), findings: strings(raw, "findings"), hash, horizonSeconds: int(raw, "horizonSeconds"), observations: int(raw, "observations"), observedAt: str(raw, "observedAt"), observedUntil: str(raw, "observedUntil"), summary, verifiedAt: str(raw, "verifiedAt") };
   })();
   const members = obj(json, "members");
   return {
@@ -1113,7 +1229,7 @@ export function bodyToJson(body: EntryBody): Record<string, Json> {
     case "probe":
       return { kind: "probe", ...probeToJson(body) };
     case "inventory":
-      return { account: body.account, email: body.email, findings: [...body.findings], hash: body.hash, kind: "inventory", observedAt: body.observedAt, summary: inventorySummaryJson(body.summary) as Record<string, Json>, uniqueId: body.uniqueId };
+      return { account: body.account, email: body.email, findings: [...body.findings], hash: body.hash, kind: "inventory", observedAt: body.observedAt, observedUntil: body.observedUntil, summary: inventorySummaryJson(body.summary) as Record<string, Json>, uniqueId: body.uniqueId };
   }
 }
 
@@ -1153,27 +1269,66 @@ function bodyFromJson(json: Record<string, Json>): EntryBody {
     const summary = summaryFromJson(obj(json, "summary"));
     const hash = str(json, "hash");
     if (hash !== inventoryHash(summary)) throw new LedgerError("Stored inventory hash does not match its summary.");
-    return { kind, account: str(json, "account"), email: str(json, "email"), findings: strings(json, "findings"), hash, observedAt: str(json, "observedAt"), summary, uniqueId: str(json, "uniqueId") };
+    return { kind, account: str(json, "account"), email: str(json, "email"), findings: strings(json, "findings"), hash, observedAt: str(json, "observedAt"), observedUntil: str(json, "observedUntil"), summary, uniqueId: str(json, "uniqueId") };
   }
   throw new LedgerError(`Unknown entry kind ${kind}.`);
 }
 
 function summaryFromJson(json: Record<string, Json>): InventorySummary {
-  const rawPolicies = json.policies;
-  if (!Array.isArray(rawPolicies)) throw new LedgerError("Document field policies is not a list.");
+  const records = (key: string, source: Record<string, Json> = json): Record<string, Json>[] => {
+    const raw = source[key];
+    if (!Array.isArray(raw)) throw new LedgerError(`Document field ${key} is not a list.`);
+    return raw.map((item) => {
+      if (!isRecord(item)) throw new LedgerError(`Document field ${key} is malformed.`);
+      return item as Record<string, Json>;
+    });
+  };
+  const denyState = obj(json, "denyState");
   return {
     ancestry: strings(json, "ancestry"),
     attachments: strings(json, "attachments"),
+    denyState: { form: str(denyState, "form"), policies: records("policies", denyState).map((policy) => ({ attachment: str(policy, "attachment"), etag: str(policy, "etag"), name: str(policy, "name") })) },
     grants: strings(json, "grants"),
     keys: strings(json, "keys"),
     lifetimeExtension: nullableStr(json, "lifetimeExtension"),
-    policies: rawPolicies.map((raw) => {
-      if (!isRecord(raw)) throw new LedgerError("Document field policies is malformed.");
-      const policy = raw as Record<string, Json>;
-      return { etag: str(policy, "etag"), resource: str(policy, "resource") };
-    }),
+    lifetimePolicies: strings(json, "lifetimePolicies"),
+    neutralized: strings(json, "neutralized"),
+    policies: records("policies").map((policy) => ({ etag: str(policy, "etag"), resource: str(policy, "resource") })),
+    roles: records("roles").map((role) => ({ etag: str(role, "etag"), name: str(role, "name") })),
     services: strings(json, "services"),
   };
+}
+
+function memberControlToJson(record: MemberControlRecord): Record<string, Json> {
+  return {
+    consumer: record.consumer,
+    deliveredAt: record.deliveredAt,
+    expiresAt: record.expiresAt,
+    member: record.member,
+    principal: record.principal,
+    targets: Object.fromEntries(Object.keys(record.targets).sort().map((account) => {
+      const control = record.targets[account]!;
+      return [account, { observedAt: control.observedAt, outcome: control.outcome, uniqueId: control.uniqueId }];
+    })),
+  };
+}
+
+function memberControlFromDocument(doc: StoredDocument): MemberControlRecord {
+  const json = decodeFields(doc.fields);
+  const targets = obj(json, "targets");
+  const controls: Record<string, MemberControl> = {};
+  for (const account of Object.keys(targets).sort()) {
+    const control = obj(targets, account);
+    const outcome = str(control, "outcome");
+    if (!(probeOutcomes as readonly string[]).includes(outcome)) throw new LedgerError("Stored member control carries an unknown outcome.");
+    controls[account] = { observedAt: str(control, "observedAt"), outcome: outcome as MemberControl["outcome"], uniqueId: str(control, "uniqueId") };
+  }
+  return { consumer: str(json, "consumer"), deliveredAt: str(json, "deliveredAt"), expiresAt: str(json, "expiresAt"), member: str(json, "member"), principal: str(json, "principal"), targets: controls };
+}
+
+function maintenanceFromDocument(doc: StoredDocument): MaintenanceTicket & { readonly open: boolean } {
+  const json = decodeFields(doc.fields);
+  return { expiresAt: str(json, "expiresAt"), key: str(json, "key"), open: bool(json, "open"), openedAt: str(json, "openedAt"), openedBy: str(json, "openedBy") };
 }
 
 function progressToJson(progress: EffectProgress): Record<string, Json> {

@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { manifestPath } from "../../tools/ci/workflow-authority";
 import { GoogleIdentityVerifier, configurationFromEnvironment, handleRequest } from "../src/http";
 import { loadRecoveryAuthority, parseAppendBody, purposeForIdentity, targetsFor, unrecordedIdentities } from "../src/model";
-import { FakeVerifier, activeSha, emulatorHost, invokerEmail, reconcilerEmail, repoRoot, testAuthority, testUniqueId, transitionSha, world } from "./support";
+import { deployIdentities } from "../src/deny";
+import { FakeVerifier, activeSha, emulatorHost, invokerEmail, prime, reconcilerEmail, repoRoot, testAuthority, testUniqueId, transitionSha, world } from "./support";
 
 const authorityText = () => readFile(join(repoRoot, "protected-recovery/authority.json"), "utf8");
 const manifestText = () => readFile(join(repoRoot, manifestPath), "utf8");
@@ -14,6 +15,9 @@ describe("recovery authority", () => {
     const authority = loadRecoveryAuthority(await authorityText(), await manifestText());
     expect(authority.broker.projectId).toBeNull();
     expect(authority.broker.projectNumber).toBeNull();
+    expect(authority.organizationId).toBeNull();
+    expect(authority.bootstrapPrincipal).toBeNull();
+    expect(authority.maintenancePrincipals).toEqual([]);
     expect(authority.consumers.map((consumer) => consumer.repository)).toEqual(["cdbentley", "critical-history", "healthmcp", "runsetta"]);
     expect(authority.consumers.every((consumer) => consumer.activeWorkflowSha === null && consumer.transitionWorkflowSha === null)).toBe(true);
     expect(authority.targetAccounts).toEqual(["gha-deploy-parity", "gha-preview-commit", "gha-preview-deploy", "gha-preview-operator", "gha-preview-publish", "gha-prod-deploy", "gha-prod-publish", "gha-terraform", "gha-wif-canary"]);
@@ -31,6 +35,11 @@ describe("recovery authority", () => {
     (assigned.broker as Record<string, unknown>).projectNumber = "123456789012";
     const assignedAuthority = loadRecoveryAuthority(JSON.stringify(assigned), await manifestText());
     expect(() => configurationFromEnvironment({}, assignedAuthority)).toThrow("records no unique ID for cdbentley/gha-deploy-parity, cdbentley/gha-preview-commit");
+    // With every identity recorded but no organization, the service still refuses to start.
+    const recorded = await testAuthority((document) => {
+      document.organizationId = null;
+    });
+    expect(() => configurationFromEnvironment({}, recorded)).toThrow("records no organization");
   });
 
   test("consumer coordinates agree with the production deploy registry", async () => {
@@ -43,6 +52,11 @@ describe("recovery authority", () => {
     for (const consumer of authority.consumers) {
       expect(bootstrap).toContain(`github_repo                 = "${consumer.repository}"\n      github_repository_id        = "${consumer.repositoryId}"`);
     }
+    // The deploy identities the deployment form excepts are exactly the accounts the canonical deploy jobs run gcloud run deploy as.
+    expect(deployIdentities).toEqual(["gha-preview-deploy", "gha-prod-deploy"]);
+    expect(deployProd).toContain('echo "deploy_service_account=gha-prod-deploy@${project_id}.iam.gserviceaccount.com"');
+    expect(deployProd).toContain('echo "preview_deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"');
+    expect(await readFile(join(repoRoot, ".github/workflows/deploy-preview.yml"), "utf8")).toContain('echo "deploy_service_account=gha-preview-deploy@${project_id}.iam.gserviceaccount.com"');
   });
 
   test("the authority refuses coordinates that do not match the manifest or each other", async () => {
@@ -58,6 +72,10 @@ describe("recovery authority", () => {
     expect(edit((authority) => (consumers(authority)[0]!.repository = "cdbentley-two"))).toThrow("must have exactly one QUARANTINE invoker");
     expect(edit((authority) => (consumers(authority)[0]!.projectNumber = "422714632513"))).toThrow("already declared");
     expect(edit((authority) => (consumers(authority)[0]!.activeWorkflowSha = "abc"))).toThrow("one full lowercase commit SHA");
+    expect(edit((authority) => (authority.organizationId = "org-1"))).toThrow("organizationId must be null or one positive decimal organization ID");
+    expect(edit((authority) => (authority.bootstrapPrincipal = "user:root@example.com"))).toThrow("bootstrapPrincipal must be null or one v2 principal identifier");
+    expect(edit((authority) => (authority.maintenancePrincipals = ["principal://goog/subject/b@example.com", "principal://goog/subject/a@example.com"]))).toThrow("must be sorted and unique");
+    expect(edit((authority) => (authority.maintenancePrincipals = ["serviceAccount:x@y.iam.gserviceaccount.com"]))).toThrow("list of v2 principal identifiers");
     expect(edit((authority) => (consumers(authority)[0]!.transitionWorkflowSha = activeSha))).toThrow("requires activeWorkflowSha");
     expect(edit((authority) => (authority.broker as Record<string, unknown>).projectId = "recovery-test")).toThrow("both be null or both be assigned");
     expect(edit((authority) => (authority.broker as Record<string, unknown>).reconcilerServiceAccount = "gha-isolate-cdbentley")).toThrow("cannot also be a recovery invoker");
@@ -196,7 +214,9 @@ describe("recovery authority", () => {
 
 describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
   test("identity, purpose, grammar, permission, and direction are enforced in order", async () => {
-    const { authority, broker } = await world();
+    const w = await world();
+    const { authority, broker } = w;
+    await prime(w, "cdbentley");
     const deps = { authority, broker, verifier: new FakeVerifier() };
     const call = (method: string, path: string, token: string | undefined, body?: unknown) =>
       handleRequest(deps, new Request(`http://broker${path}`, { body: body === undefined ? undefined : JSON.stringify(body), headers: token === undefined ? {} : { authorization: `Bearer ${token}` }, method }));
@@ -229,6 +249,12 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     expect((await call("GET", "/v1/shards/s", isolate)).status).toBe(404);
     expect((await call("GET", "/v1/shards/Bad", isolate)).status).toBe(404);
     expect((await call("DELETE", "/v1/shards/s", isolate)).status).toBe(404);
+    // The maintenance ticket is the restore direction's alone, with a closed grammar.
+    expect((await call("POST", "/v1/maintenance", isolate, { action: "open", key: "m" })).status).toBe(403);
+    expect((await call("POST", "/v1/maintenance", member, { action: "open", key: "m" })).status).toBe(403);
+    expect((await call("POST", "/v1/maintenance", reconcilerEmail, { action: "open", key: "m" })).status).toBe(403);
+    expect((await call("POST", "/v1/maintenance", restorer, { action: "widen", key: "m" })).status).toBe(400);
+    expect((await call("POST", "/v1/maintenance", restorer, { action: "open", key: "m", consumer: "cdbentley" })).status).toBe(400);
     const large = await handleRequest(deps, new Request("http://broker/v1/shards/s/entries", { body: JSON.stringify({ key: "x".repeat(9000) }), headers: { authorization: `Bearer ${isolate}` }, method: "POST" }));
     expect(large.status).toBe(413);
     const accepted = await call("POST", "/v1/shards/s/entries", isolate, { consumer: "cdbentley", intent: "QUARANTINE", key: "k" });
@@ -246,11 +272,16 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     const sweep = await call("POST", "/v1/reconcile", reconcilerEmail, {});
     expect(sweep.status).toBe(200);
     expect(await sweep.json()).toMatchObject({ next: null, shards: [{ shard: "s" }] });
-    // A close before readiness is refused with the blockers, and the shard stays OPEN.
+    // The primed positive controls admitted every effect on that sweep, so the close is refused for the negative
+    // probes every member still owes, and the shard stays OPEN.
     const notReady = await call("POST", "/v1/shards/s/close", isolate, { key: "c" });
     expect(notReady.status).toBe(409);
-    expect(await notReady.json()).toMatchObject({ blockers: expect.arrayContaining([expect.stringContaining("quarantine is RECORDED")]), error: "NOT_READY" });
+    expect(await notReady.json()).toMatchObject({ blockers: expect.arrayContaining([expect.stringMatching(/^gha-[a-z-]+: no DENIED impersonation probe of principalSet:\/\/.* after the quarantine acknowledgement$/)]), error: "NOT_READY" });
     expect((await (await call("GET", "/v1/shards/s", isolate)).json() as { shard: { phase: string; scanReady: { ready: boolean } } }).shard).toMatchObject({ phase: "OPEN", scanReady: { ready: false } });
+    // No maintenance ticket can open while the quarantine shard is not CLOSED.
+    const active = await call("POST", "/v1/maintenance", restorer, { action: "open", key: "m" });
+    expect(active.status).toBe(409);
+    expect(await active.json()).toMatchObject({ detail: "QUARANTINE shards not CLOSED: s", error: "QUARANTINE_ACTIVE" });
   });
 });
 

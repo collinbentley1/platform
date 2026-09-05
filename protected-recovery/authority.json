@@ -10,6 +10,9 @@
     "workloadIdentityProviderId": "github",
     "memberWorkloadIdentityProviderId": "github-members"
   },
+  "organizationId": null,
+  "bootstrapPrincipal": null,
+  "maintenancePrincipals": [],
   "githubOwner": "collinbentley1",
   "githubOwnerId": "16823277",
   "platformRepository": "collinbentley1/platform",

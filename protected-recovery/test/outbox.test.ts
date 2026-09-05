@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { boundedFetch } from "../src/http";
-import { type EntryBody, probePermission, targetsFor } from "../src/model";
+import { type EntryBody, probePermission } from "../src/model";
 import { GoogleEvidenceStore, entryEvidence, project } from "../src/outbox";
-import { Clock, FakeEvidence, emulatorHost, quarantine, seedTargets, world } from "./support";
+import { Clock, FakeEvidence, emulatorHost, prime, quarantine, world } from "./support";
 
 describe("outbox projection", () => {
   const bytes = new TextEncoder().encode('{"a":1}\n');
@@ -93,9 +93,7 @@ describe.skipIf(!emulatorHost)("stalled evidence bodies (Firestore emulator; GCS
     // Two consumers' quarantines: the hung shard's targets are quarantined for real, so the later shard must be another
     // consumer's for its own effects to have members to remove.
     for (const [shard, repository] of [["a-hung", "cdbentley"], ["b-ready", "runsetta"]] as const) {
-      const consumer = w.authority.consumers.find((candidate) => candidate.repository === repository)!;
-      const targets = targetsFor(w.authority, consumer)!;
-      seedTargets(w.iam, targets);
+      const targets = await prime(w, repository);
       expect((await w.ledger.append(quarantine(shard, repository, `k-${shard}`), targets)).kind).toBe("accepted");
     }
     const cursorWrites: Array<string | null> = [];
@@ -113,12 +111,14 @@ describe.skipIf(!emulatorHost)("stalled evidence bodies (Firestore emulator; GCS
       // The hung shard's projections are pending lost answers, classified inside the store; nothing escaped the sweep
       // and nothing was passed at a deadline.
       expect(views[0]!.deadline).toBeUndefined();
-      expect(views[0]!.notes.length).toBeGreaterThan(0);
+      const outbox = views[0]!.notes.filter((note) => !note.includes("awaits a delivery"));
+      expect(outbox.length).toBeGreaterThan(0);
       // A stalled upload answer is a lost put and a stalled read is a lost object body, each classified inside the
       // store as the bounded fetch's timeout, so the projection is pending rather than an escaped error.
-      expect(views[0]!.notes.every((note) => /: outbox pending; (lost|exists); object body lost: .*TimeoutError/.test(note))).toBe(true);
+      expect(outbox.every((note) => /: outbox pending; (lost|exists); object body lost: .*TimeoutError/.test(note))).toBe(true);
       expect(views[0]!.pendingOutbox).toBeGreaterThan(0);
-      expect(views[1]).toMatchObject({ notes: [], pendingEffects: 0, pendingOutbox: 0 });
+      expect(views[1]).toMatchObject({ pendingEffects: 0, pendingOutbox: 0 });
+      expect(views[1]!.notes.every((note) => note.includes("awaits a delivery"))).toBe(true);
       expect(sweep.next).toBeNull();
     }
     expect(cursorWrites).toEqual(["a-hung", "b-ready", null, "a-hung", "b-ready", null]);

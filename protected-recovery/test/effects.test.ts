@@ -1,16 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { type MemberCredentialSource, type Policy, type ProbeRequest, GoogleIssuanceProbe, LedgerMemberCredentials, driveEffect, expectedSnapshot, observedSnapshot, planEffect, policyFromJson, verifyMemberCredential } from "../src/effects";
+import { type MintOutcome, type MintResult, type Policy, GoogleIssuanceProbe, deliveryBudgetSeconds, driveEffect, expectedSnapshot, observedSnapshot, planEffect, policyFromJson, verifyMemberCredential } from "../src/effects";
 import { Broker } from "../src/http";
 import { type Target, consumerPool, managedRole, probePermission, probePrerequisite, purposeForIdentity, scanReadiness, targetsFor } from "../src/model";
 import { entryEvidence } from "../src/outbox";
-import { type World, Clock, beginClose, close, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, needsOf, proberPrincipal, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
+import { type World, Clock, beginClose, consumerOf, deliver, deliverAll, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, memberEmail, memberPrincipal, needsOf, prime, proberPrincipal, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
 
 const pool = "projects/882468538648/locations/global/workloadIdentityPools/github-actions";
 const member = (sha: string) => `principalSet://iam.googleapis.com/${pool}/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@${sha}:${sha}:production:push`;
 const target: Target = { account: "gha-terraform", email: "gha-terraform@cdbentley.iam.gserviceaccount.com", members: [member("a".repeat(40)), member("b".repeat(40))], pool, resource: "projects/cdbentley/serviceAccounts/101080000000000000000", uniqueId: "101080000000000000000" };
 const policy = (bindings: Policy["bindings"], etag = "e1"): Policy => policyFromJson({ bindings, etag, version: 1 });
-// Every managed member of every target, in the order the broker probes them.
+// Every managed member of every target, in target order.
 const membersOf = (targets: readonly Target[]) => targets.flatMap((candidate) => candidate.members.map((managed) => [candidate, managed] as const));
+// Every (target, member) pair in the order a delivery round records probes: member by member, each against its targets.
+const deliveryOrder = (targets: readonly Target[]) => [...new Set(targets.flatMap((candidate) => candidate.members))].sort().flatMap((managed) => targets.filter((candidate) => candidate.members.includes(managed)).map((candidate) => [candidate, managed] as const));
 
 describe("policy plan", () => {
   test("removes or adds exactly the managed members and preserves every unrelated binding and condition", () => {
@@ -81,6 +83,10 @@ function json(status: number, body: unknown): Response {
 }
 
 const endpoints = { credentials: "https://credentials.test", sts: "https://sts.test" };
+const resultsOf = (outcome: MintOutcome): readonly MintResult[] => {
+  if (outcome.kind !== "minted") throw new Error(outcome.reason);
+  return outcome.results;
+};
 const iamDenial = { error: { code: 403, details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", domain: "iam.googleapis.com", metadata: { permission: probePermission }, reason: "IAM_PERMISSION_DENIED" }], message: `Permission '${probePermission}' denied on resource (or it may not exist).`, status: "PERMISSION_DENIED" } };
 
 // Stand-ins for STS and IAM Credentials: STS exchanges exactly the tokens it
@@ -116,55 +122,59 @@ function googleIssuance(tokens: () => ReadonlyMap<string, string>, provider: str
 }
 
 describe("issuance probe", () => {
-  test("the positive control mints as every managed member through STS and IAM Credentials and discards the token; the probe uses the same endpoint; the principal is the provider's mapped subject", async () => {
+  test("a delivered credential is exchanged once at STS and minted as the member against every bound target through IAM Credentials, never retained; the principal is the provider's mapped subject", async () => {
     const authority = await testAuthority();
     const consumer = authority.consumers.find((candidate) => candidate.repository === "cdbentley")!;
-    const probed = targetsFor(authority, consumer)![0]!;
-    expect(probed.members.length).toBeGreaterThan(1);
+    const targets = targetsFor(authority, consumer)!;
+    const probed = targets[0]!;
+    const managed = probed.members[0]!;
+    const bound = targets.filter((candidate) => candidate.members.includes(managed));
+    expect(bound.length).toBeGreaterThan(1);
     const provider = `${consumerPool(authority, consumer)}/providers/${authority.broker.workloadIdentityProviderId}`;
     const signer = await githubSigner();
     const clock = new Clock();
     const nowSeconds = Math.floor(clock.now.getTime() / 1000);
     const tokens = new Map<string, string>();
-    for (const [index, managed] of probed.members.entries()) tokens.set(managed, await signer.sign(memberClaims(authority, consumer, managed, nowSeconds, String(1000 + index))));
-    const credentials: MemberCredentialSource = { oidcTokenFor: async (requested) => (tokens.has(requested) ? { kind: "token", token: tokens.get(requested)! } : { kind: "unavailable", reason: probePrerequisite(requested) }) };
+    tokens.set(managed, await signer.sign(memberClaims(authority, consumer, managed, nowSeconds, "1000")));
     const issuance = googleIssuance(() => tokens, provider);
-    const probe = new GoogleIssuanceProbe({ authority, credentials, endpoints, fetch: issuance.fetcher, jwks: async () => signer.jwks, now: clock.read });
-    const principalOf = (index: number) => `principal://iam.googleapis.com/${probed.pool}/subject/${authority.githubOwnerId}:${consumer.repositoryId}:github-hosted:${1000 + index}`;
-    // The positive control: one STS exchange and one actual generateAccessToken per member, all of them minting.
-    expect(await probe.preflight([probed])).toEqual({ kind: "operational", principals: { [probed.account]: Object.fromEntries(probed.members.map((managed, index) => [managed, principalOf(index)])) } });
-    expect(issuance.calls.map((call) => call.url)).toEqual(probed.members.flatMap(() => [`${endpoints.sts}/v1/token`, `${endpoints.credentials}/v1/projects/-/serviceAccounts/${probed.uniqueId}:generateAccessToken`]));
-    // The recorded principal is never the raw GitHub subject; it is the provider's numeric subject mapping.
-    const verified = await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, tokens.get(probed.members[0]!)!);
-    expect(verified).toEqual({ kind: "verified", consumer, expiresAt: new Date((nowSeconds + 300) * 1000).toISOString(), member: probed.members[0]!, principal: principalOf(0) });
-    expect(principalOf(0)).not.toContain("repo:");
-    // A member that cannot mint, or whose endpoint fails, makes the positive control unavailable, naming that member.
+    const probe = new GoogleIssuanceProbe({ authority, endpoints, fetch: issuance.fetcher, now: clock.read });
+    const principal = memberPrincipal(authority, consumer, "1000");
+    // Verification derives the exact member and the provider's numeric subject; never the raw GitHub subject.
+    const verified = await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, tokens.get(managed)!);
+    expect(verified).toEqual({ kind: "verified", consumer, expiresAt: new Date((nowSeconds + 300) * 1000).toISOString(), member: managed, principal });
+    expect(principal).not.toContain("repo:");
+    const credential = { consumer, member: managed, principal, token: tokens.get(managed)! };
+    // One STS exchange, then one actual generateAccessToken per bound target: ALLOWED while every binding stands.
+    const minted = await probe.mint(credential, bound);
+    expect(minted).toEqual({ kind: "minted", principal, results: bound.map((candidate) => ({ kind: "observed", observedAt: clock.now.toISOString(), outcome: "ALLOWED", target: candidate })) });
+    expect(issuance.calls.map((call) => call.url)).toEqual([`${endpoints.sts}/v1/token`, ...bound.map((candidate) => `${endpoints.credentials}/v1/projects/-/serviceAccounts/${candidate.uniqueId}:generateAccessToken`)]);
+    expect(issuance.calls.slice(1).every((call) => call.bearer === `Bearer federated:${managed}`)).toBe(true);
+    // DENIED only on an IAM permission denial of exactly the probe permission, per target; a failing target is unavailable alone.
     issuance.denied.add(probed.uniqueId);
-    expect(await probe.preflight([probed])).toMatchObject({ kind: "unavailable", reason: expect.stringContaining(`${probed.account}/${probed.members[0]}: generateAccessToken answered HTTP 403; the member cannot mint for ${probed.uniqueId}`) });
-    issuance.denied.delete(probed.uniqueId);
-    issuance.failing.set(probed.uniqueId, 1);
-    expect(await probe.preflight([probed])).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("generateAccessToken answered HTTP 503") });
-    // Issuance is ALLOWED while the binding stands and DENIED once IAM refuses exactly the probe permission, for any member.
-    const request: ProbeRequest = { email: probed.email, member: probed.members[1]!, permission: probePermission, resource: probed.resource, uniqueId: probed.uniqueId };
-    expect(await probe.probe(request)).toEqual({ kind: "observed", observedAt: clock.now.toISOString(), outcome: "ALLOWED", principal: principalOf(1) });
-    issuance.denied.add(probed.uniqueId);
+    issuance.failing.set(bound[1]!.uniqueId, 1);
     clock.advance(5);
-    expect(await probe.probe(request)).toEqual({ kind: "observed", observedAt: clock.now.toISOString(), outcome: "DENIED", principal: principalOf(1) });
-    expect(issuance.calls.at(-1)!.url).toBe(`${endpoints.credentials}/v1/projects/-/serviceAccounts/${probed.uniqueId}:generateAccessToken`);
-    // A denial of another permission, a denial without an IAM reason, or any other failure is unavailable.
+    const mixed = await probe.mint(credential, bound);
+    expect(mixed).toMatchObject({ kind: "minted", principal });
+    if (mixed.kind !== "minted") throw new Error();
+    expect(mixed.results[0]).toEqual({ kind: "observed", observedAt: clock.now.toISOString(), outcome: "DENIED", target: probed });
+    expect(mixed.results[1]).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("HTTP 503"), target: bound[1] });
+    // A denial of another permission, or a denial without an IAM reason, is unavailable; the documented message form is a denial.
     issuance.setDenial({ error: { code: 403, details: [{ "@type": "type.googleapis.com/google.rpc.ErrorInfo", domain: "iam.googleapis.com", metadata: { permission: "iam.serviceAccounts.actAs" }, reason: "IAM_PERMISSION_DENIED" }], message: "Permission 'iam.serviceAccounts.actAs' denied on resource.", status: "PERMISSION_DENIED" } });
-    expect(await probe.probe(request)).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("without an IAM denial") });
+    expect(resultsOf(await probe.mint(credential, [probed]))[0]).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("without an IAM denial") });
     issuance.setDenial({ error: { code: 403, message: "The caller does not have permission", status: "PERMISSION_DENIED" } });
-    expect(await probe.probe(request)).toMatchObject({ kind: "unavailable" });
+    expect(resultsOf(await probe.mint(credential, [probed]))[0]).toMatchObject({ kind: "unavailable" });
     issuance.setDenial({ error: { code: 403, message: "Permission 'iam.serviceAccounts.getAccessToken' denied on resource (or it may not exist).", status: "PERMISSION_DENIED" } });
-    expect(await probe.probe(request)).toMatchObject({ kind: "observed", outcome: "DENIED" });
+    expect(resultsOf(await probe.mint(credential, [probed]))[0]).toMatchObject({ kind: "observed", outcome: "DENIED" });
+    // A target the member is not bound to is never minted for; STS refusal makes the whole delivery unavailable.
+    const unbound = targets.find((candidate) => !candidate.members.includes(managed))!;
+    expect(resultsOf(await probe.mint(credential, [unbound]))[0]).toMatchObject({ kind: "unavailable", reason: `${managed} is not a managed member of ${unbound.account}` });
     issuance.setSts(400);
-    expect(await probe.probe(request)).toMatchObject({ kind: "unavailable", reason: "STS refused the member credential with HTTP 400" });
+    expect(await probe.mint(credential, bound)).toEqual({ kind: "unavailable", reason: "STS refused the member credential with HTTP 400" });
     issuance.setSts(200);
-    // A credential that is any other identity is refused before STS is ever called for it: another environment,
-    // another repository, another audience, an expired token, another issuer, no run, or a signature GitHub's keys do
-    // not verify. The positive control still mints as the other, valid member and is unavailable as a whole.
-    const claims = memberClaims(authority, consumer, probed.members[1]!, nowSeconds, "1001");
+    // A credential that is any other identity is refused by verification before STS is ever called: another
+    // environment, another repository, a self-hosted runner, another audience, an expired token, another issuer,
+    // no run, or a signature GitHub's keys do not verify.
+    const claims = memberClaims(authority, consumer, managed, nowSeconds, "1001");
     const refusals: Array<[Record<string, unknown>, string]> = [
       [{ ...claims, environment: "elsewhere" }, "binds to no target"],
       [{ ...claims, repository_id: "999" }, "outside the consumer repository"],
@@ -175,27 +185,15 @@ describe("issuance probe", () => {
       [{ ...claims, run_id: undefined }, "lacks the run or the authority claims"],
     ];
     for (const [payload, reason] of refusals) {
-      tokens.set(probed.members[1]!, await signer.sign(payload));
-      const at = issuance.calls.length;
-      expect(await probe.probe(request), reason).toMatchObject({ kind: "unavailable", reason: expect.stringContaining(reason) });
-      expect(issuance.calls.length, reason).toBe(at);
-      expect(await probe.preflight([probed]), reason).toMatchObject({ kind: "unavailable", reason: expect.stringContaining(`${probed.account}/${probed.members[1]}: `) });
-      expect(issuance.calls.slice(at).every((call) => call.bearer === undefined || call.bearer === `Bearer federated:${probed.members[0]}`), reason).toBe(true);
+      expect(await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, await signer.sign(payload)), reason).toMatchObject({ kind: "unavailable", reason: expect.stringContaining(reason) });
     }
-    // A credential of another member of the same consumer is refused for this member, and a signature GitHub's keys
-    // do not verify is refused before anything is called.
-    const before = issuance.calls.length;
-    tokens.set(probed.members[1]!, tokens.get(probed.members[0]!)!);
-    expect(await probe.probe(request)).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("not the probed member") });
     const foreign = await crypto.subtle.generateKey({ hash: "SHA-256", modulusLength: 2048, name: "RSASSA-PKCS1-v1_5", publicExponent: new Uint8Array([1, 0, 1]) }, true, ["sign", "verify"]);
-    tokens.set(probed.members[1]!, await signer.signWith(claims, foreign.privateKey));
-    expect(await probe.probe(request)).toMatchObject({ kind: "unavailable", reason: "the member credential is not a GitHub-signed RS256 token" });
-    expect(issuance.calls.length).toBe(before);
-    // Without a delivered credential every preflight and probe is unavailable, naming the member and the channel.
-    const undelivered = new GoogleIssuanceProbe({ authority, credentials: { oidcTokenFor: async (requested) => ({ kind: "unavailable", reason: probePrerequisite(requested) }) }, endpoints, fetch: issuance.fetcher, jwks: async () => [], now: clock.read });
-    expect(await undelivered.preflight([probed])).toEqual({ kind: "unavailable", reason: probed.members.map((managed) => `${probed.account}/${managed}: ${probePrerequisite(managed)}`).join("; ") });
-    expect(await undelivered.probe(request)).toEqual({ kind: "unavailable", reason: probePrerequisite(request.member) });
-    expect(issuance.calls.length).toBe(before);
+    expect(await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, await signer.signWith(claims, foreign.privateKey))).toEqual({ kind: "unavailable", reason: "the member credential is not a GitHub-signed RS256 token" });
+    // A credential delivered for the wrong consumer is refused by verification as well.
+    expect(await verifyMemberCredential({ authority, jwks: async () => signer.jwks, now: clock.read }, tokens.get(managed)!, authority.consumers[3]!)).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("not minted for the consumer provider audience") });
+    // The delivery budget grows with the targets a member is bound to.
+    expect(deliveryBudgetSeconds(1)).toBe(50);
+    expect(deliveryBudgetSeconds(4)).toBe(65);
   });
 });
 
@@ -211,6 +209,7 @@ const entriesOf = (w: World, shard: string) => w.ledger.readShard(shard).then((d
 const contentOf = (w: World, resource: string) => observedSnapshot(w.iam.policies.get(resource)!);
 const readinessOf = async (w: World, shard: string) => scanReadiness((await w.ledger.readShard(shard))!, w.clock.now);
 const isolate = (w: World) => purposeForIdentity(w.authority, invokerEmail("cdbentley"))!;
+const probeEntries = async (w: World, shard: string) => (await entriesOf(w, shard)).filter((entry) => entry.body.kind === "probe");
 
 async function quarantineAndClose(w: World & { readonly targets: readonly Target[] }, shard: string): Promise<void> {
   expect((await w.ledger.append(quarantine(shard, "cdbentley", `${shard}-q`), w.targets)).kind).toBe("accepted");
@@ -221,17 +220,28 @@ async function quarantineAndClose(w: World & { readonly targets: readonly Target
 }
 
 describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memory IAM, evidence, probe, and inventory stand-ins)", () => {
-  test("an exact policy A -> B -> A cycle: quarantine, inventory baseline, two probe phases for every managed member, protected close, terminal projection, then a separately journaled restore", async () => {
+  test("an exact policy A -> B -> A cycle: quarantine, inventory baseline, two probe phases for every managed member from the deliveries themselves, protected close, terminal projection, then a separately journaled restore", async () => {
     const w = await setup();
     const { broker, evidence, iam, ledger, probe, targets } = w;
+    const consumer = consumerOf(w, "cdbentley");
     const members = membersOf(targets);
+    const recorded = deliveryOrder(targets);
     expect(members.length).toBe(35);
+    expect(recorded.length).toBe(35);
+    const principal = memberPrincipal(w.authority, consumer);
+    // Every canonical job delivered once while the bindings stood: the positive controls admission needs.
+    await prime(w, "cdbentley");
+    const primed = probe.mints.length;
+    expect(primed).toBe(14);
     const before = new Map(targets.map((candidate) => [candidate.resource, contentOf(w, candidate.resource)]));
     expect((await ledger.append(quarantine("q1", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const view = await broker.reconcileShard("q1");
-    expect(view).toMatchObject({ notes: [], pendingEffects: 0, pendingOutbox: 0, phase: "OPEN" });
+    expect(view).toMatchObject({ pendingEffects: 0, pendingOutbox: 0, phase: "OPEN" });
+    // The reconcile names every delivery its revocation probes await, one per member of every target.
+    expect((view as { notes: string[] }).notes).toHaveLength(members.length);
+    expect((view as { notes: string[] }).notes.every((note) => note.includes("REVOCATION probe of") && note.includes("awaits a delivery"))).toBe(true);
     const acked = await entriesOf(w, "q1");
-    expect(acked).toHaveLength(18 + members.length);
+    expect(acked).toHaveLength(18);
     for (const [index, candidate] of targets.entries()) {
       const entry = acked[index]!;
       if (entry.progress?.state !== "ACKED") throw new Error(`${candidate.account} is ${entry.progress?.state}`);
@@ -246,37 +256,43 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
       expect(await ledger.readActuator(candidate.uniqueId)).toEqual({ epoch: 1, holder: null, lastEtag: entry.progress.observed.etag });
     }
     expect(iam.writes).toHaveLength(9);
-    // The same reconcile recorded the inventory baseline of every target and then one revocation probe per managed
-    // member of every target from the probe source, each bound to the exact identity and member; the shard mirrors
-    // every member's chain.
-    expect(probe.requests).toHaveLength(members.length);
-    expect(probe.requests.map((request) => [request.uniqueId, request.member])).toEqual(members.map(([candidate, managed]) => [candidate.uniqueId, managed]));
-    expect(probe.requests[0]).toEqual({ email: targets[0]!.email, member: targets[0]!.members[0]!, permission: probePermission, resource: targets[0]!.resource, uniqueId: targets[0]!.uniqueId });
-    const shardAfterFirstPass = (await ledger.readShard("q1"))!;
+    // The same reconcile recorded the inventory baseline of every target, dated over the batch's interval.
     for (const [index, candidate] of targets.entries()) {
       const inventory = acked[9 + index]!;
-      expect(inventory.body).toMatchObject({ kind: "inventory", account: candidate.account, email: candidate.email, findings: [], observedAt: w.clock.now.toISOString(), uniqueId: candidate.uniqueId });
+      expect(inventory.body).toMatchObject({ kind: "inventory", account: candidate.account, email: candidate.email, findings: [], observedAt: w.clock.now.toISOString(), observedUntil: w.clock.now.toISOString(), uniqueId: candidate.uniqueId });
       expect(inventory.outbox.state).toBe("PROJECTED");
-      const state = shardAfterFirstPass.targets[candidate.account]!;
-      expect(state).toMatchObject({ effect: { ackedAt: w.clock.now.toISOString(), alternateIssuers: [], state: "ACKED" }, sequence: index + 1 });
-      expect(state.chain).toMatchObject({ inventory: { changes: 0, findings: [], hash: inventory.body.kind === "inventory" ? inventory.body.hash : "", observations: 1 }, journaled: 1 + candidate.members.length, suppressed: 0 });
-      expect(Object.keys(state.chain.members).sort()).toEqual([...candidate.members].sort());
-      for (const managed of candidate.members) expect(state.chain.members[managed]).toMatchObject({ allowed: { count: 0, lastObservedAt: null }, denied: 1, post: null, revocation: { member: managed, outcome: "DENIED", phase: "REVOCATION" } });
     }
-    for (const [index, [candidate, managed]] of members.entries()) {
-      expect(acked[18 + index]!.body).toEqual({ kind: "probe", account: candidate.account, email: candidate.email, member: managed, observedAt: w.clock.now.toISOString(), outcome: "DENIED", permission: probePermission, phase: "REVOCATION", principal: proberPrincipal, uniqueId: candidate.uniqueId });
-      expect(acked[18 + index]!.outbox.state).toBe("PROJECTED");
+    // Every canonical job delivers its credential once: the broker mints as each member against every target it is
+    // bound to -- DENIED, the bindings being gone -- and records the revocation probe of every (target, member) pair.
+    const responses = await deliverAll(w, "cdbentley");
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    expect(probe.mints).toHaveLength(primed + 14);
+    expect(probe.mints.slice(primed).reduce((count, mint) => count + mint.targets.length, 0)).toBe(members.length);
+    const shardAfterRound = (await ledger.readShard("q1"))!;
+    for (const [index, candidate] of targets.entries()) {
+      const state = shardAfterRound.targets[candidate.account]!;
+      expect(state).toMatchObject({ effect: { ackedAt: w.clock.now.toISOString(), alternateIssuers: [], state: "ACKED" }, sequence: index + 1 });
+      expect(state.chain).toMatchObject({ inventory: { changes: 0, findings: [], hash: (acked[9 + index]!.body as { hash: string }).hash, horizonSeconds: 3600, observations: 1 }, journaled: 1 + candidate.members.length, suppressed: 0 });
+      expect(Object.keys(state.chain.members).sort()).toEqual([...candidate.members].sort());
+      for (const managed of candidate.members) expect(state.chain.members[managed]).toMatchObject({ allowed: { count: 0, lastObservedAt: null }, denied: 1, post: null, revocation: { member: managed, outcome: "DENIED", phase: "REVOCATION", principal } });
+    }
+    const probes = await probeEntries(w, "q1");
+    expect(probes).toHaveLength(members.length);
+    for (const [index, [candidate, managed]] of recorded.entries()) {
+      expect(probes[index]!.body).toEqual({ kind: "probe", account: candidate.account, email: candidate.email, member: managed, observedAt: w.clock.now.toISOString(), outcome: "DENIED", permission: probePermission, phase: "REVOCATION", principal, uniqueId: candidate.uniqueId });
     }
     // Not ready until every member's horizon drains and its post-horizon probe is recorded; close is refused until then.
     const horizonAt = new Date(w.clock.now.getTime() + 3600 * 1000).toISOString();
     expect(await readinessOf(w, "q1")).toEqual({ blockers: members.map(([candidate, managed]) => `${candidate.account}: token horizon of ${managed} drains at ${horizonAt}`), horizonAt, ready: false });
     expect(await beginClose(w, "q1", "c0")).toMatchObject({ kind: "rejected", rejection: { reason: "NOT_READY" } });
     w.clock.advance(3600);
-    await broker.reconcileShard("q1");
-    expect(probe.requests).toHaveLength(2 * members.length);
+    await deliverAll(w, "cdbentley");
+    expect(await probeEntries(w, "q1")).toHaveLength(2 * members.length);
     expect(await readinessOf(w, "q1")).toEqual({ blockers: [], horizonAt, ready: true });
-    // The re-observed inventory was equal: no entry, the baseline re-verified.
+    // The next reconcile projects the journaled probes and re-verifies the baseline: no entry, the baseline confirmed.
+    await broker.reconcileShard("q1");
     expect((await ledger.readShard("q1"))!.targets[targets[0]!.account]!.chain.inventory).toMatchObject({ changes: 0, observations: 2, verifiedAt: w.clock.now.toISOString() });
+    expect((await entriesOf(w, "q1")).every((entry) => entry.outbox.state === "PROJECTED")).toBe(true);
     // Managed bindings stay absent through the protected close and the terminal projection.
     expect((await beginClose(w, "q1", "c1")).kind).toBe("closing");
     const closed = await broker.reconcileShard("q1");
@@ -285,15 +301,15 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const shard = (await ledger.readShard("q1"))!;
     if (shard.phase !== "CLOSED") throw new Error();
     expect(new TextDecoder().decode(evidence.objects.get(shard.terminal.objectName)!.bytes)).toBe(shard.terminal.receipt);
-    const receipt = JSON.parse(shard.terminal.receipt) as { targets: Record<string, { chain: { inventory: { hash: string; summary: unknown }; members: Record<string, { post: unknown; revocation: unknown }>; suppressed: number } }> };
+    const receipt = JSON.parse(shard.terminal.receipt) as { targets: Record<string, { chain: { inventory: { hash: string; summary: { denyState: { form: string } } }; members: Record<string, { post: unknown; revocation: unknown }>; suppressed: number } }> };
     expect(receipt).toMatchObject({ closeHighWater: highWater, consumer: "cdbentley", intent: "QUARANTINE", readiness: { blockers: [], horizonAt, ready: true }, shard: "q1" });
     for (const [candidate, managed] of members) {
-      expect(receipt.targets[candidate.account]!.chain.members[managed]).toMatchObject({ post: { member: managed, phase: "HORIZON" }, revocation: { member: managed, phase: "REVOCATION" } });
+      expect(receipt.targets[candidate.account]!.chain.members[managed]).toMatchObject({ post: { member: managed, phase: "HORIZON", principal }, revocation: { member: managed, phase: "REVOCATION", principal } });
     }
-    // The receipt carries the preimage of every target's readiness hash: the inventory summary itself.
+    // The receipt carries the preimage of every target's readiness hash: the inventory summary itself, the live Deny state included.
     expect(receipt.targets[targets[0]!.account]!.chain).toMatchObject({ inventory: { hash: (acked[9]!.body as { hash: string }).hash, summary: (acked[9]!.body as { summary: unknown }).summary }, suppressed: 0 });
+    expect(receipt.targets[targets[0]!.account]!.chain.inventory.summary.denyState.form).toBe("steady");
     expect(iam.writes).toHaveLength(9);
-    expect(probe.requests).toHaveLength(2 * members.length);
     // Restore is its own journal with its own receipt, restoring exactly the captured members on exactly the captured
     // identities, admitted only against the source's freshly observed inventory; it admits no probe.
     expect((await ledger.append(restore("r1", "cdbentley", "k2", "q1"), targets, await freshOf(w, "q1"))).kind).toBe("accepted");
@@ -322,12 +338,17 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const again = await broker.reconcileShard("r2");
     expect((again as { notes: string[] }).notes.every((note) => note.includes("already present"))).toBe(true);
     expect(iam.writes).toHaveLength(18);
-  }, 120_000);
+    // With the bindings back, a delivery round mints ALLOWED as every member again: the positive controls of the next quarantine.
+    await deliverAll(w, "cdbentley");
+    const control = await ledger.readMemberControl(targets[0]!.members[0]!);
+    expect(control).toMatchObject({ consumer: "cdbentley", member: targets[0]!.members[0]!, principal, targets: { [targets[0]!.account]: { outcome: "ALLOWED", uniqueId: targets[0]!.uniqueId } } });
+  }, 180_000);
 
   test("scan-ready needs an inventory baseline and, for every managed member of every target, a DENIED probe after acknowledgement, a drained one-hour horizon, and another DENIED probe after it", async () => {
     const w = await setup();
     const { broker, clock, ledger, probe, targets } = w;
     const members = membersOf(targets);
+    await prime(w, "cdbentley");
     // A one-hour token minted one second before the quarantine lands must keep the shard unready until it expires.
     const mintedAt = clock.now.getTime();
     clock.advance(1);
@@ -335,20 +356,24 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(w, "q")).toMatchObject({ horizonAt: null, ready: false });
     expect((await readinessOf(w, "q")).blockers).toEqual(targets.map((candidate) => `${candidate.account}: quarantine is RECORDED`));
     await broker.reconcileShard("q");
+    // A delivery before the baseline exists records a control but no probe; the baseline is here, so the round records revocations.
+    await deliverAll(w, "cdbentley");
     const tokenExpiry = mintedAt + 3600 * 1000;
     const horizon = clock.now.getTime() + 3600 * 1000;
     const horizonAt = new Date(horizon).toISOString();
     expect(horizon).toBeGreaterThanOrEqual(tokenExpiry);
-    expect(probe.requests).toHaveLength(members.length);
+    expect(await probeEntries(w, "q")).toHaveLength(members.length);
     expect(await readinessOf(w, "q")).toEqual({ blockers: members.map(([candidate, managed]) => `${candidate.account}: token horizon of ${managed} drains at ${horizonAt}`), horizonAt, ready: false });
-    // Before the horizon no post-horizon probe is taken, and none would be admitted as one.
+    // Before the horizon a delivery mints as every member but no post-horizon probe is recorded, and none would be admitted as one.
     clock.now = new Date(tokenExpiry - 1000);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(members.length);
+    await deliverAll(w, "cdbentley");
+    expect(await probeEntries(w, "q")).toHaveLength(members.length);
     expect((await readinessOf(w, "q")).ready).toBe(false);
     clock.now = new Date(horizon - 1000);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(members.length);
+    const mintsBefore = probe.mints.length;
+    await deliverAll(w, "cdbentley");
+    expect(probe.mints.length).toBeGreaterThan(mintsBefore);
+    expect(await probeEntries(w, "q")).toHaveLength(members.length);
     expect(await needsOf(w, "q", targets)).toEqual([]);
     expect((await readinessOf(w, "q")).ready).toBe(false);
     const early = targets[0]!;
@@ -362,14 +387,15 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(w, "q")).toEqual({ blockers: members.map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the token horizon ${horizonAt}`), horizonAt, ready: false });
     expect(await ledger.recordProbe("q", { account: early.account, email: early.email, member: early.members[0]!, observedAt: clock.now.toISOString(), outcome: "DENIED", permission: probePermission, phase: "HORIZON", principal: proberPrincipal, uniqueId: early.uniqueId })).toMatchObject({ kind: "recorded", role: "HORIZON" });
     expect((await readinessOf(w, "q")).blockers).toEqual(members.filter(([candidate, managed]) => !(candidate === early && managed === early.members[0])).map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the token horizon ${horizonAt}`));
-    // At the horizon the broker records every remaining member's post-horizon probe and the shard is ready; time alone never made it so.
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(2 * members.length - 1);
+    // At the horizon a delivery round records every remaining member's post-horizon probe and the shard is ready; time alone never made it so.
+    await deliverAll(w, "cdbentley");
+    expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 1);
     expect(await readinessOf(w, "q")).toEqual({ blockers: [], horizonAt, ready: true });
-    // The readiness is reported on the caller-facing view.
+    // The readiness and the deliveries still owed are reported on the caller-facing view.
     const view = await broker.handle({ kind: "reconciler", serviceAccount: "recovery-reconciler" }, { kind: "read", shard: "q" });
-    expect((view.body.shard as { scanReady: unknown }).scanReady).toEqual({ blockers: [], horizonAt, ready: true });
-  }, 120_000);
+    expect((view.body.shard as { deliveriesOwed: unknown[]; scanReady: unknown }).scanReady).toEqual({ blockers: [], horizonAt, ready: true });
+    expect((view.body.shard as { deliveriesOwed: unknown[] }).deliveriesOwed).toEqual([]);
+  }, 180_000);
 
   test("an ALLOWED observation restarts only that member's chain, and an unreachable source records nothing", async () => {
     const w = await setup();
@@ -381,39 +407,43 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     // those chains are untouched.
     const lingering = first.members[0]!;
     expect(targets.filter((candidate) => candidate.members.includes(lingering)).length).toBeGreaterThan(1);
+    await prime(w, "cdbentley");
     probe.outcomes.set(`${first.uniqueId}|${lingering}`, "ALLOWED");
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(members.length);
+    await deliverAll(w, "cdbentley");
+    expect(await probeEntries(w, "q")).toHaveLength(members.length);
     let readiness = await readinessOf(w, "q");
     expect(readiness.horizonAt).toBeNull();
     expect(readiness.blockers).toEqual([`${first.account}: no DENIED impersonation probe of ${lingering} after the quarantine acknowledgement`, ...members.filter(([candidate, managed]) => !(candidate === first && managed === lingering)).map(([candidate, managed]) => `${candidate.account}: token horizon of ${managed} drains at ${new Date(clock.now.getTime() + 3600 * 1000).toISOString()}`)]);
     expect((await ledger.readShard("q"))!.targets[first.account]!.chain.members[lingering]).toMatchObject({ allowed: { count: 1, lastObservedAt: clock.now.toISOString() }, revocation: null });
     expect((await ledger.readShard("q"))!.targets[first.account]!.chain.members[first.members[1]!]).toMatchObject({ allowed: { count: 0 }, revocation: { outcome: "DENIED" } });
-    // Still allowed ten minutes later: only that member is probed again, still blocked; every other member waits for its horizon.
+    // The sweep names the one delivery still owed.
+    expect(((await broker.reconcileShard("q")) as { notes: string[] }).notes).toEqual([`${first.account}: REVOCATION probe of ${lingering} awaits a delivery: the canonical job that is this member must run again and deliver its credential to POST /v1/members`]);
+    // Still allowed ten minutes later: that member's delivery restarts nothing else; every other member waits for its horizon.
     clock.advance(600);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(members.length + 1);
-    expect(probe.requests.at(-1)).toMatchObject({ member: lingering, uniqueId: first.uniqueId });
+    await deliver(w, "cdbentley", lingering);
+    expect(await probeEntries(w, "q")).toHaveLength(members.length + 1);
+    expect((await probeEntries(w, "q")).at(-1)!.body).toMatchObject({ member: lingering, outcome: "ALLOWED", uniqueId: first.uniqueId });
     // Denied at T+1200: the horizon of that member is one hour after that, later than every other member's.
     probe.outcomes.delete(`${first.uniqueId}|${lingering}`);
     clock.advance(600);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(members.length + 2);
+    await deliver(w, "cdbentley", lingering);
+    expect(await probeEntries(w, "q")).toHaveLength(members.length + 2);
     const lateHorizon = clock.now.getTime() + 3600 * 1000;
     readiness = await readinessOf(w, "q");
     expect(readiness.horizonAt).toBe(new Date(lateHorizon).toISOString());
     expect(readiness.ready).toBe(false);
     // Every other member drains first and gets its post-horizon probe; the lingering member still blocks.
     clock.advance(2400);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(2 * members.length + 1);
+    await deliverAll(w, "cdbentley");
+    expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 1);
     readiness = await readinessOf(w, "q");
     expect(readiness.blockers).toEqual([`${first.account}: token horizon of ${lingering} drains at ${new Date(lateHorizon).toISOString()}`]);
     expect(await beginClose(w, "q", "c0")).toMatchObject({ kind: "rejected", rejection: { blockers: readiness.blockers, reason: "NOT_READY" } });
     clock.advance(1200);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(2 * members.length + 2);
+    await deliver(w, "cdbentley", lingering);
+    expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 2);
     expect((await readinessOf(w, "q")).ready).toBe(true);
     // A later ALLOWED observation of one member of a ready target restarts that member's chain alone: a fresh DENIED
     // probe and a fresh hour are required again for it, and the other members keep their completed chains.
@@ -423,67 +453,87 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(readiness).toMatchObject({ blockers: [`${second.account}: no DENIED impersonation probe of ${restarted} after the quarantine acknowledgement`], horizonAt: null, ready: false });
     expect(await beginClose(w, "q", "c1")).toMatchObject({ kind: "rejected", rejection: { reason: "NOT_READY" } });
     clock.advance(1);
-    await broker.reconcileShard("q");
-    expect(probe.requests).toHaveLength(2 * members.length + 3);
-    expect(probe.requests.at(-1)).toMatchObject({ member: restarted, uniqueId: second.uniqueId });
+    await deliver(w, "cdbentley", restarted);
+    expect((await probeEntries(w, "q")).at(-1)!.body).toMatchObject({ member: restarted, outcome: "DENIED", uniqueId: second.uniqueId });
     expect((await readinessOf(w, "q")).blockers).toEqual([`${second.account}: token horizon of ${restarted} drains at ${new Date(clock.now.getTime() + 3600 * 1000).toISOString()}`]);
-    // An unreachable source records nothing, for any member.
+    // An unreachable source records nothing, for any member: the delivery is refused and no observation exists.
     const u = await setup();
+    await prime(u, "cdbentley");
     expect((await u.ledger.append(quarantine("q", "cdbentley", "k1"), u.targets)).kind).toBe("accepted");
-    u.probe.unavailable = members.length;
-    const unavailable = await u.broker.reconcileShard("q");
-    expect((unavailable as { notes: string[] }).notes).toEqual(members.map(([candidate]) => `${candidate.account}: REVOCATION probe unavailable; the probe source is unreachable`));
-    expect((await entriesOf(u, "q")).filter((entry) => entry.body.kind === "probe")).toHaveLength(0);
+    await u.broker.reconcileShard("q");
+    u.probe.unavailable = 14;
+    const refused = await deliverAll(u, "cdbentley");
+    expect(refused.every((response) => response.status === 409 && response.body.error === "MINT_UNAVAILABLE")).toBe(true);
+    expect(await probeEntries(u, "q")).toHaveLength(0);
     expect((await readinessOf(u, "q")).blockers).toEqual(members.map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the quarantine acknowledgement`));
-  }, 120_000);
+  }, 180_000);
 
-  test("a QUARANTINE is refused before acceptance and before any effect is prepared while the probe source cannot mint as every member or an inventory is not clean; the delivered credentials of the canonical jobs are what make it operational", async () => {
+  test("a QUARANTINE is refused before acceptance, before any effect is prepared, and before a PREPARED effect is resumed while any member lacks a positive control, a maintenance ticket is open, or an inventory is not clean; the deliveries of the canonical jobs are what establish the controls", async () => {
     const w = await setup();
-    const { broker, iam, inventory, ledger, probe, targets } = w;
+    const { broker, iam, inventory, ledger, targets } = w;
     const purpose = isolate(w);
-    // The positive control fails: refused before acceptance, nothing journaled, nothing read or written.
-    probe.preflightUnavailable = 1;
-    expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { detail: "the probe source cannot act as the managed members", error: "PROBE_UNAVAILABLE" } });
+    const members = membersOf(targets);
+    // No member has ever delivered: refused before acceptance, nothing journaled, nothing read or written.
+    const refused = await broker.handle(purpose, quarantine("q", "cdbentley", "k1"));
+    expect(refused).toEqual({ status: 409, body: { detail: members.map(([candidate, managed]) => `${candidate.account}/${managed}: ${probePrerequisite(managed)}`).join("; "), error: "PROBE_UNAVAILABLE" } });
     expect(await ledger.readShard("q")).toBeUndefined();
-    expect(probe.preflights.at(-1)!.map((candidate) => candidate.uniqueId)).toEqual(targets.map((candidate) => candidate.uniqueId));
     expect(inventory.requests).toHaveLength(0);
     expect(iam.writes).toHaveLength(0);
+    // Every canonical job delivers once while the bindings stand: every member's positive control is recorded.
+    await deliverAll(w, "cdbentley");
     // A target with an alternate credential path: refused before acceptance, naming the path.
     inventory.findings.set(targets[2]!.uniqueId, ["key:projects/cdbentley/serviceAccounts/x/keys/k1"]);
     expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: [`${targets[2]!.account}: key:projects/cdbentley/serviceAccounts/x/keys/k1`], error: "INVENTORY_BLOCKED" } });
     expect(await ledger.readShard("q")).toBeUndefined();
     inventory.findings.delete(targets[2]!.uniqueId);
-    // Operational and clean: accepted.
+    // The consumer is still in its deployment form: the live Deny state must be read back steady before admission.
+    inventory.setDenyForm("cdbentley", "deployment");
+    expect(await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { blockers: targets.map((candidate) => `${candidate.account}: deny-state:deployment`), error: "INVENTORY_BLOCKED" } });
+    inventory.setDenyForm("cdbentley", "steady");
+    // Controls present, steady, and clean: accepted, against one fresh batch inventory of every target.
+    const batches = inventory.batches.length;
     expect((await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).status).toBe(201);
+    expect(inventory.batches.slice(batches)).toEqual([targets.map((candidate) => candidate.account)]);
     expect((await ledger.readShard("q"))!.nextSequence).toBe(10);
-    // The source becomes unavailable after acceptance: no RECORDED effect is prepared, no actuator taken, nothing written.
-    probe.preflightUnavailable = 1;
+    // The Deny state leaves steady after acceptance: no RECORDED effect is prepared, no actuator taken, nothing written.
+    inventory.setDenyForm("cdbentley", "bootstrap");
     const held = await broker.reconcileShard("q");
-    expect((held as { notes: string[] }).notes).toEqual(targets.map((_, index) => `${index + 1}: pending; not prepared because PROBE_UNAVAILABLE; the probe source cannot act as the managed members`));
+    expect((held as { notes: string[] }).notes).toEqual(targets.map((_, index) => `${index + 1}: pending; not prepared because INVENTORY_BLOCKED; ${targets.map((candidate) => `${candidate.account}: deny-state:bootstrap`).join("; ")}`));
     expect(iam.writes).toHaveLength(0);
     expect((await entriesOf(w, "q")).every((entry) => entry.progress?.state === "RECORDED")).toBe(true);
     expect(await ledger.readActuator(targets[0]!.uniqueId)).toBeUndefined();
     expect(iam.policies.get(targets[0]!.resource)!.bindings.some((binding) => binding.role === managedRole)).toBe(true);
-    // A replay of the accepted key is answered by the ledger without another positive control.
-    probe.preflightUnavailable = 1;
+    // A replay of the accepted key is answered by the ledger without another admission.
+    const requests = inventory.requests.length;
     expect((await broker.handle(purpose, quarantine("q", "cdbentley", "k1"))).status).toBe(200);
-    expect(probe.preflightUnavailable).toBe(1);
-    // Operational again: prepared, written, acknowledged.
-    probe.preflightUnavailable = 0;
+    expect(inventory.requests).toHaveLength(requests);
+    // Steady again: the first target is prepared, then the worker dies before its write; the rest are written.
+    inventory.setDenyForm("cdbentley", "steady");
+    iam.beforeWrite = async () => {
+      throw new Error("the worker died before the write");
+    };
+    await expect(driveEffect(ledger, iam, "q", (await ledger.readEntry("q", 1))!, targets[0]!)).rejects.toThrow("died before the write");
+    expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "PREPARED", attempts: 1 });
+    // The Deny state drifts while the effect is PREPARED: the takeover re-admits before resuming and writes nothing.
+    inventory.setDenyForm("cdbentley", "drifted: no live rule carries the row x");
+    const resumed = await broker.reconcileShard("q");
+    expect((resumed as { notes: string[] }).notes[0]).toBe(`1: pending; not resumed because INVENTORY_BLOCKED; ${targets.map((candidate) => `${candidate.account}: deny-state:drifted: no live rule carries the row x`).join("; ")}`);
+    expect(iam.writes).toHaveLength(0);
+    expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "PREPARED", attempts: 1 });
+    inventory.setDenyForm("cdbentley", "steady");
     await broker.reconcileShard("q");
     expect(iam.writes).toHaveLength(9);
-    // The production binding: the real issuance probe over the credentials the canonical jobs deliver. With none
-    // delivered every member is unavailable, naming the channel: refused before acceptance, and a shard journaled by
-    // any other route stays RECORDED and unwritten.
+    expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "ACKED", attempts: 2 });
+    // The production binding: the real issuance probe over credentials delivered through the real request path. With
+    // none delivered every member lacks its control: refused before acceptance, and a shard journaled by any other
+    // route stays RECORDED and unwritten.
     const p = await setup();
-    const consumer = p.authority.consumers.find((candidate) => candidate.repository === "cdbentley")!;
+    const consumer = consumerOf(p, "cdbentley");
     const provider = `${consumerPool(p.authority, consumer)}/providers/${p.authority.broker.workloadIdentityProviderId}`;
-    const signer = await githubSigner();
     const tokens = new Map<string, string>();
     const issuance = googleIssuance(() => tokens, provider);
-    const production = new GoogleIssuanceProbe({ authority: p.authority, credentials: new LedgerMemberCredentials(p.ledger, p.clock.read), endpoints, fetch: issuance.fetcher, jwks: async () => signer.jwks, now: p.clock.read });
-    const live = new Broker({ authority: p.authority, evidence: p.evidence, iam: p.iam, inventory: p.inventory, jwks: async () => signer.jwks, ledger: p.ledger, now: p.clock.read, probe: production });
-    const members = membersOf(p.targets);
+    const production = new GoogleIssuanceProbe({ authority: p.authority, endpoints, fetch: issuance.fetcher, now: p.clock.read });
+    const live = new Broker({ authority: p.authority, evidence: p.evidence, iam: p.iam, inventory: p.inventory, jwks: async () => p.signer.jwks, ledger: p.ledger, now: p.clock.read, probe: production });
     const detail = members.map(([candidate, managed]) => `${candidate.account}/${managed}: ${probePrerequisite(managed)}`).join("; ");
     expect(await live.handle(isolate(p), quarantine("q", "cdbentley", "k1"))).toEqual({ status: 409, body: { detail, error: "PROBE_UNAVAILABLE" } });
     expect(await p.ledger.readShard("q")).toBeUndefined();
@@ -496,43 +546,60 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(p, "q")).toEqual({ blockers: p.targets.map((candidate) => `${candidate.account}: quarantine is RECORDED`), horizonAt: null, ready: false });
     expect(await beginClose(p, "q", "c")).toMatchObject({ kind: "rejected", rejection: { reason: "NOT_READY" } });
     // Every canonical job delivers its own credential through the consumer's member-delivery identity; another
-    // consumer's identity cannot deliver it, and a credential of a member bound to no target is refused.
-    const deliverer = purposeForIdentity(p.authority, "gha-member-cdbentley@recovery-test.iam.gserviceaccount.com")!;
-    const other = purposeForIdentity(p.authority, "gha-member-runsetta@recovery-test.iam.gserviceaccount.com")!;
+    // consumer's identity cannot deliver it, a credential of a member bound to no target is refused, and one with too
+    // little life left for the delivery is refused before any exchange. The bearer is never stored.
+    const deliverer = purposeForIdentity(p.authority, memberEmail("cdbentley"))!;
+    const other = purposeForIdentity(p.authority, memberEmail("runsetta"))!;
     const nowSeconds = Math.floor(p.clock.now.getTime() / 1000);
-    for (const [index, [, managed]] of members.entries()) {
-      const token = await signer.sign(memberClaims(p.authority, consumer, managed, nowSeconds, String(2000 + index)));
-      if (index === 0) expect(await live.handle(other, { kind: "deliver", token })).toEqual({ status: 409, body: { detail: "the member credential is not minted for the consumer provider audience", error: "MEMBER_UNVERIFIED" } });
-      expect(await live.handle(deliverer, { kind: "deliver", token })).toEqual({ status: 200, body: { expiresAt: new Date((nowSeconds + 300) * 1000).toISOString(), member: managed } });
+    const distinct = [...new Set(members.map(([, managed]) => managed))].sort();
+    for (const [index, managed] of distinct.entries()) {
+      const token = await p.signer.sign(memberClaims(p.authority, consumer, managed, nowSeconds, String(2000 + index)));
       tokens.set(managed, token);
+      if (index === 0) expect(await live.handle(other, { kind: "deliver", token })).toEqual({ status: 409, body: { detail: "the member credential is not minted for the consumer provider audience", error: "MEMBER_UNVERIFIED" } });
+      const bound = p.targets.filter((candidate) => candidate.members.includes(managed));
+      const response = await live.handle(deliverer, { kind: "deliver", token });
+      expect(response).toEqual({ status: 200, body: { controls: Object.fromEntries(bound.map((candidate) => [candidate.account, "ALLOWED"])), member: managed, probes: [], unavailable: [] } });
+      expect(JSON.stringify(response.body)).not.toContain(token);
     }
-    const unbound = await signer.sign({ ...memberClaims(p.authority, consumer, members[0]![1], nowSeconds), environment: "elsewhere" });
+    const unbound = await p.signer.sign({ ...memberClaims(p.authority, consumer, distinct[0]!, nowSeconds), environment: "elsewhere" });
     expect(await live.handle(deliverer, { kind: "deliver", token: unbound })).toMatchObject({ status: 409, body: { detail: expect.stringContaining("binds to no target"), error: "MEMBER_UNVERIFIED" } });
-    expect(await p.ledger.readMemberCredential(members[0]![1])).toMatchObject({ consumer: "cdbentley", member: members[0]![1], token: tokens.get(members[0]![1]) });
-    // With every member's live credential the positive control mints as each of them: the RECORDED effects are prepared,
-    // written, and acknowledged, and the revocation probes go through the same endpoint as every member.
+    const callsBefore = issuance.calls.length;
+    const expiring = await p.signer.sign({ ...memberClaims(p.authority, consumer, distinct[0]!, nowSeconds), exp: nowSeconds + 20 });
+    expect(await live.handle(deliverer, { kind: "deliver", token: expiring })).toMatchObject({ status: 409, body: { detail: expect.stringContaining("expires in"), error: "MEMBER_EXPIRING" } });
+    expect(issuance.calls).toHaveLength(callsBefore);
+    const stored = await p.ledger.readMemberControl(distinct[0]!);
+    expect(stored).toMatchObject({ consumer: "cdbentley", member: distinct[0]!, principal: memberPrincipal(p.authority, consumer, "2000") });
+    expect(JSON.stringify(stored)).not.toContain(tokens.get(distinct[0]!)!);
+    // With every member's positive control the RECORDED effects are prepared, written, and acknowledged, and the
+    // deliveries that follow mint as every member against the exact identities: DENIED now that the bindings are gone.
     const mintCalls = () => issuance.calls.filter((call) => call.url.endsWith(":generateAccessToken")).length;
+    expect(mintCalls()).toBe(members.length);
     await live.reconcileShard("q");
     expect(p.iam.writes).toHaveLength(9);
+    for (const candidate of p.targets) issuance.denied.add(candidate.uniqueId);
+    for (const [index, managed] of distinct.entries()) {
+      const token = await p.signer.sign(memberClaims(p.authority, consumer, managed, Math.floor(p.clock.now.getTime() / 1000), String(3000 + index)));
+      tokens.set(managed, token);
+      const response = await live.handle(deliverer, { kind: "deliver", token });
+      expect(response.status).toBe(200);
+      expect((response.body.probes as Array<{ phase: string; role?: string }>).every((probe) => probe.phase === "REVOCATION" && probe.role === "REVOCATION")).toBe(true);
+    }
     expect(mintCalls()).toBe(2 * members.length);
-    expect((await readinessOf(p, "q")).blockers.every((blocker) => blocker.includes("drains at"))).toBe(false);
-    // The probes minted as every member after removal: ALLOWED, because the IAM stand-in keeps issuing; nothing is ready.
-    expect((await p.ledger.readShard("q"))!.targets[p.targets[0]!.account]!.chain.members[p.targets[0]!.members[0]!]).toMatchObject({ allowed: { count: 1 }, revocation: null });
-    // Once the credential expires the member is unavailable again, naming the channel.
-    p.clock.advance(600);
-    const expired = await live.reconcileShard("q");
-    expect((expired as { notes: string[] }).notes).toContain(`${p.targets[0]!.account}: REVOCATION probe unavailable; ${probePrerequisite(p.targets[0]!.members[0]!)}`);
-  }, 180_000);
+    const firstMember = p.targets[0]!.members[0]!;
+    expect((await p.ledger.readShard("q"))!.targets[p.targets[0]!.account]!.chain.members[firstMember]).toMatchObject({ allowed: { count: 0 }, denied: 1, revocation: { outcome: "DENIED", principal: memberPrincipal(p.authority, consumer, String(3000 + distinct.indexOf(firstMember))) } });
+    expect((await readinessOf(p, "q")).blockers.every((blocker) => blocker.includes("drains at"))).toBe(true);
+  }, 240_000);
 
   test("a partial quarantine, an alternate issuer, or a pre-prepare divergence is never scan-ready, is not probed, and refuses to close", async () => {
     const w = await setup();
-    const { broker, clock, evidence, iam, ledger, probe, targets } = w;
+    const { broker, clock, evidence, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     // Target 1 carries an extra token creator; target 2 lost one managed member out of band.
     iam.seed(targets[1]!.resource, [{ condition: null, members: ["serviceAccount:minter@cdbentley.iam.gserviceaccount.com"], role: "roles/iam.serviceAccountTokenCreator" }, { condition: null, members: [...targets[1]!.members], role: managedRole }]);
     iam.seed(targets[2]!.resource, [{ condition: null, members: targets[2]!.members.slice(1), role: managedRole }]);
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const view = await broker.reconcileShard("q");
-    expect((view as { notes: string[] }).notes).toEqual([`3: diverged; managed members are not exactly present; missing ${targets[2]!.members[0]}`]);
+    expect((view as { notes: string[] }).notes.filter((note) => !note.includes("awaits a delivery"))).toEqual([`3: diverged; managed members are not exactly present; missing ${targets[2]!.members[0]}`]);
     const entries = await entriesOf(w, "q");
     expect(entries[1]!.progress).toMatchObject({ state: "ACKED", alternateIssuers: ["roles/iam.serviceAccountTokenCreator:serviceAccount:minter@cdbentley.iam.gserviceaccount.com"] });
     expect(iam.policies.get(targets[1]!.resource)!.bindings).toEqual([{ condition: null, members: ["serviceAccount:minter@cdbentley.iam.gserviceaccount.com"], role: "roles/iam.serviceAccountTokenCreator" }]);
@@ -541,9 +608,13 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes.map((write) => write.resource)).not.toContain(targets[2]!.resource);
     expect(evidence.objects.has(entries[2]!.objectName)).toBe(false);
     expect(await ledger.readActuator(targets[2]!.uniqueId)).toEqual({ epoch: 1, holder: null, lastEtag: (entries[2]!.progress as { observed: { etag: string } }).observed.etag });
-    // Neither the alternate-issuer target nor the diverged target is probed; every member of the other seven is.
-    expect(probe.requests.map((request) => request.uniqueId)).toEqual(membersOf(targets.filter((_, index) => index !== 1 && index !== 2)).map(([candidate]) => candidate.uniqueId));
+    // A delivery round probes neither the alternate-issuer target nor the diverged target; every member of the other seven.
+    await deliverAll(w, "cdbentley");
+    const probed = (await probeEntries(w, "q")).map((entry) => (entry.body as { uniqueId: string }).uniqueId);
+    expect(new Set(probed)).toEqual(new Set(targets.filter((_, index) => index !== 1 && index !== 2).map((candidate) => candidate.uniqueId)));
+    expect(probed).toHaveLength(membersOf(targets.filter((_, index) => index !== 1 && index !== 2)).length);
     clock.advance(3600);
+    await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q");
     const readiness = await readinessOf(w, "q");
     expect(readiness.ready).toBe(false);
@@ -554,11 +625,12 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect((await ledger.readShard("q"))!.phase).toBe("OPEN");
     expect(evidence.objects.has("shards/q/close.json")).toBe(false);
     expect(await ledger.append(restore("r", "cdbentley", "k2", "q"), targets, await freshOf(w, "q"))).toMatchObject({ kind: "rejected", rejection: { reason: "SOURCE_NOT_COMPLETE" } });
-  }, 120_000);
+  }, 180_000);
 
   test("a resource whose returned identity is not the journaled unique ID and email is refused before any read or write", async () => {
     const w = await setup();
     const { broker, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     const [recreated, prepared, unavailable] = [targets[0]!, targets[1]!, targets[2]!];
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     // Driving a journaled effect with any other target identity is refused before the actuator is even reserved.
@@ -606,6 +678,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("termination at each boundary reconciles to one exact outcome: reservation, PREPARE, landed write, ACK, entry outbox, terminal outbox", async () => {
     const w = await setup();
     const { broker, evidence, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const entry = (sequence: number) => ledger.readEntry("q", sequence).then((found) => found!);
     const targetAt = (sequence: number) => targets[sequence - 1]!;
@@ -629,7 +702,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect((await evidence.create(fifth.objectName, entryEvidence("q", fifth))).kind).toBe("created");
     const writesBefore = iam.writes.length;
     const view = await broker.reconcileShard("q");
-    expect(view).toMatchObject({ notes: [], pendingEffects: 0, pendingOutbox: 0 });
+    expect(view).toMatchObject({ pendingEffects: 0, pendingOutbox: 0 });
+    expect((view as { notes: string[] }).notes.every((note) => note.includes("awaits a delivery"))).toBe(true);
     const entries = await entriesOf(w, "q");
     expect(entries.every((candidate) => (candidate.progress === null || candidate.progress.state === "ACKED") && candidate.outbox.state === "PROJECTED")).toBe(true);
     expect(entries[0]!.progress).toMatchObject({ attempts: 1, effectId: "q/1", epoch: 1 });
@@ -641,7 +715,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes.filter((write) => write.resource === targetAt(3).resource)).toHaveLength(1);
     expect(entries[4]!.outbox).toMatchObject({ state: "PROJECTED", generation: evidence.objects.get(fifth.objectName)!.generation });
     // 6: ready, close, then the terminal projection's answer is lost and the bucket is unreadable: FINALIZING, not CLOSED.
+    await deliverAll(w, "cdbentley");
     w.clock.advance(3600);
+    await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q");
     expect((await beginClose(w, "q", "c")).kind).toBe("closing");
     evidence.dropResponses = 1;
@@ -657,6 +733,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("close stays CLOSING with no terminal receipt until pending work resolves, and a diverged terminal never becomes CLOSED", async () => {
     const w = await setup();
     const { broker, evidence, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     const members = membersOf(targets);
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     // Nothing acknowledged yet: not ready, so the close is refused outright and nothing is written or projected.
@@ -667,7 +744,10 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes).toHaveLength(0);
     // Ready, but the post-horizon probe entries could not be projected: the close begins and stays CLOSING.
     await broker.reconcileShard("q");
+    await deliverAll(w, "cdbentley");
+    await broker.reconcileShard("q");
     w.clock.advance(3600);
+    await deliverAll(w, "cdbentley");
     evidence.dropResponses = members.length;
     evidence.unavailableReads = members.length;
     await broker.reconcileShard("q");
@@ -686,6 +766,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("a lost response is taken over exactly once, whether the first worker survives or dies", async () => {
     const w = await setup();
     const { broker, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     iam.dropResponses = 1;
     const survived = await driveEffect(ledger, iam, "q", (await ledger.readEntry("q", 1))!, targets[0]!);
@@ -717,6 +798,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("a paused QUARANTINE actuator that resumes after a takeover and a RESTORE is stale and changes nothing", async () => {
     const w = await setup();
     const { broker, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     const first = targets[0]!;
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const paused = gate();
@@ -741,7 +823,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await ledger.readActuator(first.uniqueId)).toEqual(actuatorBefore);
     expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "ACKED", attempts: 2 });
     expect((await ledger.readEntry("r", 1))!.progress).toMatchObject({ state: "ACKED", epoch: 2 });
-    // A worker paused between its read and its PREPARE is equally stale.
+    // A worker paused between its read and its PREPARE is equally stale. The restore put the bindings back, and a
+    // delivery round records the ALLOWED controls a second quarantine needs.
+    await deliverAll(w, "cdbentley");
     expect((await ledger.append(quarantine("q2", "cdbentley", "k3"), targets)).kind).toBe("accepted");
     const pausedRead = gate();
     iam.beforeRead = pausedRead.wait;
@@ -756,6 +840,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("the stale actuator is fenced by the etag alone: a non-fencing API would let the stale write land, which the live canary must rule out", async () => {
     const w = await setup();
     const { broker, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     const first = targets[0]!;
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const paused = gate();
@@ -779,6 +864,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
   test("opposite-direction contention: a QUARANTINE waits until the prepared RESTORE on the same identity is reconciled", async () => {
     const w = await setup();
     const { broker, iam, ledger, targets } = w;
+    await prime(w, "cdbentley");
     const first = targets[0]!;
     await quarantineAndClose(w, "q0");
     expect((await ledger.append(restore("r0", "cdbentley", "r0-k", "q0"), targets, await freshOf(w, "q0"))).kind).toBe("accepted");
@@ -798,8 +884,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(writes).toHaveLength(3);
     expect(writes.map((write) => write.bindings.some((binding) => binding.role === managedRole))).toEqual([false, true, false]);
     expect((await ledger.readEntry("q1", 1))!.progress).toMatchObject({ state: "ACKED", epoch: 3 });
-    // The rest of q1 completes and the second restore is refused until q1 closes.
+    // The rest of q1 completes once every member's control is fresh again after the restore.
     await broker.reconcileShard("r0");
+    await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q1");
     expect((await entriesOf(w, "q1")).filter((entry) => entry.body.kind === "effect").every((entry) => entry.progress?.state === "ACKED")).toBe(true);
   }, 120_000);

@@ -1,6 +1,8 @@
+import { type DenyVerdict, type LiveDenyPolicy, brokerAttachment, classifyDenyState, consumerAttachment, denyFormFor, denyPoliciesUrl, livePolicyFromJson, organizationAttachment } from "./deny";
 import { type JsonResponse, type Policy, policyFromJson, sendJson } from "./effects";
 import {
   type Consumer,
+  type DenyStateSummary,
   type InventoryRecord,
   type InventorySummary,
   type RecoveryAuthority,
@@ -9,6 +11,7 @@ import {
   inventoryHash,
   isRecord,
   managedRole,
+  regionId,
 } from "./model";
 
 // The credential inventory of one target: every path by which a principal
@@ -20,19 +23,44 @@ import {
 //
 //   allow policies   the target's own policy, then its project's, each
 //                    folder's, and the organization's, every role expanded
-//                    through iam.roles.get so custom and basic roles count
+//                    through iam.roles.get so custom and basic roles count,
+//                    and every role's definition version (etag) recorded so
+//                    an edited-and-restored custom role still changes the hash
 //   keys             user-managed keys of the target
 //   lifetime         the effective iam.allowServiceAccountCredentialLifetimeExtension
-//                    policy of the project, which can stretch a token to 12 hours
+//                    policy of the project, which can stretch a token to 12
+//                    hours, and the policy resource set at the project and at
+//                    every ancestor (etag and updateTime), so a policy set and
+//                    restored between two reads still changes the hash
+//   deny state       the live Deny policies at the broker project, the
+//                    organization, and the consumer project, by name and
+//                    etag, and the form they satisfy; any form but steady is a
+//                    finding, which is how post-activation drift disables the
+//                    broker's authority without any apply
 //   federation       any principal of the consumer's pool granted anywhere in
 //                    the ancestry, other than the managed members on the target
 //   attachments      Compute instances and templates; Cloud Run services,
-//                    their traffic-serving revisions, jobs, and in-flight
-//                    executions in every region the project can use; and
-//                    Cloud Build triggers and current builds in every Cloud
-//                    Build region -- each region enumerated from the API
+//                    their traffic-serving revisions, jobs, in-flight
+//                    executions, and worker pools in every region the project
+//                    can use; Cloud Build triggers and current builds in every
+//                    Cloud Build region; and Cloud Scheduler jobs in every
+//                    Scheduler region -- each region enumerated from the API
 //                    itself and every page completed, or the inventory is
 //                    unavailable
+//   service agents   a Google-managed service agent bound its own predefined
+//                    role at the project carries token permissions for every
+//                    account in the project, but can exercise them only
+//                    through a workload of its service attached to the
+//                    account. That grant is neutralized -- recorded, not
+//                    hidden -- exactly when the live Deny state is the steady
+//                    form (every attachment path of that service frozen for
+//                    every principal, service agents included) and this
+//                    inventory found no attachment of that service running as
+//                    the target; otherwise it is a grant finding
+//
+// One batch reads one consumer project's shared state once and every target
+// against it; the record of each target spans the interval from the batch's
+// first read to that target's last, and nothing is reused across batches.
 //
 // Domain-wide delegation is not a resource the IAM API exposes; exercising it
 // requires signing a JWT as the target, which needs a user-managed key or a
@@ -42,8 +70,15 @@ export type InventoryOutcome =
   | { readonly kind: "observed"; readonly inventory: InventoryRecord }
   | { readonly kind: "unavailable"; readonly reason: string };
 
+export type DenyStateOutcome =
+  | { readonly kind: "observed"; readonly state: DenyStateSummary; readonly verdict: DenyVerdict }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
 export interface CredentialInventory {
-  inventory(target: Target, consumer: Consumer): Promise<InventoryOutcome>;
+  // Every target of one consumer against one uncached batch snapshot.
+  inventoryAll(targets: readonly Target[], consumer: Consumer): Promise<readonly InventoryOutcome[]>;
+  // The live Deny state alone, for gates that mutate nothing target-specific.
+  denyState(consumer: Consumer): Promise<DenyStateOutcome>;
 }
 
 // Permissions that issue, sign for, key, attach, or re-grant a service
@@ -69,8 +104,19 @@ export const actuatorRoleId = "protectedRecoveryActuator";
 export const actuatorPermissions: readonly string[] = ["iam.serviceAccountKeys.list", "iam.serviceAccounts.get", "iam.serviceAccounts.getIamPolicy", "iam.serviceAccounts.setIamPolicy"];
 export const lifetimeExtensionConstraint = "iam.allowServiceAccountCredentialLifetimeExtension";
 
+// The Google-managed service agents whose attachment kinds this inventory
+// enumerates, each with the one predefined role Google binds it at the
+// project and the attachment prefix its workloads are recorded under.
+export const serviceAgents: ReadonlyArray<{ readonly domain: string; readonly prefix: string; readonly role: string; readonly service: string }> = [
+  { domain: "serverless-robot-prod.iam.gserviceaccount.com", prefix: "run.googleapis.com/", role: "roles/run.serviceAgent", service: "run.googleapis.com" },
+  { domain: "gcp-sa-cloudbuild.iam.gserviceaccount.com", prefix: "cloudbuild.googleapis.com/", role: "roles/cloudbuild.serviceAgent", service: "cloudbuild.googleapis.com" },
+  { domain: "compute-system.iam.gserviceaccount.com", prefix: "compute.googleapis.com/", role: "roles/compute.serviceAgent", service: "compute.googleapis.com" },
+  { domain: "gcp-sa-cloudscheduler.iam.gserviceaccount.com", prefix: "cloudscheduler.googleapis.com/", role: "roles/cloudscheduler.serviceAgent", service: "cloudscheduler.googleapis.com" },
+];
+
 export function inventoryFindings(summary: InventorySummary): readonly string[] {
   return [
+    ...(summary.denyState.form === "steady" ? [] : [`deny-state:${summary.denyState.form}`]),
     ...summary.grants.map((grant) => `grant:${grant}`),
     ...summary.keys.map((key) => `key:${key}`),
     ...(summary.lifetimeExtension === null ? [] : [`lifetime-extension:${summary.lifetimeExtension}`]),
@@ -80,7 +126,7 @@ export function inventoryFindings(summary: InventorySummary): readonly string[] 
 
 export interface InventoryDependencies {
   readonly authority: RecoveryAuthority;
-  readonly endpoints?: { readonly cloudBuild?: string; readonly compute?: string; readonly iam?: string; readonly orgPolicy?: string; readonly resourceManager?: string; readonly run?: string };
+  readonly endpoints?: { readonly cloudBuild?: string; readonly compute?: string; readonly iam?: string; readonly orgPolicy?: string; readonly resourceManager?: string; readonly run?: string; readonly scheduler?: string };
   readonly fetch: typeof fetch;
   readonly now: () => Date;
   readonly token: () => Promise<string>;
@@ -90,11 +136,6 @@ class Unavailable extends Error {}
 
 const maxPages = 100;
 const maxAncestryDepth = 10;
-// Attachment listings are per project, not per target: one snapshot of a
-// consumer project's regions and workloads serves every target of that
-// project observed within this window, and the record of each target is
-// dated at the snapshot, never later.
-const snapshotTtlMs = 60_000;
 const regionConcurrency = 8;
 // Cloud Build workloads that still run or are about to: a completed build
 // holds no credential.
@@ -106,6 +147,7 @@ interface RunRegion {
   readonly region: string;
   readonly revisions: readonly unknown[];
   readonly services: readonly unknown[];
+  readonly workerPools: readonly unknown[];
 }
 
 interface BuildRegion {
@@ -114,59 +156,108 @@ interface BuildRegion {
   readonly triggers: readonly unknown[];
 }
 
-// Everything attachment-related the broker read from one consumer project,
-// dated when the reads began.
+interface SchedulerRegion {
+  readonly jobs: readonly unknown[];
+  readonly region: string;
+}
+
+// Everything one batch read of a consumer project that is shared by every
+// target of the project.
 interface Snapshot {
+  readonly ancestry: readonly string[];
   readonly build: readonly BuildRegion[] | "disabled";
   readonly compute: { readonly instances: ReadonlyArray<readonly [string, unknown]>; readonly templates: ReadonlyArray<readonly [string, unknown]> } | "disabled";
+  readonly denyState: DenyStateSummary;
+  readonly lifetimePolicies: readonly string[];
   readonly observedAt: string;
+  readonly policies: ReadonlyArray<{ readonly policy: Policy; readonly resource: string }>;
+  readonly roles: Map<string, { readonly etag: string; readonly permissions: readonly string[] }>;
   readonly run: readonly RunRegion[] | "disabled";
+  readonly scheduler: readonly SchedulerRegion[] | "disabled";
 }
 
 export class GoogleCredentialInventory implements CredentialInventory {
   readonly #deps: InventoryDependencies;
-  readonly #snapshots = new Map<string, Promise<Snapshot>>();
 
   constructor(deps: InventoryDependencies) {
     this.#deps = deps;
   }
 
-  async inventory(target: Target, consumer: Consumer): Promise<InventoryOutcome> {
+  async inventoryAll(targets: readonly Target[], consumer: Consumer): Promise<readonly InventoryOutcome[]> {
+    let bearer: string;
+    let snapshot: Snapshot;
+    try {
+      bearer = await this.#deps.token();
+      snapshot = await this.#read(consumer, bearer);
+    } catch (error) {
+      if (error instanceof Unavailable) return targets.map(() => ({ kind: "unavailable", reason: error.message }));
+      throw error;
+    }
+    const outcomes: InventoryOutcome[] = [];
+    for (const target of targets) {
+      try {
+        const summary = await this.#summarize(target, consumer, bearer, snapshot);
+        const observedUntil = this.#deps.now().toISOString();
+        outcomes.push({ kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: snapshot.observedAt, observedUntil, summary, uniqueId: target.uniqueId } });
+      } catch (error) {
+        if (!(error instanceof Unavailable)) throw error;
+        outcomes.push({ kind: "unavailable", reason: error.message });
+      }
+    }
+    return outcomes;
+  }
+
+  async denyState(consumer: Consumer): Promise<DenyStateOutcome> {
     try {
       const bearer = await this.#deps.token();
-      const snapshot = await this.#snapshot(consumer, bearer);
-      const summary = await this.#summarize(target, consumer, bearer, snapshot);
-      return { kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: snapshot.observedAt, summary, uniqueId: target.uniqueId } };
+      return await this.#denyState(consumer, bearer);
     } catch (error) {
       if (error instanceof Unavailable) return { kind: "unavailable", reason: error.message };
       throw error;
     }
   }
 
-  // The project snapshot in force, or a fresh one: a failed read is never
-  // cached, and a snapshot older than its window is replaced.
-  async #snapshot(consumer: Consumer, bearer: string): Promise<Snapshot> {
-    const cached = this.#snapshots.get(consumer.projectId);
-    if (cached) {
-      const snapshot = await cached.catch(() => undefined);
-      if (snapshot && this.#deps.now().getTime() - Date.parse(snapshot.observedAt) < snapshotTtlMs) return snapshot;
-    }
-    const pending = this.#read(consumer, bearer);
-    this.#snapshots.set(consumer.projectId, pending);
-    try {
-      return await pending;
-    } catch (error) {
-      if (this.#snapshots.get(consumer.projectId) === pending) this.#snapshots.delete(consumer.projectId);
-      throw error;
-    }
-  }
-
+  // The shared state of one consumer project, read once per batch, dated
+  // when the first read began.
   async #read(consumer: Consumer, bearer: string): Promise<Snapshot> {
     const observedAt = this.#deps.now().toISOString();
+    const resourceManager = this.#endpoint("resourceManager");
+    const project = await this.#json("GET", `${resourceManager}/v3/projects/${consumer.projectNumber}`, undefined, bearer, `project ${consumer.projectNumber}`);
+    if (!isRecord(project) || project.projectId !== consumer.projectId) throw new Unavailable(`projects/${consumer.projectNumber} is not ${consumer.projectId}`);
+    const ancestry = [`projects/${consumer.projectNumber}`];
+    const policies: Array<{ readonly policy: Policy; readonly resource: string }> = [{ policy: await this.#policy(`${resourceManager}/v3/projects/${consumer.projectNumber}:getIamPolicy`, bearer, `projects/${consumer.projectNumber}`), resource: `projects/${consumer.projectNumber}` }];
+    let parent = typeof project.parent === "string" ? project.parent : undefined;
+    for (let depth = 0; parent !== undefined; depth += 1) {
+      if (depth >= maxAncestryDepth) throw new Unavailable(`the ancestry of projects/${consumer.projectNumber} exceeds ${maxAncestryDepth} levels`);
+      // The recorded organization is the only one whose policy this inventory reads: a project under any other
+      // organization is unavailable before a single read of that organization is made.
+      if (parent.startsWith("organizations/") && this.#deps.authority.organizationId !== null && parent !== `organizations/${this.#deps.authority.organizationId}`) {
+        throw new Unavailable(`projects/${consumer.projectNumber} sits under ${parent}, not the recorded organizations/${this.#deps.authority.organizationId}`);
+      }
+      ancestry.push(parent);
+      policies.push({ policy: await this.#policy(`${resourceManager}/v3/${parent}:getIamPolicy`, bearer, parent), resource: parent });
+      if (parent.startsWith("organizations/")) break;
+      if (!parent.startsWith("folders/")) throw new Unavailable(`${parent} is neither a folder nor an organization`);
+      const folder = await this.#json("GET", `${resourceManager}/v3/${parent}`, undefined, bearer, parent);
+      parent = isRecord(folder) && typeof folder.parent === "string" ? folder.parent : undefined;
+    }
+    const organization = ancestry.at(-1);
+    if (organization === undefined || !organization.startsWith("organizations/")) throw new Unavailable(`projects/${consumer.projectNumber} is not parented by an organization`);
+    const roles = new Map<string, { readonly etag: string; readonly permissions: readonly string[] }>();
+    for (const { policy } of policies) {
+      for (const binding of policy.bindings) {
+        if (roles.has(binding.role)) continue;
+        roles.set(binding.role, await this.#role(binding.role, bearer));
+      }
+    }
+    const lifetimePolicies = await Promise.all(ancestry.map((resource) => this.#lifetimePolicy(resource, bearer)));
+    const denyState = await this.#denyState(consumer, bearer);
+    if (denyState.kind === "unavailable") throw new Unavailable(denyState.reason);
     const compute = await this.#computeSnapshot(consumer, bearer);
     const run = await this.#runSnapshot(consumer, bearer);
     const build = await this.#buildSnapshot(consumer, bearer);
-    return { build, compute, observedAt, run };
+    const scheduler = await this.#schedulerSnapshot(consumer, bearer);
+    return { ancestry, build, compute, denyState: denyState.state, lifetimePolicies: [...lifetimePolicies].sort(), observedAt, policies, roles, run, scheduler };
   }
 
   async #summarize(target: Target, consumer: Consumer, bearer: string, snapshot: Snapshot): Promise<InventorySummary> {
@@ -175,63 +266,84 @@ export class GoogleCredentialInventory implements CredentialInventory {
     if (!isRecord(identity) || identity.email !== target.email || identity.uniqueId !== target.uniqueId) {
       throw new Unavailable(`${target.resource} does not resolve to ${target.email} (${target.uniqueId})`);
     }
-    const policies: Array<{ readonly policy: Policy; readonly resource: string }> = [{ policy: await this.#policy(`${iam}/v1/${target.resource}:getIamPolicy`, bearer, target.resource), resource: target.resource }];
-    const ancestry = [`projects/${consumer.projectNumber}`];
-    const resourceManager = this.#endpoint("resourceManager");
-    const project = await this.#json("GET", `${resourceManager}/v3/projects/${consumer.projectNumber}`, undefined, bearer, `project ${consumer.projectNumber}`);
-    if (!isRecord(project) || project.projectId !== consumer.projectId) throw new Unavailable(`projects/${consumer.projectNumber} is not ${consumer.projectId}`);
-    policies.push({ policy: await this.#policy(`${resourceManager}/v3/projects/${consumer.projectNumber}:getIamPolicy`, bearer, `projects/${consumer.projectNumber}`), resource: `projects/${consumer.projectNumber}` });
-    let parent = typeof project.parent === "string" ? project.parent : undefined;
-    for (let depth = 0; parent !== undefined; depth += 1) {
-      if (depth >= maxAncestryDepth) throw new Unavailable(`the ancestry of projects/${consumer.projectNumber} exceeds ${maxAncestryDepth} levels`);
-      ancestry.push(parent);
-      policies.push({ policy: await this.#policy(`${resourceManager}/v3/${parent}:getIamPolicy`, bearer, parent), resource: parent });
-      if (parent.startsWith("organizations/")) break;
-      if (!parent.startsWith("folders/")) throw new Unavailable(`${parent} is neither a folder nor an organization`);
-      const folder = await this.#json("GET", `${resourceManager}/v3/${parent}`, undefined, bearer, parent);
-      parent = isRecord(folder) && typeof folder.parent === "string" ? folder.parent : undefined;
+    const policies = [{ policy: await this.#policy(`${iam}/v1/${target.resource}:getIamPolicy`, bearer, target.resource), resource: target.resource }, ...snapshot.policies];
+    const roles = new Map(snapshot.roles);
+    for (const binding of policies[0]!.policy.bindings) {
+      if (roles.has(binding.role)) continue;
+      roles.set(binding.role, await this.#role(binding.role, bearer));
     }
-    const permissionsOf = new Map<string, readonly string[]>();
-    for (const { policy } of policies) {
-      for (const binding of policy.bindings) {
-        if (permissionsOf.has(binding.role)) continue;
-        permissionsOf.set(binding.role, await this.#rolePermissions(binding.role, bearer));
-      }
-    }
+    const attachments = [...new Set([...computeAttachments(target, consumer, snapshot), ...runAttachments(target, snapshot), ...buildAttachments(target, consumer, snapshot), ...schedulerAttachments(target, snapshot)])].sort();
     const grants = new Set<string>();
+    const neutralized: string[] = [];
     const poolPrefixes = [`principalSet://iam.googleapis.com/${target.pool}/`, `principal://iam.googleapis.com/${target.pool}/`];
     const broker = brokerMember(this.#deps.authority);
     const actuatorRole = `projects/${consumer.projectId}/roles/${actuatorRoleId}`;
+    const projectResource = `projects/${consumer.projectNumber}`;
     for (const { policy, resource } of policies) {
       for (const binding of policy.bindings) {
-        const permissions = permissionsOf.get(binding.role) ?? [];
+        const permissions = roles.get(binding.role)?.permissions ?? [];
         const capable = permissions.some((permission) => credentialPermissions.includes(permission));
         const label = `${resource}|${binding.role}${binding.condition ? `[${binding.condition.title}]` : ""}`;
         for (const member of binding.members) {
           const federated = poolPrefixes.some((prefix) => member.startsWith(prefix));
           if (resource === target.resource && binding.condition === null && binding.role === managedRole && target.members.includes(member)) continue;
           if (resource === target.resource && binding.condition === null && binding.role === actuatorRole && member === broker && permissions.every((permission) => actuatorPermissions.includes(permission))) continue;
-          if (capable || federated) grants.add(`${label}|${member}`);
+          if (!capable && !federated) continue;
+          const agent = serviceAgents.find((candidate) => candidate.role === binding.role && member === `serviceAccount:service-${consumer.projectNumber}@${candidate.domain}`);
+          if (agent && resource === projectResource && binding.condition === null && snapshot.denyState.form === "steady" && !attachments.some((attachment) => attachment.startsWith(agent.prefix))) {
+            neutralized.push(`${label}|${member}|frozen:${agent.service}`);
+            continue;
+          }
+          grants.add(`${label}|${member}`);
         }
       }
     }
     const keys = await this.#keys(target, bearer);
     const lifetimeExtension = await this.#lifetimeExtension(target, consumer, bearer);
     const services = [
+      `cloudbuild.googleapis.com:${snapshot.build === "disabled" ? "disabled" : "enabled"}`,
+      `cloudscheduler.googleapis.com:${snapshot.scheduler === "disabled" ? "disabled" : "enabled"}`,
       `compute.googleapis.com:${snapshot.compute === "disabled" ? "disabled" : "enabled"}`,
       `run.googleapis.com:${snapshot.run === "disabled" ? "disabled" : "enabled"}`,
-      `cloudbuild.googleapis.com:${snapshot.build === "disabled" ? "disabled" : "enabled"}`,
     ];
-    const attachments = [...computeAttachments(target, consumer, snapshot), ...runAttachments(target, snapshot), ...buildAttachments(target, consumer, snapshot)];
     return {
-      ancestry,
-      attachments: [...new Set(attachments)].sort(),
+      ancestry: [...snapshot.ancestry],
+      attachments,
+      denyState: snapshot.denyState,
       grants: [...grants].sort(),
       keys,
       lifetimeExtension,
+      lifetimePolicies: snapshot.lifetimePolicies,
+      neutralized: neutralized.sort(),
       policies: policies.map(({ policy, resource }) => ({ etag: policy.etag, resource })).sort((left, right) => left.resource.localeCompare(right.resource)),
+      roles: [...roles.entries()].map(([name, role]) => ({ etag: role.etag, name })).sort((left, right) => left.name.localeCompare(right.name)),
       services: services.sort(),
     };
+  }
+
+  // The live Deny policies at the broker project, the organization, and the
+  // consumer project, each listed and read by name, and the form they satisfy.
+  async #denyState(consumer: Consumer, bearer: string): Promise<DenyStateOutcome> {
+    const authority = this.#deps.authority;
+    const attachments = [brokerAttachment(authority), organizationAttachment(authority), consumerAttachment(consumer)];
+    const live: LiveDenyPolicy[] = [];
+    for (const attachment of attachments) {
+      const listing = await this.#json("GET", denyPoliciesUrl(attachment).replace("https://iam.googleapis.com", this.#endpoint("iam")), undefined, bearer, `the deny policies of ${attachment}`);
+      const names = isRecord(listing) && listing.policies !== undefined ? listing.policies : [];
+      if (!Array.isArray(names)) throw new Unavailable(`the deny policies of ${attachment} are malformed`);
+      for (const entry of names) {
+        if (!isRecord(entry) || typeof entry.name !== "string") throw new Unavailable(`the deny policies of ${attachment} are malformed`);
+        const document = await this.#json("GET", `${this.#endpoint("iam")}/v2/${entry.name}`, undefined, bearer, `the deny policy ${entry.name}`);
+        try {
+          live.push(livePolicyFromJson(attachment, document));
+        } catch (error) {
+          throw new Unavailable(String(error instanceof Error ? error.message : error));
+        }
+      }
+    }
+    const verdict = classifyDenyState(authority, live, attachments);
+    const state: DenyStateSummary = { form: denyFormFor(verdict, consumer), policies: live.map((policy) => ({ attachment: policy.attachment, etag: policy.etag, name: policy.name })).sort((left, right) => left.name.localeCompare(right.name)) };
+    return { kind: "observed", state, verdict };
   }
 
   async #policy(url: string, bearer: string, resource: string): Promise<Policy> {
@@ -245,14 +357,16 @@ export class GoogleCredentialInventory implements CredentialInventory {
 
   // Predefined, basic, and custom roles are all expanded through the same
   // API, so a custom role carrying getAccessToken counts exactly as
-  // roles/iam.serviceAccountTokenCreator does.
-  async #rolePermissions(role: string, bearer: string): Promise<readonly string[]> {
+  // roles/iam.serviceAccountTokenCreator does; the definition's etag is kept
+  // so an edited-and-restored definition still changes the inventory.
+  async #role(role: string, bearer: string): Promise<{ readonly etag: string; readonly permissions: readonly string[] }> {
     if (!/^(?:roles\/[A-Za-z0-9._]+|(?:projects|organizations)\/[A-Za-z0-9._-]+\/roles\/[A-Za-z0-9._]+)$/.test(role)) throw new Unavailable(`${role} is not a role name`);
     const body = await this.#json("GET", `${this.#endpoint("iam")}/v1/${role}`, undefined, bearer, `role ${role}`);
     if (!isRecord(body)) throw new Unavailable(`role ${role} is malformed`);
     const permissions = body.includedPermissions === undefined ? [] : body.includedPermissions;
     if (!Array.isArray(permissions) || !permissions.every((permission): permission is string => typeof permission === "string")) throw new Unavailable(`role ${role} carries malformed permissions`);
-    return permissions;
+    if (typeof body.etag !== "string" || body.etag.length === 0) throw new Unavailable(`role ${role} carries no etag`);
+    return { etag: body.etag, permissions };
   }
 
   async #keys(target: Target, bearer: string): Promise<readonly string[]> {
@@ -286,6 +400,17 @@ export class GoogleCredentialInventory implements CredentialInventory {
     return covering.length === 0 ? null : covering.sort().join(",");
   }
 
+  // The lifetime-extension policy resource set at one ancestor, versioned:
+  // absent, or its etag and last update.
+  async #lifetimePolicy(resource: string, bearer: string): Promise<string> {
+    const response = await this.#send("GET", `${this.#endpoint("orgPolicy")}/v2/${resource}/policies/${lifetimeExtensionConstraint}`, undefined, bearer);
+    if (response.kind === "response" && response.status === 404) return `${resource}|absent`;
+    const body = this.#ok(response, `the ${lifetimeExtensionConstraint} policy of ${resource}`);
+    const spec = isRecord(body) && isRecord(body.spec) ? body.spec : undefined;
+    if (spec === undefined || typeof spec.etag !== "string" || typeof spec.updateTime !== "string") throw new Unavailable(`the ${lifetimeExtensionConstraint} policy of ${resource} carries no etag and update time`);
+    return `${resource}|${spec.etag}|${spec.updateTime}`;
+  }
+
   // Attachment reads are billed to the consumer project (X-Goog-User-Project),
   // whose own enablement of each attachment API is exactly what decides
   // whether that API can host an attachment; the broker project enables none
@@ -300,26 +425,27 @@ export class GoogleCredentialInventory implements CredentialInventory {
 
   // Cloud Run: the regions the project can use, from the API's own location
   // list (the v2 list contracts refuse the "-" wildcard for a location), and
-  // in every one of them the services, every revision, the jobs, and every
-  // execution, page by page.
+  // in every one of them the services, every revision, the jobs, every
+  // execution, and the worker pools, page by page.
   async #runSnapshot(consumer: Consumer, bearer: string): Promise<Snapshot["run"]> {
     const run = this.#endpoint("run");
     const locations = await this.#list(`${run}/v1/projects/${consumer.projectId}/locations`, "locations", bearer, consumer.projectId);
     if (locations.kind === "disabled") return "disabled";
     const regions = locations.items.map((location) => {
-      if (!isRecord(location) || typeof location.locationId !== "string" || !/^[a-z]+-[a-z]+[0-9]$/.test(location.locationId)) throw new Unavailable(`Cloud Run listed a malformed location for ${consumer.projectId}`);
+      if (!isRecord(location) || typeof location.locationId !== "string" || !regionId.test(location.locationId)) throw new Unavailable(`Cloud Run listed a malformed location for ${consumer.projectId}`);
       return location.locationId;
     });
     if (regions.length === 0) throw new Unavailable(`Cloud Run listed no region for ${consumer.projectId}`);
     return await mapConcurrently([...new Set(regions)].sort(), regionConcurrency, async (region) => {
       const parent = `${run}/v2/projects/${consumer.projectId}/locations/${region}`;
-      const [services, revisions, jobs, executions] = await Promise.all([
+      const [services, revisions, jobs, executions, workerPools] = await Promise.all([
         this.#complete(`${parent}/services`, "services", bearer, consumer.projectId),
         this.#complete(`${parent}/services/-/revisions`, "revisions", bearer, consumer.projectId),
         this.#complete(`${parent}/jobs`, "jobs", bearer, consumer.projectId),
         this.#complete(`${parent}/jobs/-/executions`, "executions", bearer, consumer.projectId),
+        this.#complete(`${parent}/workerPools`, "workerPools", bearer, consumer.projectId),
       ]);
-      return { executions, jobs, region, revisions, services };
+      return { executions, jobs, region, revisions, services, workerPools };
     });
   }
 
@@ -338,7 +464,7 @@ export class GoogleCredentialInventory implements CredentialInventory {
     const endpoints = isRecord(document) && Array.isArray(document.endpoints) ? document.endpoints : undefined;
     if (endpoints === undefined) throw new Unavailable("the Cloud Build discovery document lists no endpoints");
     const regions = endpoints.map((endpoint) => {
-      if (!isRecord(endpoint) || typeof endpoint.location !== "string" || !/^[a-z]+-[a-z]+[0-9]$/.test(endpoint.location)) throw new Unavailable("the Cloud Build discovery document lists a malformed endpoint");
+      if (!isRecord(endpoint) || typeof endpoint.location !== "string" || !regionId.test(endpoint.location)) throw new Unavailable("the Cloud Build discovery document lists a malformed endpoint");
       return endpoint.location;
     });
     if (regions.length === 0) throw new Unavailable("the Cloud Build discovery document lists no region");
@@ -351,6 +477,20 @@ export class GoogleCredentialInventory implements CredentialInventory {
       ]);
       return { builds, region, triggers };
     });
+  }
+
+  // Cloud Scheduler: every location the API lists for the project and in
+  // each the jobs, whose HTTP targets can name a service account to mint
+  // for.
+  async #schedulerSnapshot(consumer: Consumer, bearer: string): Promise<Snapshot["scheduler"]> {
+    const scheduler = this.#endpoint("scheduler");
+    const locations = await this.#list(`${scheduler}/v1/projects/${consumer.projectId}/locations`, "locations", bearer, consumer.projectId);
+    if (locations.kind === "disabled") return "disabled";
+    const regions = locations.items.map((location) => {
+      if (!isRecord(location) || typeof location.locationId !== "string" || !regionId.test(location.locationId)) throw new Unavailable(`Cloud Scheduler listed a malformed location for ${consumer.projectId}`);
+      return location.locationId;
+    });
+    return await mapConcurrently([...new Set(regions)].sort(), regionConcurrency, async (region) => ({ jobs: await this.#complete(`${scheduler}/v1/projects/${consumer.projectId}/locations/${region}/jobs`, "jobs", bearer, consumer.projectId), region }));
   }
 
   // A list that must be complete: a disabled API here is not an answer,
@@ -417,7 +557,7 @@ export class GoogleCredentialInventory implements CredentialInventory {
     return response.body;
   }
 
-  #endpoint(name: "cloudBuild" | "compute" | "iam" | "orgPolicy" | "resourceManager" | "run"): string {
+  #endpoint(name: "cloudBuild" | "compute" | "iam" | "orgPolicy" | "resourceManager" | "run" | "scheduler"): string {
     const defaults = {
       cloudBuild: "https://cloudbuild.googleapis.com",
       compute: "https://compute.googleapis.com",
@@ -425,6 +565,7 @@ export class GoogleCredentialInventory implements CredentialInventory {
       orgPolicy: "https://orgpolicy.googleapis.com",
       resourceManager: "https://cloudresourcemanager.googleapis.com",
       run: "https://run.googleapis.com",
+      scheduler: "https://cloudscheduler.googleapis.com",
     };
     return this.#deps.endpoints?.[name] ?? defaults[name];
   }
@@ -447,13 +588,14 @@ function computeAttachments(target: Target, consumer: Consumer, snapshot: Snapsh
 // it, every revision of a service that serves traffic (by percent, by tag, or
 // as the latest ready revision) and names it -- an older serving revision
 // keeps its own identity after the template changes -- a job whose template
-// names it, and every execution of a job that has not completed and names
-// it. A serving revision the region's revision list does not carry makes the
-// inventory unavailable rather than clean.
+// names it, every execution of a job that has not completed and names it, and
+// a worker pool whose template names it. A serving revision the region's
+// revision list does not carry makes the inventory unavailable rather than
+// clean.
 function runAttachments(target: Target, snapshot: Snapshot): readonly string[] {
   if (snapshot.run === "disabled") return [];
   const attachments: string[] = [];
-  for (const { executions, jobs, region, revisions, services } of snapshot.run) {
+  for (const { executions, jobs, region, revisions, services, workerPools } of snapshot.run) {
     const revisionsByName = new Map<string, Record<string, unknown>>();
     for (const revision of revisions) {
       if (!isRecord(revision) || typeof revision.name !== "string") throw new Unavailable(`Cloud Run listed a malformed revision in ${region}`);
@@ -486,6 +628,10 @@ function runAttachments(target: Target, snapshot: Snapshot): readonly string[] {
       const completed = typeof execution.completionTime === "string" && execution.completionTime.length > 0;
       if (!completed && isRecord(execution.template) && execution.template.serviceAccount === target.email) attachments.push(`run.googleapis.com/${execution.name}`);
     }
+    for (const pool of workerPools) {
+      if (!isRecord(pool) || typeof pool.name !== "string") throw new Unavailable(`Cloud Run listed a malformed worker pool in ${region}`);
+      if (isRecord(pool.template) && pool.template.serviceAccount === target.email) attachments.push(`run.googleapis.com/${pool.name}`);
+    }
   }
   return attachments;
 }
@@ -507,6 +653,23 @@ function buildAttachments(target: Target, consumer: Consumer, snapshot: Snapshot
       if (!isRecord(build) || typeof build.id !== "string" || typeof build.status !== "string") throw new Unavailable(`Cloud Build listed a malformed build in ${region}`);
       if (!currentBuildStatuses.includes(build.status)) continue;
       if (typeof build.serviceAccount === "string" && accounts.has(build.serviceAccount)) attachments.push(`cloudbuild.googleapis.com/projects/${consumer.projectId}/locations/${region}/builds/${build.id}`);
+    }
+  }
+  return attachments;
+}
+
+// Cloud Scheduler jobs whose HTTP target mints an OIDC or OAuth token as the
+// target, in any state: a paused job is one update from running.
+function schedulerAttachments(target: Target, snapshot: Snapshot): readonly string[] {
+  if (snapshot.scheduler === "disabled") return [];
+  const attachments: string[] = [];
+  for (const { jobs, region } of snapshot.scheduler) {
+    for (const job of jobs) {
+      if (!isRecord(job) || typeof job.name !== "string") throw new Unavailable(`Cloud Scheduler listed a malformed job in ${region}`);
+      const http = isRecord(job.httpTarget) ? job.httpTarget : {};
+      const oidc = isRecord(http.oidcToken) ? http.oidcToken.serviceAccountEmail : undefined;
+      const oauth = isRecord(http.oauthToken) ? http.oauthToken.serviceAccountEmail : undefined;
+      if (oidc === target.email || oauth === target.email) attachments.push(`cloudscheduler.googleapis.com/${job.name}`);
     }
   }
   return attachments;

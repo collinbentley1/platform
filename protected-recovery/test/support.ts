@@ -1,30 +1,33 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { type RecoveryIntent, manifestPath, recoveryInvokerName } from "../../tools/ci/workflow-authority";
-import { type IdentityOutcome, type ImpersonationProbe, type Jwk, type Policy, type PolicyBinding, type PreflightOutcome, type ProbeRequest, type ProbeResult, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
-import { Broker, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
-import { type CredentialInventory, type InventoryOutcome, inventoryFindings } from "../src/inventory";
+import { type RecoveryIntent, manifestPath, memberDeliveryName, recoveryInvokerName } from "../../tools/ci/workflow-authority";
+import { type DenyFlags, type DenyMatrix, type DenyVerdict, type LiveDenyPolicy, brokerAttachment, consumerAttachment, organizationAttachment, rulesByException, steadyFlags } from "../src/deny";
+import { type IdentityOutcome, type ImpersonationProbe, type Jwk, type MemberCredential, type MintOutcome, type MintResult, type Policy, type PolicyBinding, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
+import { Broker, type BrokerResponse, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
+import { type CredentialInventory, type DenyStateOutcome, type InventoryOutcome, inventoryFindings } from "../src/inventory";
 import { type Fresh, Ledger } from "../src/ledger";
-import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type Target, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, probesNeeded, targetOfEffect } from "../src/model";
+import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type Target, consumerPool, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, probesNeeded, purposeForIdentity, targetOfEffect, targetsFor } from "../src/model";
 import { type EvidenceStore, type GetOutcome, type PutOutcome } from "../src/outbox";
 
 // Test support. The ledger is the real Firestore emulator (FIRESTORE_EMULATOR_HOST);
-// the IAM API, the evidence bucket, the impersonation probe source, and the
-// credential inventory are in-memory stand-ins with the exact etag,
-// generation, identity, and hash semantics the broker relies on. None of the
+// the IAM API, the evidence bucket, the issuance probe, and the credential
+// inventory are in-memory stand-ins with the exact etag, generation,
+// identity, hash, and interval semantics the broker relies on. None of the
 // stand-ins is emulator coverage: the live canary must verify the actual
 // returned etag behaviour of setIamPolicy, the ifGenerationMatch behaviour of
-// GCS, the identity that serviceAccounts.get returns for a unique-ID resource,
-// and the real answers of the inventory APIs; the probe stand-in exercises
-// the broker's readiness logic over evidence it would record from the real
-// source, whose member credentials the canonical jobs deliver (see
-// probePrerequisite and the delivery tests in effects.test.ts).
+// GCS, the identity that serviceAccounts.get returns for a unique-ID
+// resource, and the real answers of the inventory, STS, and IAM Credentials
+// APIs. Member credentials are minted here by a GitHub-style signer whose
+// JWKS the broker is given, and delivered through the real request path
+// (POST /v1/members), exactly as the canonical jobs deliver theirs.
 
 export const repoRoot = resolve(import.meta.dir, "..", "..");
 export const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
 export const activeSha = "a".repeat(40);
 export const transitionSha = "b".repeat(40);
-export const proberPrincipal = "recovery-prober@recovery-test.iam.gserviceaccount.com";
+export const organizationId = "100000000001";
+// A principal for observations tests record directly, outside any delivery.
+export const proberPrincipal = "principal://iam.googleapis.com/projects/882468538648/locations/global/workloadIdentityPools/github-actions/subject/16823277:1255553151:github-hosted:1";
 
 export class Clock {
   now: Date;
@@ -45,14 +48,16 @@ export class Clock {
   };
 }
 
-// The real repository authority with the broker project assigned, the
-// consumer pins recorded, and a distinct test unique ID for every target, so
-// purposes and targets derive exactly as in production.
-export async function testAuthority(): Promise<RecoveryAuthority> {
+// The real repository authority with the broker project and organization
+// assigned, the consumer pins recorded, and a distinct test unique ID for
+// every target, so purposes, targets, and the Deny matrix derive exactly as
+// in production.
+export async function testAuthority(edit: (authority: Record<string, unknown>) => void = () => undefined): Promise<RecoveryAuthority> {
   const authority = JSON.parse(await readFile(join(repoRoot, "protected-recovery/authority.json"), "utf8")) as Record<string, unknown>;
   const broker = authority.broker as Record<string, unknown>;
   broker.projectId = "recovery-test";
   broker.projectNumber = "123456789012";
+  authority.organizationId = organizationId;
   (authority.consumers as Array<Record<string, unknown>>).forEach((consumer, consumerIndex) => {
     consumer.activeWorkflowSha = activeSha;
     consumer.transitionWorkflowSha = consumer.repository === "runsetta" ? transitionSha : null;
@@ -61,6 +66,7 @@ export async function testAuthority(): Promise<RecoveryAuthority> {
       ids[account] = testUniqueId(consumerIndex, accountIndex);
     });
   });
+  edit(authority);
   return loadRecoveryAuthority(JSON.stringify(authority), await readFile(join(repoRoot, manifestPath), "utf8"));
 }
 
@@ -70,6 +76,10 @@ export function testUniqueId(consumerIndex: number, accountIndex: number): strin
 
 export function invokerEmail(consumer: string, intent: RecoveryIntent = "QUARANTINE"): string {
   return `${recoveryInvokerName(consumer, intent)}@recovery-test.iam.gserviceaccount.com`;
+}
+
+export function memberEmail(consumer: string): string {
+  return `${memberDeliveryName(consumer)}@recovery-test.iam.gserviceaccount.com`;
 }
 
 export const reconcilerEmail = "recovery-reconciler@recovery-test.iam.gserviceaccount.com";
@@ -134,6 +144,13 @@ export class FakeIam implements ServiceAccountIam {
     const policy = { bindings, etag: this.#nextEtag(), version: 1 };
     this.policies.set(resource, policy);
     return policy;
+  }
+
+  // Whether the managed role on a resource currently carries a member: what
+  // the issuance probe stand-in answers from.
+  grants(resource: string, member: string): boolean {
+    const policy = this.policies.get(resource);
+    return policy?.bindings.some((binding) => binding.role === managedRole && binding.condition === null && binding.members.includes(member)) ?? false;
   }
 
   async getIdentity(resource: string): Promise<IdentityOutcome> {
@@ -227,58 +244,64 @@ export class FakeEvidence implements EvidenceStore {
   }
 }
 
-// In-memory stand-in for the issuance probe source: every request and every
-// preflight is logged, the preflight is operational unless made unavailable,
-// the outcome is DENIED unless the target's unique ID, or the exact target
-// and member (`${uniqueId}|${member}`, since one member tuple is commonly
-// bound to several targets), is set to ALLOWED, and the observation time is
-// the clock's.
+// In-memory stand-in for the issuance probe: every delivered credential is
+// exchanged once and minted against each bound target, and the answer is what
+// the IAM stand-in's managed binding says right now -- ALLOWED while the
+// member is bound, DENIED once it is not -- unless an outcome is forced for
+// the exact target and member (`${uniqueId}|${member}`) or the target. The
+// observation time is the clock's.
 export class FakeProbe implements ImpersonationProbe {
-  readonly requests: ProbeRequest[] = [];
-  readonly preflights: Array<readonly Target[]> = [];
+  readonly mints: Array<{ readonly member: string; readonly principal: string; readonly targets: readonly string[] }> = [];
   readonly outcomes = new Map<string, ProbeOutcome>();
+  // Whole exchanges that fail, and targets whose mint answers with a failure.
   unavailable = 0;
-  preflightUnavailable = 0;
+  readonly unavailableTargets = new Set<string>();
   readonly #clock: Clock;
+  readonly #iam: FakeIam;
 
-  constructor(clock: Clock) {
+  constructor(clock: Clock, iam: FakeIam) {
     this.#clock = clock;
+    this.#iam = iam;
   }
 
-  async preflight(targets: readonly Target[]): Promise<PreflightOutcome> {
-    this.preflights.push(targets);
-    if (this.preflightUnavailable > 0) {
-      this.preflightUnavailable -= 1;
-      return { kind: "unavailable", reason: "the probe source cannot act as the managed members" };
-    }
-    return { kind: "operational", principals: Object.fromEntries(targets.map((target) => [target.account, Object.fromEntries(target.members.map((member) => [member, proberPrincipal]))])) };
-  }
-
-  async probe(request: ProbeRequest): Promise<ProbeResult> {
-    this.requests.push(request);
+  async mint(credential: MemberCredential, targets: readonly Target[]): Promise<MintOutcome> {
+    this.mints.push({ member: credential.member, principal: credential.principal, targets: targets.map((target) => target.uniqueId) });
     if (this.unavailable > 0) {
       this.unavailable -= 1;
       return { kind: "unavailable", reason: "the probe source is unreachable" };
     }
-    return { kind: "observed", observedAt: this.#clock.now.toISOString(), outcome: this.outcomes.get(`${request.uniqueId}|${request.member}`) ?? this.outcomes.get(request.uniqueId) ?? "DENIED", principal: proberPrincipal };
+    const results: MintResult[] = targets.map((target) => {
+      if (this.unavailableTargets.has(target.uniqueId)) return { kind: "unavailable", reason: "generateAccessToken answered HTTP 503", target };
+      const forced = this.outcomes.get(`${target.uniqueId}|${credential.member}`) ?? this.outcomes.get(target.uniqueId);
+      const outcome: ProbeOutcome = forced ?? (this.#iam.grants(target.resource, credential.member) ? "ALLOWED" : "DENIED");
+      return { kind: "observed", observedAt: this.#clock.now.toISOString(), outcome, target };
+    });
+    return { kind: "minted", principal: credential.principal, results };
   }
 }
 
 // In-memory stand-in for the credential inventory: every target is clean
 // with a stable summary unless findings are set for its unique ID, the
-// summary's etags move when a target is marked changed, and the observation
-// time is the clock's. A one-shot afterObserve hook runs after a read has
-// produced its record, to model a change landing right after the read.
+// summary's etags move when a target is marked changed, the Deny state is
+// steady unless the form is set, and every batch spans the clock's reads.
+// A one-shot afterObserve hook runs after a read has produced its record, to
+// model a change landing right after the read.
 export class FakeInventory implements CredentialInventory {
   readonly requests: Target[] = [];
+  readonly batches: Array<readonly string[]> = [];
   readonly findings = new Map<string, readonly string[]>();
   readonly versions = new Map<string, number>();
   unavailable = 0;
   afterObserve: ((target: Target) => void) | undefined;
+  // The live Deny form the batch reads back, per consumer; steady by default.
+  readonly forms = new Map<string, string>();
+  denyVersion = 0;
+  readonly #authority: RecoveryAuthority;
   readonly #clock: Clock;
 
-  constructor(clock: Clock) {
+  constructor(clock: Clock, authority: RecoveryAuthority) {
     this.#clock = clock;
+    this.#authority = authority;
   }
 
   // Something in the target's credential inventory changed: a later
@@ -287,38 +310,82 @@ export class FakeInventory implements CredentialInventory {
     this.versions.set(uniqueId, (this.versions.get(uniqueId) ?? 0) + 1);
   }
 
-  summaryOf(target: Target): InventorySummary {
+  // The live Deny state changed: every policy etag moves, into the given form.
+  setDenyForm(consumer: string, form: string): void {
+    this.forms.set(consumer, form);
+    this.denyVersion += 1;
+  }
+
+  summaryOf(target: Target, consumer: Consumer): InventorySummary {
     const version = this.versions.get(target.uniqueId) ?? 0;
     const findings = this.findings.get(target.uniqueId) ?? [];
+    const form = this.forms.get(consumer.repository) ?? "steady";
     return {
-      ancestry: ["projects/882468538648", "organizations/100000000001"],
+      ancestry: [`projects/${consumer.projectNumber}`, `organizations/${organizationId}`],
       attachments: findings.filter((finding) => finding.startsWith("attachment:")).map((finding) => finding.slice("attachment:".length)),
+      denyState: {
+        form,
+        policies: [
+          { attachment: brokerAttachment(this.#authority), etag: `deny-broker-${this.denyVersion}`, name: "policies/cloudresourcemanager.googleapis.com%2Fprojects%2Frecovery-test/denypolicies/protected-recovery-broker" },
+          { attachment: consumerAttachment(consumer), etag: `deny-${consumer.repository}-${this.denyVersion}`, name: `policies/cloudresourcemanager.googleapis.com%2Fprojects%2F${consumer.projectId}/denypolicies/protected-recovery-consumer` },
+          { attachment: organizationAttachment(this.#authority), etag: `deny-org-${this.denyVersion}`, name: `policies/cloudresourcemanager.googleapis.com%2Forganizations%2F${organizationId}/denypolicies/protected-recovery-organization` },
+        ],
+      },
       grants: findings.filter((finding) => finding.startsWith("grant:")).map((finding) => finding.slice("grant:".length)),
       keys: findings.filter((finding) => finding.startsWith("key:")).map((finding) => finding.slice("key:".length)),
       lifetimeExtension: findings.find((finding) => finding.startsWith("lifetime-extension:"))?.slice("lifetime-extension:".length) ?? null,
+      lifetimePolicies: [`organizations/${organizationId}|absent`, `projects/${consumer.projectNumber}|absent`],
+      neutralized: [],
       policies: [
         { etag: `sa-etag-${target.uniqueId}-${version}`, resource: target.resource },
-        { etag: `project-etag-${version}`, resource: "projects/882468538648" },
+        { etag: `project-etag-${version}`, resource: `projects/${consumer.projectNumber}` },
       ],
-      services: ["cloudbuild.googleapis.com:enabled", "compute.googleapis.com:disabled", "run.googleapis.com:enabled"],
+      roles: [{ etag: "role-etag-1", name: managedRole }],
+      services: ["cloudbuild.googleapis.com:enabled", "cloudscheduler.googleapis.com:enabled", "compute.googleapis.com:disabled", "run.googleapis.com:enabled"],
     };
   }
 
-  async inventory(target: Target, _consumer: Consumer): Promise<InventoryOutcome> {
-    this.requests.push(target);
+  async inventory(target: Target, consumer: Consumer): Promise<InventoryOutcome> {
+    return (await this.inventoryAll([target], consumer))[0]!;
+  }
+
+  async inventoryAll(targets: readonly Target[], consumer: Consumer): Promise<readonly InventoryOutcome[]> {
+    this.batches.push(targets.map((target) => target.account));
+    const observedAt = this.#clock.read().toISOString();
+    const outcomes: InventoryOutcome[] = [];
+    for (const target of targets) {
+      this.requests.push(target);
+      if (this.unavailable > 0) {
+        this.unavailable -= 1;
+        outcomes.push({ kind: "unavailable", reason: "the inventory source is unreachable" });
+        continue;
+      }
+      const summary = this.summaryOf(target, consumer);
+      const observedUntil = this.#clock.read().toISOString();
+      outcomes.push({ kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt, observedUntil, summary, uniqueId: target.uniqueId } });
+      const hook = this.afterObserve;
+      if (hook) {
+        this.afterObserve = undefined;
+        hook(target);
+      }
+    }
+    return outcomes;
+  }
+
+  async denyState(consumer: Consumer): Promise<DenyStateOutcome> {
     if (this.unavailable > 0) {
       this.unavailable -= 1;
       return { kind: "unavailable", reason: "the inventory source is unreachable" };
     }
-    const summary = this.summaryOf(target);
-    const record: InventoryOutcome = { kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: this.#clock.now.toISOString(), summary, uniqueId: target.uniqueId } };
-    const hook = this.afterObserve;
-    if (hook) {
-      this.afterObserve = undefined;
-      hook(target);
-    }
-    return record;
+    const summary = this.summaryOf({ account: "-", email: "-", members: [], pool: "-", resource: "-", uniqueId: "-" }, consumer);
+    return { kind: "observed", state: summary.denyState, verdict: verdictOf(summary.denyState.form, consumer) };
   }
+}
+
+function verdictOf(form: string, consumer: Consumer): DenyVerdict {
+  if (form.startsWith("drifted")) return { kind: "drifted", reasons: [form] };
+  const flags: DenyFlags = { ...steadyFlags, bootstrap: form === "bootstrap", deployment: form === "deployment" ? [consumer.repository] : [], maintenance: form === "maintenance" };
+  return { kind: "classified", flags };
 }
 
 // Bearer tokens map straight to identities; the real verifier is tested on its own.
@@ -330,6 +397,12 @@ export class FakeVerifier implements IdentityVerifier {
   }
 }
 
+export interface Signer {
+  readonly jwks: readonly Jwk[];
+  readonly sign: (payload: Record<string, unknown>) => Promise<string>;
+  readonly signWith: (payload: Record<string, unknown>, key: CryptoKey) => Promise<string>;
+}
+
 export interface World {
   readonly authority: RecoveryAuthority;
   readonly broker: Broker;
@@ -339,6 +412,8 @@ export interface World {
   readonly inventory: FakeInventory;
   readonly ledger: Ledger;
   readonly probe: FakeProbe;
+  // The GitHub-style signer whose JWKS the broker verifies member credentials against.
+  readonly signer: Signer;
   // A second service instance sharing the ledger, IAM, evidence, probe, and inventory sources.
   readonly anotherInstance: () => { readonly broker: Broker; readonly ledger: Ledger };
 }
@@ -346,7 +421,7 @@ export interface World {
 export interface WorldOverrides {
   // The evidence store the broker projects to; the in-memory stand-in by default.
   readonly evidence?: EvidenceStore;
-  // GitHub's JWKS as the broker sees it; empty by default, so no delivered credential verifies.
+  // GitHub's JWKS as the broker sees it; the world's own signer by default.
   readonly jwks?: () => Promise<readonly Jwk[]>;
   // The ledger fetcher, distinct from the evidence store's own.
   readonly ledgerFetch?: typeof fetch;
@@ -357,20 +432,21 @@ export async function world(clock = new Clock(), fetcher: typeof fetch = fetch, 
   const project = freshProject();
   const iam = new FakeIam();
   const evidence = new FakeEvidence();
-  const probe = new FakeProbe(clock);
-  const inventory = new FakeInventory(clock);
-  const jwks = overrides.jwks ?? (async (): Promise<readonly Jwk[]> => []);
+  const probe = new FakeProbe(clock, iam);
+  const inventory = new FakeInventory(clock, authority);
+  const signer = await githubSigner();
+  const jwks = overrides.jwks ?? (async (): Promise<readonly Jwk[]> => signer.jwks);
   const instance = () => {
     const ledger = emulatorLedger(clock, overrides.ledgerFetch ?? fetcher, project);
     return { broker: new Broker({ authority, ...(deadlines ? { deadlines } : {}), evidence: overrides.evidence ?? evidence, iam, inventory, jwks, ledger, now: clock.read, probe }), ledger };
   };
   const first = instance();
-  return { authority, broker: first.broker, clock, evidence, iam, inventory, ledger: first.ledger, probe, anotherInstance: instance };
+  return { authority, broker: first.broker, clock, evidence, iam, inventory, ledger: first.ledger, probe, signer, anotherInstance: instance };
 }
 
 // A GitHub-style RS256 signer with its JWKS entry, for member credentials
 // the tests mint themselves.
-export async function githubSigner(kid = "gh1"): Promise<{ readonly jwks: readonly Jwk[]; readonly sign: (payload: Record<string, unknown>) => Promise<string>; readonly signWith: (payload: Record<string, unknown>, key: CryptoKey) => Promise<string> }> {
+export async function githubSigner(kid = "gh1"): Promise<Signer> {
   const keys = await crypto.subtle.generateKey({ hash: "SHA-256", modulusLength: 2048, name: "RSASSA-PKCS1-v1_5", publicExponent: new Uint8Array([1, 0, 1]) }, true, ["sign", "verify"]);
   const jwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
   const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -387,7 +463,7 @@ export async function githubSigner(kid = "gh1"): Promise<{ readonly jwks: readon
 // composes, the numeric identity claims its subject mapping uses, and a
 // normal GitHub subject, which the provider never uses as the principal.
 export function memberClaims(authority: RecoveryAuthority, consumer: Consumer, member: string, nowSeconds: number, runId = "4242"): Record<string, unknown> {
-  const pool = `projects/${consumer.projectNumber}/locations/global/workloadIdentityPools/${authority.broker.workloadIdentityPoolId}`;
+  const pool = consumerPool(authority, consumer);
   const composite = member.slice(`principalSet://iam.googleapis.com/${pool}/attribute.authority/`.length).split(":");
   return {
     aud: `https://iam.googleapis.com/${pool}/providers/${authority.broker.workloadIdentityProviderId}`,
@@ -407,6 +483,36 @@ export function memberClaims(authority: RecoveryAuthority, consumer: Consumer, m
   };
 }
 
+// The federated principal STS creates for a member credential minted in one run.
+export function memberPrincipal(authority: RecoveryAuthority, consumer: Consumer, runId = "4242"): string {
+  return `principal://iam.googleapis.com/${consumerPool(authority, consumer)}/subject/${authority.githubOwnerId}:${consumer.repositoryId}:github-hosted:${runId}`;
+}
+
+export function consumerOf(w: World, repository: string): Consumer {
+  const consumer = w.authority.consumers.find((candidate) => candidate.repository === repository);
+  if (!consumer) throw new Error(`no consumer ${repository}`);
+  return consumer;
+}
+
+// One canonical job delivering its credential: a token of the exact member,
+// minted now for the consumer provider's audience, through the consumer's
+// member-delivery identity and the real request path.
+export async function deliver(w: World, repository: string, member: string, runId = "4242"): Promise<BrokerResponse> {
+  const consumer = consumerOf(w, repository);
+  const token = await w.signer.sign(memberClaims(w.authority, consumer, member, Math.floor(w.clock.now.getTime() / 1000), runId));
+  return await w.broker.handle(purposeForIdentity(w.authority, memberEmail(repository))!, { kind: "deliver", token });
+}
+
+// Every canonical job of a consumer delivering once, in member order: one
+// delivery round.
+export async function deliverAll(w: World, repository: string, runId = "4242"): Promise<readonly BrokerResponse[]> {
+  const consumer = consumerOf(w, repository);
+  const members = [...new Set((targetsFor(w.authority, consumer) ?? []).flatMap((target) => target.members))].sort();
+  const responses: BrokerResponse[] = [];
+  for (const member of members) responses.push(await deliver(w, repository, member, runId));
+  return responses;
+}
+
 export const unrelatedBindings: readonly PolicyBinding[] = [
   { condition: null, members: ["serviceAccount:audit@recovery-test.iam.gserviceaccount.com"], role: "roles/iam.serviceAccountViewer" },
   {
@@ -423,13 +529,29 @@ export function seedTargets(iam: FakeIam, targets: readonly Target[], extra: rea
   }
 }
 
+// Seed a consumer's targets and record every member's positive control by a
+// delivery round while the bindings stand: what admission needs.
+export async function prime(w: World, repository: string): Promise<readonly Target[]> {
+  const targets = targetsFor(w.authority, consumerOf(w, repository))!;
+  seedTargets(w.iam, targets);
+  for (const response of await deliverAll(w, repository)) {
+    if (response.status !== 200) throw new Error(`priming delivery answered ${response.status}: ${JSON.stringify(response.body)}`);
+  }
+  return targets;
+}
+
 // Drive an OPEN QUARANTINE shard to scan-ready through the broker's own
-// observation recording: reconcile (acknowledges effects, records the
-// inventory baselines and the revocation probes), drain the one-hour token
-// horizon, reconcile again (records the post-horizon probes).
+// observation recording: reconcile (acknowledges effects and records the
+// inventory baselines), a delivery round (records the revocation probe of
+// every member from the deliveries themselves), drain the one-hour token
+// horizon, another round (the post-horizon probes), then reconcile again to
+// project the journaled probes.
 export async function makeReady(w: World, shard: string): Promise<void> {
   await w.broker.reconcileShard(shard);
+  const repository = (await w.ledger.readShard(shard))!.consumer;
+  await deliverAll(w, repository);
   w.clock.advance(3600);
+  await deliverAll(w, repository);
   await w.broker.reconcileShard(shard);
 }
 
@@ -438,14 +560,19 @@ export async function makeReady(w: World, shard: string): Promise<void> {
 export async function freshOf(w: World, shardId: string): Promise<Fresh> {
   const shard = await w.ledger.readShard(shardId);
   if (!shard) return {};
-  const consumer = w.authority.consumers.find((candidate) => candidate.repository === shard.consumer)!;
+  const consumer = consumerOf(w, shard.consumer);
   const fresh: Record<string, FreshInventory> = {};
+  const targets: Array<{ readonly account: string; readonly target: Target }> = [];
   for (const [account, state] of Object.entries(shard.targets)) {
     if (state.effect.state !== "ACKED") continue;
     const entry = await w.ledger.readEntry(shardId, state.sequence);
     if (!entry || entry.body.kind !== "effect") continue;
-    const outcome = await w.inventory.inventory(targetOfEffect(w.authority, consumer, entry.body), consumer);
-    if (outcome.kind === "observed") fresh[account] = { findings: outcome.inventory.findings, hash: outcome.inventory.hash, observedAt: outcome.inventory.observedAt };
+    targets.push({ account, target: targetOfEffect(w.authority, consumer, entry.body) });
+  }
+  const outcomes = targets.length === 0 ? [] : await w.inventory.inventoryAll(targets.map((entry) => entry.target), consumer);
+  for (const [index, { account }] of targets.entries()) {
+    const outcome = outcomes[index]!;
+    if (outcome.kind === "observed") fresh[account] = { findings: outcome.inventory.findings, hash: outcome.inventory.hash, observedAt: outcome.inventory.observedAt, observedUntil: outcome.inventory.observedUntil };
   }
   return fresh;
 }
@@ -466,4 +593,21 @@ export function gate(): { readonly release: () => void; readonly wait: () => Pro
     release = resolve;
   });
   return { release, wait: () => promise };
+}
+
+// The live Deny policies the IAM v2 API would answer for a matrix: one policy
+// per attachment point, one rule per exception set, each rule listing every
+// permission that shares it, named and etagged deterministically. Both the
+// projected form the classifier reads and the JSON documents the API stand-in
+// serves.
+export function livePoliciesFromMatrix(matrix: DenyMatrix, etag = (attachment: string) => `deny-etag-${attachment.split("/").at(-1)}`): { readonly documents: Readonly<Record<string, Record<string, unknown>>>; readonly policies: readonly LiveDenyPolicy[] } {
+  const policies: LiveDenyPolicy[] = [];
+  const documents: Record<string, Record<string, unknown>> = {};
+  for (const [attachment, rules] of rulesByException(matrix)) {
+    const name = `policies/${encodeURIComponent(attachment)}/denypolicies/protected-recovery`;
+    const projected = rules.map((rule) => ({ condition: null, denied: ["principalSet://goog/public:all"], exceptedPermissions: [], exceptions: rule.exceptions, permissions: [...rule.permissions] }));
+    policies.push({ attachment, etag: etag(attachment), name, rules: projected });
+    documents[name] = { etag: etag(attachment), name, rules: projected.map((rule) => ({ denyRule: { deniedPermissions: rule.permissions, deniedPrincipals: rule.denied, exceptionPrincipals: rule.exceptions } })) };
+  }
+  return { documents, policies };
 }

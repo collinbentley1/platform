@@ -14,10 +14,16 @@ import {
   isRecord,
   managedRole,
   probePermission,
-  probePrerequisite,
   sha256Hex,
   targetsFor,
 } from "./model";
+
+// A bounded external dependency of one request or one shard -- GitHub's or
+// Google's JWKS, the metadata server -- answered with a failure. It is the
+// one error class such failures are normalized to, so a request boundary can
+// answer 503 and a shard boundary can pass the shard, while every other
+// thrown error stays a broker defect that propagates.
+export class ExternalUnavailable extends Error {}
 
 // The one external effect: a compare-and-set of one target service account's
 // IAM allow policy that adds or removes exactly the managed members of the
@@ -67,35 +73,36 @@ export interface ServiceAccountIam {
   setPolicy(resource: string, policy: Policy): Promise<WriteOutcome>;
 }
 
-// A negative impersonation probe: an attempt of exactly the probe permission
-// as the managed member against the exact target identity, performed by the
-// broker itself, with the outcome observed by the broker. The result names
-// the exact federated principal and the broker's observation time.
-export interface ProbeRequest {
-  readonly email: string;
+// The issuance probe: an attempt of exactly the probe permission as the
+// managed member against each exact target identity the member is bound to,
+// performed by the broker itself at the moment the member's canonical job
+// delivers its credential, with every outcome observed by the broker and
+// bound to the federated principal STS created. Nothing is retained but the
+// outcomes; the bearer is discarded when the request ends.
+export interface MemberCredential {
+  readonly consumer: Consumer;
   readonly member: string;
-  readonly permission: typeof probePermission;
-  readonly resource: string;
-  readonly uniqueId: string;
+  readonly principal: string;
+  readonly token: string;
 }
 
-export type ProbeResult =
-  | { readonly kind: "observed"; readonly observedAt: string; readonly outcome: ProbeOutcome; readonly principal: string }
-  | { readonly kind: "unavailable"; readonly reason: string };
+export type MintResult =
+  | { readonly kind: "observed"; readonly observedAt: string; readonly outcome: ProbeOutcome; readonly target: Target }
+  | { readonly kind: "unavailable"; readonly reason: string; readonly target: Target };
 
-// Whether the probe source can act as every managed member of every target
-// right now: a positive control taken before a QUARANTINE is accepted and
-// again before any of its effects is prepared, so that no binding is removed
-// unless the observation that ends the quarantine can be made. The
-// principals are the federated principal proven for each member of each
-// target account.
-export type PreflightOutcome =
-  | { readonly kind: "operational"; readonly principals: Readonly<Record<string, Readonly<Record<string, string>>>> }
+export type MintOutcome =
+  | { readonly kind: "minted"; readonly principal: string; readonly results: readonly MintResult[] }
   | { readonly kind: "unavailable"; readonly reason: string };
 
 export interface ImpersonationProbe {
-  preflight(targets: readonly Target[]): Promise<PreflightOutcome>;
-  probe(request: ProbeRequest): Promise<ProbeResult>;
+  mint(credential: MemberCredential, targets: readonly Target[]): Promise<MintOutcome>;
+}
+
+// The remaining life a delivered credential must have for one delivery: one
+// STS exchange, one mint per bound target, and the ledger transactions that
+// record them, sequentially, with room for a cold start.
+export function deliveryBudgetSeconds(targets: number): number {
+  return 45 + 5 * targets;
 }
 
 export type DriveOutcome =
@@ -451,16 +458,28 @@ export async function verifyRs256Jwt(token: string, jwks: readonly Jwk[]): Promi
   return verified && isRecord(payload) ? payload : undefined;
 }
 
+// A JWKS cached to its max-age. Every failure -- unreachable, a non-2xx
+// answer, a lost body, malformed JSON -- is ExternalUnavailable: the keys
+// are simply not known right now, and nothing that depends on them may act.
 export function cachedJwks(url: string, fetcher: typeof fetch, now: () => Date): () => Promise<readonly Jwk[]> {
   let cached: { readonly keys: readonly Jwk[]; readonly until: number } | undefined;
   return async () => {
     if (cached && cached.until > now().getTime()) return cached.keys;
-    const response = await fetcher(url, { redirect: "error" });
-    if (!response.ok) throw new Error(`JWKS fetch failed with HTTP ${response.status}.`);
-    const body = JSON.parse(await response.text()) as unknown;
-    const keys = isRecord(body) && Array.isArray(body.keys)
-      ? body.keys.filter((key): key is Jwk => isRecord(key) && typeof key.kid === "string" && typeof key.n === "string" && typeof key.e === "string" && key.kty === "RSA")
-      : [];
+    let response: Response;
+    try {
+      response = await fetcher(url, { redirect: "error" });
+    } catch (error) {
+      throw new ExternalUnavailable(`JWKS ${url} is unreachable: ${String(error)}`);
+    }
+    if (!response.ok) throw new ExternalUnavailable(`JWKS ${url} answered HTTP ${response.status}`);
+    let body: unknown;
+    try {
+      body = JSON.parse(await response.text()) as unknown;
+    } catch (error) {
+      throw new ExternalUnavailable(`JWKS ${url} answered malformed JSON: ${String(error)}`);
+    }
+    if (!isRecord(body) || !Array.isArray(body.keys)) throw new ExternalUnavailable(`JWKS ${url} carries no key set`);
+    const keys = body.keys.filter((key): key is Jwk => isRecord(key) && typeof key.kid === "string" && typeof key.n === "string" && typeof key.e === "string" && key.kty === "RSA");
     const maxAge = /max-age=(\d+)/.exec(response.headers.get("cache-control") ?? "")?.[1];
     cached = { keys, until: now().getTime() + Math.min(Number(maxAge ?? "300"), 3600) * 1000 };
     return keys;
@@ -471,43 +490,11 @@ export const githubIssuer = "https://token.actions.githubusercontent.com";
 export const githubJwksUrl = `${githubIssuer}/.well-known/jwks`;
 const clockSkewSeconds = 60;
 
-// The credential of a managed member: the GitHub OIDC token of the one
-// canonical job that is that member, minted for the consumer provider's
-// audience. Only such a job can hold it, and only with it can the broker act
-// as the member at STS and IAM Credentials.
-export type MemberToken =
-  | { readonly kind: "token"; readonly token: string }
-  | { readonly kind: "unavailable"; readonly reason: string };
-
-export interface MemberCredentialSource {
-  oidcTokenFor(member: string): Promise<MemberToken>;
-}
-
-// The production credential source: the live credential each canonical job
-// delivered through POST /v1/members, read from the ledger and served only
-// until it expires. A member whose job has not delivered one is unavailable,
-// naming exactly what is missing.
-export class LedgerMemberCredentials implements MemberCredentialSource {
-  readonly #ledger: Ledger;
-  readonly #now: () => Date;
-
-  constructor(ledger: Ledger, now: () => Date) {
-    this.#ledger = ledger;
-    this.#now = now;
-  }
-
-  async oidcTokenFor(member: string): Promise<MemberToken> {
-    const record = await this.#ledger.readMemberCredential(member);
-    if (!record || Date.parse(record.expiresAt) <= this.#now().getTime()) return { kind: "unavailable", reason: probePrerequisite(member) };
-    return { kind: "token", token: record.token };
-  }
-}
-
 // What a verified member credential proves: the consumer whose provider it
 // is minted for, the exact managed member the provider derives from its
 // claims, the federated principal STS creates for it (the provider's
 // google.subject mapping, never the raw GitHub subject), and its expiry.
-export type MemberCredential =
+export type VerifiedMember =
   | { readonly kind: "verified"; readonly consumer: Consumer; readonly expiresAt: string; readonly member: string; readonly principal: string }
   | { readonly kind: "unavailable"; readonly reason: string };
 
@@ -523,7 +510,7 @@ export interface MemberVerificationDependencies {
 // validity window, the consumer repository on GitHub-hosted runners, and the
 // five authority claims whose composite is the managed member. The principal
 // is the provider's mapped google.subject.
-export async function verifyMemberCredential(deps: MemberVerificationDependencies, token: string, consumer?: Consumer): Promise<MemberCredential> {
+export async function verifyMemberCredential(deps: MemberVerificationDependencies, token: string, consumer?: Consumer): Promise<VerifiedMember> {
   const claims = await verifyRs256Jwt(token, await deps.jwks());
   if (!claims) return { kind: "unavailable", reason: "the member credential is not a GitHub-signed RS256 token" };
   const nowSeconds = Math.floor(deps.now().getTime() / 1000);
@@ -548,28 +535,24 @@ export async function verifyMemberCredential(deps: MemberVerificationDependencie
   return { kind: "verified", consumer: owner, expiresAt: new Date(claims.exp * 1000).toISOString(), member, principal: `principal://iam.googleapis.com/${pool}/subject/${subject.join(":")}` };
 }
 
-export interface IssuanceProbeDependencies extends MemberVerificationDependencies {
-  readonly credentials: MemberCredentialSource;
+export interface IssuanceProbeDependencies {
+  readonly authority: RecoveryAuthority;
   readonly endpoints?: { readonly credentials?: string; readonly sts?: string };
   readonly fetch: typeof fetch;
+  readonly now: () => Date;
 }
 
-type Federated =
-  | { readonly kind: "federated"; readonly accessToken: string; readonly principal: string }
-  | { readonly kind: "unavailable"; readonly reason: string };
-
-// The broker-verifiable issuance probe. For a managed member the broker
-// verifies the canonical job's GitHub OIDC token against GitHub's JWKS,
-// derives the member from the token's claims exactly as the consumer
-// provider maps them and requires equality, exchanges the token at STS for
-// the consumer pool, and then makes the IAM Credentials generateAccessToken
-// request itself against the target's permanent identity: ALLOWED on a
-// minted token (never retained), DENIED only on an IAM permission denial of
-// exactly the probe permission, unavailable for anything else. The preflight
-// positive control is the same request for every managed member of every
-// target and must mint. Every result is bound to the exact federated
-// principal, the target unique ID, the member, the permission, the broker's
-// clock, and the API's own answer; no analysis API stands in.
+// The broker-verifiable issuance probe. The broker has already verified the
+// delivered GitHub OIDC token against GitHub's JWKS and derived the member
+// from its claims exactly as the consumer provider maps them; here the token
+// is exchanged at STS for the consumer pool once, and the IAM Credentials
+// generateAccessToken request is made as that federated identity against
+// each bound target's permanent identity: ALLOWED on a minted token (never
+// retained), DENIED only on an IAM permission denial of exactly the probe
+// permission, unavailable for anything else. Every result is bound to the
+// exact federated principal, the target unique ID, the member, the
+// permission, the broker's clock, and the API's own answer; no analysis API
+// stands in.
 export class GoogleIssuanceProbe implements ImpersonationProbe {
   readonly #deps: IssuanceProbeDependencies;
 
@@ -577,62 +560,8 @@ export class GoogleIssuanceProbe implements ImpersonationProbe {
     this.#deps = deps;
   }
 
-  async preflight(targets: readonly Target[]): Promise<PreflightOutcome> {
-    const principals: Record<string, Record<string, string>> = {};
-    const reasons: string[] = [];
-    for (const target of targets) {
-      if (target.members.length === 0) {
-        reasons.push(`${target.account}: no managed member`);
-        continue;
-      }
-      for (const member of target.members) {
-        const federated = await this.#federated(target.resource, member);
-        if (federated.kind === "unavailable") {
-          reasons.push(`${target.account}/${member}: ${federated.reason}`);
-          continue;
-        }
-        const response = await this.#mint(target.uniqueId, federated.accessToken);
-        if (response.kind === "unreachable") {
-          reasons.push(`${target.account}/${member}: ${response.reason}`);
-          continue;
-        }
-        if (!response.ok) {
-          reasons.push(`${target.account}/${member}: generateAccessToken answered HTTP ${response.status}; the member cannot mint for ${target.uniqueId}, so the probe cannot serve as a positive control`);
-          continue;
-        }
-        principals[target.account] = { ...principals[target.account], [member]: federated.principal };
-      }
-    }
-    return reasons.length === 0 ? { kind: "operational", principals } : { kind: "unavailable", reason: reasons.join("; ") };
-  }
-
-  async probe(request: ProbeRequest): Promise<ProbeResult> {
-    if (request.permission !== probePermission) return { kind: "unavailable", reason: `the probe permission is ${probePermission}` };
-    const federated = await this.#federated(request.resource, request.member);
-    if (federated.kind === "unavailable") return federated;
-    const response = await this.#mint(request.uniqueId, federated.accessToken);
-    const observedAt = this.#deps.now().toISOString();
-    if (response.kind === "unreachable") return { kind: "unavailable", reason: response.reason };
-    if (response.ok) return { kind: "observed", observedAt, outcome: "ALLOWED", principal: federated.principal };
-    if (response.status === 403 && deniedForProbePermission(response.body)) return { kind: "observed", observedAt, outcome: "DENIED", principal: federated.principal };
-    return { kind: "unavailable", reason: `generateAccessToken answered HTTP ${response.status} without an IAM denial of ${probePermission}` };
-  }
-
-  // The one issuance request, as the member, against the exact identity. The
-  // minted token, if any, is never retained: the answer is the evidence.
-  async #mint(uniqueId: string, accessToken: string): Promise<JsonResponse> {
-    return await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("credentials")}/v1/projects/-/serviceAccounts/${uniqueId}:generateAccessToken`, { lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, accessToken);
-  }
-
-  async #federated(resource: string, member: string): Promise<Federated> {
-    const consumer = this.#consumerOf(resource);
-    if (!consumer) return { kind: "unavailable", reason: `${resource} belongs to no declared consumer` };
-    const credential = await this.#deps.credentials.oidcTokenFor(member);
-    if (credential.kind === "unavailable") return credential;
-    const verified = await verifyMemberCredential(this.#deps, credential.token, consumer);
-    if (verified.kind === "unavailable") return verified;
-    if (verified.member !== member) return { kind: "unavailable", reason: `the member credential is ${verified.member}, not the probed member` };
-    const provider = consumerProvider(this.#deps.authority, consumer);
+  async mint(credential: MemberCredential, targets: readonly Target[]): Promise<MintOutcome> {
+    const provider = consumerProvider(this.#deps.authority, credential.consumer);
     const exchange = await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("sts")}/v1/token`, {
       audience: `//iam.googleapis.com/${provider}`,
       grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -645,12 +574,23 @@ export class GoogleIssuanceProbe implements ImpersonationProbe {
     if (!exchange.ok || !isRecord(exchange.body) || typeof exchange.body.access_token !== "string" || exchange.body.access_token.length === 0) {
       return { kind: "unavailable", reason: `STS refused the member credential with HTTP ${exchange.status}` };
     }
-    return { kind: "federated", accessToken: exchange.body.access_token, principal: verified.principal };
-  }
-
-  #consumerOf(resource: string): Consumer | undefined {
-    const match = /^projects\/([^/]+)\/serviceAccounts\/[1-9][0-9]*$/.exec(resource);
-    return match ? this.#deps.authority.consumers.find((consumer) => consumer.projectId === match[1]) : undefined;
+    const accessToken = exchange.body.access_token;
+    const results: MintResult[] = [];
+    for (const target of targets) {
+      if (!target.members.includes(credential.member)) {
+        results.push({ kind: "unavailable", reason: `${credential.member} is not a managed member of ${target.account}`, target });
+        continue;
+      }
+      // The one issuance request, as the member, against the exact identity.
+      // The minted token, if any, is never retained: the answer is the evidence.
+      const response = await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("credentials")}/v1/projects/-/serviceAccounts/${target.uniqueId}:generateAccessToken`, { lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, accessToken);
+      const observedAt = this.#deps.now().toISOString();
+      if (response.kind === "unreachable") results.push({ kind: "unavailable", reason: response.reason, target });
+      else if (response.ok) results.push({ kind: "observed", observedAt, outcome: "ALLOWED", target });
+      else if (response.status === 403 && deniedForProbePermission(response.body)) results.push({ kind: "observed", observedAt, outcome: "DENIED", target });
+      else results.push({ kind: "unavailable", reason: `generateAccessToken answered HTTP ${response.status} without an IAM denial of ${probePermission}`, target });
+    }
+    return { kind: "minted", principal: credential.principal, results };
   }
 
   #endpoint(name: "credentials" | "sts"): string {

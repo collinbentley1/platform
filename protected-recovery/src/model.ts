@@ -36,9 +36,18 @@ import {
 //   GET  /v1/shards/{shard}            the same invoker, reconciler
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
 //   POST /v1/members                   the consumer's member-delivery identity   {"token": "<GitHub OIDC token>"}
-//     200                             -> {"member", "expiresAt"}   the canonical job's own credential, verified and
-//                                                                  held until it expires, so the broker can probe as it
-//   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE
+//     200                             -> {"member", "controls", "probes"}   the canonical job's own credential, verified,
+//                                        exchanged at STS, and used at once to mint as the member against every target it is
+//                                        bound to; the outcomes are recorded (a positive control before any quarantine, the
+//                                        revocation or post-horizon probe of every OPEN quarantine that needs it) and the
+//                                        bearer is discarded -- it is never stored
+//     409 MEMBER_UNVERIFIED | MEMBER_EXPIRING   refused before any exchange
+//   POST /v1/maintenance               a RESTORE invoker   {"key", "action": "open" | "close"}
+//     200                             -> {"ticket": {...} | null}   the maintenance ticket under which the root may widen the
+//                                        Deny matrix to its maintenance form; refused (409 QUARANTINE_ACTIVE) while any
+//                                        QUARANTINE shard is not CLOSED, and while a ticket is open no QUARANTINE is accepted
+//   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE |
+//   503 DEPENDENCY_UNAVAILABLE (an external dependency of the request answered with a failure)
 //
 // No body carries evidence. Negative impersonation probes and credential
 // inventories are recorded by the broker itself from its own sources, never
@@ -61,6 +70,12 @@ export const brokerServiceAccountId = "recovery-broker";
 // bounded by the first negative probe after the last positive one -- and then
 // needs another negative probe.
 export const tokenHorizonSeconds = 3600;
+// The horizon when the token-lifetime path was ambiguous during the interval:
+// constraints/iam.allowServiceAccountCredentialLifetimeExtension can extend an
+// access token to twelve hours, so a chain rebuilt after a change of the Deny
+// form, of a bound role's definition, or of a lifetime-extension policy waits
+// the maximum lifetime such a change could have granted.
+export const extendedTokenHorizonSeconds = 43_200;
 // The journal ceiling of one shard. Effects need entries; observations are
 // journaled while entries remain and otherwise folded into the shard's
 // per-target chain state, so no number of observations can make the DENIED
@@ -79,14 +94,20 @@ export type ProbeOutcome = (typeof probeOutcomes)[number];
 // The issuance probe is a real IAM Credentials request as the exact managed
 // member: the broker verifies the GitHub OIDC token of the one canonical job
 // that is that member, exchanges it at STS for the consumer pool, and observes
-// generateAccessToken against the target's permanent identity itself. The
-// canonical job delivers that token through POST /v1/members (see
-// protected-recovery/deliver-member.sh); the broker holds it in the ledger
-// until it expires. A member whose canonical job has not delivered a live
-// credential cannot be probed, so every QUARANTINE that needs it is refused
-// before acceptance, before PREPARE, and before any mutation.
+// generateAccessToken against the target's permanent identity itself, at the
+// moment the job delivers the token through POST /v1/members (see
+// protected-recovery/deliver-member.sh). The bearer is never stored: what the
+// ledger keeps is the outcome. A member whose canonical job has never
+// delivered and minted (the positive control) cannot be quarantined, so every
+// QUARANTINE that needs it is refused before acceptance, before PREPARE, and
+// before any mutation; a member that has not delivered again after the effect
+// owes the delivery its negative probe needs.
 export function probePrerequisite(member: string): string {
-  return `no live credential of the canonical job for ${member}: the issuance probe needs that job's GitHub OIDC token, minted for the consumer provider's audience and delivered to POST /v1/members before it expires`;
+  return `no positive control for ${member}: the canonical job that is this member must deliver its GitHub OIDC token, minted for the consumer provider's audience, to POST /v1/members so the broker can mint as it once before any quarantine`;
+}
+
+export function deliveryOwed(member: string, phase: ProbePhase): string {
+  return `${phase} probe of ${member} awaits a delivery: the canonical job that is this member must run again and deliver its credential to POST /v1/members`;
 }
 
 export class AuthorityError extends Error {}
@@ -123,11 +144,20 @@ export interface Broker {
 // consumer, in which direction, and which consumer accounts are bound to which
 // exact tuples all come from the canonical workflow-authority manifest.
 export interface RecoveryAuthority {
+  // The one principal the Deny matrix's bootstrap form excepts on exactly the
+  // rows the module's own apply mutates; null until the offline root is named.
+  readonly bootstrapPrincipal: string | null;
   readonly broker: Broker;
   readonly consumers: readonly Consumer[];
   readonly entries: readonly WorkflowAuthorityEntry[];
   readonly githubOwner: string;
   readonly githubOwnerId: string;
+  // The principals the matrix's maintenance form excepts on the consumer IAM,
+  // federation, role, and organization-policy rows under an open ticket.
+  readonly maintenancePrincipals: readonly string[];
+  // The organization every consumer project and the broker project sit under;
+  // the third Deny attachment point. Null until the organization exists.
+  readonly organizationId: string | null;
   readonly platformRepository: string;
   readonly platformRepositoryId: string;
   readonly targetAccounts: readonly string[];
@@ -175,39 +205,92 @@ export interface ProbeRecord {
 // Compute, Cloud Run, and Cloud Build attachments that run as the target.
 // The hash is over this summary alone; any change to it is a change of the
 // inventory.
+// The live Deny state the inventory read in the same batch: the deny policies
+// at the broker project, the organization, and the consumer project, by name
+// and etag, and the form they satisfy (steady, bootstrap, maintenance, or
+// drifted). Any change of a policy changes the hash; any form but steady is a
+// finding, so authority is disabled by the state itself, never by an apply.
+export interface DenyStateSummary {
+  readonly form: string;
+  readonly policies: ReadonlyArray<{ readonly attachment: string; readonly etag: string; readonly name: string }>;
+}
+
 export interface InventorySummary {
   readonly ancestry: readonly string[];
   readonly attachments: readonly string[];
+  readonly denyState: DenyStateSummary;
   readonly grants: readonly string[];
   readonly keys: readonly string[];
   readonly lifetimeExtension: string | null;
+  // The lifetime-extension policy resource set at the project and at every
+  // ancestor, each as "<resource>|absent" or "<resource>|<etag>|<updateTime>":
+  // a policy set and restored between two reads still moves its updateTime.
+  readonly lifetimePolicies: readonly string[];
+  // Service-agent grants the frozen attachment model neutralized, with the
+  // proof each rested on; recorded so the receipt carries the reasoning.
+  readonly neutralized: readonly string[];
   readonly policies: ReadonlyArray<{ readonly etag: string; readonly resource: string }>;
+  // The definition version (etag) of every role bound in the ancestry: a
+  // custom role edited and restored still moves its etag.
+  readonly roles: ReadonlyArray<{ readonly etag: string; readonly name: string }>;
   // Which attachment APIs were enabled in the consumer project when read; a
   // disabled API hosts no attachment and is recorded as such, never assumed.
   readonly services: readonly string[];
 }
 
+// An inventory is observed over an interval: observedAt is when the earliest
+// of its component reads began and observedUntil when the last one completed.
+// Folding orders inventories by observedUntil, and a change voids every chain
+// built before the read that detected it, because the change could have
+// landed at any instant up to that read.
 export interface InventoryRecord {
   readonly account: string;
   readonly email: string;
   readonly findings: readonly string[];
   readonly hash: string;
   readonly observedAt: string;
+  readonly observedUntil: string;
   readonly summary: InventorySummary;
   readonly uniqueId: string;
 }
 
-// The live credential of one managed member as delivered by its canonical
-// job and verified by the broker: the member it proves, the consumer whose
-// provider it is minted for, the federated principal STS will create for it,
-// and the token itself until it expires.
-export interface MemberCredentialRecord {
+// What the broker keeps of a delivered member credential: never the bearer,
+// only the member it proved, the consumer whose provider it was minted for,
+// the federated principal STS created for it, when it was delivered and
+// expired, and the outcome of minting as it against every target it is bound
+// to -- the positive control that admits a quarantine of those targets.
+export interface MemberControl {
+  readonly observedAt: string;
+  readonly outcome: ProbeOutcome;
+  readonly uniqueId: string;
+}
+
+export interface MemberControlRecord {
   readonly consumer: string;
   readonly deliveredAt: string;
   readonly expiresAt: string;
   readonly member: string;
   readonly principal: string;
-  readonly token: string;
+  readonly targets: Readonly<Record<string, MemberControl>>;
+}
+
+// The one maintenance ticket: while it is open the root may widen the Deny
+// matrix to its maintenance form for infrastructure work, no QUARANTINE is
+// accepted, and once it expires a still-widened matrix is drift. It cannot be
+// opened while any QUARANTINE shard is not CLOSED.
+export const maintenanceTicketSeconds = 4 * 3600;
+
+// How recent a member's positive control must be for a quarantine to be
+// accepted, prepared, or resumed: the canonical job must have delivered and
+// minted within this window, so admission rests on a channel proven to exist
+// in its current form, not on a control from a job that may since have gone.
+export const controlValiditySeconds = 24 * 3600;
+
+export interface MaintenanceTicket {
+  readonly expiresAt: string;
+  readonly key: string;
+  readonly openedAt: string;
+  readonly openedBy: string;
 }
 
 export type EntryBody =
@@ -283,8 +366,15 @@ export interface ChainInventory {
   readonly changes: number;
   readonly findings: readonly string[];
   readonly hash: string;
+  // The waiting horizon of every chain built on this baseline: the one-hour
+  // token lifetime, or twelve hours when the lifetime path was ambiguous
+  // before this baseline (see extendedTokenHorizonSeconds).
+  readonly horizonSeconds: number;
   readonly observations: number;
   readonly observedAt: string;
+  // When the observation that set this baseline completed: the earliest a
+  // DENIED probe can start a chain, and the instant later reads are ordered by.
+  readonly observedUntil: string;
   readonly summary: InventorySummary;
   readonly verifiedAt: string;
 }
@@ -400,7 +490,17 @@ export interface DeliverRequest {
   readonly token: string;
 }
 
-export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest;
+export const maintenanceActions = ["close", "open"] as const;
+export type MaintenanceAction = (typeof maintenanceActions)[number];
+
+export interface MaintenanceRequest {
+  readonly kind: "maintenance";
+  readonly action: MaintenanceAction;
+  readonly bodyHash: string;
+  readonly key: string;
+}
+
+export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest | MaintenanceRequest;
 
 export function intentOf(body: AppendBody): Intent {
   return body.kind === "restore" ? "RESTORE" : "QUARANTINE";
@@ -412,8 +512,15 @@ const decimalId = /^[1-9][0-9]*$/;
 const serviceAccountId = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const projectId = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const repositoryName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const region = /^[a-z]+-[a-z]+[0-9]$/;
+// A Google Cloud location identifier as the location APIs publish them:
+// continent, hyphen, area, then a one-or-more-digit ordinal (europe-west1,
+// europe-west10, northamerica-northeast2). Nothing assumes a single digit.
+export const regionId = /^[a-z]+-[a-z]+[1-9][0-9]*$/;
+const region = regionId;
 const commitSha = /^[0-9a-f]{40}$/;
+// A v2 principal identifier of the two kinds the Deny forms name outside the
+// broker's own derivations: a Google Account or a service account.
+export const principalId = /^principal:\/\/(?:goog\/subject\/[^/\s]+@[^/\s]+|iam\.googleapis\.com\/projects\/-\/serviceAccounts\/[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com)$/;
 
 export function loadRecoveryAuthority(authorityText: string, manifestText: string): RecoveryAuthority {
   let document: unknown;
@@ -423,7 +530,18 @@ export function loadRecoveryAuthority(authorityText: string, manifestText: strin
     throw new AuthorityError(`${authorityPath}: ${String(error)}`);
   }
   const root = record(document, authorityPath);
-  exactKeys(root, ["broker", "consumers", "githubOwner", "githubOwnerId", "platformRepository", "platformRepositoryId"], authorityPath);
+  exactKeys(root, ["bootstrapPrincipal", "broker", "consumers", "githubOwner", "githubOwnerId", "maintenancePrincipals", "organizationId", "platformRepository", "platformRepositoryId"], authorityPath);
+  const organizationId = root.organizationId;
+  if (organizationId !== null && (typeof organizationId !== "string" || !decimalId.test(organizationId))) throw new AuthorityError(`${authorityPath}.organizationId must be null or one positive decimal organization ID.`);
+  const bootstrapPrincipal = root.bootstrapPrincipal;
+  if (bootstrapPrincipal !== null && (typeof bootstrapPrincipal !== "string" || !principalId.test(bootstrapPrincipal))) throw new AuthorityError(`${authorityPath}.bootstrapPrincipal must be null or one v2 principal identifier.`);
+  const maintenancePrincipals = root.maintenancePrincipals;
+  if (!Array.isArray(maintenancePrincipals) || !maintenancePrincipals.every((principal): principal is string => typeof principal === "string" && principalId.test(principal))) {
+    throw new AuthorityError(`${authorityPath}.maintenancePrincipals must be a list of v2 principal identifiers.`);
+  }
+  if (new Set(maintenancePrincipals).size !== maintenancePrincipals.length || [...maintenancePrincipals].sort().join(",") !== maintenancePrincipals.join(",")) {
+    throw new AuthorityError(`${authorityPath}.maintenancePrincipals must be sorted and unique.`);
+  }
   const githubOwner = string(root.githubOwner, `${authorityPath}.githubOwner`);
   const githubOwnerId = string(root.githubOwnerId, `${authorityPath}.githubOwnerId`);
   const platformRepository = string(root.platformRepository, `${authorityPath}.platformRepository`);
@@ -455,7 +573,7 @@ export function loadRecoveryAuthority(authorityText: string, manifestText: strin
       throw new AuthorityError(`${manifestPath}: the reconciler ${broker.reconcilerServiceAccount} cannot also be a recovery invoker.`);
     }
   }
-  return { broker, consumers, entries: manifest.entries, githubOwner, githubOwnerId, platformRepository, platformRepositoryId, targetAccounts };
+  return { bootstrapPrincipal, broker, consumers, entries: manifest.entries, githubOwner, githubOwnerId, maintenancePrincipals, organizationId, platformRepository, platformRepositoryId, targetAccounts };
 }
 
 function parseConsumers(value: unknown, targetAccounts: readonly string[]): readonly Consumer[] {
@@ -732,6 +850,14 @@ export function parseDeliverBody(body: unknown): DeliverRequest {
   return { kind: "deliver", token: source.token };
 }
 
+export function parseMaintenanceBody(body: unknown): MaintenanceRequest {
+  const source = requestRecord(body, "body");
+  requestKeys(source, ["action", "key"]);
+  const key = requestKey(source.key);
+  if (typeof source.action !== "string" || !(maintenanceActions as readonly string[]).includes(source.action)) throw new RequestError(`action must be one of ${maintenanceActions.join(", ")}`);
+  return { kind: "maintenance", action: source.action as MaintenanceAction, bodyHash: sha256Hex(canonicalJson({ action: source.action, key })), key };
+}
+
 export const emptyMemberChain: MemberChain = { allowed: { count: 0, lastObservedAt: null }, denied: 0, post: null, revocation: null };
 
 // The chains of a target at journaling: one empty chain per exact managed
@@ -740,16 +866,28 @@ export function emptyChain(members: readonly string[]): TargetChain {
   return { inventory: null, journaled: 0, members: Object.fromEntries([...members].sort().map((member) => [member, emptyMemberChain])), suppressed: 0 };
 }
 
-export function horizonOf(revocation: ProbeRecord): number {
-  return Date.parse(revocation.observedAt) + tokenHorizonSeconds * 1000;
+export function horizonOf(revocation: ProbeRecord, horizonSeconds: number): number {
+  return Date.parse(revocation.observedAt) + horizonSeconds * 1000;
 }
 
 // The earliest instant a DENIED observation can start a chain for this
-// target: the quarantine acknowledgement, then the inventory baseline.
+// target: the quarantine acknowledgement, then the completion of the
+// inventory baseline's observation.
 export function chainFloor(state: TargetState): number {
   const acked = state.effect.ackedAt === null ? Number.NaN : Date.parse(state.effect.ackedAt);
-  const baseline = state.chain.inventory === null ? Number.NaN : Date.parse(state.chain.inventory.observedAt);
+  const baseline = state.chain.inventory === null ? Number.NaN : Date.parse(state.chain.inventory.observedUntil);
   return Math.max(acked, baseline);
+}
+
+// Whether the token-lifetime path was ambiguous between two inventories: the
+// Deny form was not steady in either, or a bound role's definition or a
+// lifetime-extension policy resource moved. Chains rebuilt after such a
+// change wait the maximum lifetime the path could have granted.
+export function lifetimeAmbiguous(previous: InventorySummary, next: InventorySummary): boolean {
+  if (previous.denyState.form !== "steady" || next.denyState.form !== "steady") return true;
+  if (canonicalJson(previous.lifetimePolicies) !== canonicalJson(next.lifetimePolicies)) return true;
+  if (canonicalJson(previous.roles) !== canonicalJson(next.roles)) return true;
+  return previous.lifetimeExtension !== next.lifetimeExtension;
 }
 
 export type Observation =
@@ -787,25 +925,31 @@ function voidBefore(members: Readonly<Record<string, MemberChain>>, instant: num
 export function applyObservation(state: TargetState, observation: Observation): { readonly chain: TargetChain; readonly role: ChainRole } {
   const chain = state.chain;
   if (observation.kind === "inventory") {
-    const { findings, hash, observedAt, summary } = observation.inventory;
+    const { findings, hash, observedAt, observedUntil, summary } = observation.inventory;
     if (chain.inventory === null) {
-      return { chain: { ...chain, inventory: { changes: 0, findings, hash, observations: 1, observedAt, summary, verifiedAt: observedAt } }, role: "BASELINE" };
+      const horizonSeconds = summary.denyState.form === "steady" ? tokenHorizonSeconds : extendedTokenHorizonSeconds;
+      return { chain: { ...chain, inventory: { changes: 0, findings, hash, horizonSeconds, observations: 1, observedAt, observedUntil, summary, verifiedAt: observedUntil } }, role: "BASELINE" };
     }
-    const observed = Date.parse(observedAt);
+    // Inventories are ordered by the completion of their reads: an
+    // observation that completed before the latest recorded one is stale.
+    const observed = Date.parse(observedUntil);
     const latest = Date.parse(chain.inventory.verifiedAt);
     if (observed < latest) return { chain, role: "STALE" };
     if (chain.inventory.hash === hash) {
       // A strictly later confirmation of the same hash settles any conflict marker.
       const settled = observed > latest ? findings : chain.inventory.findings;
-      return { chain: { ...chain, inventory: { ...chain.inventory, findings: settled, observations: chain.inventory.observations + 1, verifiedAt: observedAt } }, role: "REDUNDANT" };
+      return { chain: { ...chain, inventory: { ...chain.inventory, findings: settled, observations: chain.inventory.observations + 1, verifiedAt: observedUntil } }, role: "REDUNDANT" };
     }
+    // A change could have landed at any instant up to the read that detected
+    // it: every chain whose revocation was observed before that read is void.
+    const horizonSeconds = lifetimeAmbiguous(chain.inventory.summary, summary) ? extendedTokenHorizonSeconds : tokenHorizonSeconds;
     if (observed === latest) {
-      const conflict = `conflict:${chain.inventory.hash}!=${hash}@${observedAt}`;
+      const conflict = `conflict:${chain.inventory.hash}!=${hash}@${observedUntil}`;
       const merged = [...new Set([...chain.inventory.findings, ...findings, conflict])].sort();
       return {
         chain: {
           ...chain,
-          inventory: { changes: chain.inventory.changes + 1, findings: merged, hash, observations: chain.inventory.observations + 1, observedAt, summary, verifiedAt: observedAt },
+          inventory: { changes: chain.inventory.changes + 1, findings: merged, hash, horizonSeconds, observations: chain.inventory.observations + 1, observedAt, observedUntil, summary, verifiedAt: observedUntil },
           members: voidBefore(chain.members, observed + 1),
         },
         role: "CONFLICT",
@@ -814,8 +958,8 @@ export function applyObservation(state: TargetState, observation: Observation): 
     return {
       chain: {
         ...chain,
-        inventory: { changes: chain.inventory.changes + 1, findings, hash, observations: chain.inventory.observations + 1, observedAt, summary, verifiedAt: observedAt },
-        members: voidBefore(chain.members, observed),
+        inventory: { changes: chain.inventory.changes + 1, findings, hash, horizonSeconds, observations: chain.inventory.observations + 1, observedAt, observedUntil, summary, verifiedAt: observedUntil },
+        members: voidBefore(chain.members, observed + 1),
       },
       role: "CHANGE",
     };
@@ -841,7 +985,7 @@ export function applyObservation(state: TargetState, observation: Observation): 
     if (observed >= chainFloor(state) && afterAllowed) return { chain: withMember({ ...counted, revocation: probe }), role: "REVOCATION" };
     return { chain: withMember(counted), role: "REDUNDANT" };
   }
-  if (member.post === null && observed >= horizonOf(member.revocation)) return { chain: withMember({ ...counted, post: probe }), role: "HORIZON" };
+  if (member.post === null && observed >= horizonOf(member.revocation, chain.inventory.horizonSeconds)) return { chain: withMember({ ...counted, post: probe }), role: "HORIZON" };
   return { chain: withMember(counted), role: "REDUNDANT" };
 }
 
@@ -919,7 +1063,7 @@ export function scanReadiness(shard: Shard, now: Date): ScanReadiness {
         horizonKnown = false;
         continue;
       }
-      const memberHorizon = horizonOf(memberChain.revocation);
+      const memberHorizon = horizonOf(memberChain.revocation, chain.inventory.horizonSeconds);
       horizon = Math.max(horizon, memberHorizon);
       if (now.getTime() < memberHorizon) {
         blockers.push(`${account}: token horizon of ${member} drains at ${new Date(memberHorizon).toISOString()}`);
@@ -952,8 +1096,8 @@ export function probesNeeded(shard: Shard, now: Date, members: (account: string)
       if (memberChain.revocation === null) {
         const floor = Math.max(chainFloor(state), memberChain.allowed.lastObservedAt === null ? 0 : Date.parse(memberChain.allowed.lastObservedAt) + 1);
         needs.push({ ...base, notBefore: new Date(floor).toISOString(), phase: "REVOCATION" });
-      } else if (memberChain.post === null && now.getTime() >= horizonOf(memberChain.revocation)) {
-        needs.push({ ...base, notBefore: new Date(horizonOf(memberChain.revocation)).toISOString(), phase: "HORIZON" });
+      } else if (memberChain.post === null && now.getTime() >= horizonOf(memberChain.revocation, chain.inventory.horizonSeconds)) {
+        needs.push({ ...base, notBefore: new Date(horizonOf(memberChain.revocation, chain.inventory.horizonSeconds)).toISOString(), phase: "HORIZON" });
       }
     }
   }
@@ -966,6 +1110,7 @@ export interface FreshInventory {
   readonly findings: readonly string[];
   readonly hash: string;
   readonly observedAt: string;
+  readonly observedUntil: string;
 }
 
 // The blockers a gate raises when the freshly observed inventory of a target
@@ -982,7 +1127,7 @@ export function inventoryDrift(shard: Shard, fresh: Readonly<Record<string, Fres
       continue;
     }
     if (current.findings.length > 0) blockers.push(`${account}: alternate credential paths at the gate ${current.findings.join(", ")}`);
-    if (Date.parse(current.observedAt) < Date.parse(state.chain.inventory.verifiedAt)) blockers.push(`${account}: the credential inventory observed at the gate is older than the inventory recorded at ${state.chain.inventory.verifiedAt}`);
+    if (Date.parse(current.observedUntil) < Date.parse(state.chain.inventory.verifiedAt)) blockers.push(`${account}: the credential inventory observed at the gate is older than the inventory recorded at ${state.chain.inventory.verifiedAt}`);
     if (current.hash !== state.chain.inventory.hash) blockers.push(`${account}: credential inventory changed since ${state.chain.inventory.observedAt}`);
   }
   return blockers;
@@ -993,7 +1138,7 @@ export function probeKey(probe: ProbeRecord): string {
 }
 
 export function inventoryKey(inventory: InventoryRecord): string {
-  return `inventory/${inventory.account}/${inventory.observedAt}`;
+  return `inventory/${inventory.account}/${inventory.observedUntil}`;
 }
 
 export function inventoryHash(summary: InventorySummary): string {
@@ -1004,10 +1149,14 @@ export function inventorySummaryJson(summary: InventorySummary): Record<string, 
   return {
     ancestry: [...summary.ancestry],
     attachments: [...summary.attachments],
+    denyState: { form: summary.denyState.form, policies: summary.denyState.policies.map((policy) => ({ attachment: policy.attachment, etag: policy.etag, name: policy.name })) },
     grants: [...summary.grants],
     keys: [...summary.keys],
     lifetimeExtension: summary.lifetimeExtension,
+    lifetimePolicies: [...summary.lifetimePolicies],
+    neutralized: [...summary.neutralized],
     policies: summary.policies.map((policy) => ({ etag: policy.etag, resource: policy.resource })),
+    roles: summary.roles.map((role) => ({ etag: role.etag, name: role.name })),
     services: [...summary.services],
   };
 }
