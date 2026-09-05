@@ -494,10 +494,10 @@ try {
     !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.url !== "string" ||
     manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-04T00:30:56Z_1788503446.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "d588f263d59606363b9e499aa5631c1c8a504cb447304797ca5c92cb7ff44a29" ||
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-05T00:31:34Z_1788589620.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "43c58300b3989b927b54a71ab7c4b53b3cba7e1a47ca1ca09c04cd288efdbc4a" ||
     manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-09-04T06:30:46Z"
+    manifest.built !== "2026-09-05T06:27:00Z"
   ) {
     failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
   }
@@ -594,7 +594,7 @@ for (const [path, workflow] of [
 }
 const artifactContract = await read("tools/ci/container-artifact-contract.sh");
 for (const boundary of [
-  "GRYPE_DB_MANIFEST_SHA256=e90711b1338537f9ddaf79ce07105ed89bfbb71b995087bfc67d5788addd8720",
+  "GRYPE_DB_MANIFEST_SHA256=2409add386e2f92996559f098f991f2097c09681bb59fea38e77f67e01ffbf8e",
   'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
   'test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST"',
   'verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"',
