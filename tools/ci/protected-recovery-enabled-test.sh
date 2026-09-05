@@ -179,11 +179,15 @@ verification() {
   esac
   if [ "$verified" = true ]; then
     certificate="$(certificate "$phase" "$variant" | jq -R -r '@json')"
-    statement="$(jq -cn --arg sha "$(raw_of "$phase")" --argjson predicate "$(predicate "$phase" "$variant")" '{
+    # The predicate carries every row of both phases and exceeds a single
+    # argument's size on Linux (MAX_ARG_STRLEN), so it reaches jq as a file
+    # rather than as argv.
+    predicate "$phase" "$variant" > "$copy/predicate.json"
+    statement="$(jq -cn --arg sha "$(raw_of "$phase")" --slurpfile predicate "$copy/predicate.json" '{
       "_type": "https://in-toto.io/Statement/v1",
       predicateType: "https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v2",
       subject: [{ name: "deny-canary.json", digest: { sha256: $sha } }],
-      predicate: $predicate
+      predicate: $predicate[0]
     }' | jq -R -r '@json')"
   else
     certificate='"{}"'
