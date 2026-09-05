@@ -1,12 +1,16 @@
 import type { Ledger } from "./ledger";
 import {
+  type Consumer,
   type Entry,
   type ExpectedSnapshot,
   type Intent,
   type ObservedSnapshot,
   type ProbeOutcome,
+  type RecoveryAuthority,
   type Target,
   canonicalJson,
+  consumerPool,
+  consumerProvider,
   isRecord,
   managedRole,
   probePermission,
@@ -63,9 +67,9 @@ export interface ServiceAccountIam {
 }
 
 // A negative impersonation probe: an attempt of exactly the probe permission
-// as the managed member against the exact target identity, by a principal the
-// broker trusts, with the outcome observed by the broker. The result names
-// that principal and the observation time.
+// as the managed member against the exact target identity, performed by the
+// broker itself, with the outcome observed by the broker. The result names
+// the exact federated principal and the broker's observation time.
 export interface ProbeRequest {
   readonly email: string;
   readonly member: string;
@@ -78,16 +82,18 @@ export type ProbeResult =
   | { readonly kind: "observed"; readonly observedAt: string; readonly outcome: ProbeOutcome; readonly principal: string }
   | { readonly kind: "unavailable"; readonly reason: string };
 
+// Whether the probe source can act as the managed member of every target
+// right now: a positive control taken before a QUARANTINE is accepted and
+// again before any of its effects is prepared, so that no binding is removed
+// unless the observation that ends the quarantine can be made.
+export type PreflightOutcome =
+  | { readonly kind: "operational"; readonly principals: Readonly<Record<string, string>> }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
 export interface ImpersonationProbe {
+  preflight(targets: readonly Target[]): Promise<PreflightOutcome>;
   probe(request: ProbeRequest): Promise<ProbeResult>;
 }
-
-// The production binding until an approved probe source exists: every probe
-// is unavailable, nothing is recorded, and readiness names the prerequisite.
-// This can never satisfy a gate; it only refuses.
-export const undeployedProbe: ImpersonationProbe = {
-  probe: async () => ({ kind: "unavailable", reason: probePrerequisite }),
-};
 
 export type DriveOutcome =
   | { readonly kind: "acked"; readonly entry: Entry }
@@ -98,7 +104,9 @@ export type DriveOutcome =
   | { readonly kind: "terminal"; readonly entry: Entry };
 
 // Roles on the target itself that issue or refresh its credentials by some
-// path other than the modeled one. They are never touched, only reported.
+// path other than the modeled one. They are never touched, only reported at
+// PREPARE from the very policy the effect compare-and-sets; the credential
+// inventory (inventory.ts) is the binding judgement, with role expansion.
 const credentialRoles = [
   "roles/iam.serviceAccountAdmin",
   "roles/iam.serviceAccountKeyAdmin",
@@ -307,13 +315,49 @@ function strictRecord(value: unknown, label: string, keys: readonly string[]): R
   return value;
 }
 
+export type JsonResponse =
+  | { readonly kind: "response"; readonly ok: boolean; readonly status: number; readonly body: unknown }
+  | { readonly kind: "unreachable"; readonly reason: string };
+
+const maxResourceBytes = 4 * 1024 * 1024;
+
+// One bounded JSON exchange with a Google API: a bearer token, an optional
+// JSON body, and a parsed answer or an unreachable verdict. A body that is
+// not JSON or exceeds the bound is a failed response, never a snapshot.
+export async function sendJson(fetcher: typeof fetch, method: "GET" | "POST", url: string, body: unknown, bearer: string | undefined, headers: Readonly<Record<string, string>> = {}): Promise<JsonResponse> {
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
+      headers: { ...headers, ...(bearer === undefined ? {} : { Authorization: `Bearer ${bearer}` }), ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
+      method,
+      redirect: "error",
+    });
+  } catch (error) {
+    return { kind: "unreachable", reason: String(error) };
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } catch (error) {
+    return { kind: "unreachable", reason: `response body lost: ${String(error)}` };
+  }
+  if (bytes.byteLength > maxResourceBytes) return { kind: "response", ok: false, status: response.status, body: undefined };
+  let parsed: unknown;
+  try {
+    parsed = bytes.byteLength === 0 ? undefined : (JSON.parse(new TextDecoder().decode(bytes)) as unknown);
+  } catch {
+    return { kind: "response", ok: false, status: response.status, body: undefined };
+  }
+  return { kind: "response", ok: response.ok, status: response.status, body: parsed };
+}
+
 export interface GoogleIamDependencies {
   readonly baseUrl?: string;
   readonly fetch: typeof fetch;
   readonly token: () => Promise<string>;
 }
 
-const maxResourceBytes = 256 * 1024;
 const conflictStatuses = [409, 412];
 
 // The IAM API client: serviceAccounts.get for the identity of the resource
@@ -330,7 +374,7 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
   }
 
   async getIdentity(resource: string): Promise<IdentityOutcome> {
-    const response = await this.#send("GET", resource, undefined);
+    const response = await sendJson(this.#deps.fetch, "GET", `${this.#baseUrl}/v1/${resource}`, undefined, await this.#deps.token());
     if (response.kind === "unreachable") return { kind: "unavailable", reason: response.reason };
     if (!response.ok) return { kind: "unavailable", reason: `HTTP ${response.status}` };
     const body = response.body;
@@ -341,7 +385,7 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
   }
 
   async getPolicy(resource: string): Promise<ReadOutcome> {
-    const response = await this.#post(`${resource}:getIamPolicy`, { options: { requestedPolicyVersion: 3 } });
+    const response = await sendJson(this.#deps.fetch, "POST", `${this.#baseUrl}/v1/${resource}:getIamPolicy`, { options: { requestedPolicyVersion: 3 } }, await this.#deps.token());
     if (response.kind === "unreachable") return { kind: "unavailable", reason: response.reason };
     if (!response.ok) return { kind: "unavailable", reason: `HTTP ${response.status}` };
     try {
@@ -352,7 +396,7 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
   }
 
   async setPolicy(resource: string, policy: Policy): Promise<WriteOutcome> {
-    const response = await this.#post(`${resource}:setIamPolicy`, { policy: policyJson(policy), updateMask: "bindings,etag" });
+    const response = await sendJson(this.#deps.fetch, "POST", `${this.#baseUrl}/v1/${resource}:setIamPolicy`, { policy: policyJson(policy), updateMask: "bindings,etag" }, await this.#deps.token());
     if (response.kind === "unreachable") return { kind: "lost", reason: response.reason };
     if (response.ok) {
       try {
@@ -365,36 +409,214 @@ export class GoogleServiceAccountIam implements ServiceAccountIam {
     if (response.status >= 500) return { kind: "lost", reason: `HTTP ${response.status}` };
     return { kind: "refused", status: response.status };
   }
+}
 
-  async #post(path: string, body: unknown): Promise<{ readonly kind: "response"; readonly ok: boolean; readonly status: number; readonly body: unknown } | { readonly kind: "unreachable"; readonly reason: string }> {
-    return await this.#send("POST", path, body);
+// RS256 JSON Web Tokens verified against a JWKS: the shape every identity
+// the broker trusts arrives in, from Google (its callers) and from GitHub
+// (the canonical jobs whose credentials its probes act with).
+export interface Jwk {
+  readonly alg?: string;
+  readonly e: string;
+  readonly kid: string;
+  readonly kty: string;
+  readonly n: string;
+  readonly use?: string;
+}
+
+export async function verifyRs256Jwt(token: string, jwks: readonly Jwk[]): Promise<Record<string, unknown> | undefined> {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts.some((part) => part.length === 0 || part.length > 8192)) return undefined;
+  const [encodedHeader, encodedPayload, encodedSignature] = parts as [string, string, string];
+  let header: unknown;
+  let payload: unknown;
+  try {
+    header = JSON.parse(Buffer.from(encodedHeader, "base64url").toString("utf8")) as unknown;
+    payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(header) || header.alg !== "RS256" || typeof header.kid !== "string") return undefined;
+  const key = jwks.find((candidate) => candidate.kid === header.kid && candidate.kty === "RSA");
+  if (!key) return undefined;
+  let verified: boolean;
+  try {
+    const cryptoKey = await crypto.subtle.importKey("jwk", { e: key.e, kty: "RSA", n: key.n }, { hash: "SHA-256", name: "RSASSA-PKCS1-v1_5" }, false, ["verify"]);
+    verified = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, Buffer.from(encodedSignature, "base64url"), Buffer.from(`${encodedHeader}.${encodedPayload}`, "utf8"));
+  } catch {
+    return undefined;
+  }
+  return verified && isRecord(payload) ? payload : undefined;
+}
+
+export function cachedJwks(url: string, fetcher: typeof fetch, now: () => Date): () => Promise<readonly Jwk[]> {
+  let cached: { readonly keys: readonly Jwk[]; readonly until: number } | undefined;
+  return async () => {
+    if (cached && cached.until > now().getTime()) return cached.keys;
+    const response = await fetcher(url, { redirect: "error" });
+    if (!response.ok) throw new Error(`JWKS fetch failed with HTTP ${response.status}.`);
+    const body = JSON.parse(await response.text()) as unknown;
+    const keys = isRecord(body) && Array.isArray(body.keys)
+      ? body.keys.filter((key): key is Jwk => isRecord(key) && typeof key.kid === "string" && typeof key.n === "string" && typeof key.e === "string" && key.kty === "RSA")
+      : [];
+    const maxAge = /max-age=(\d+)/.exec(response.headers.get("cache-control") ?? "")?.[1];
+    cached = { keys, until: now().getTime() + Math.min(Number(maxAge ?? "300"), 3600) * 1000 };
+    return keys;
+  };
+}
+
+export const githubIssuer = "https://token.actions.githubusercontent.com";
+export const githubJwksUrl = `${githubIssuer}/.well-known/jwks`;
+const clockSkewSeconds = 60;
+
+// The credential of a managed member: the GitHub OIDC token of the one
+// canonical job that is that member, minted for the consumer provider's
+// audience. Only such a job can hold it, and only with it can the broker act
+// as the member at STS and IAM Credentials.
+export type MemberToken =
+  | { readonly kind: "token"; readonly token: string }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
+export interface MemberCredentialSource {
+  oidcTokenFor(member: string): Promise<MemberToken>;
+}
+
+// The production binding until a consumer job delivers its token to the
+// broker: every member's credential is unavailable, so every preflight fails
+// and every QUARANTINE is refused before acceptance and before any mutation.
+export const undeployedMemberCredentials: MemberCredentialSource = {
+  oidcTokenFor: async () => ({ kind: "unavailable", reason: probePrerequisite }),
+};
+
+export interface IssuanceProbeDependencies {
+  readonly authority: RecoveryAuthority;
+  readonly credentials: MemberCredentialSource;
+  readonly endpoints?: { readonly credentials?: string; readonly iam?: string; readonly sts?: string };
+  readonly fetch: typeof fetch;
+  // GitHub's JWKS, for the canonical jobs' OIDC tokens.
+  readonly jwks: () => Promise<readonly Jwk[]>;
+  readonly now: () => Date;
+}
+
+type Federated =
+  | { readonly kind: "federated"; readonly accessToken: string; readonly principal: string }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
+// The broker-verifiable issuance probe. For a managed member the broker
+// verifies the canonical job's GitHub OIDC token against GitHub's JWKS,
+// derives the member from the token's claims exactly as the consumer
+// provider maps them and requires equality, exchanges the token at STS for
+// the consumer pool, and then makes the IAM Credentials request itself
+// against the target's permanent identity: generateAccessToken for a probe
+// (ALLOWED on success, DENIED only on an IAM permission denial of exactly the
+// probe permission, unavailable for anything else) and testIamPermissions
+// for the preflight positive control. Every result is bound to the exact
+// federated principal, the target unique ID, the member, the permission, the
+// broker's clock, and the API's own answer; no analysis API stands in.
+export class GoogleIssuanceProbe implements ImpersonationProbe {
+  readonly #deps: IssuanceProbeDependencies;
+
+  constructor(deps: IssuanceProbeDependencies) {
+    this.#deps = deps;
   }
 
-  async #send(method: "GET" | "POST", path: string, body: unknown): Promise<{ readonly kind: "response"; readonly ok: boolean; readonly status: number; readonly body: unknown } | { readonly kind: "unreachable"; readonly reason: string }> {
-    let response: Response;
-    try {
-      response = await this.#deps.fetch(`${this.#baseUrl}/v1/${path}`, {
-        ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
-        headers: { Authorization: `Bearer ${await this.#deps.token()}`, ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
-        method,
-        redirect: "error",
-      });
-    } catch (error) {
-      return { kind: "unreachable", reason: String(error) };
+  async preflight(targets: readonly Target[]): Promise<PreflightOutcome> {
+    const principals: Record<string, string> = {};
+    const reasons: string[] = [];
+    for (const target of targets) {
+      const member = target.members[0];
+      if (member === undefined) {
+        reasons.push(`${target.account}: no managed member`);
+        continue;
+      }
+      const federated = await this.#federated(target.resource, member);
+      if (federated.kind === "unavailable") {
+        reasons.push(`${target.account}: ${federated.reason}`);
+        continue;
+      }
+      const response = await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("iam")}/v1/projects/-/serviceAccounts/${target.uniqueId}:testIamPermissions`, { permissions: [probePermission] }, federated.accessToken);
+      if (response.kind === "unreachable") {
+        reasons.push(`${target.account}: ${response.reason}`);
+        continue;
+      }
+      const granted = response.ok && isRecord(response.body) && Array.isArray(response.body.permissions) && response.body.permissions.includes(probePermission);
+      if (!granted) {
+        reasons.push(`${target.account}: the member is not affirmed for ${probePermission} on ${target.uniqueId} (HTTP ${response.status}); the probe cannot serve as a positive control`);
+        continue;
+      }
+      principals[target.account] = federated.principal;
     }
-    let bytes: Uint8Array;
-    try {
-      bytes = new Uint8Array(await response.arrayBuffer());
-    } catch (error) {
-      return { kind: "unreachable", reason: `response body lost: ${String(error)}` };
-    }
-    if (bytes.byteLength > maxResourceBytes) return { kind: "response", ok: false, status: response.status, body: undefined };
-    let parsed: unknown;
-    try {
-      parsed = bytes.byteLength === 0 ? undefined : (JSON.parse(new TextDecoder().decode(bytes)) as unknown);
-    } catch {
-      return { kind: "response", ok: false, status: response.status, body: undefined };
-    }
-    return { kind: "response", ok: response.ok, status: response.status, body: parsed };
+    return reasons.length === 0 ? { kind: "operational", principals } : { kind: "unavailable", reason: reasons.join("; ") };
   }
+
+  async probe(request: ProbeRequest): Promise<ProbeResult> {
+    if (request.permission !== probePermission) return { kind: "unavailable", reason: `the probe permission is ${probePermission}` };
+    const federated = await this.#federated(request.resource, request.member);
+    if (federated.kind === "unavailable") return federated;
+    const response = await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("credentials")}/v1/projects/-/serviceAccounts/${request.uniqueId}:generateAccessToken`, { lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, federated.accessToken);
+    const observedAt = this.#deps.now().toISOString();
+    if (response.kind === "unreachable") return { kind: "unavailable", reason: response.reason };
+    // The minted token, if any, is never retained: the answer is the evidence.
+    if (response.ok) return { kind: "observed", observedAt, outcome: "ALLOWED", principal: federated.principal };
+    if (response.status === 403 && deniedForProbePermission(response.body)) return { kind: "observed", observedAt, outcome: "DENIED", principal: federated.principal };
+    return { kind: "unavailable", reason: `generateAccessToken answered HTTP ${response.status} without an IAM denial of ${probePermission}` };
+  }
+
+  async #federated(resource: string, member: string): Promise<Federated> {
+    const consumer = this.#consumerOf(resource);
+    if (!consumer) return { kind: "unavailable", reason: `${resource} belongs to no declared consumer` };
+    const pool = consumerPool(this.#deps.authority, consumer);
+    const provider = consumerProvider(this.#deps.authority, consumer);
+    const credential = await this.#deps.credentials.oidcTokenFor(member);
+    if (credential.kind === "unavailable") return credential;
+    const claims = await verifyRs256Jwt(credential.token, await this.#deps.jwks());
+    if (!claims) return { kind: "unavailable", reason: "the member credential is not a GitHub-signed RS256 token" };
+    const nowSeconds = Math.floor(this.#deps.now().getTime() / 1000);
+    if (claims.iss !== githubIssuer) return { kind: "unavailable", reason: "the member credential was not issued by GitHub Actions" };
+    if (claims.aud !== `https://iam.googleapis.com/${provider}`) return { kind: "unavailable", reason: "the member credential is not minted for the consumer provider audience" };
+    if (typeof claims.exp !== "number" || claims.exp <= nowSeconds - clockSkewSeconds) return { kind: "unavailable", reason: "the member credential has expired" };
+    if (typeof claims.iat !== "number" || claims.iat > nowSeconds + clockSkewSeconds) return { kind: "unavailable", reason: "the member credential is not yet valid" };
+    if (claims.repository_owner_id !== this.#deps.authority.githubOwnerId || claims.repository_id !== consumer.repositoryId || claims.runner_environment !== "github-hosted") {
+      return { kind: "unavailable", reason: "the member credential was minted outside the consumer repository on GitHub-hosted runners" };
+    }
+    const composite = ["workflow_ref", "job_workflow_ref", "job_workflow_sha", "environment", "event_name"].map((claim) => claims[claim]);
+    if (typeof claims.sub !== "string" || claims.sub.length === 0 || !composite.every((value): value is string => typeof value === "string" && value.length > 0)) {
+      return { kind: "unavailable", reason: "the member credential lacks the subject or the authority claims" };
+    }
+    const derived = `principalSet://iam.googleapis.com/${pool}/attribute.authority/${composite.join(":")}`;
+    if (derived !== member) return { kind: "unavailable", reason: `the member credential is ${derived}, not the probed member` };
+    const exchange = await sendJson(this.#deps.fetch, "POST", `${this.#endpoint("sts")}/v1/token`, {
+      audience: `//iam.googleapis.com/${provider}`,
+      grantType: "urn:ietf:params:oauth:grant-type:token-exchange",
+      requestedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+      scope: "https://www.googleapis.com/auth/cloud-platform",
+      subjectToken: credential.token,
+      subjectTokenType: "urn:ietf:params:oauth:token-type:jwt",
+    }, undefined);
+    if (exchange.kind === "unreachable") return { kind: "unavailable", reason: `STS is unreachable: ${exchange.reason}` };
+    if (!exchange.ok || !isRecord(exchange.body) || typeof exchange.body.access_token !== "string" || exchange.body.access_token.length === 0) {
+      return { kind: "unavailable", reason: `STS refused the member credential with HTTP ${exchange.status}` };
+    }
+    return { kind: "federated", accessToken: exchange.body.access_token, principal: `principal://iam.googleapis.com/${pool}/subject/${claims.sub}` };
+  }
+
+  #consumerOf(resource: string): Consumer | undefined {
+    const match = /^projects\/([^/]+)\/serviceAccounts\/[1-9][0-9]*$/.exec(resource);
+    return match ? this.#deps.authority.consumers.find((consumer) => consumer.projectId === match[1]) : undefined;
+  }
+
+  #endpoint(name: "credentials" | "iam" | "sts"): string {
+    const defaults = { credentials: "https://iamcredentials.googleapis.com", iam: "https://iam.googleapis.com", sts: "https://sts.googleapis.com" };
+    return this.#deps.endpoints?.[name] ?? defaults[name];
+  }
+}
+
+// An IAM permission denial of exactly the probe permission: PERMISSION_DENIED
+// with an ErrorInfo naming that permission, or the documented message form.
+function deniedForProbePermission(body: unknown): boolean {
+  if (!isRecord(body) || !isRecord(body.error) || body.error.status !== "PERMISSION_DENIED") return false;
+  const details = Array.isArray(body.error.details) ? body.error.details : [];
+  for (const detail of details) {
+    if (isRecord(detail) && detail.reason === "IAM_PERMISSION_DENIED" && isRecord(detail.metadata) && detail.metadata.permission === probePermission) return true;
+  }
+  return typeof body.error.message === "string" && body.error.message.includes(`'${probePermission}'`);
 }

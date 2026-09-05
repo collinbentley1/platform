@@ -1,21 +1,24 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type RecoveryIntent, manifestPath, recoveryInvokerName } from "../../tools/ci/workflow-authority";
-import { type IdentityOutcome, type ImpersonationProbe, type Policy, type PolicyBinding, type ProbeRequest, type ProbeResult, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
-import { Broker, type Identity, type IdentityVerifier } from "../src/http";
-import { Ledger } from "../src/ledger";
-import { type ProbeOutcome, type RecoveryAuthority, type Target, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody } from "../src/model";
+import { type IdentityOutcome, type ImpersonationProbe, type Policy, type PolicyBinding, type PreflightOutcome, type ProbeRequest, type ProbeResult, type ReadOutcome, type ServiceAccountIam, type WriteOutcome } from "../src/effects";
+import { Broker, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
+import { type CredentialInventory, type InventoryOutcome, inventoryFindings } from "../src/inventory";
+import { type Fresh, Ledger } from "../src/ledger";
+import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type Target, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, probesNeeded, targetOfEffect } from "../src/model";
 import { type EvidenceStore, type GetOutcome, type PutOutcome } from "../src/outbox";
 
 // Test support. The ledger is the real Firestore emulator (FIRESTORE_EMULATOR_HOST);
-// the IAM API, the evidence bucket, and the impersonation probe source are
-// in-memory stand-ins with the exact etag, generation, and identity semantics
-// the broker relies on. None of the stand-ins is emulator coverage: the live
-// canary must verify the actual returned etag behaviour of setIamPolicy, the
-// ifGenerationMatch behaviour of GCS, and the identity that serviceAccounts.get
-// returns for a unique-ID resource; and no probe source exists in production
-// at all (see probePrerequisite), so the probe stand-in only exercises the
-// broker's readiness logic over evidence it would record from a real source.
+// the IAM API, the evidence bucket, the impersonation probe source, and the
+// credential inventory are in-memory stand-ins with the exact etag,
+// generation, identity, and hash semantics the broker relies on. None of the
+// stand-ins is emulator coverage: the live canary must verify the actual
+// returned etag behaviour of setIamPolicy, the ifGenerationMatch behaviour of
+// GCS, the identity that serviceAccounts.get returns for a unique-ID resource,
+// and the real answers of the inventory APIs; and no consumer job delivers a
+// member credential to the production probe yet (see probePrerequisite), so
+// the probe stand-in only exercises the broker's readiness logic over
+// evidence it would record from the real source.
 
 export const repoRoot = resolve(import.meta.dir, "..", "..");
 export const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
@@ -121,6 +124,10 @@ export class FakeIam implements ServiceAccountIam {
   refuseOnce: number | undefined;
   unavailableReads = 0;
   unavailableIdentities = 0;
+  // A hung API: an identity read that never settles for these resources, or
+  // a write whose answer never arrives after it landed.
+  readonly hangIdentities = new Set<string>();
+  hangAfterWrite = false;
   #etags = 0;
 
   seed(resource: string, bindings: readonly PolicyBinding[]): Policy {
@@ -130,6 +137,7 @@ export class FakeIam implements ServiceAccountIam {
   }
 
   async getIdentity(resource: string): Promise<IdentityOutcome> {
+    if (this.hangIdentities.has(resource)) await new Promise<never>(() => {});
     if (this.unavailableIdentities > 0) {
       this.unavailableIdentities -= 1;
       return { kind: "unavailable", reason: "HTTP 503" };
@@ -173,6 +181,10 @@ export class FakeIam implements ServiceAccountIam {
       this.throwAfterWrite = false;
       throw new Error("the worker died after the write landed");
     }
+    if (this.hangAfterWrite) {
+      this.hangAfterWrite = false;
+      await new Promise<never>(() => {});
+    }
     if (this.dropResponses > 0) {
       this.dropResponses -= 1;
       return { kind: "lost", reason: "response dropped after the write landed" };
@@ -215,17 +227,30 @@ export class FakeEvidence implements EvidenceStore {
   }
 }
 
-// In-memory stand-in for a trusted probe source: every request is logged,
+// In-memory stand-in for the issuance probe source: every request and every
+// preflight is logged, the preflight is operational unless made unavailable,
 // the outcome is DENIED unless the target's unique ID is set to ALLOWED, and
-// the observation time is the clock's. Production has no such source.
+// the observation time is the clock's. Production has no member credential
+// source yet, so its real adapter refuses every preflight.
 export class FakeProbe implements ImpersonationProbe {
   readonly requests: ProbeRequest[] = [];
+  readonly preflights: Array<readonly Target[]> = [];
   readonly outcomes = new Map<string, ProbeOutcome>();
   unavailable = 0;
+  preflightUnavailable = 0;
   readonly #clock: Clock;
 
   constructor(clock: Clock) {
     this.#clock = clock;
+  }
+
+  async preflight(targets: readonly Target[]): Promise<PreflightOutcome> {
+    this.preflights.push(targets);
+    if (this.preflightUnavailable > 0) {
+      this.preflightUnavailable -= 1;
+      return { kind: "unavailable", reason: "the probe source cannot act as the managed members" };
+    }
+    return { kind: "operational", principals: Object.fromEntries(targets.map((target) => [target.account, proberPrincipal])) };
   }
 
   async probe(request: ProbeRequest): Promise<ProbeResult> {
@@ -235,6 +260,55 @@ export class FakeProbe implements ImpersonationProbe {
       return { kind: "unavailable", reason: "the probe source is unreachable" };
     }
     return { kind: "observed", observedAt: this.#clock.now.toISOString(), outcome: this.outcomes.get(request.uniqueId) ?? "DENIED", principal: proberPrincipal };
+  }
+}
+
+// In-memory stand-in for the credential inventory: every target is clean
+// with a stable summary unless findings are set for its unique ID, the
+// summary's etags move when a target is marked changed, and the observation
+// time is the clock's.
+export class FakeInventory implements CredentialInventory {
+  readonly requests: Target[] = [];
+  readonly findings = new Map<string, readonly string[]>();
+  readonly versions = new Map<string, number>();
+  unavailable = 0;
+  readonly #clock: Clock;
+
+  constructor(clock: Clock) {
+    this.#clock = clock;
+  }
+
+  // Something in the target's credential inventory changed: a later
+  // observation carries a different hash.
+  change(uniqueId: string): void {
+    this.versions.set(uniqueId, (this.versions.get(uniqueId) ?? 0) + 1);
+  }
+
+  summaryOf(target: Target): InventorySummary {
+    const version = this.versions.get(target.uniqueId) ?? 0;
+    const findings = this.findings.get(target.uniqueId) ?? [];
+    return {
+      ancestry: ["projects/882468538648", "organizations/100000000001"],
+      attachments: findings.filter((finding) => finding.startsWith("attachment:")).map((finding) => finding.slice("attachment:".length)),
+      grants: findings.filter((finding) => finding.startsWith("grant:")).map((finding) => finding.slice("grant:".length)),
+      keys: findings.filter((finding) => finding.startsWith("key:")).map((finding) => finding.slice("key:".length)),
+      lifetimeExtension: findings.find((finding) => finding.startsWith("lifetime-extension:"))?.slice("lifetime-extension:".length) ?? null,
+      policies: [
+        { etag: `sa-etag-${target.uniqueId}-${version}`, resource: target.resource },
+        { etag: `project-etag-${version}`, resource: "projects/882468538648" },
+      ],
+      services: ["cloudbuild.googleapis.com:enabled", "compute.googleapis.com:disabled", "run.googleapis.com:enabled"],
+    };
+  }
+
+  async inventory(target: Target, _consumer: Consumer): Promise<InventoryOutcome> {
+    this.requests.push(target);
+    if (this.unavailable > 0) {
+      this.unavailable -= 1;
+      return { kind: "unavailable", reason: "the inventory source is unreachable" };
+    }
+    const summary = this.summaryOf(target);
+    return { kind: "observed", inventory: { account: target.account, email: target.email, findings: inventoryFindings(summary), hash: inventoryHash(summary), observedAt: this.#clock.now.toISOString(), summary, uniqueId: target.uniqueId } };
   }
 }
 
@@ -253,24 +327,26 @@ export interface World {
   readonly clock: Clock;
   readonly evidence: FakeEvidence;
   readonly iam: FakeIam;
+  readonly inventory: FakeInventory;
   readonly ledger: Ledger;
   readonly probe: FakeProbe;
-  // A second service instance sharing the ledger, IAM, evidence, and probe source.
+  // A second service instance sharing the ledger, IAM, evidence, probe, and inventory sources.
   readonly anotherInstance: () => { readonly broker: Broker; readonly ledger: Ledger };
 }
 
-export async function world(clock = new Clock(), fetcher: typeof fetch = fetch): Promise<World> {
+export async function world(clock = new Clock(), fetcher: typeof fetch = fetch, deadlines?: Deadlines): Promise<World> {
   const authority = await testAuthority();
   const project = freshProject();
   const iam = new FakeIam();
   const evidence = new FakeEvidence();
   const probe = new FakeProbe(clock);
+  const inventory = new FakeInventory(clock);
   const instance = () => {
     const ledger = emulatorLedger(clock, fetcher, project);
-    return { broker: new Broker({ authority, evidence, iam, ledger, now: clock.read, probe }), ledger };
+    return { broker: new Broker({ authority, ...(deadlines ? { deadlines } : {}), evidence, iam, inventory, ledger, now: clock.read, probe }), ledger };
   };
   const first = instance();
-  return { authority, broker: first.broker, clock, evidence, iam, ledger: first.ledger, probe, anotherInstance: instance };
+  return { authority, broker: first.broker, clock, evidence, iam, inventory, ledger: first.ledger, probe, anotherInstance: instance };
 }
 
 export const unrelatedBindings: readonly PolicyBinding[] = [
@@ -289,14 +365,41 @@ export function seedTargets(iam: FakeIam, targets: readonly Target[], extra: rea
   }
 }
 
-// Drive an OPEN QUARANTINE shard to scan-ready through the broker's own probe
-// recording: reconcile (acknowledges effects and records revocation probes),
-// drain the one-hour token horizon, reconcile again (records the post-horizon
-// probes).
+// Drive an OPEN QUARANTINE shard to scan-ready through the broker's own
+// observation recording: reconcile (acknowledges effects, records the
+// inventory baselines and the revocation probes), drain the one-hour token
+// horizon, reconcile again (records the post-horizon probes).
 export async function makeReady(w: World, shard: string): Promise<void> {
   await w.broker.reconcileShard(shard);
   w.clock.advance(3600);
   await w.broker.reconcileShard(shard);
+}
+
+// The inventory of every acknowledged target of a shard as the broker would
+// observe it immediately before a gate.
+export async function freshOf(w: World, shardId: string): Promise<Fresh> {
+  const shard = await w.ledger.readShard(shardId);
+  if (!shard) return {};
+  const consumer = w.authority.consumers.find((candidate) => candidate.repository === shard.consumer)!;
+  const fresh: Record<string, FreshInventory> = {};
+  for (const [account, state] of Object.entries(shard.targets)) {
+    if (state.effect.state !== "ACKED") continue;
+    const entry = await w.ledger.readEntry(shardId, state.sequence);
+    if (!entry || entry.body.kind !== "effect") continue;
+    const outcome = await w.inventory.inventory(targetOfEffect(w.authority, consumer, entry.body), consumer);
+    if (outcome.kind === "observed") fresh[account] = { findings: outcome.inventory.findings, hash: outcome.inventory.hash, observedAt: outcome.inventory.observedAt };
+  }
+  return fresh;
+}
+
+// Begin a close exactly as the broker does for an invoker: with the fresh
+// inventory of the shard's targets for a QUARANTINE shard.
+export async function beginClose(w: World, shard: string, key: string, consumer = "cdbentley", intent: RecoveryIntent = "QUARANTINE") {
+  return await w.ledger.beginClose(close(shard, key), consumer, intent, intent === "QUARANTINE" ? await freshOf(w, shard) : undefined);
+}
+
+export async function needsOf(w: World, shard: string, targets: readonly Target[]) {
+  return probesNeeded((await w.ledger.readShard(shard))!, w.clock.now, (account) => targets.find((target) => target.account === account));
 }
 
 export function gate(): { readonly release: () => void; readonly wait: () => Promise<void> } {

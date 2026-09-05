@@ -1,10 +1,25 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { manifestPath } from "../../tools/ci/workflow-authority";
-import { type ImpersonationProbe, type ServiceAccountIam, GoogleServiceAccountIam, driveEffect, undeployedProbe } from "./effects";
-import { type FirestoreTarget, type Rejection, Ledger, LedgerUnavailable } from "./ledger";
 import {
+  type ImpersonationProbe,
+  type Jwk,
+  type ServiceAccountIam,
+  GoogleIssuanceProbe,
+  GoogleServiceAccountIam,
+  cachedJwks,
+  driveEffect,
+  githubJwksUrl,
+  undeployedMemberCredentials,
+  verifyRs256Jwt,
+} from "./effects";
+import { type CredentialInventory, GoogleCredentialInventory } from "./inventory";
+import { type FirestoreTarget, type Fresh, type Rejection, Ledger, LedgerError, LedgerUnavailable, targetsToJson } from "./ledger";
+import {
+  type Consumer,
   type Entry,
+  type InventoryRecord,
   type ParsedRequest,
   type Purpose,
   type RecoveryAuthority,
@@ -12,7 +27,6 @@ import {
   type Target,
   RequestError,
   consumerNamed,
-  consumerPool,
   intentOf,
   loadRecoveryAuthority,
   maxBodyBytes,
@@ -24,6 +38,7 @@ import {
   probesNeeded,
   purposeForIdentity,
   scanReadiness,
+  targetOfEffect,
   targetsFor,
   unrecordedIdentities,
 } from "./model";
@@ -32,7 +47,7 @@ import { type EvidenceStore, GoogleEvidenceStore, entryEvidence, project } from 
 // The thin HTTP service. Identity is verified first and purpose is derived from
 // it; the body is parsed once against a closed grammar; the purpose's binding
 // to its consumer and its one effect direction is enforced; then the ledger,
-// effects, probe, and outbox modules do the work.
+// effects, probe, inventory, and outbox modules do the work.
 
 export interface Identity {
   readonly email: string;
@@ -42,10 +57,20 @@ export interface IdentityVerifier {
   verify(authorization: string | null): Promise<Identity | undefined>;
 }
 
+export interface Deadlines {
+  // One caller request: the inventory reads a close or restore admission
+  // makes, then its transaction. Under Cloud Run's 120-second request timeout.
+  readonly requestMs: number;
+  // One shard's reconciliation within the fleet sweep or the per-shard route.
+  readonly shardMs: number;
+}
+
 export interface BrokerDependencies {
   readonly authority: RecoveryAuthority;
+  readonly deadlines?: Deadlines;
   readonly evidence: EvidenceStore;
   readonly iam: ServiceAccountIam;
+  readonly inventory: CredentialInventory;
   readonly ledger: Ledger;
   readonly now: () => Date;
   readonly probe: ImpersonationProbe;
@@ -56,6 +81,48 @@ export interface BrokerResponse {
   readonly status: number;
 }
 
+// Every outbound call carries its own deadline, and every unit of work the
+// broker performs for one shard or one request runs under a deadline of its
+// own, so a call that never settles can neither hold a request past Cloud
+// Run's timeout nor hold the fleet sweep on one shard. Work interrupted by a
+// deadline leaves only PREPARE/effect/ACK states the next pass classifies
+// exactly, because every ledger transition is conditional and every lost
+// IAM answer is reconciled against the prepared before and after snapshots.
+export const outboundCallMs = 15_000;
+export const defaultDeadlines: Deadlines = { requestMs: 100_000, shardMs: 30_000 };
+const deadlines = new AsyncLocalStorage<AbortSignal>();
+
+export class DeadlineExceeded extends Error {}
+
+export function boundedFetch(fetcher: typeof fetch, timeoutMs = outboundCallMs): typeof fetch {
+  const bounded = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const signals = [AbortSignal.timeout(timeoutMs)];
+    const enclosing = deadlines.getStore();
+    if (enclosing) signals.push(enclosing);
+    if (init?.signal) signals.push(init.signal);
+    return await fetcher(input, { ...init, signal: AbortSignal.any(signals) });
+  };
+  return Object.assign(bounded, { preconnect: fetcher.preconnect });
+}
+
+// Run work under a deadline: every outbound call made within it aborts at
+// the deadline, and the work's result is refused at the deadline even if some
+// call ignores its signal.
+export async function withDeadline<T>(ms: number, work: () => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const enclosing = deadlines.getStore();
+  const signal = enclosing ? AbortSignal.any([enclosing, controller.signal]) : controller.signal;
+  const timer = setTimeout(() => controller.abort(new DeadlineExceeded(`the deadline of ${ms}ms was exceeded`)), ms);
+  try {
+    return await Promise.race([
+      deadlines.run(signal, work),
+      new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason instanceof Error ? signal.reason : new DeadlineExceeded(String(signal.reason))), { once: true })),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // One page of the fleet sweep, and the time the sweep may spend in one
 // invocation: Cloud Run allows the request 120 seconds and Scheduler waits
 // 180, so the sweep stops early, records where it stopped, and the next
@@ -64,20 +131,53 @@ export interface BrokerResponse {
 const reconcileBatch = 64;
 const reconcileBudgetMs = 90_000;
 
+interface Observed {
+  readonly fresh: Fresh;
+  readonly records: readonly InventoryRecord[];
+  readonly unavailable: readonly string[];
+}
+
 export class Broker {
   readonly #deps: BrokerDependencies;
+  readonly #deadlines: Deadlines;
 
   constructor(deps: BrokerDependencies) {
     this.#deps = deps;
+    this.#deadlines = deps.deadlines ?? defaultDeadlines;
   }
 
   async handle(purpose: Purpose, request: ParsedRequest): Promise<BrokerResponse> {
-    const { ledger } = this.#deps;
+    try {
+      return await withDeadline(this.#deadlines.requestMs, () => this.#handle(purpose, request));
+    } catch (error) {
+      if (error instanceof DeadlineExceeded) return { status: 503, body: { detail: error.message, error: "DEADLINE_EXCEEDED" } };
+      throw error;
+    }
+  }
+
+  async #handle(purpose: Purpose, request: ParsedRequest): Promise<BrokerResponse> {
+    const { authority, ledger } = this.#deps;
     switch (request.kind) {
       case "append": {
         if (purpose.kind !== "recovery" || purpose.consumer.repository !== request.consumer || purpose.intent !== intentOf(request.body)) return forbidden();
-        const targets = request.body.kind === "quarantine" ? targetsFor(this.#deps.authority, purpose.consumer) : undefined;
-        const outcome = await ledger.append(request, targets);
+        // A replay of a recorded key is answered by the ledger alone; a new
+        // QUARANTINE is admitted only once the probe source is operational
+        // against every target and every target's inventory is clean, and a
+        // new RESTORE only against the source's freshly observed inventory.
+        const recorded = await ledger.readKey(request.shard, request.key);
+        let outcome;
+        if (request.body.kind === "quarantine") {
+          const targets = targetsFor(authority, purpose.consumer);
+          if (targets && !recorded) {
+            const refusal = await this.#admissible(purpose.consumer, targets);
+            if (refusal) return refusal;
+          }
+          outcome = await ledger.append(request, targets);
+        } else {
+          const source = recorded ? undefined : await ledger.readShard(request.body.source);
+          const fresh = source && source.consumer === purpose.consumer.repository ? (await this.#observe(request.body.source, source, purpose.consumer)).fresh : undefined;
+          outcome = await ledger.append(request, undefined, fresh);
+        }
         switch (outcome.kind) {
           case "accepted":
             return { status: 201, body: JSON.parse(outcome.result) as Record<string, unknown> };
@@ -92,7 +192,17 @@ export class Broker {
       // eslint-disable-next-line no-fallthrough
       case "close": {
         if (purpose.kind !== "recovery") return forbidden();
-        const outcome = await ledger.beginClose(request, purpose.consumer.repository, purpose.intent);
+        let fresh: Fresh | undefined;
+        if (purpose.intent === "QUARANTINE") {
+          const shard = await ledger.readShard(request.shard);
+          if (shard && shard.phase === "OPEN" && shard.intent === "QUARANTINE" && shard.consumer === purpose.consumer.repository) {
+            const observed = await this.#observe(request.shard, shard, purpose.consumer);
+            // A changed inventory is recorded, voiding the chain, before the gate judges it.
+            for (const record of observed.records) await ledger.recordInventory(request.shard, record);
+            fresh = observed.fresh;
+          }
+        }
+        const outcome = await ledger.beginClose(request, purpose.consumer.repository, purpose.intent, fresh);
         switch (outcome.kind) {
           case "closing":
           case "replayed":
@@ -113,7 +223,7 @@ export class Broker {
         const shard = await ledger.readShard(request.shard);
         if (!shard) return notFound();
         if (!allowed(purpose, shard)) return forbidden();
-        const view = await this.reconcileShard(request.shard);
+        const view = await this.#reconcileBounded(request.shard);
         return view ? { status: 200, body: { shard: view } } : notFound();
       }
       case "read": {
@@ -121,16 +231,20 @@ export class Broker {
         if (!shard) return notFound();
         if (!allowed(purpose, shard)) return forbidden();
         const entries = await ledger.readEntries(request.shard, shard.nextSequence - 1);
-        return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), scanReady: scanReadiness(shard, entries, this.#deps.now()) } } };
+        return { status: 200, body: { entries: entries.map((entry) => entryView(entry)), shard: { ...shardView(request.shard, shard), scanReady: scanReadiness(shard, this.#deps.now()) } } };
       }
     }
   }
 
   // Sweep the complete reconcilable set in document-name order, one page at a
-  // time, from where the previous sweep stopped. When the budget runs out the
-  // cursor records the last shard reached; when the end is reached the cursor
-  // clears so the next sweep restarts. A cursor left past the end of a set
-  // that has since shrunk restarts within the same sweep.
+  // time, from where the previous sweep stopped. Every shard runs under its
+  // own deadline and the cursor is persisted after every shard, so a shard
+  // whose calls never settle is passed, recorded as passed, and cannot keep
+  // a later shard from being visited by this or the next invocation. When
+  // the budget runs out the cursor records the last shard reached; when the
+  // end is reached the cursor clears so the next sweep restarts. A cursor
+  // left past the end of a set that has since shrunk restarts within the
+  // same sweep.
   async reconcileFleet(): Promise<Record<string, unknown>> {
     const { ledger, now } = this.#deps;
     const started = now().getTime();
@@ -151,11 +265,12 @@ export class Broker {
       }
       let processed = 0;
       for (const shard of page) {
-        if (now().getTime() - started >= reconcileBudgetMs) break;
-        const view = await this.reconcileShard(shard);
+        if (now().getTime() - started + this.#deadlines.shardMs > reconcileBudgetMs) break;
+        const view = await this.#reconcileBounded(shard);
         if (view) views.push(view);
         after = shard;
         processed += 1;
+        await ledger.writeReconcileCursor(after);
       }
       if (processed < page.length) break;
       if (page.length < reconcileBatch) {
@@ -168,11 +283,27 @@ export class Broker {
     return { next, shards: views };
   }
 
+  // One shard under its deadline: a shard whose work exceeds it, or whose
+  // ledger is unavailable or malformed, is reported and passed; anything
+  // else is a broker defect and propagates.
+  async #reconcileBounded(shardId: string): Promise<Record<string, unknown> | undefined> {
+    try {
+      return await withDeadline(this.#deadlines.shardMs, () => this.reconcileShard(shardId));
+    } catch (error) {
+      if (error instanceof DeadlineExceeded) return { deadline: true, notes: [`passed; ${error.message}`], shard: shardId };
+      if (error instanceof LedgerUnavailable || error instanceof LedgerError) return { deadline: false, notes: [`passed; ${error.message}`], shard: shardId };
+      throw error;
+    }
+  }
+
   // Drive every recorded pending step of one shard and finish the close only
   // when nothing remains. Every step is idempotent and conditional, so any
   // number of instances (or zero, followed by one) reaches the same state.
-  // For an OPEN QUARANTINE shard the broker also records the probes it needs
-  // from its probe source; with no source deployed, nothing is recorded.
+  // A RECORDED QUARANTINE effect is prepared only while the probe source is
+  // operational against its target and the target's inventory is clean, so
+  // no binding is removed unless the observations that end the quarantine
+  // can be made. For an OPEN QUARANTINE shard the broker then records the
+  // inventories and probes its targets need from its own sources.
   async reconcileShard(shardId: string): Promise<Record<string, unknown> | undefined> {
     const { authority, evidence, iam, ledger, now, probe } = this.#deps;
     let shard = await ledger.readShard(shardId);
@@ -186,15 +317,27 @@ export class Broker {
     };
     if (shard.phase === "OPEN" || shard.phase === "CLOSING") {
       const consumer = consumerNamed(authority, shard.consumer);
-      for (const initial of await ledger.readEntries(shardId, shard.nextSequence - 1)) {
+      const entries = await ledger.readEntries(shardId, shard.nextSequence - 1);
+      let admission: string | undefined;
+      if (shard.intent === "QUARANTINE" && consumer) {
+        const recorded = entries.flatMap((entry) => (entry.body.kind === "effect" && entry.progress?.state === "RECORDED" ? [targetOfEffect(authority, consumer, entry.body)] : []));
+        if (recorded.length > 0) {
+          const refusal = await this.#admissible(consumer, recorded);
+          if (refusal) admission = `${String(refusal.body.error)}; ${describe(refusal.body)}`;
+        }
+      }
+      for (const initial of entries) {
         let entry = initial;
         if (entry.body.kind === "effect" && entry.progress !== null && (entry.progress.state === "RECORDED" || entry.progress.state === "PREPARED")) {
           if (!consumer) {
             notes.push(`${entry.sequence}: pending; consumer ${shard.consumer} is not declared`);
             continue;
           }
-          const target: Target = { account: entry.body.account, email: entry.body.email, members: entry.body.members, pool: consumerPool(authority, consumer), resource: entry.body.resource, uniqueId: entry.body.uniqueId };
-          const driven = await driveEffect(ledger, iam, shardId, entry, target);
+          if (entry.progress.state === "RECORDED" && admission !== undefined) {
+            notes.push(`${entry.sequence}: pending; not prepared because ${admission}`);
+            continue;
+          }
+          const driven = await driveEffect(ledger, iam, shardId, entry, targetOfEffect(authority, consumer, entry.body));
           entry = driven.entry;
           if (driven.kind === "pending") notes.push(`${entry.sequence}: pending; ${driven.reason}`);
           else if (driven.kind === "stale") notes.push(`${entry.sequence}: stale actuator; nothing written`);
@@ -207,9 +350,18 @@ export class Broker {
       }
       shard = await ledger.readShard(shardId);
       if (!shard) return undefined;
-      if (shard.phase === "OPEN" && shard.intent === "QUARANTINE") {
-        const entries = await ledger.readEntries(shardId, shard.nextSequence - 1);
-        for (const need of probesNeeded(shard, entries, now())) {
+      if (shard.phase === "OPEN" && shard.intent === "QUARANTINE" && consumer) {
+        const targets = new Map(entries.flatMap((entry) => (entry.body.kind === "effect" ? [[entry.body.account, targetOfEffect(authority, consumer, entry.body)] as const] : [])));
+        const observed = await this.#observe(shardId, shard, consumer, entries);
+        notes.push(...observed.unavailable.map((reason) => `credential inventory unavailable; ${reason}`));
+        for (const record of observed.records) {
+          const recorded = await ledger.recordInventory(shardId, record);
+          if (recorded.kind === "refused") notes.push(`${record.account}: inventory refused; ${recorded.reason}`);
+          else if (recorded.entry) await projectEntry(recorded.entry);
+        }
+        shard = await ledger.readShard(shardId);
+        if (!shard) return undefined;
+        for (const need of probesNeeded(shard, now(), (account) => targets.get(account))) {
           const result = await probe.probe({ email: need.email, member: need.member, permission: probePermission, resource: need.resource, uniqueId: need.uniqueId });
           if (result.kind === "unavailable") {
             notes.push(`${need.account}: ${need.phase} probe unavailable; ${result.reason}`);
@@ -221,13 +373,14 @@ export class Broker {
             notes.push(`${need.account}: ${need.phase} probe refused; ${recorded.reason}`);
             continue;
           }
-          await projectEntry(recorded.entry);
+          if (recorded.entry) await projectEntry(recorded.entry);
         }
         shard = await ledger.readShard(shardId);
         if (!shard) return undefined;
       }
       if (shard.phase === "CLOSING") {
-        const finished = await ledger.finishClose(shardId);
+        const fresh = shard.intent === "QUARANTINE" && consumer ? (await this.#observe(shardId, shard, consumer, entries)).fresh : undefined;
+        const finished = await ledger.finishClose(shardId, fresh);
         if (finished.kind === "finalizing") shard = finished.shard;
         else notes.push(`close pending; ${finished.reason}`);
       }
@@ -240,6 +393,49 @@ export class Broker {
     }
     return { ...shardView(shardId, shard), notes };
   }
+
+  // Whether a QUARANTINE of these targets may be accepted or prepared right
+  // now: the probe source must be operational against every target, and
+  // every target's inventory must be observed and clean. Otherwise the
+  // refusal names exactly what is missing, and nothing has been mutated.
+  async #admissible(consumer: Consumer, targets: readonly Target[]): Promise<BrokerResponse | undefined> {
+    const preflight = await this.#deps.probe.preflight(targets);
+    if (preflight.kind === "unavailable") return { status: 409, body: { detail: preflight.reason, error: "PROBE_UNAVAILABLE" } };
+    const blockers: string[] = [];
+    for (const target of targets) {
+      const outcome = await this.#deps.inventory.inventory(target, consumer);
+      if (outcome.kind === "unavailable") blockers.push(`${target.account}: credential inventory unavailable; ${outcome.reason}`);
+      else if (outcome.inventory.findings.length > 0) blockers.push(`${target.account}: ${outcome.inventory.findings.join(", ")}`);
+    }
+    return blockers.length === 0 ? undefined : { status: 409, body: { blockers, error: "INVENTORY_BLOCKED" } };
+  }
+
+  // The freshly observed inventory of every acknowledged target of a shard.
+  async #observe(shardId: string, shard: Shard, consumer: Consumer, entries?: readonly Entry[]): Promise<Observed> {
+    const fresh: Record<string, InventoryRecord> = {};
+    const records: InventoryRecord[] = [];
+    const unavailable: string[] = [];
+    for (const account of Object.keys(shard.targets).sort()) {
+      const state = shard.targets[account]!;
+      if (state.effect.state !== "ACKED") continue;
+      const entry = entries?.find((candidate) => candidate.sequence === state.sequence) ?? (await this.#deps.ledger.readEntry(shardId, state.sequence));
+      if (!entry || entry.body.kind !== "effect") continue;
+      const outcome = await this.#deps.inventory.inventory(targetOfEffect(this.#deps.authority, consumer, entry.body), consumer);
+      if (outcome.kind === "unavailable") {
+        unavailable.push(`${account}: ${outcome.reason}`);
+        continue;
+      }
+      records.push(outcome.inventory);
+      fresh[account] = outcome.inventory;
+    }
+    return { fresh: Object.fromEntries(Object.entries(fresh).map(([account, record]) => [account, { findings: record.findings, hash: record.hash, observedAt: record.observedAt }])), records, unavailable };
+  }
+}
+
+function describe(body: Record<string, unknown>): string {
+  if (typeof body.detail === "string") return body.detail;
+  if (Array.isArray(body.blockers)) return body.blockers.map((blocker) => String(blocker)).join("; ");
+  return "";
 }
 
 // A purpose may touch only the shards of its own consumer and its own
@@ -277,7 +473,7 @@ function shardView(shardId: string, shard: Shard): Record<string, unknown> {
     phase: shard.phase,
     shard: shardId,
     source: shard.source,
-    targets: shard.targets,
+    targets: targetsToJson(shard.targets),
     terminal,
   };
 }
@@ -382,15 +578,6 @@ function json(status: number, body: Record<string, unknown>): Response {
   });
 }
 
-export interface Jwk {
-  readonly alg?: string;
-  readonly e: string;
-  readonly kid: string;
-  readonly kty: string;
-  readonly n: string;
-  readonly use?: string;
-}
-
 export interface GoogleIdentityDependencies {
   readonly audience: string;
   readonly jwks: () => Promise<readonly Jwk[]>;
@@ -421,29 +608,8 @@ export class GoogleIdentityVerifier implements IdentityVerifier {
 
   async verify(authorization: string | null): Promise<Identity | undefined> {
     if (authorization === null || !authorization.startsWith("Bearer ")) return undefined;
-    const token = authorization.slice("Bearer ".length).trim();
-    const parts = token.split(".");
-    if (parts.length !== 3 || parts.some((part) => part.length === 0 || part.length > 8192)) return undefined;
-    const [encodedHeader, encodedPayload, encodedSignature] = parts as [string, string, string];
-    let header: unknown;
-    let payload: unknown;
-    try {
-      header = JSON.parse(Buffer.from(encodedHeader, "base64url").toString("utf8")) as unknown;
-      payload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as unknown;
-    } catch {
-      return undefined;
-    }
-    if (!isPlainObject(header) || header.alg !== "RS256" || typeof header.kid !== "string") return undefined;
-    const key = (await this.#deps.jwks()).find((candidate) => candidate.kid === header.kid && candidate.kty === "RSA");
-    if (!key) return undefined;
-    let verified: boolean;
-    try {
-      const cryptoKey = await crypto.subtle.importKey("jwk", { e: key.e, kty: "RSA", n: key.n }, { hash: "SHA-256", name: "RSASSA-PKCS1-v1_5" }, false, ["verify"]);
-      verified = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, Buffer.from(encodedSignature, "base64url"), Buffer.from(`${encodedHeader}.${encodedPayload}`, "utf8"));
-    } catch {
-      return undefined;
-    }
-    if (!verified || !isPlainObject(payload)) return undefined;
+    const payload = await verifyRs256Jwt(authorization.slice("Bearer ".length).trim(), await this.#deps.jwks());
+    if (!payload) return undefined;
     const nowSeconds = Math.floor(this.#deps.now().getTime() / 1000);
     if (typeof payload.iss !== "string" || !issuers.includes(payload.iss)) return undefined;
     if (payload.aud !== this.#deps.audience) return undefined;
@@ -456,27 +622,7 @@ export class GoogleIdentityVerifier implements IdentityVerifier {
   }
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const jwksUrl = "https://www.googleapis.com/oauth2/v3/certs";
-
-export function googleJwks(fetcher: typeof fetch, now: () => Date): () => Promise<readonly Jwk[]> {
-  let cached: { readonly keys: readonly Jwk[]; readonly until: number } | undefined;
-  return async () => {
-    if (cached && cached.until > now().getTime()) return cached.keys;
-    const response = await fetcher(jwksUrl, { redirect: "error" });
-    if (!response.ok) throw new Error(`JWKS fetch failed with HTTP ${response.status}.`);
-    const body = JSON.parse(await response.text()) as unknown;
-    const keys = isPlainObject(body) && Array.isArray(body.keys)
-      ? body.keys.filter((key): key is Jwk => isPlainObject(key) && typeof key.kid === "string" && typeof key.n === "string" && typeof key.e === "string" && key.kty === "RSA")
-      : [];
-    const maxAge = /max-age=(\d+)/.exec(response.headers.get("cache-control") ?? "")?.[1];
-    cached = { keys, until: now().getTime() + Math.min(Number(maxAge ?? "300"), 3600) * 1000 };
-    return keys;
-  };
-}
+export const googleJwksUrl = "https://www.googleapis.com/oauth2/v3/certs";
 
 // The runtime service-account token from the metadata server, cached to its
 // expiry. Only the broker identity ever calls Google APIs.
@@ -490,10 +636,11 @@ export function metadataToken(fetcher: typeof fetch, now: () => Date): () => Pro
     });
     if (!response.ok) throw new Error(`Metadata token request failed with HTTP ${response.status}.`);
     const body = JSON.parse(await response.text()) as unknown;
-    if (!isPlainObject(body) || typeof body.access_token !== "string" || typeof body.expires_in !== "number") {
+    if (typeof body !== "object" || body === null || Array.isArray(body) || typeof (body as Record<string, unknown>).access_token !== "string" || typeof (body as Record<string, unknown>).expires_in !== "number") {
       throw new Error("Metadata token response is malformed.");
     }
-    cached = { token: body.access_token, until: now().getTime() + Math.max(0, body.expires_in - 120) * 1000 };
+    const { access_token: token, expires_in: expiresIn } = body as { access_token: string; expires_in: number };
+    cached = { token, until: now().getTime() + Math.max(0, expiresIn - 120) * 1000 };
     return cached.token;
   };
 }
@@ -545,19 +692,24 @@ if (import.meta.main) {
   const authority = loadRecoveryAuthority(await readFile(join(root, "protected-recovery", "authority.json"), "utf8"), await readFile(join(root, manifestPath), "utf8"));
   const configuration = configurationFromEnvironment(Bun.env, authority);
   const now = (): Date => new Date();
-  const token = configuration.firestoreEmulator ? async (): Promise<string> => "owner" : metadataToken(fetch, now);
-  const ledger = new Ledger({ fetch, firestore: configuration.firestore, now, token });
+  // Every outbound call of the service is bounded, and every shard and
+  // request runs under its own deadline (see boundedFetch and withDeadline).
+  const fetcher = boundedFetch(fetch);
+  const token = configuration.firestoreEmulator ? async (): Promise<string> => "owner" : metadataToken(fetcher, now);
+  const ledger = new Ledger({ fetch: fetcher, firestore: configuration.firestore, now, token });
   const broker = new Broker({
     authority,
-    evidence: new GoogleEvidenceStore({ bucket: configuration.evidenceBucket, fetch, token }),
-    iam: new GoogleServiceAccountIam({ fetch, token }),
+    evidence: new GoogleEvidenceStore({ bucket: configuration.evidenceBucket, fetch: fetcher, token }),
+    iam: new GoogleServiceAccountIam({ fetch: fetcher, token }),
+    inventory: new GoogleCredentialInventory({ authority, fetch: fetcher, now, token }),
     ledger,
     now,
-    // No approved probe source exists; every probe is unavailable and no
-    // QUARANTINE shard can become scan-ready, close, or be restored.
-    probe: undeployedProbe,
+    // The real issuance probe, whose member credentials no consumer job
+    // delivers yet: every preflight is unavailable, so every QUARANTINE is
+    // refused before acceptance and before any effect is prepared.
+    probe: new GoogleIssuanceProbe({ authority, credentials: undeployedMemberCredentials, fetch: fetcher, jwks: cachedJwks(githubJwksUrl, fetcher, now), now }),
   });
-  const verifier = new GoogleIdentityVerifier({ audience: configuration.audience, jwks: googleJwks(fetch, now), now });
+  const verifier = new GoogleIdentityVerifier({ audience: configuration.audience, jwks: cachedJwks(googleJwksUrl, fetcher, now), now });
   const server = Bun.serve({
     fetch: (request) => handleRequest({ authority, broker, verifier }, request),
     hostname: "0.0.0.0",

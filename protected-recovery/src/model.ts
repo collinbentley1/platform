@@ -23,6 +23,9 @@ import {
 //     {"key", "consumer", "intent": "RESTORE", "source": "<shard>"}  one RESTORE effect per effect of the scan-ready CLOSED source shard
 //     201 accepted / 200 replayed     -> {"shard", "sequences", "key", "bodyHash", "acceptedAt"}
 //     409 KEY_BODY_MISMATCH | SHARD_NOT_OPEN | SHARD_FULL | SHARD_MISMATCH | SOURCE_NOT_COMPLETE | PINS_UNRECORDED
+//     409 PROBE_UNAVAILABLE | INVENTORY_BLOCKED   a QUARANTINE is refused before acceptance unless the broker's own
+//                                                 issuance probe is operational against every target and the credential
+//                                                 inventory of every target is observed and clean
 //   POST /v1/shards/{shard}/close      the same invoker   {"key"}
 //     200                             -> {"shard", "phase": "CLOSING", "closeHighWater", "closingAt"}
 //     409 NOT_READY                   -> {"blockers": [...]}  a QUARANTINE shard closes only once scan-ready
@@ -33,24 +36,31 @@ import {
 //     200                             -> {"shard": ShardView, "entries": [EntryView]}
 //   400 INVALID_REQUEST, 401 UNAUTHENTICATED, 403 FORBIDDEN, 404 NOT_FOUND, 413 BODY_TOO_LARGE, 503 LEDGER_UNAVAILABLE
 //
-// No body carries evidence. Negative impersonation probes are recorded by the
-// broker itself from its probe source, never from a caller, and a shard is
-// scan-ready only on that recorded evidence. Retries are secured by the ledger:
-// the same key with the same body returns the recorded result; the same key
-// with a different body is refused. A shard is CLOSED only once its terminal
-// receipt is verified in GCS; until then it is FINALIZING and no caller-facing
-// completion exists.
+// No body carries evidence. Negative impersonation probes and credential
+// inventories are recorded by the broker itself from its own sources, never
+// from a caller, and a shard is scan-ready only on that recorded evidence.
+// Retries are secured by the ledger: the same key with the same body returns
+// the recorded result; the same key with a different body is refused. A shard
+// is CLOSED only once its terminal receipt is verified in GCS; until then it
+// is FINALIZING and no caller-facing completion exists.
 
 export const authorityPath = "protected-recovery/authority.json";
 export const intents = recoveryIntents;
 export type Intent = RecoveryIntent;
 export const managedRole = "roles/iam.workloadIdentityUser";
+// The broker's own service account ID in the broker project; the Terraform
+// module creates exactly this account and grants it the actuator role.
+export const brokerServiceAccountId = "recovery-broker";
 // Binding removal blocks new impersonation only. A holder of the managed role
 // can mint a one-hour access token up to the moment removal propagates, so a
 // protected scan waits this long after the last plausibly successful mint --
 // bounded by the first negative probe after the last positive one -- and then
 // needs another negative probe.
 export const tokenHorizonSeconds = 3600;
+// The journal ceiling of one shard. Effects need entries; observations are
+// journaled while entries remain and otherwise folded into the shard's
+// per-target chain state, so no number of observations can make the DENIED
+// chain that reaches a terminal outcome unrecordable.
 export const maxEntriesPerShard = 256;
 export const maxBodyBytes = 8 * 1024;
 
@@ -62,13 +72,14 @@ export const probePhases = ["REVOCATION", "HORIZON"] as const;
 export type ProbePhase = (typeof probePhases)[number];
 export const probeOutcomes = ["ALLOWED", "DENIED"] as const;
 export type ProbeOutcome = (typeof probeOutcomes)[number];
-// No broker-verifiable negative-impersonation probe source exists yet. The
-// broker cannot mint a GitHub OIDC token to try the federated member itself,
-// a consumer-run attempt is an unverifiable assertion, and the broker's own
-// authority is limited to the target policies; so the production binding
-// reports every probe unavailable, readiness stays blocked, and this names the
-// live prerequisite that activation must satisfy before any protected close.
-export const probePrerequisite = "no broker-verifiable negative-impersonation probe source is deployed; activation must supply an approved source whose result binds the probe principal, the target unique ID, the attempted member and permission, a server-observed time, and an independently verifiable outcome";
+// The issuance probe is a real IAM Credentials request as the exact managed
+// member: the broker verifies the GitHub OIDC token of the one canonical job
+// that is that member, exchanges it at STS for the consumer pool, and observes
+// generateAccessToken against the target's permanent identity itself. No
+// consumer job delivers such a token to the broker yet, so the production
+// credential source reports every member unavailable and the broker refuses
+// every QUARANTINE before acceptance, before PREPARE, and before any mutation.
+export const probePrerequisite = "no canonical-member credential source is deployed: the issuance probe needs the GitHub OIDC token of the exact canonical job for each managed member, minted for the consumer pool's provider audience, and no consumer job delivers one to the broker; activation must supply that source before any QUARANTINE can be accepted";
 
 export class AuthorityError extends Error {}
 export class RequestError extends Error {}
@@ -140,9 +151,40 @@ export interface ProbeRecord {
   readonly uniqueId: string;
 }
 
+// The credential-relevant inventory of one target, exactly as the broker
+// observed it: every allow-policy attachment point in the target's ancestry
+// with its etag and every credential-capable grant found there after role
+// expansion (excluding only the broker's own modeled actuator grant),
+// user-managed keys, the effective credential-lifetime-extension policy, and
+// Compute, Cloud Run, and Cloud Build attachments that run as the target.
+// The hash is over this summary alone; any change to it is a change of the
+// inventory.
+export interface InventorySummary {
+  readonly ancestry: readonly string[];
+  readonly attachments: readonly string[];
+  readonly grants: readonly string[];
+  readonly keys: readonly string[];
+  readonly lifetimeExtension: string | null;
+  readonly policies: ReadonlyArray<{ readonly etag: string; readonly resource: string }>;
+  // Which attachment APIs were enabled in the consumer project when read; a
+  // disabled API hosts no attachment and is recorded as such, never assumed.
+  readonly services: readonly string[];
+}
+
+export interface InventoryRecord {
+  readonly account: string;
+  readonly email: string;
+  readonly findings: readonly string[];
+  readonly hash: string;
+  readonly observedAt: string;
+  readonly summary: InventorySummary;
+  readonly uniqueId: string;
+}
+
 export type EntryBody =
   | { readonly kind: "effect"; readonly account: string; readonly email: string; readonly intent: Intent; readonly members: readonly string[]; readonly resource: string; readonly uniqueId: string }
-  | ({ readonly kind: "probe" } & ProbeRecord);
+  | ({ readonly kind: "probe" } & ProbeRecord)
+  | ({ readonly kind: "inventory" } & InventoryRecord);
 
 // Complete policy snapshots: the canonical bindings and their content hash,
 // plus the etag when the snapshot was observed rather than expected.
@@ -170,6 +212,8 @@ export type EffectProgress =
   | ({ readonly state: "ACKED"; readonly ackedAt: string; readonly attempts: number; readonly mutated: boolean; readonly observed: ObservedSnapshot } & PreparedFacts)
   | { readonly state: "DIVERGED"; readonly attempts: number; readonly divergedAt: string; readonly observed: ObservedSnapshot | null; readonly prepared: PreparedFacts | null; readonly reason: string };
 
+export type EffectState = EffectProgress["state"];
+
 export type OutboxProgress =
   | { readonly state: "PENDING" }
   | { readonly state: "PROJECTED"; readonly generation: string; readonly projectedAt: string; readonly sha256: string }
@@ -193,6 +237,48 @@ export interface TerminalOutbox {
   readonly sha256: string;
 }
 
+// The effect state of one target mirrored into the shard document by the
+// same transactions that move the entry, so readiness never needs the entries.
+export interface TargetEffect {
+  readonly ackedAt: string | null;
+  readonly alternateIssuers: readonly string[];
+  readonly state: EffectState;
+}
+
+// The current inventory baseline of one target: the hash first observed at
+// observedAt, re-verified unchanged at verifiedAt, after this many changes.
+export interface ChainInventory {
+  readonly changes: number;
+  readonly findings: readonly string[];
+  readonly hash: string;
+  readonly observations: number;
+  readonly observedAt: string;
+  readonly verifiedAt: string;
+}
+
+// The probe chain of one target as committed state, not as a scan of entries:
+// the revocation probe (the earliest DENIED observation after the quarantine
+// acknowledgement, after the latest ALLOWED observation, and at or after the
+// inventory baseline), the post-horizon probe (a DENIED observation at or
+// after the token horizon), and the folded counts of every other observation.
+// Observations are journaled as entries while the shard has room and
+// otherwise counted as suppressed; the chain itself is always writable.
+export interface TargetChain {
+  readonly allowed: { readonly count: number; readonly lastObservedAt: string | null };
+  readonly denied: number;
+  readonly inventory: ChainInventory | null;
+  readonly journaled: number;
+  readonly post: ProbeRecord | null;
+  readonly revocation: ProbeRecord | null;
+  readonly suppressed: number;
+}
+
+export interface TargetState {
+  readonly chain: TargetChain;
+  readonly effect: TargetEffect;
+  readonly sequence: number;
+}
+
 interface ShardBase {
   readonly consumer: string;
   readonly createdAt: string;
@@ -201,7 +287,7 @@ interface ShardBase {
   readonly pendingEffects: number;
   readonly pendingOutbox: number;
   readonly source: string | null;
-  readonly targets: Readonly<Record<string, number>>;
+  readonly targets: Readonly<Record<string, TargetState>>;
 }
 
 interface ClosingFacts {
@@ -457,6 +543,18 @@ export function consumerPool(authority: RecoveryAuthority, consumer: Consumer): 
   return `projects/${consumer.projectNumber}/locations/global/workloadIdentityPools/${authority.broker.workloadIdentityPoolId}`;
 }
 
+// The consumer's own provider inside its pool: the one a canonical job's
+// GitHub OIDC token is minted for and exchanged through.
+export function consumerProvider(authority: RecoveryAuthority, consumer: Consumer): string {
+  return `${consumerPool(authority, consumer)}/providers/${authority.broker.workloadIdentityProviderId}`;
+}
+
+// The broker's own allow-policy member in the broker project, or undefined
+// while the broker project is unrecorded.
+export function brokerMember(authority: RecoveryAuthority): string | undefined {
+  return authority.broker.projectId === null ? undefined : `serviceAccount:${brokerServiceAccountId}@${authority.broker.projectId}.iam.gserviceaccount.com`;
+}
+
 export function serviceAccountResource(consumer: Consumer, uniqueId: string): string {
   return `projects/${consumer.projectId}/serviceAccounts/${uniqueId}`;
 }
@@ -510,6 +608,11 @@ export function targetsFor(authority: RecoveryAuthority, consumer: Consumer): re
   return targets;
 }
 
+// The target a journaled effect names, for a consumer of the authority.
+export function targetOfEffect(authority: RecoveryAuthority, consumer: Consumer, body: EntryBody & { readonly kind: "effect" }): Target {
+  return { account: body.account, email: body.email, members: body.members, pool: consumerPool(authority, consumer), resource: body.resource, uniqueId: body.uniqueId };
+}
+
 export function parseShardId(value: string): string {
   if (!shardId.test(value)) throw new RequestError("shard must match ^[a-z0-9][a-z0-9-]{0,62}$");
   return value;
@@ -517,10 +620,10 @@ export function parseShardId(value: string): string {
 
 // Every body is parsed exactly once, here, against a closed key set. A body
 // that names a project, resource, role, member list, policy, object name, or
-// any probe or canary evidence is refused as an unknown field: those facts
-// come from the identity, the inventory, and the broker's own probes only. The
-// consumer and intent are repeated in the body so that the recorded request is
-// self-describing; they must equal the purpose's binding.
+// any probe, inventory, or canary evidence is refused as an unknown field:
+// those facts come from the identity, the inventory, and the broker's own
+// sources only. The consumer and intent are repeated in the body so that the
+// recorded request is self-describing; they must equal the purpose's binding.
 export function parseAppendBody(shard: string, body: unknown): AppendRequest {
   const source = requestRecord(body, "body");
   const consumer = typeof source.consumer === "string" && repositoryName.test(source.consumer) ? source.consumer : undefined;
@@ -561,6 +664,81 @@ export function parseReconcileBody(shard: string | null, body: unknown): Reconci
   return { kind: "reconcile", shard: shard === null ? null : parseShardId(shard) };
 }
 
+export const emptyChain: TargetChain = { allowed: { count: 0, lastObservedAt: null }, denied: 0, inventory: null, journaled: 0, post: null, revocation: null, suppressed: 0 };
+
+export function horizonOf(revocation: ProbeRecord): number {
+  return Date.parse(revocation.observedAt) + tokenHorizonSeconds * 1000;
+}
+
+// The earliest instant a DENIED observation can start a chain for this
+// target: the quarantine acknowledgement, then the inventory baseline.
+export function chainFloor(state: TargetState): number {
+  const acked = state.effect.ackedAt === null ? Number.NaN : Date.parse(state.effect.ackedAt);
+  const baseline = state.chain.inventory === null ? Number.NaN : Date.parse(state.chain.inventory.observedAt);
+  return Math.max(acked, baseline);
+}
+
+export type Observation =
+  | { readonly kind: "probe"; readonly probe: ProbeRecord }
+  | { readonly kind: "inventory"; readonly inventory: InventoryRecord };
+
+// What an observation meant for the chain: it started it (REVOCATION), ended
+// it (HORIZON), broke it (ALLOWED or CHANGE), established the inventory
+// baseline (BASELINE), or repeated known facts (REDUNDANT).
+export type ChainRole = "ALLOWED" | "BASELINE" | "CHANGE" | "HORIZON" | "REDUNDANT" | "REVOCATION";
+
+// Apply one broker-recorded observation to a target's chain. Pure: the ledger
+// commits the result with the shard document. A later ALLOWED observation or
+// a changed inventory voids the revocation and post-horizon probes observed
+// before it, so a timer alone never ends a chain; a DENIED observation counts
+// as the revocation only after the acknowledgement, after the latest ALLOWED
+// observation, and at or after the inventory baseline; a DENIED observation
+// counts as the post-horizon probe only at or after the horizon.
+export function applyObservation(state: TargetState, observation: Observation): { readonly chain: TargetChain; readonly role: ChainRole } {
+  const chain = state.chain;
+  if (observation.kind === "inventory") {
+    const { findings, hash, observedAt } = observation.inventory;
+    if (chain.inventory === null) {
+      return { chain: { ...chain, inventory: { changes: 0, findings, hash, observations: 1, observedAt, verifiedAt: observedAt } }, role: "BASELINE" };
+    }
+    if (chain.inventory.hash === hash) {
+      const verifiedAt = Date.parse(observedAt) > Date.parse(chain.inventory.verifiedAt) ? observedAt : chain.inventory.verifiedAt;
+      return { chain: { ...chain, inventory: { ...chain.inventory, observations: chain.inventory.observations + 1, verifiedAt } }, role: "REDUNDANT" };
+    }
+    const changed = Date.parse(observedAt);
+    const voided = chain.revocation !== null && Date.parse(chain.revocation.observedAt) < changed;
+    return {
+      chain: {
+        ...chain,
+        inventory: { changes: chain.inventory.changes + 1, findings, hash, observations: chain.inventory.observations + 1, observedAt, verifiedAt: observedAt },
+        post: voided ? null : chain.post,
+        revocation: voided ? null : chain.revocation,
+      },
+      role: "CHANGE",
+    };
+  }
+  const probe = observation.probe;
+  const observed = Date.parse(probe.observedAt);
+  if (probe.outcome === "ALLOWED") {
+    const last = chain.allowed.lastObservedAt;
+    const lastObservedAt = last === null || observed > Date.parse(last) ? probe.observedAt : last;
+    const voided = chain.revocation !== null && Date.parse(chain.revocation.observedAt) <= observed;
+    return {
+      chain: { ...chain, allowed: { count: chain.allowed.count + 1, lastObservedAt }, post: voided ? null : chain.post, revocation: voided ? null : chain.revocation },
+      role: "ALLOWED",
+    };
+  }
+  const counted = { ...chain, denied: chain.denied + 1 };
+  if (chain.inventory === null) return { chain: counted, role: "REDUNDANT" };
+  if (chain.revocation === null) {
+    const afterAllowed = chain.allowed.lastObservedAt === null || observed > Date.parse(chain.allowed.lastObservedAt);
+    if (observed >= chainFloor(state) && afterAllowed) return { chain: { ...counted, revocation: probe }, role: "REVOCATION" };
+    return { chain: counted, role: "REDUNDANT" };
+  }
+  if (chain.post === null && observed >= horizonOf(chain.revocation)) return { chain: { ...counted, post: probe }, role: "HORIZON" };
+  return { chain: counted, role: "REDUNDANT" };
+}
+
 export interface ScanReadiness {
   readonly blockers: readonly string[];
   // The instant the token horizon drains for the latest revocation probe --
@@ -581,107 +759,132 @@ export interface ProbeNeed {
   readonly uniqueId: string;
 }
 
-interface ProbeChain {
-  readonly horizon: number | null;
-  readonly post: Entry | undefined;
-  readonly revocation: Entry | undefined;
-}
-
-// The probes that count for one acknowledged target, in two phases. The
-// revocation probe is the earliest DENIED observation after the quarantine
-// acknowledgement and after the latest ALLOWED observation: minting may have
-// succeeded up to that moment, so the token horizon drains one hour after it.
-// The post-horizon probe is a DENIED observation at or after that horizon.
-// Any later ALLOWED observation restarts the chain; a timer alone never ends
-// it. Only probes that name the target's exact identity and a managed member
-// are considered.
-function probeChain(effect: Entry, entries: readonly Entry[]): ProbeChain {
-  const target = effect.body;
-  if (target.kind !== "effect" || effect.progress?.state !== "ACKED") throw new TypeError(`Entry ${effect.sequence} is not an acknowledged effect.`);
-  const ackedAt = Date.parse(effect.progress.ackedAt);
-  const probes = entries
-    .filter((entry): entry is Entry & { readonly body: { readonly kind: "probe" } & ProbeRecord } =>
-      entry.body.kind === "probe" && entry.body.account === target.account && entry.body.uniqueId === target.uniqueId && target.members.includes(entry.body.member) && Date.parse(entry.body.observedAt) >= ackedAt,
-    )
-    .sort((left, right) => Date.parse(left.body.observedAt) - Date.parse(right.body.observedAt) || left.sequence - right.sequence);
-  const lastAllowed = probes.filter((probe) => probe.body.outcome === "ALLOWED").at(-1);
-  const denied = probes.filter((probe) => probe.body.outcome === "DENIED" && (!lastAllowed || Date.parse(probe.body.observedAt) > Date.parse(lastAllowed.body.observedAt)));
-  const revocation = denied[0];
-  if (!revocation) return { horizon: null, post: undefined, revocation: undefined };
-  const horizon = Date.parse(revocation.body.observedAt) + tokenHorizonSeconds * 1000;
-  return { horizon, post: denied.find((probe) => Date.parse(probe.body.observedAt) >= horizon), revocation };
-}
-
-function ackedEffects(shard: Shard, entries: readonly Entry[]): ReadonlyArray<{ readonly account: string; readonly effect: Entry | undefined }> {
+function sortedTargets(shard: Shard): ReadonlyArray<readonly [string, TargetState]> {
   return Object.keys(shard.targets)
     .sort()
-    .map((account) => ({ account, effect: entries.find((entry) => entry.sequence === shard.targets[account]) }));
+    .map((account) => [account, shard.targets[account]!] as const);
 }
 
-// Scan-ready is a pure judgement over committed ledger facts: every target of
-// a QUARANTINE shard acknowledged with no alternate issuer in its policy, a
+// Scan-ready is a pure judgement over the committed shard state: every target
+// of a QUARANTINE shard acknowledged with no alternate issuer in its policy
+// and no alternate credential path in its recorded inventory, a
 // broker-recorded DENIED probe of a managed member against the exact target
-// identity after that target's acknowledgement, the one-hour token horizon
-// drained since that probe, and another DENIED probe after the horizon. A
-// fixed propagation timer alone never satisfies it, and nothing a caller
-// submits contributes to it.
-export function scanReadiness(shard: Shard, entries: readonly Entry[], now: Date): ScanReadiness {
+// identity after that target's acknowledgement and inventory baseline, the
+// one-hour token horizon drained since that probe, and another DENIED probe
+// after the horizon. A fixed propagation timer alone never satisfies it, and
+// nothing a caller submits contributes to it.
+export function scanReadiness(shard: Shard, now: Date): ScanReadiness {
   const blockers: string[] = [];
   if (shard.intent !== "QUARANTINE") return { blockers: ["shard intent is RESTORE"], horizonAt: null, ready: false };
-  const targets = ackedEffects(shard, entries);
+  const targets = sortedTargets(shard);
   if (targets.length === 0) blockers.push("no target has been journaled");
   let horizon = 0;
   let horizonKnown = true;
-  for (const { account, effect } of targets) {
-    if (!effect || effect.body.kind !== "effect" || effect.progress === null) {
-      blockers.push(`${account}: effect entry is missing`);
+  for (const [account, state] of targets) {
+    if (state.effect.state !== "ACKED") {
+      blockers.push(`${account}: quarantine is ${state.effect.state}`);
       horizonKnown = false;
       continue;
     }
-    if (effect.progress.state !== "ACKED") {
-      blockers.push(`${account}: quarantine is ${effect.progress.state}`);
+    if (state.effect.alternateIssuers.length > 0) blockers.push(`${account}: alternate credential issuers ${state.effect.alternateIssuers.join(", ")}`);
+    const chain = state.chain;
+    if (chain.inventory === null) {
+      blockers.push(`${account}: no credential inventory since the quarantine acknowledgement`);
       horizonKnown = false;
       continue;
     }
-    if (effect.progress.alternateIssuers.length > 0) blockers.push(`${account}: alternate credential issuers ${effect.progress.alternateIssuers.join(", ")}`);
-    const chain = probeChain(effect, entries);
-    if (!chain.revocation || chain.horizon === null) {
+    if (chain.inventory.findings.length > 0) blockers.push(`${account}: alternate credential paths ${chain.inventory.findings.join(", ")}`);
+    if (chain.revocation === null) {
       blockers.push(`${account}: no DENIED impersonation probe after the quarantine acknowledgement`);
       horizonKnown = false;
       continue;
     }
-    horizon = Math.max(horizon, chain.horizon);
-    if (now.getTime() < chain.horizon) {
-      blockers.push(`${account}: token horizon drains at ${new Date(chain.horizon).toISOString()}`);
+    const targetHorizon = horizonOf(chain.revocation);
+    horizon = Math.max(horizon, targetHorizon);
+    if (now.getTime() < targetHorizon) {
+      blockers.push(`${account}: token horizon drains at ${new Date(targetHorizon).toISOString()}`);
       continue;
     }
-    if (!chain.post) blockers.push(`${account}: no DENIED impersonation probe after the token horizon ${new Date(chain.horizon).toISOString()}`);
+    if (chain.post === null) blockers.push(`${account}: no DENIED impersonation probe after the token horizon ${new Date(targetHorizon).toISOString()}`);
   }
   return { blockers, horizonAt: horizonKnown && horizon > 0 ? new Date(horizon).toISOString() : null, ready: blockers.length === 0 };
 }
 
 // The probes the broker should record for an OPEN QUARANTINE shard now: a
-// revocation probe for every acknowledged target without one, and a
-// post-horizon probe for every target whose horizon has drained without one.
-// Targets with an alternate issuer are never ready in this shard, so they are
-// not probed. The member tried is the target's first managed member.
-export function probesNeeded(shard: Shard, entries: readonly Entry[], now: Date): readonly ProbeNeed[] {
+// revocation probe for every acknowledged, inventoried, clean target without
+// one, and a post-horizon probe for every target whose horizon has drained
+// without one. Targets with an alternate issuer or an alternate credential
+// path are never ready in this shard, so they are not probed. The member
+// tried is the target's first managed member.
+export function probesNeeded(shard: Shard, now: Date, members: (account: string) => Target | undefined): readonly ProbeNeed[] {
   if (shard.phase !== "OPEN" || shard.intent !== "QUARANTINE") return [];
   const needs: ProbeNeed[] = [];
-  for (const { effect } of ackedEffects(shard, entries)) {
-    if (!effect || effect.body.kind !== "effect" || effect.progress?.state !== "ACKED" || effect.progress.alternateIssuers.length > 0) continue;
-    const member = effect.body.members[0];
-    if (member === undefined) continue;
-    const base = { account: effect.body.account, email: effect.body.email, member, resource: effect.body.resource, uniqueId: effect.body.uniqueId };
-    const chain = probeChain(effect, entries);
-    if (!chain.revocation || chain.horizon === null) needs.push({ ...base, notBefore: effect.progress.ackedAt, phase: "REVOCATION" });
-    else if (!chain.post && now.getTime() >= chain.horizon) needs.push({ ...base, notBefore: new Date(chain.horizon).toISOString(), phase: "HORIZON" });
+  for (const [account, state] of sortedTargets(shard)) {
+    if (state.effect.state !== "ACKED" || state.effect.alternateIssuers.length > 0) continue;
+    const chain = state.chain;
+    if (chain.inventory === null || chain.inventory.findings.length > 0) continue;
+    const target = members(account);
+    const member = target?.members[0];
+    if (!target || member === undefined) continue;
+    const base = { account, email: target.email, member, resource: target.resource, uniqueId: target.uniqueId };
+    if (chain.revocation === null) {
+      const floor = Math.max(chainFloor(state), chain.allowed.lastObservedAt === null ? 0 : Date.parse(chain.allowed.lastObservedAt) + 1);
+      needs.push({ ...base, notBefore: new Date(floor).toISOString(), phase: "REVOCATION" });
+    } else if (chain.post === null && now.getTime() >= horizonOf(chain.revocation)) {
+      needs.push({ ...base, notBefore: new Date(horizonOf(chain.revocation)).toISOString(), phase: "HORIZON" });
+    }
   }
   return needs;
 }
 
+// A fresh inventory of one target as observed by the broker immediately
+// before a gate; absent when the observation was unavailable.
+export interface FreshInventory {
+  readonly findings: readonly string[];
+  readonly hash: string;
+  readonly observedAt: string;
+}
+
+// The blockers a gate raises when the freshly observed inventory of a target
+// is unavailable, dirty, or differs from the baseline the chain was built on:
+// the quarantine/close interval is protected exactly by this equality.
+export function inventoryDrift(shard: Shard, fresh: Readonly<Record<string, FreshInventory>>): readonly string[] {
+  const blockers: string[] = [];
+  for (const [account, state] of sortedTargets(shard)) {
+    if (state.effect.state !== "ACKED" || state.chain.inventory === null) continue;
+    const current = fresh[account];
+    if (!current) {
+      blockers.push(`${account}: credential inventory is unavailable at the gate`);
+      continue;
+    }
+    if (current.findings.length > 0) blockers.push(`${account}: alternate credential paths at the gate ${current.findings.join(", ")}`);
+    if (current.hash !== state.chain.inventory.hash) blockers.push(`${account}: credential inventory changed since ${state.chain.inventory.observedAt}`);
+  }
+  return blockers;
+}
+
 export function probeKey(probe: ProbeRecord): string {
   return `probe/${probe.account}/${probe.phase}/${probe.observedAt}`;
+}
+
+export function inventoryKey(inventory: InventoryRecord): string {
+  return `inventory/${inventory.account}/${inventory.observedAt}`;
+}
+
+export function inventoryHash(summary: InventorySummary): string {
+  return sha256Hex(canonicalJson(inventorySummaryJson(summary)));
+}
+
+export function inventorySummaryJson(summary: InventorySummary): Record<string, unknown> {
+  return {
+    ancestry: [...summary.ancestry],
+    attachments: [...summary.attachments],
+    grants: [...summary.grants],
+    keys: [...summary.keys],
+    lifetimeExtension: summary.lifetimeExtension,
+    policies: summary.policies.map((policy) => ({ etag: policy.etag, resource: policy.resource })),
+    services: [...summary.services],
+  };
 }
 
 function requestKey(value: unknown): string {
