@@ -333,6 +333,9 @@ skip_never_created() {
   never_created "$resource" "$service" "$tag" || return 1
   witness_call GET "$(capability_url "$resource" "$service")"
   if ! service_disabled_exact "$service"; then
+    if [ "$recovery_proof" = 1 ] && [[ "$last_status" =~ ^2 ]] && jq -e 'type == "object" and (has("error") | not)' "$workdir/body" > /dev/null 2>&1 && jq -e --arg resource "$resource" '[.[] | select(.resource == $resource)] | length == 1 and .[0].state == "NOT_ATTEMPTED"' "$resource_creation" > /dev/null; then
+      return 1
+    fi
     fail "${resource}: never-created proof requires the authoritative API to remain disabled; HTTP ${last_status}"
     return 0
   fi

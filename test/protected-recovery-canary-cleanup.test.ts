@@ -3,6 +3,11 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const bash = Bun.which("bash");
+if (!bash || Bun.spawnSync([bash, "-c", 'test "${BASH_VERSINFO[0]}" -ge 4'], { stdout: "ignore", stderr: "ignore" }).exitCode !== 0) {
+  throw new Error("Canary cleanup fixtures require Bash 4 or newer. Put its bin directory first in PATH before running bun test; macOS /bin/bash is version 3.2.");
+}
+
 const source = await readFile(join(import.meta.dir, "../tools/ci/protected-recovery-deny-canary.sh"), "utf8");
 function functionSource(name: string): string {
   const found = source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
@@ -85,7 +90,7 @@ ${command}
 `;
     const path = join(directory, "test.sh");
     await writeFile(path, script);
-    const process = Bun.spawn(["bash", path, directory], { stdout: "pipe", stderr: "pipe" });
+    const process = Bun.spawn([bash, path, directory], { stdout: "pipe", stderr: "pipe" });
     const stderr = await new Response(process.stderr).text();
     expect(await process.exited, stderr).toBe(0);
     return { failures: await readFile(join(directory, "failures"), "utf8"), calls: await readFile(join(directory, "calls"), "utf8"), observations: await readFile(join(directory, "observations"), "utf8"), creation: await readFile(join(directory, "creation.json"), "utf8") };
@@ -299,20 +304,35 @@ retire_carriers`, [{ status: 200, body: { email: "deny-canary-test@consumer-proj
   expect(recreated.calls).not.toContain("DELETE");
 });
 
-test("verified checkpoint recovery retains missing carrier IDs and still requires a fresh disabled read", async () => {
+test("verified checkpoint recovery retains missing carrier IDs and repeats enabled or disabled resource checks", async () => {
   const checkpointSetup = `${carrierSetup}
 creation_initialize
 jq -n --slurpfile carriers "$retained_carriers" --slurpfile creation "$resource_creation" '{schema:"protected-recovery/deny-canary-cleanup-checkpoint/v3",phase:"cleanup",controlRunId:"123",run:{headSha:"reviewed",id:400,attempt:1},brokerImage:"image",organization:"organizations/99999",witnessServiceAccount:"witness",throwaways:{project:"deny-canary-test",folder:"12345",goneUniqueIds:{"broker-project":"222"}},leftovers:[],removed:[],cleanupSkips:[],creationVector:"PPPP",resourceCreation:$creation[0],retainedCarriers:$carriers[0]}' > "$workdir/checkpoint.json"
 CLEANUP_CHECKPOINT="$workdir/checkpoint.json"
 checkpoint_read
 collect_carriers
-if ! skip_never_created projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new compute.googleapis.com; then fail missing-proof; fi`;
+if ! skip_never_created projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new compute.googleapis.com; then remove DELETE https://compute.googleapis.com/compute/v1/projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new instance compute; fi`;
   const result = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, disabled]);
   expect(result.failures).toBe("");
   expect(result.calls.trim().split("\n")).toHaveLength(3);
   expect(result.calls).not.toContain("DELETE");
-  const enabled = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, { status: 200, body: {} }]);
-  expect(enabled.failures).toContain("requires the authoritative API to remain disabled");
+  const enabled = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, { status: 200, body: {} }, { status: 404, body: {} }]);
+  expect(enabled.failures).toBe("");
+  expect(enabled.calls.trim().split("\n").at(-1)).toBe("DELETE https://compute.googleapis.com/compute/v1/projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new");
+  for (const answer of [{ status: 500, body: {} }, { status: 200, body: { error: {} } }, { status: 200, body: [] }, { status: 200, body: "invalid" }]) {
+    const unread = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, answer]);
+    expect(unread.failures).toContain("requires the authoritative API to remain disabled");
+    expect(unread.calls).not.toContain("DELETE");
+  }
+  const build = await cleanup(`CONTROL_PREDICATE=
+carrier_read broker-project
+transient_builds consumer-project`, [
+    { status: 200, body: { email: carrierEmail, uniqueId: "222", description: carrierDescription("PPPP") } },
+    { status: 200, body: { builds: [] } }, { status: 200, body: { builds: [] } },
+  ]);
+  expect(build.failures).toBe("");
+  expect(build.calls.trim().split("\n")).toHaveLength(3);
+  expect(decodeURIComponent(build.calls)).toContain('tags="protected-recovery-deny-canary-123"');
 });
 
 test("the carrier create itself contains durable P metadata before any later provisioning", async () => {

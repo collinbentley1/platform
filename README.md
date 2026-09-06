@@ -253,6 +253,15 @@ checksum-pinned Bun executable, not dependency-shadowable package-script
 orchestration. Doctor also rejects committed Terraform state, saved plans,
 variable/override files, CLI config, and crash logs.
 
+## Local Verification
+
+The canary cleanup fixtures require Bash 4 or newer and `jq`. Put the modern
+Bash installation's `bin` directory first in `PATH` before running `bun test`.
+On macOS, `/bin/bash` is version 3.2 and cannot run these fixtures. The tests
+check the selected Bash version before starting; they do not skip cleanup
+coverage when the prerequisite is missing. GitHub Actions runs these checks on
+Ubuntu with Bash 5.
+
 ## Release
 
 Release `0.5.13` only after required checks and adversarial review. Create a
