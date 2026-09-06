@@ -365,10 +365,10 @@ data "external" "deny_state" {
 
 # Whether each consumer project enables the two attachment APIs the Deny
 # canary cannot reach through IAM when they are disabled: a Compute or Cloud
-# Build row whose control request answered SERVICE_DISABLED and whose deny
-# phase explicitly skipped the mutation is accepted only beside this read
-# proving the API disabled now, at
-# apply (locals unserviceable_row_satisfied). Read through the same
+# Build row whose control and deny phases explicitly skipped the mutation
+# after an exact disabled-API preflight is accepted only beside this read
+# proving the API disabled now, at apply (locals unserviceable_row_satisfied).
+# Read through the same
 # credential-free reader pattern as the Deny state.
 data "external" "service_state" {
   for_each = local.authority_enabled ? local.service_reads : {}
@@ -635,7 +635,6 @@ locals {
             service          = try(tostring(observation.response.service), "")
             status           = try(tostring(observation.response.status), "")
             skipped_mutation = try(observation.response.skippedMutation == true, false)
-            has_skip_proof   = try(contains(keys(observation.response), "skippedMutation") || contains(keys(observation.response), "observedRequest"), false)
             observed_request = try(observation.response.observedRequest, null)
           }], [])
         }
@@ -903,10 +902,10 @@ locals {
     alltrue([for resource in values(local.allow_reads) : try(length(local.canary_allows.control[resource].canary) > 0, false)])
   )
 
-  # The control mutation actually answered SERVICE_DISABLED. Its signed
-  # manifest records that exact resource as never created; the deny phase
-  # explicitly skips the mutation and instead observes SERVICE_DISABLED
-  # through the exact read endpoint. The live read must also say that API
+  # Both phases skip disabled-API mutations before any create attempt and
+  # observe SERVICE_DISABLED through the exact read endpoint. Their signed
+  # manifests record the exact resource as never created. The live read must
+  # also say that API
   # is disabled in that project now. No attachment can be created through a
   # disabled API, the broker's inventory records every attachment API's
   # enablement in the hash of every gate, and every attachment path also
@@ -946,7 +945,7 @@ locals {
           observation.principal == local.canary_principal &&
           observation.reason == "SERVICE_DISABLED" &&
           observation.service == lookup(local.unserviceable_permissions, row.permission, "") &&
-          observation.status == "403" && !observation.has_skip_proof
+          observation.status == "403" && observation.skipped_mutation
         ]
       ]
     ])[0], null)
@@ -997,7 +996,9 @@ locals {
         local.control_unserviceable_observation[key].method == "POST" &&
         local.control_unserviceable_observation[key].url == local.unserviceable_identities[key].mutation_url &&
         local.control_unserviceable_observation[key].pre_resource == local.unserviceable_identities[key].resource &&
-        local.unserviceable_observation[key].observed_request == { method = "GET", url = local.unserviceable_identities[key].read_url } &&
+        alltrue([for observation in [local.unserviceable_observation[key], local.control_unserviceable_observation[key]] :
+          observation.observed_request == { method = "GET", url = local.unserviceable_identities[key].read_url }
+        ]) &&
         local.unserviceable_creation_bound[key],
         false,
       ) &&

@@ -18,14 +18,16 @@ name: Protected recovery deny canary
 #             equivalent resources in the same actual pre-state must be refused with
 #             IAM permission denials naming the rows' own permissions. Four
 #             reserved-name IAM create APIs use explicit fresh-name pairs.
-#             For exact resources the signed control proves were never
-#             created because their API was disabled, deny executes only a
-#             read-only capability preflight. It records that GET separately
+#             For APIs authoritatively read as disabled before creation,
+#             both phases execute only a read-only capability preflight. It records that GET separately
 #             from the unexecuted mutation; enabled or unreadable APIs fail.
 #             Raw requests remain attested beside the exact comparison.
 #   cleanup   dispatched last, naming the control run, under the control form
-#             again: removes every throwaway resource the control run created
-#             and attests the removal; a leftover fails the run.
+#             again: removes every throwaway resource the control run created,
+#             attests a recovery checkpoint, then retires its retained
+#             metadata carriers and attests the removal. A leftover fails
+#             the run; a checkpoint lets a later cleanup repeat fresh checks
+#             after an interrupted carrier retirement.
 #
 # All three runs attest exactly what they observed -- policy names, etags,
 # rules, the allow policies at every attachment point, and per-permission
@@ -86,6 +88,10 @@ on:
         description: For the deny and cleanup phases, the run ID of the control phase whose throwaway resources this run addresses; empty for the control phase.
         required: false
         type: string
+      cleanup_checkpoint_run_id:
+        description: Optional prior cleanup run whose verified checkpoint recovers identities after interrupted carrier retirement; cleanup only.
+        required: false
+        type: string
       organization_id:
         description: Numeric ID of the organization that parents the broker project and every consumer project; the third attachment point, attested for the module's organization check.
         required: true
@@ -141,8 +147,14 @@ jobs:
         env:
           PHASE: ${{ inputs.phase }}
           CONTROL_RUN_ID: ${{ inputs.control_run_id }}
+          CLEANUP_CHECKPOINT_RUN_ID: ${{ inputs.cleanup_checkpoint_run_id }}
         run: |
           set -euo pipefail
+          if [ -n "$CLEANUP_CHECKPOINT_RUN_ID" ]; then
+            test "$PHASE" = cleanup
+            [[ "$CLEANUP_CHECKPOINT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+            test "$CLEANUP_CHECKPOINT_RUN_ID" != "$GITHUB_RUN_ID"
+          fi
           case "$PHASE" in
             control)
               test -z "$CONTROL_RUN_ID"
@@ -174,6 +186,27 @@ jobs:
           gh run download "$CONTROL_RUN_ID" --repo "$GITHUB_REPOSITORY" --name deny-canary --dir "$directory"
           gh attestation verify "$directory/deny-canary.json" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/protected-recovery-deny-canary.yml" --predicate-type https://github.com/collinbentley1/platform/protected-recovery/deny-canary/v3 --deny-self-hosted-runners --format json > "$directory/verified.json"
           jq -e --arg sha "$GITHUB_SHA" --arg invocation "https://github.com/$GITHUB_REPOSITORY/actions/runs/$CONTROL_RUN_ID/attempts/1" --slurpfile control "$directory/deny-canary.json" 'length == 1 and (.[0].verificationResult | .signature.certificate.sourceRepositoryDigest == $sha and .signature.certificate.sourceRepositoryRef == "refs/heads/main" and .signature.certificate.runInvocationURI == $invocation and .statement.predicate == $control[0])' "$directory/verified.json" > /dev/null
+
+      # A failed run may have successfully attested a cleanup checkpoint
+      # before carrier retirement was interrupted. It supplies metadata only;
+      # the new cleanup repeats every ordinary and transient resource check.
+      - name: Verify an earlier cleanup checkpoint
+        id: cleanup_checkpoint
+        if: inputs.phase == 'cleanup' && inputs.cleanup_checkpoint_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKPOINT_RUN_ID: ${{ inputs.cleanup_checkpoint_run_id }}
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/recovery-checkpoint"
+          mkdir -p "$directory"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CHECKPOINT_RUN_ID" > "$directory/run.json"
+          jq -e --arg sha "$GITHUB_SHA" '.head_sha == $sha and .event == "workflow_dispatch" and .path == ".github/workflows/protected-recovery-deny-canary.yml"' "$directory/run.json" > /dev/null
+          gh run download "$CHECKPOINT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name deny-canary-cleanup-checkpoint --dir "$directory"
+          predicate="$directory/deny-canary-cleanup-checkpoint.json"
+          attempt="$(jq -er '.run.attempt | select(type == "number" and . >= 1 and . == floor)' "$predicate")"
+          gh attestation verify "$predicate" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/protected-recovery-deny-canary.yml" --predicate-type https://github.com/collinbentley1/platform/protected-recovery/deny-canary-cleanup-checkpoint/v3 --deny-self-hosted-runners --format json > "$directory/verified.json"
+          jq -e --arg sha "$GITHUB_SHA" --arg invocation "https://github.com/$GITHUB_REPOSITORY/actions/runs/$CHECKPOINT_RUN_ID/attempts/$attempt" --argjson run "$CHECKPOINT_RUN_ID" --slurpfile checkpoint "$predicate" '$checkpoint[0].run.id == $run and length == 1 and (.[0].verificationResult | .signature.certificate.sourceRepositoryDigest == $sha and .signature.certificate.sourceRepositoryRef == "refs/heads/main" and .signature.certificate.runInvocationURI == $invocation and .statement.predicate == $checkpoint[0])' "$directory/verified.json" > /dev/null
 
       - name: Exchange for the Deny canary identity
         id: auth
@@ -244,6 +277,7 @@ jobs:
       # A removal that leaves anything over fails here and is never attested
       # away: the module requires the attested leftovers to be empty.
       - name: Remove the throwaway resources of the control run
+        id: cleanup_resources
         if: inputs.phase == 'cleanup'
         env:
           ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
@@ -253,9 +287,10 @@ jobs:
           CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
           CONTROL_RUN_ID: ${{ steps.phase.outputs.control_run_id }}
           CONTROL_PREDICATE: ${{ steps.control_manifest.outcome == 'success' && format('{0}/control-canary/deny-canary.json', runner.temp) || '' }}
+          CLEANUP_CHECKPOINT: ${{ steps.cleanup_checkpoint.outcome == 'success' && format('{0}/recovery-checkpoint/deny-canary-cleanup-checkpoint.json', runner.temp) || '' }}
           ORGANIZATION_ID: ${{ inputs.organization_id }}
           PHASE: cleanup
-        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary-cleanup.json"
+        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary-cleanup-checkpoint.json"
 
       # On success, on failure, and on cancellation alike: whatever a phase
       # creates and removes within itself -- keys of the throwaway accounts,
@@ -265,7 +300,7 @@ jobs:
       # completed local predicate can prove its own build was never created;
       # later phases require the verified immutable control predicate.
       - name: Remove this run's transient resources
-        if: always() && steps.phase.outcome == 'success' && steps.auth.outcome == 'success' && steps.witness.outcome == 'success'
+        if: always() && steps.phase.outcome == 'success' && steps.auth.outcome == 'success' && steps.witness.outcome == 'success' && (inputs.phase != 'cleanup' || steps.cleanup_resources.outcome != 'success')
         env:
           ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
           CANARY_WITNESS_ACCESS_TOKEN: ${{ steps.witness.outputs.access_token }}
@@ -276,6 +311,7 @@ jobs:
           CONTROL_PREDICATE: ${{ steps.control_manifest.outcome == 'success' && format('{0}/control-canary/deny-canary.json', runner.temp) || '' }}
           ORGANIZATION_ID: ${{ inputs.organization_id }}
           PHASE: ${{ inputs.phase }}
+          CLEANUP_CHECKPOINT: ${{ steps.cleanup_checkpoint.outcome == 'success' && format('{0}/recovery-checkpoint/deny-canary-cleanup-checkpoint.json', runner.temp) || '' }}
           CURRENT_PREDICATE: ${{ format('{0}/deny-canary.json', runner.temp) }}
           TRANSIENT_CLEANUP: "1"
         run: |
@@ -286,6 +322,43 @@ jobs:
             jq -r '.leftovers[]' "$RUNNER_TEMP/deny-canary-transient.json" | sed 's/^/transient leftover: /' >&2
           fi
           exit "$status"
+
+      - name: Require complete cleanup before checkpoint attestation
+        if: inputs.phase == 'cleanup'
+        run: |
+          jq -e '.schema == "protected-recovery/deny-canary-cleanup-checkpoint/v3" and .phase == "cleanup" and .leftovers == [] and (.retainedCarriers | length > 0)' "$RUNNER_TEMP/deny-canary-cleanup-checkpoint.json" > /dev/null
+
+      - name: Upload the recovery checkpoint before carrier retirement
+        if: inputs.phase == 'cleanup'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deny-canary-cleanup-checkpoint
+          path: ${{ runner.temp }}/deny-canary-cleanup-checkpoint.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attest the recovery checkpoint before carrier retirement
+        if: inputs.phase == 'cleanup'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/deny-canary-cleanup-checkpoint.json
+          predicate-type: https://github.com/collinbentley1/platform/protected-recovery/deny-canary-cleanup-checkpoint/v3
+          predicate-path: ${{ runner.temp }}/deny-canary-cleanup-checkpoint.json
+
+      - name: Retire the checkpointed carriers by permanent identity
+        if: inputs.phase == 'cleanup'
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          CANARY_WITNESS_ACCESS_TOKEN: ${{ steps.witness.outputs.access_token }}
+          CANARY_WITNESS_SERVICE_ACCOUNT: ${{ steps.broker.outputs.witness }}
+          BROKER_IMAGE: ${{ inputs.broker_image }}
+          CANARY_SERVICE_ACCOUNT: ${{ steps.broker.outputs.canary }}
+          CONTROL_RUN_ID: ${{ steps.phase.outputs.control_run_id }}
+          CLEANUP_CHECKPOINT: ${{ runner.temp }}/deny-canary-cleanup-checkpoint.json
+          ORGANIZATION_ID: ${{ inputs.organization_id }}
+          PHASE: cleanup
+          CARRIER_RETIREMENT: "1"
+        run: bash tools/ci/protected-recovery-deny-canary.sh "$RUNNER_TEMP/deny-canary-cleanup.json"
 
       # Nothing incomplete is attested: every permission of every live rule
       # must have been exercised, the phase must have observed only what it

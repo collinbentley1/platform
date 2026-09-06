@@ -20,6 +20,7 @@ async function cleanup(command: string, answers: readonly { readonly status: num
   try {
     await writeFile(join(directory, "answers.json"), JSON.stringify(answers));
     await writeFile(join(directory, "predicate.json"), JSON.stringify(validManifest));
+    await writeFile(join(directory, "authority.json"), JSON.stringify({ consumers: [{ projectId: "consumer-project" }] }));
     const script = `set -euo pipefail
 workdir="$1"
 failures="$workdir/failures"
@@ -29,9 +30,26 @@ removed="$workdir/removed"
 : > "$workdir/calls"
 crm=https://cloudresourcemanager.googleapis.com/v3
 PHASE=cleanup
+transient_cleanup=1
+recovery_proof=0
+operation_json=null
+last_status=000
+declare -A mutation_ready=()
+declare -A manifest_gone=()
+broker_project=broker-project
+authority="$workdir/authority.json"
+iam=https://iam.googleapis.com/v1
+retained_carriers="$workdir/carriers.json"
+printf '[]' > "$retained_carriers"
+manifest_ids="$workdir/manifest-ids"
+: > "$manifest_ids"
+cleanup_skips="$workdir/cleanup-skips"
+: > "$cleanup_skips"
 folder_id=12345
 ORGANIZATION_ID=99999
 throwaway=deny-canary-test
+throwaway_new=deny-canary-test-new
+canary_project=deny-canary-test
 CONTROL_RUN_ID=123
 GITHUB_RUN_ID=456
 GITHUB_RUN_ATTEMPT=1
@@ -48,6 +66,7 @@ printf '[]' > "$resource_creation"
 observations="$workdir/observations"
 : > "$observations"
 canary_principal=canary
+manifest_write() { cp "$resource_creation" "$workdir/durable-creation.json"; }
 record_allow_boundary() { :; }
 pre_state() { pre_observed=unknown; pre_detail=fixture; }
 canary_body_sha256() { printf bodysha; }
@@ -61,7 +80,7 @@ call() {
   index=$((index + 1))
 }
 wait_operation() { return 0; }
-${["fail", "remove", "remove_unless_deleted", "cleanup_folder", "creation_record", "creation_answer", "service_disabled_exact", "never_created", "build_filter", "capability_url", "skip_never_created", "classify", "observe", "transient_builds"].map(functionSource).join("\n")}
+${["fail", "remove", "remove_unless_deleted", "cleanup_folder", "creation_record", "creation_answer", "creation_persist", "creation_resources", "creation_initialize", "creation_vector", "creation_restore", "service_account_email", "carrier_read", "carrier_projects", "consumer_projects", "checkpoint_read", "collect_carriers", "retire_carriers", "json_body", "provision", "manifest_description", "service_disabled_exact", "never_created", "build_filter", "capability_url", "skip_never_created", "classify", "observe", "transient_builds"].map(functionSource).join("\n")}
 ${command}
 `;
     const path = join(directory, "test.sh");
@@ -191,4 +210,124 @@ transient_builds consumer-project`, [answer]);
   const unread = await cleanup(`${setup}
 transient_builds consumer-project`, [{ status: 500, body: {} }]);
   expect(unread.failures).toContain("requires the authoritative API to remain disabled");
+});
+
+const carrierEmail = "deny-canary-test@broker-project.iam.gserviceaccount.com";
+const carrierDescription = (freeze: string) => JSON.stringify({ gone: "222", folder: "12345", controlRunId: "123", headSha: "reviewed", freeze });
+
+test("failed controls recover P and N only through exact durable metadata and a fresh disabled read", async () => {
+  const resource = "projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new";
+  for (const state of ["PPPP", "NNNN", "UUUU", "CCCC"]) {
+    const result = await cleanup(`CONTROL_PREDICATE=
+carrier_read broker-project
+if ! skip_never_created ${resource} compute.googleapis.com; then fail unresolved-creation; fi`, [
+      { status: 200, body: { email: carrierEmail, uniqueId: "222", description: carrierDescription(state) } }, disabled,
+    ]);
+    expect(result.failures).toBe(state === "PPPP" || state === "NNNN" ? "" : "unresolved-creation\n");
+    expect(result.calls.trim().split("\n")).toHaveLength(state === "PPPP" || state === "NNNN" ? 2 : 1);
+  }
+  const mismatch = await cleanup("if ! carrier_read broker-project; then fail rejected-carrier; fi", [
+    { status: 200, body: { email: carrierEmail, uniqueId: "222", description: carrierDescription("PPPP").replace("reviewed", "different") } },
+  ]);
+  expect(mismatch.failures).toContain("rejected-carrier");
+});
+
+test("control persists U before an enabled create and a failed durable write suppresses the mutation", async () => {
+  const observeControl = observeNeverCreated.replace("PHASE=deny", "PHASE=control\ntransient_cleanup=0");
+  const setup = `creation_record ${instanceResource} compute.googleapis.com NOT_ATTEMPTED
+mutation_ready[${instanceResource}]=1`;
+  const result = await cleanup(`${setup}
+manifest_write() { printf 'PERSIST U\\n' >> "$workdir/calls"; }
+${observeControl}`, [{ status: 200, body: {} }]);
+  expect(result.calls.trim().split("\n")).toEqual(["PERSIST U", "POST https://compute.googleapis.com/compute/v1/projects/consumer-project/zones/us-east4-a/instances"]);
+  expect(JSON.parse(result.creation)[0].state).toBe("UNKNOWN");
+  const failedWrite = await cleanup(`${setup}
+manifest_write() { return 1; }
+if ${observeControl}; then fail unexpected-mutation; fi`, []);
+  expect(failedWrite.calls).toBe("");
+  expect(failedWrite.failures).toBe("");
+  const disabledControl = await cleanup(`creation_record ${instanceResource} compute.googleapis.com NEVER_CREATED SERVICE_DISABLED
+${observeControl}`, [disabled]);
+  expect(disabledControl.calls).not.toContain("POST");
+  expect(JSON.parse(disabledControl.observations).response.skippedMutation).toBe(true);
+});
+
+test("durable carrier writes verify exact readback and reject oversized descriptions before any write", async () => {
+  const command = `${functionSource("manifest_write")}
+creation_initialize
+manifest_gone[broker-project]=222
+if ! manifest_write broker-project; then fail carrier-write-rejected; fi`;
+  const valid = await cleanup(command, [
+    { status: 200, body: {} },
+    { status: 200, body: { email: carrierEmail, uniqueId: "222", description: carrierDescription("PPPP") } },
+  ]);
+  expect(valid.failures).toBe("");
+  expect(valid.calls).toContain("PATCH");
+  const changed = await cleanup(command, [{ status: 200, body: {} }, { status: 200, body: { email: carrierEmail, uniqueId: "222", description: "changed" } }]);
+  expect(changed.failures).toContain("carrier-write-rejected");
+  const oversized = await cleanup(`GITHUB_SHA=${"a".repeat(300)}
+${command}`, []);
+  expect(oversized.failures).toContain("256-byte description bound");
+  expect(oversized.calls).toBe("");
+});
+
+const retainedCarriers = [
+  { project: "consumer-project", email: "deny-canary-test@consumer-project.iam.gserviceaccount.com", uniqueId: "111" },
+  { project: "broker-project", email: carrierEmail, uniqueId: "222" },
+];
+const carrierSetup = `printf '%s' '${JSON.stringify(retainedCarriers)}' > "$retained_carriers"`;
+
+test("carrier retirement uses permanent IDs, verifies absence, and preserves the broker after any earlier failure", async () => {
+  const answers = retainedCarriers.flatMap((carrier) => [
+    { status: 200, body: { email: carrier.email, uniqueId: carrier.uniqueId } },
+    { status: 204, body: {} }, { status: 404, body: {} }, { status: 404, body: {} },
+  ]);
+  const success = await cleanup(`${carrierSetup}
+retire_carriers`, answers);
+  expect(success.failures).toBe("");
+  expect(success.calls.split("\n").filter((line) => line.startsWith("DELETE"))).toEqual([
+    "DELETE https://iam.googleapis.com/v1/projects/-/serviceAccounts/111",
+    "DELETE https://iam.googleapis.com/v1/projects/-/serviceAccounts/222",
+  ]);
+  const incomplete = await cleanup(`${carrierSetup}
+retire_carriers`, [{ status: 200, body: { email: "deny-canary-test@consumer-project.iam.gserviceaccount.com", uniqueId: "111" } }, { status: 403, body: {} }, { status: 200, body: {} }, { status: 200, body: {} }]);
+  expect(incomplete.failures).toContain("final carrier absence is not readable");
+  expect(incomplete.calls).not.toContain(carrierEmail);
+  const recreated = await cleanup(`${carrierSetup}
+retire_carriers`, [{ status: 200, body: { email: "deny-canary-test@consumer-project.iam.gserviceaccount.com", uniqueId: "999" } }]);
+  expect(recreated.failures).toContain("carrier identity changed");
+  expect(recreated.calls).not.toContain("DELETE");
+});
+
+test("verified checkpoint recovery retains missing carrier IDs and still requires a fresh disabled read", async () => {
+  const checkpointSetup = `${carrierSetup}
+creation_initialize
+jq -n --slurpfile carriers "$retained_carriers" --slurpfile creation "$resource_creation" '{schema:"protected-recovery/deny-canary-cleanup-checkpoint/v3",phase:"cleanup",controlRunId:"123",run:{headSha:"reviewed",id:400,attempt:1},brokerImage:"image",organization:"organizations/99999",witnessServiceAccount:"witness",throwaways:{project:"deny-canary-test",folder:"12345",goneUniqueIds:{"broker-project":"222"}},leftovers:[],removed:[],cleanupSkips:[],creationVector:"PPPP",resourceCreation:$creation[0],retainedCarriers:$carriers[0]}' > "$workdir/checkpoint.json"
+CLEANUP_CHECKPOINT="$workdir/checkpoint.json"
+checkpoint_read
+collect_carriers
+if ! skip_never_created projects/consumer-project/zones/us-east4-a/instances/deny-canary-test-new compute.googleapis.com; then fail missing-proof; fi`;
+  const result = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, disabled]);
+  expect(result.failures).toBe("");
+  expect(result.calls.trim().split("\n")).toHaveLength(3);
+  expect(result.calls).not.toContain("DELETE");
+  const enabled = await cleanup(checkpointSetup, [{ status: 404, body: {} }, { status: 404, body: {} }, { status: 200, body: {} }]);
+  expect(enabled.failures).toContain("requires the authoritative API to remain disabled");
+});
+
+test("the carrier create itself contains durable P metadata before any later provisioning", async () => {
+  const result = await cleanup(`${functionSource("identity_rows")}
+creation_initialize
+folder_id=
+create_new=deny-canary-test-new-c
+throwaway_gone=deny-canary-test-gone
+delegate=deny-canary-test-d
+preparing() { return 0; }
+provision() { cp "$3" "$observations"; printf 'CREATE %s\\n' "$2" >> "$workdir/calls"; return 1; }
+if identity_rows attachment broker-project broker; then fail unexpectedly-continued; fi`, []);
+  const request = JSON.parse(result.observations);
+  expect(request.accountId).toBe("deny-canary-test");
+  expect(JSON.parse(request.serviceAccount.description)).toEqual({ gone: "", folder: "", controlRunId: "123", headSha: "reviewed", freeze: "PPPP" });
+  expect(result.calls.trim().split("\n")).toHaveLength(1);
+  expect(result.failures).toBe("");
 });

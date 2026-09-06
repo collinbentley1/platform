@@ -20,8 +20,8 @@
 # even when the canary cannot. Unknown state is never a positive precondition.
 #
 # Cleanup uses the persisted numeric folder identity and requires a readable
-# terminal result. Only exact control-proven never-created resources may be
-# skipped while an authoritative read still proves their API disabled. The live
+# terminal result. Only exact proven never-created resources may be skipped
+# while an authoritative read still proves their API disabled. The live
 # retirement reader subsequently checks inherited grants and rereads the
 # exact folder/project IDs. Neither predicate includes a bearer credential.
 #
@@ -32,8 +32,11 @@
 # from the canary. The workflow's existing controller mapping and read-only
 # permissions are deployment prerequisites; this script grants neither.
 # TRANSIENT_CLEANUP=1 removes this run's keys and queued builds and fails
-# closed when it cannot enumerate or remove them. The sole argument is the
-# output predicate path.
+# closed when it cannot enumerate or remove them. Cleanup first emits a
+# checkpoint with all carriers retained; CARRIER_RETIREMENT=1 consumes that
+# checkpoint after workflow attestation. A verified CLEANUP_CHECKPOINT can
+# recover metadata on retry, followed by fresh cleanup. The sole argument
+# is the output predicate path.
 set -euo pipefail
 
 output="${1:?output path}"
@@ -58,6 +61,8 @@ fi
 [[ "$BROKER_IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
 [[ "$CANARY_SERVICE_ACCOUNT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$ ]]
 transient_cleanup="${TRANSIENT_CLEANUP:-0}"
+carrier_retirement="${CARRIER_RETIREMENT:-0}"
+recovery_proof=0
 prepare_only=0
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -134,10 +139,15 @@ pre_observed=unknown
 pre_detail=""
 folder_id=""
 declare -A manifest_gone=()
+declare -A mutation_ready=()
 manifest_ids="$workdir/manifest-ids.jsonl"
 : > "$manifest_ids"
 resource_creation="$workdir/resource-creation.json"
 printf '[]\n' > "$resource_creation"
+retained_carriers="$workdir/retained-carriers.json"
+printf '[]\n' > "$retained_carriers"
+cleanup_skips="$workdir/cleanup-skips.jsonl"
+: > "$cleanup_skips"
 
 fail() {
   echo "$1" >> "$failures"
@@ -204,27 +214,79 @@ service_disabled() {
   [ "$last_status" = 403 ] && jq -e '[.error.details[]? | select(.reason == "SERVICE_DISABLED")] | length > 0' "$workdir/body" > /dev/null 2>&1
 }
 
-# Only completed producer predicates can prove that no create ever succeeded
-# or had an ambiguous result. Later phases may use the verified control proof
-# because the deny observer structurally suppresses those mutations.
+# P survives interruption before any attempt; U is persisted and read back
+# before a create can run. N records a disabled capability read. U/C never
+# become P/N. Signed control or checkpoint evidence and the durable carrier
+# bind later cleanup to these same exact resources.
 creation_record() {
   local resource="$1" service="$2" state="$3" reason="${4:-}" tag="${5:-}"
   jq --arg resource "$resource" --arg service "$service" --arg state "$state" --arg reason "$reason" --arg tag "$tag" '
     ([.[] | select(.resource == $resource)] | .[0]) as $prior
-    | if $prior.state == "CREATED" or $prior.state == "UNKNOWN" then .
+    | if ($state == "NEVER_CREATED" or $state == "NOT_ATTEMPTED") and ($prior.state == "CREATED" or $prior.state == "UNKNOWN") then .
       else [.[] | select(.resource != $resource)] + [{resource: $resource, service: $service, state: $state, reason: $reason, tag: $tag}] end
   ' "$resource_creation" > "$workdir/creation-next.json"
   mv "$workdir/creation-next.json" "$resource_creation"
 }
 
+# The broker's compact vector is ordered by the reviewed consumer list;
+# within each project: retained instance, new instance, template, build.
+creation_resources() {
+  local project="$1"
+  printf '%s\n' "projects/${project}/zones/${zone}/instances/${throwaway}" "projects/${project}/zones/${zone}/instances/${throwaway_new}" "projects/${project}/global/instanceTemplates/${throwaway_new}" "projects/${project}/locations/global/builds"
+}
+
+creation_initialize() {
+  local project resource service tag
+  while IFS= read -r project; do
+    while IFS= read -r resource; do
+      service=compute.googleapis.com; tag=""
+      if [[ "$resource" == */builds ]]; then service=cloudbuild.googleapis.com; tag="protected-recovery-deny-canary-${CONTROL_RUN_ID}"; fi
+      creation_record "$resource" "$service" NOT_ATTEMPTED "" "$tag"
+    done < <(creation_resources "$project")
+  done < <(consumer_projects)
+}
+
+creation_vector() {
+  local project="$1" resource
+  while IFS= read -r resource; do
+    jq -er --arg resource "$resource" '[.[] | select(.resource == $resource)] | if length == 1 then .[0].state else "UNKNOWN" end | {NOT_ATTEMPTED:"P",NEVER_CREATED:"N",UNKNOWN:"U",CREATED:"C"}[.]' "$resource_creation" | tr -d '\n'
+  done < <(if [ "$project" = "$broker_project" ]; then while IFS= read -r consumer; do creation_resources "$consumer"; done < <(consumer_projects); else creation_resources "$project"; fi)
+}
+
+creation_restore() {
+  local vector="$1" project resource state service tag index=0
+  while IFS= read -r project; do
+    while IFS= read -r resource; do
+      case "${vector:index:1}" in P) state=NOT_ATTEMPTED ;; N) state=NEVER_CREATED ;; U) state=UNKNOWN ;; C) state=CREATED ;; *) return 1 ;; esac
+      service=compute.googleapis.com; tag=""
+      if [[ "$resource" == */builds ]]; then service=cloudbuild.googleapis.com; tag="protected-recovery-deny-canary-${CONTROL_RUN_ID}"; fi
+      creation_record "$resource" "$service" "$state" "$(if [ "$state" = NEVER_CREATED ]; then printf SERVICE_DISABLED; fi)" "$tag"
+      index=$((index + 1))
+    done < <(creation_resources "$project")
+  done < <(consumer_projects)
+  [ "$index" = "${#vector}" ]
+}
+
+creation_persist() {
+  local saved_status="$last_status" saved_operation="$operation_json" saved_body
+  saved_body="$(mktemp "$workdir/creation-response.XXXXXX")"
+  if [ -f "$workdir/body" ]; then cp "$workdir/body" "$saved_body"; fi
+  creation_record "$@" || return 1
+  # No dependent create may run unless its U marker is durable and readable.
+  manifest_write "$broker_project" || return 1
+  last_status="$saved_status"; operation_json="$saved_operation"
+  cp "$saved_body" "$workdir/body"
+  rm "$saved_body"
+}
+
 creation_answer() {
   local resource="$1" service="$2" tag="${3:-}"
   if [ "$last_outcome" = UNSERVICEABLE ] && service_disabled_exact "$service"; then
-    creation_record "$resource" "$service" NEVER_CREATED SERVICE_DISABLED "$tag"
+    creation_persist "$resource" "$service" NEVER_CREATED SERVICE_DISABLED "$tag" || return 1
   elif [ "$last_outcome" = ALLOWED ]; then
-    creation_record "$resource" "$service" CREATED "" "$tag"
+    creation_persist "$resource" "$service" CREATED "" "$tag" || return 1
   else
-    creation_record "$resource" "$service" UNKNOWN "" "$tag"
+    creation_persist "$resource" "$service" UNKNOWN "" "$tag" || return 1
   fi
 }
 
@@ -234,6 +296,11 @@ service_disabled_exact() {
 
 never_created() {
   local resource="$1" service="$2" tag="${3:-}" predicate="${CONTROL_PREDICATE:-}" expected_phase=control expected_run="$CONTROL_RUN_ID" expected_attempt=1
+  if { [ "$PHASE" = control ] && [ "$transient_cleanup" = 0 ]; } || [ "$recovery_proof" = 1 ]; then
+    if [ "$PHASE" = control ] && [ "${mutation_ready[$resource]:-0}" = 1 ]; then return 1; fi
+    jq -e --arg resource "$resource" --arg service "$service" --arg tag "$tag" '[.[] | select(.resource == $resource)] | length == 1 and .[0].service == $service and .[0].tag == $tag and (.[0].state == "NEVER_CREATED" or .[0].state == "NOT_ATTEMPTED")' "$resource_creation" > /dev/null
+    return
+  fi
   if [ "$PHASE" = control ]; then
     [ "$GITHUB_RUN_ATTEMPT" = 1 ] || return 1
     predicate="${CURRENT_PREDICATE:-}"
@@ -269,6 +336,7 @@ skip_never_created() {
     fail "${resource}: never-created proof requires the authoritative API to remain disabled; HTTP ${last_status}"
     return 0
   fi
+  jq -cn --arg resource "$resource" --arg service "$service" --arg tag "$tag" --arg url "$(capability_url "$resource" "$service")" '{resource:$resource,service:$service,tag:$tag,observedRequest:{method:"GET",url:$url},response:{status:"403",reason:"SERVICE_DISABLED",service:$service},observedAt:(now|todateiso8601)}' >> "$cleanup_skips"
   echo "never created: ${resource}" >> "$removed"
   return 0
 }
@@ -411,7 +479,7 @@ observe() {
   fi
   local observed_url="" service="${permission%%/*}" tag=""
   [ "$service" != cloudbuild.googleapis.com ] || tag="protected-recovery-deny-canary-${CONTROL_RUN_ID}"
-  if [ "$PHASE" = deny ] && never_created "$pre_name" "$service" "$tag"; then
+  if never_created "$pre_name" "$service" "$tag"; then
     observed_url="$(capability_url "$pre_name" "$service")"
     witness_call GET "$observed_url"
     classified="$(classify)"
@@ -420,6 +488,9 @@ observe() {
     fi
     classified="$(jq -c --arg url "$observed_url" '. + {skippedMutation: true, observedRequest: {method: "GET", url: $url}}' <<< "$classified")"
   else
+    if [ "$PHASE" = control ] && { [ "$permission" = compute.googleapis.com/instances.create ] || [ "$permission" = compute.googleapis.com/instanceTemplates.create ] || [ "$permission" = cloudbuild.googleapis.com/builds.create ]; }; then
+      creation_persist "$pre_name" "$service" UNKNOWN "" "$tag" || return 1
+    fi
     call "$method" "$url" "$body" "$content_type"
     classified="$(classify)"
   fi
@@ -566,29 +637,145 @@ service_account_email() {
 # What later phases cannot rederive -- the unique ID of the deleted account
 # the undelete row addresses, the folder the movement row addresses -- is
 # kept in the description of the retained throwaway account of the project.
+manifest_description() {
+  local project="$1" description
+  description="$(jq -cn --arg gone "${manifest_gone[$project]:-}" --arg folder "$folder_id" --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --arg freeze "$(creation_vector "$project")" '{gone:$gone,folder:$folder,controlRunId:$control,headSha:$sha,freeze:$freeze}')"
+  [ "${#description}" -le 256 ] || { fail "the recovery carrier exceeds its 256-byte description bound"; return 1; }
+  printf '%s' "$description"
+}
+
 manifest_write() {
-  local project="$1"
-  local email
+  local project="$1" email description body
   email="$(service_account_email "$throwaway" "$project")"
-  jq -cn --arg project "$project" --arg id "${manifest_gone[$project]:-}" '{key: $project, value: $id}' >> "$manifest_ids"
-  provision PATCH "${iam}/projects/-/serviceAccounts/${email}?updateMask=description" "$(json_body "$(jq -cn --arg gone "${manifest_gone[$project]:-}" --arg folder "$folder_id" --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" '{description: ({gone: $gone, folder: $folder, controlRunId: $control, headSha: $sha} | tojson)}')")" || true
+  description="$(manifest_description "$project")" || return 1
+  body="$(json_body "$(jq -cn --arg description "$description" '{description:$description}')")"
+  provision PATCH "${iam}/projects/-/serviceAccounts/${email}?updateMask=description" "$body" || return 1
+  witness_call GET "${iam}/projects/${project}/serviceAccounts/${email}"
+  if [ "$last_status" != 200 ] || ! jq -e --arg email "$email" --arg description "$description" '.email == $email and .description == $description and (.uniqueId | test("^[1-9][0-9]*$"))' "$workdir/body" > /dev/null; then
+    fail "the recovery carrier write is not readable at its exact identity"
+    return 1
+  fi
+  jq -cn --arg project "$project" --arg id "${manifest_gone[$project]:-}" '{key:$project,value:$id}' >> "$manifest_ids"
+}
+
+carrier_read() {
+  local project="$1" email vector expected
+  email="$(service_account_email "$throwaway" "$project")"
+  witness_call GET "${iam}/projects/${project}/serviceAccounts/${email}"
+  expected="$(jq '.consumers | length * 4' "$authority")"
+  if [ "$last_status" != 200 ] || ! jq -e --arg email "$email" --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --argjson count "$expected" '.email == $email and (.uniqueId | test("^[1-9][0-9]*$")) and (.description | length <= 256) and ((.description | fromjson) | .controlRunId == $control and .headSha == $sha and (.freeze | type == "string" and length == $count and test("^[PNUC]+$")) and (.folder | test("^([1-9][0-9]*|\\?)?$")))' "$workdir/body" > /dev/null; then
+    fail "the failed control's durable cleanup metadata is unreadable"
+    return 1
+  fi
+  folder_id="$(jq -r '.description | fromjson | .folder' "$workdir/body")"
+  manifest_gone[$project]="$(jq -r '.description | fromjson | .gone' "$workdir/body")"
+  vector="$(jq -r '.description | fromjson | .freeze' "$workdir/body")"
+  creation_restore "$vector" || { fail "the failed control's creation vector is invalid"; return 1; }
+  recovery_proof=1
+}
+
+carrier_projects() {
+  consumer_projects
+  printf '%s\n' "$broker_project"
+}
+
+checkpoint_read() {
+  local checkpoint="${CLEANUP_CHECKPOINT:-}" project email vector
+  [ -n "$checkpoint" ] && [ -f "$checkpoint" ] || return 1
+  : > "$workdir/carrier-names.jsonl"
+  while IFS= read -r project; do
+    email="$(service_account_email "$throwaway" "$project")"
+    jq -cn --arg project "$project" --arg email "$email" '{project:$project,email:$email}' >> "$workdir/carrier-names.jsonl"
+  done < <(carrier_projects)
+  if ! jq -e --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --arg image "$BROKER_IMAGE" --arg name "$canary_project" --arg org "organizations/${ORGANIZATION_ID}" --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" --slurpfile carriers "$workdir/carrier-names.jsonl" '
+    .schema == "protected-recovery/deny-canary-cleanup-checkpoint/v3" and .phase == "cleanup" and .controlRunId == $control and .run.headSha == $sha and .brokerImage == $image and .organization == $org and .witnessServiceAccount == $witness and .throwaways.project == $name
+    and .leftovers == [] and (.removed | type == "array") and (.cleanupSkips | type == "array")
+    and ([.retainedCarriers[] | {project,email}] == $carriers)
+    and all(.retainedCarriers[]; .uniqueId == null or (.uniqueId | type == "string" and test("^[1-9][0-9]*$")))
+    and (.throwaways.folder | test("^([1-9][0-9]*)?$"))
+  ' "$checkpoint" > /dev/null; then
+    fail "the verified cleanup checkpoint does not match these exact recovery identities"
+    return 1
+  fi
+  folder_id="$(jq -r '.throwaways.folder' "$checkpoint")"
+  jq '.retainedCarriers' "$checkpoint" > "$retained_carriers"
+  vector="$(jq -er '.creationVector | select(type == "string" and test("^[PNUC]+$"))' "$checkpoint")" || return 1
+  creation_restore "$vector" || { fail "the cleanup checkpoint has an invalid creation vector"; return 1; }
+  if ! jq -e --slurpfile actual "$resource_creation" '(.resourceCreation | sort_by(.resource)) == ($actual[0] | sort_by(.resource))' "$checkpoint" > /dev/null; then
+    fail "the cleanup checkpoint creation identities do not match the reviewed vector"
+    return 1
+  fi
+  while IFS= read -r project; do
+    manifest_gone[$project]="$(jq -r --arg project "$project" '.throwaways.goneUniqueIds[$project] // ""' "$checkpoint")"
+    jq -cn --arg project "$project" --arg id "${manifest_gone[$project]}" '{key:$project,value:$id}' >> "$manifest_ids"
+  done < <(carrier_projects)
+  recovery_proof=1
+}
+
+# Capture permanent IDs before attestation. A checkpoint permits an already
+# deleted carrier on retry; an email recreated under a new ID never matches.
+collect_carriers() {
+  local project email prior unique_id
+  : > "$workdir/carriers-next.jsonl"
+  while IFS= read -r project; do
+    email="$(service_account_email "$throwaway" "$project")"
+    prior="$(jq -c --arg email "$email" '[.[] | select(.email == $email)] | .[0] // null' "$retained_carriers")"
+    witness_call GET "${iam}/projects/${project}/serviceAccounts/${email}"
+    if [ "$last_status" = 404 ]; then
+      unique_id="$(jq -c '.uniqueId // null' <<< "$prior")"
+    elif [ "$last_status" = 200 ] && jq -e --arg email "$email" '.email == $email and (.uniqueId | test("^[1-9][0-9]*$"))' "$workdir/body" > /dev/null; then
+      unique_id="$(jq -c '.uniqueId' "$workdir/body")"
+      if [ "$prior" != null ] && [ "$unique_id" != "$(jq -c '.uniqueId' <<< "$prior")" ]; then
+        fail "${email}: carrier permanent identity differs from the verified checkpoint"
+        continue
+      fi
+      if [ -z "${manifest_gone[$project]:-}" ]; then
+        manifest_gone[$project]="$(jq -r 'try (.description | fromjson | .gone) // ""' "$workdir/body")"
+      fi
+    else
+      fail "${email}: carrier identity is unreadable; HTTP ${last_status}"
+      continue
+    fi
+    jq -cn --arg project "$project" --arg email "$email" --argjson id "$unique_id" '{project:$project,email:$email,uniqueId:$id}' >> "$workdir/carriers-next.jsonl"
+    jq -cn --arg project "$project" --arg id "${manifest_gone[$project]:-}" '{key:$project,value:$id}' >> "$manifest_ids"
+  done < <(carrier_projects)
+  jq -s . "$workdir/carriers-next.jsonl" > "$retained_carriers"
+}
+
+retire_carriers() {
+  local project email unique_id
+  while IFS=$'\t' read -r project email unique_id; do
+    if [ -s "$failures" ]; then break; fi
+    witness_call GET "${iam}/projects/${project}/serviceAccounts/${email}"
+    if [ "$last_status" = 200 ]; then
+      if [ "$unique_id" = null ] || ! jq -e --arg email "$email" --arg id "$unique_id" '.email == $email and .uniqueId == $id' "$workdir/body" > /dev/null; then
+        fail "${email}: carrier identity changed before retirement"
+        continue
+      fi
+      remove DELETE "${iam}/projects/-/serviceAccounts/${unique_id}" "account ${throwaway} of ${project}"
+    elif [ "$last_status" != 404 ]; then
+      fail "${email}: carrier unreadable before retirement; HTTP ${last_status}"
+      continue
+    fi
+    witness_call GET "${iam}/projects/${project}/serviceAccounts/${email}"
+    if [ "$last_status" != 404 ]; then fail "${email}: final carrier absence is not readable"; fi
+    if [ "$unique_id" != null ]; then
+      witness_call GET "${iam}/projects/-/serviceAccounts/${unique_id}"
+      if [ "$last_status" != 404 ]; then fail "${email}: permanent carrier identity is not absent"; fi
+    fi
+  done < <(jq -r '.[] | [.project,.email,(.uniqueId // "null")] | @tsv' "$retained_carriers")
 }
 
 manifest_read() {
   local project="$1"
+  if [ "$PHASE" = cleanup ] && [ -n "${CLEANUP_CHECKPOINT:-}" ]; then checkpoint_read; return; fi
   if [ -z "${CONTROL_PREDICATE:-}" ] || [ ! -f "$CONTROL_PREDICATE" ]; then
     # Failed controls still need cleanup. Their prepared carrier records the
     # exact folder ID. Successful controls use the immutable signed artifact,
     # which remains available after the carrier has been deleted.
-    [ "$PHASE" = cleanup ] || { fail "the verified control artifact is required"; return 1; }
-    witness_call GET "${iam}/projects/${project}/serviceAccounts/$(service_account_email "$throwaway" "$project")"
-    if [ "$last_status" != 200 ] || ! jq -e --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" '(.description | fromjson) | .controlRunId == $control and .headSha == $sha and (.folder | test("^[1-9][0-9]*$"))' "$workdir/body" > /dev/null; then
-      fail "the failed control's cleanup identities are unreadable"
-      return 1
-    fi
-    folder_id="$(jq -r '.description | fromjson | .folder' "$workdir/body")"
-    manifest_gone[$project]="$(jq -r '.description | fromjson | .gone' "$workdir/body")"
-    return 0
+    [ "$PHASE" = cleanup ] || { [ "$PHASE" = control ] && [ "$transient_cleanup" = 1 ]; } || { fail "the verified control artifact is required"; return 1; }
+    carrier_read "$broker_project"
+    return
   fi
   if ! jq -e --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --arg image "$BROKER_IMAGE" --arg name "$throwaway" --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" '.schema == "protected-recovery/deny-canary/v3" and .phase == "control" and .controlRunId == $control and .run.headSha == $sha and .brokerImage == $image and .throwaways.name == $name and .throwaways.project == $name and .witnessServiceAccount == $witness and (.throwaways.folder | test("^[1-9][0-9]*$"))' "$CONTROL_PREDICATE" > /dev/null; then
     fail "the verified control manifest does not match this phase"
@@ -629,12 +816,17 @@ identity_rows() {
   local provider_body='{"displayName":"Protected recovery Deny canary throwaway","oidc":{"issuerUri":"https://token.actions.githubusercontent.com/"},"attributeMapping":{"google.subject":"assertion.sub"},"attributeCondition":"false"}'
 
   if preparing; then
-    provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$throwaway" --argjson base "$account_body" '$base + {accountId: $id}')")" || true
+    local initial_description
+    initial_description="$(manifest_description "$project")" || return 1
+    provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$throwaway" --arg description "$initial_description" --argjson base "$account_body" '$base + {accountId: $id} | .serviceAccount.description = $description')")" || return 1
+    manifest_write "$project" || return 1
     if [ "$scope" = broker ]; then
       provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$delegate" --argjson base "$account_body" '$base + {accountId: $id}')")" || true
     fi
     if provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$throwaway_gone" --argjson base "$account_body" '$base + {accountId: $id}')")"; then
       manifest_gone[$project]="$(jq -r '.uniqueId // ""' "$workdir/body")"
+      [[ "${manifest_gone[$project]}" =~ ^[1-9][0-9]*$ ]] || { fail "${sa_gone}: permanent identity unreadable before deletion"; return 1; }
+      manifest_write "$project" || return 1
       provision DELETE "${iam}/${sa_gone}" || true
     fi
     provision POST "${iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${throwaway}" "$(json_body "$pool_body")" "" iam || true
@@ -690,10 +882,18 @@ identity_rows() {
   observe "$attachment" iam.googleapis.com/serviceAccounts.enable POST "${iam}/${sa_enable}:enable" "$(json_body '{}')" "" iam "$sa_enable" present iam.googleapis.com/serviceAccounts.enable
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/${sa_enable}:disable" "$(json_body '{}')" || true; fi
 
-  call GET "${iam}/${sa}"
+  # The recovery metadata carrier survives every observation. The existing
+  # disabled enable-account is the deletion target and is restored disabled.
+  witness_call GET "${iam}/${sa_enable}"
   unique_id="$(jq -r '.uniqueId // ""' "$workdir/body")"
-  observe "$attachment" iam.googleapis.com/serviceAccounts.delete DELETE "${iam}/${sa}" "" "" iam "$sa" present iam.googleapis.com/serviceAccounts.delete
-  if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/projects/-/serviceAccounts/${unique_id:-0}:undelete" "$(json_body '{}')" || true; fi
+  if [ "$last_status" != 200 ] || ! [[ "$unique_id" =~ ^[1-9][0-9]*$ ]]; then
+    fail "${sa_enable}: deletion target permanent identity is unreadable"
+    return 1
+  fi
+  observe "$attachment" iam.googleapis.com/serviceAccounts.delete DELETE "${iam}/${sa_enable}" "" "" iam "$sa_enable" present iam.googleapis.com/serviceAccounts.delete
+  if provisioning && [ "$last_outcome" = ALLOWED ]; then
+    provision POST "${iam}/projects/-/serviceAccounts/${unique_id}:undelete" "$(json_body '{}')" && provision POST "${iam}/${sa_enable}:disable" "$(json_body '{}')" || true
+  fi
   # IAM get does not expose a deleted-account tombstone. Read the permanent
   # ID from the control manifest, never a reusable email. The successful
   # control undelete and subsequent delete bind this ID; Terraform limits
@@ -878,19 +1078,32 @@ freeze_rows() {
   instance_body="$(jq -cn --arg name "$throwaway_new" --arg zone "$zone" '{name: $name, machineType: ("zones/" + $zone + "/machineTypes/e2-micro"), disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}')"
   template_body="$(jq -cn --arg name "$throwaway_new" '{name: $name, properties: {machineType: "e2-micro", disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}}')"
   if preparing; then
-    call GET "${compute}/projects/${project}/zones/${zone}"
-    if [[ "$last_status" =~ ^2 ]]; then
-      if provision POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$(jq -c --arg name "$throwaway" '.name = $name' <<< "$instance_body")")" "" compute; then
-        creation_record "$instance" compute.googleapis.com CREATED
-        provision POST "${compute}/${instance}/stop" "" "" compute || true
+    local resource capability
+    for capability in compute.googleapis.com cloudbuild.googleapis.com; do
+      witness_call GET "$(capability_url "$instance" "$capability")"
+      if service_disabled_exact "$capability"; then
+        while IFS= read -r resource; do
+          if { [ "$capability" = cloudbuild.googleapis.com ] && [[ "$resource" == */builds ]]; } || { [ "$capability" = compute.googleapis.com ] && [[ "$resource" != */builds ]]; }; then
+            creation_persist "$resource" "$capability" NEVER_CREATED SERVICE_DISABLED "$(if [ "$capability" = cloudbuild.googleapis.com ]; then printf '%s' "$build_tag"; fi)" || return 1
+          fi
+        done < <(creation_resources "$project")
+      elif [[ "$last_status" =~ ^2 ]]; then
+        while IFS= read -r resource; do
+          if { [ "$capability" = cloudbuild.googleapis.com ] && [[ "$resource" == */builds ]]; } || { [ "$capability" = compute.googleapis.com ] && [[ "$resource" != */builds ]]; }; then
+            mutation_ready[$resource]=1
+          fi
+        done < <(creation_resources "$project")
       else
-        creation_record "$instance" compute.googleapis.com UNKNOWN
+        fail "${project}: preparation capability ${capability} is unreadable"
+        return 1
       fi
-    elif service_disabled_exact compute.googleapis.com; then
-      creation_record "$instance" compute.googleapis.com NEVER_CREATED SERVICE_DISABLED
-    else
-      creation_record "$instance" compute.googleapis.com UNKNOWN
-      fail "${instance}: preparation capability is unreadable"
+    done
+    if ! never_created "$instance" compute.googleapis.com; then
+      creation_persist "$instance" compute.googleapis.com UNKNOWN || return 1
+      if provision POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$(jq -c --arg name "$throwaway" '.name = $name' <<< "$instance_body")")" "" compute; then
+        creation_persist "$instance" compute.googleapis.com CREATED || return 1
+        provision POST "${compute}/${instance}/stop" "" "" compute || true
+      fi
     fi
   fi
   if preparing; then return 0; fi
@@ -930,6 +1143,8 @@ organization_rows() {
     provision POST "${iam}/organizations/${ORGANIZATION_ID}/roles" "$(json_body "$(jq -cn --arg id "$role_gone" --argjson base "$role_body" '$base + {roleId: $id}')")" && provision DELETE "${iam}/${role_gone_name}" || true
     provision POST "${orgpolicy}/${policies}" "$(json_body "$(jq -cn --arg name "${policies}/${constraint_kept}" '{name: $name, spec: {rules: [{enforce: true}]}}')")" || true
     provision POST "${crm}/projects" "$(json_body "$(jq -cn --arg id "$canary_project" --arg parent "organizations/${ORGANIZATION_ID}" '{projectId: $id, parent: $parent, displayName: "Protected recovery Deny canary throwaway"}')")" "" crm || true
+    folder_id="?"
+    manifest_write "$broker_project"
     if provision POST "${crm}/folders" "$(json_body "$(jq -cn --arg name "$throwaway" --arg parent "organizations/${ORGANIZATION_ID}" '{displayName: $name, parent: $parent}')")" "" crm; then
       folder_id="$(jq -r '.response.name // "" | sub("^folders/"; "")' <<< "$operation_json")"
       [ -n "$folder_id" ] || folder_id="$(jq -r '.response.name // "" | sub("^folders/"; "")' "$workdir/body")"
@@ -1046,10 +1261,7 @@ cleanup_project() {
   for name in "$throwaway" "$throwaway_new" "${throwaway_new}-c" "${throwaway_new}-d" "$throwaway_gone" "$delegate" "$enable_account"; do
     email="$(service_account_email "$name" "$project")"
     if [ "$name" = "$delegate" ] && [ "$scope" != broker ]; then continue; fi
-    if [ "$scope" = broker ] && [ "$name" = "$throwaway" ] && [ -s "$failures" ]; then
-      fail "account ${name} of ${project}: retained to preserve unresolved cleanup identities"
-      continue
-    fi
+    if [ "$name" = "$throwaway" ]; then continue; fi
     remove DELETE "${iam}/projects/${project}/serviceAccounts/${email}" "account ${name} of ${project}"
   done
 }
@@ -1057,6 +1269,7 @@ cleanup_project() {
 # The manifest owns this numeric identity. An unread or mismatched object
 # cannot authorize deletion, and an accepted delete is followed by a read.
 cleanup_folder() {
+  if [ -z "$folder_id" ] && [ "$recovery_proof" = 1 ]; then return 0; fi
   if ! [[ "$folder_id" =~ ^[1-9][0-9]*$ ]]; then
     fail "throwaway folder: the control manifest has no numeric folder identity"
     return 0
@@ -1168,7 +1381,19 @@ consumer_projects() {
   jq -r '.consumers[].projectId' "$authority"
 }
 
+if [ "$carrier_retirement" = 1 ]; then
+  [ "$PHASE" = cleanup ] || { fail "carrier retirement is a cleanup-only operation"; exit 1; }
+  checkpoint_read
+  jq -e --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" '.run.id == $run and .run.attempt == $attempt' "$CLEANUP_CHECKPOINT" > /dev/null
+  retire_carriers
+  jq --rawfile removed "$removed" --rawfile failures "$failures" '.schema = "protected-recovery/deny-canary-cleanup/v3" | .removed += ($removed | split("\n") | map(select(length > 0))) | .leftovers = ($failures | split("\n") | map(select(length > 0)))' "$CLEANUP_CHECKPOINT" > "$output"
+  [ ! -s "$failures" ]
+  exit 0
+fi
+
 if [ "$transient_cleanup" = 1 ]; then
+  if [ "$PHASE" = control ] && { [ -z "${CURRENT_PREDICATE:-}" ] || [ ! -f "$CURRENT_PREDICATE" ]; }; then manifest_read "$broker_project"; fi
+  if [ "$PHASE" = cleanup ]; then manifest_read "$broker_project"; fi
   transient_keys "$broker_project"
   while IFS= read -r project; do
     transient_keys "$project"
@@ -1185,9 +1410,15 @@ if [ "$PHASE" = cleanup ]; then
   # an earlier cleanup already deleted the account that carried the manifest.
   manifest_read "$broker_project"
   cleanup_organization
+  collect_carriers
   cleanup_project "$broker_project" broker
   while IFS= read -r project; do
     cleanup_project "$project" consumer
+  done < <(consumer_projects)
+  transient_keys "$broker_project"
+  while IFS= read -r project; do
+    transient_keys "$project"
+    transient_builds "$project"
   done < <(consumer_projects)
   jq -n \
     --arg control "$CONTROL_RUN_ID" \
@@ -1200,15 +1431,26 @@ if [ "$PHASE" = cleanup ]; then
     --argjson id "$GITHUB_RUN_ID" \
     --arg repositoryId "$GITHUB_REPOSITORY_ID" \
     --arg workflow "$workflow_path" \
+    --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" \
+    --arg vector "$(creation_vector "$broker_project")" \
+    --slurpfile creation "$resource_creation" \
+    --slurpfile carriers "$retained_carriers" \
+    --slurpfile manifest_ids "$manifest_ids" \
+    --slurpfile skips "$cleanup_skips" \
     --rawfile failures "$failures" \
     --rawfile removed "$removed" '{
-      schema: "protected-recovery/deny-canary-cleanup/v3",
+      schema: "protected-recovery/deny-canary-cleanup-checkpoint/v3",
       phase: "cleanup",
       controlRunId: $control,
       brokerImage: $brokerImage,
       organization: $organization,
       run: {attempt: $attempt, event: $event, headSha: $headSha, id: $id, repositoryId: $repositoryId, workflow: $workflow},
-      throwaways: {folder: $folder, project: $project},
+      throwaways: {folder: $folder, project: $project, goneUniqueIds:($manifest_ids|from_entries)},
+      witnessServiceAccount: $witness,
+      creationVector: $vector,
+      resourceCreation: $creation[0],
+      retainedCarriers: $carriers[0],
+      cleanupSkips: $skips,
       removed: ($removed | split("\n") | map(select(length > 0))),
       leftovers: ($failures | split("\n") | map(select(length > 0)))
     }' > "$output"
@@ -1253,7 +1495,9 @@ if provisioning; then
   while IFS=$'\t' read -r attachment project scope; do
     case "$scope" in
       broker)
+        creation_initialize
         identity_rows "$attachment" "$project" broker
+        manifest_write "$broker_project"
         run_rows "$attachment" "$project" broker
         registry_row "$attachment" "$project"
         ledger_rows "$attachment" "$project"
@@ -1265,7 +1509,7 @@ if provisioning; then
         freeze_rows "$attachment" "$project"
         manifest_write "$project"
         ;;
-      organization) organization_rows "$attachment" ;;
+      organization) organization_rows "$attachment"; manifest_write "$broker_project" ;;
     esac
   done < "$attachments"
   manifest_write "$broker_project"

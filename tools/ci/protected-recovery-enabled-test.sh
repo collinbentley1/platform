@@ -150,7 +150,7 @@ predicate() {
     disabled-missing-skip) jq -c "${disabled} |= (.response |= del(.skippedMutation, .observedRequest))" "$fixtures/$phase.json" ;;
     disabled-other-read) jq -c "(${disabled} | .response.observedRequest.url) += \"?other-project=1\"" "$fixtures/$phase.json" ;;
     disabled-other-service) jq -c "(${disabled} | .response.service) = \"unrelated.googleapis.com\"" "$fixtures/$phase.json" ;;
-    disabled-control-skipped) jq -c "(${disabled} | .response.skippedMutation) = true" "$fixtures/$phase.json" ;;
+    disabled-control-missing-preflight) jq -c "${disabled} |= (.response |= del(.observedRequest))" "$fixtures/$phase.json" ;;
     disabled-resource-created) jq -c '.resourceCreation[] |= (if .state == "NEVER_CREATED" then .state = "CREATED" else . end)' "$fixtures/$phase.json" ;;
     disabled-other-resource) jq -c '.resourceCreation[] |= (if .state == "NEVER_CREATED" then .resource += "-unrelated" else . end)' "$fixtures/$phase.json" ;;
     disabled-other-build-tag) jq -c '(.resourceCreation[] | select(.service == "cloudbuild.googleapis.com") | .tag) = "protected-recovery-deny-canary-another-run"' "$fixtures/$phase.json" ;;

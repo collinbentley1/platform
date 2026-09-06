@@ -181,7 +181,7 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
     "iam.googleapis.com/serviceAccountKeys.create": () => one("POST", `${endpoints.iam}/${sa}/keys`, { keyAlgorithm: "KEY_ALG_RSA_2048", privateKeyType: "TYPE_GOOGLE_CREDENTIALS_FILE" }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.actAs": () => one("POST", `${endpoints.scheduler}/${parent}/jobs`, { httpTarget: { httpMethod: "GET", oidcToken: { serviceAccountEmail: runtime }, uri: "https://deny-canary.invalid/" }, name: `${parent}/jobs/${throwaway}`, schedule: "0 0 1 1 *", timeZone: "Etc/UTC" }, `${parent}/jobs/${throwaway}`, "absent"),
     "iam.googleapis.com/serviceAccounts.create": () => one("POST", `${endpoints.iam}/projects/${project}/serviceAccounts`, accountBody(createNew), saNew, "absent"),
-    "iam.googleapis.com/serviceAccounts.delete": () => one("DELETE", `${endpoints.iam}/${sa}`, null, sa, "present"),
+    "iam.googleapis.com/serviceAccounts.delete": () => one("DELETE", `${endpoints.iam}/projects/-/serviceAccounts/${email(enableAccount, project)}`, null, `projects/-/serviceAccounts/${email(enableAccount, project)}`, "present", { detail: "disabled" }),
     "iam.googleapis.com/serviceAccounts.disable": () => one("POST", `${endpoints.iam}/${sa}:disable`, {}, sa, "present"),
     "iam.googleapis.com/serviceAccounts.enable": () => one("POST", `${endpoints.iam}/projects/-/serviceAccounts/${email(enableAccount, project)}:enable`, {}, `projects/-/serviceAccounts/${email(enableAccount, project)}`, "present"),
     "iam.googleapis.com/serviceAccounts.getAccessToken": () => one("POST", `${endpoints.credentials}/${sa}:generateAccessToken`, { lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, sa, "present"),
@@ -235,7 +235,7 @@ function response(scope: Scope, project: string, permission: string): Record<str
     const filter = encodeURIComponent(`(status="QUEUED" OR status="WORKING") AND tags="protected-recovery-deny-canary-${controlRunId}"`).replaceAll("(", "%28").replaceAll(")", "%29");
     const url = api === "compute.googleapis.com" ? `${endpoints.compute}/projects/${project}/zones/${zone}` : `${endpoints.cloudbuild}/projects/${project}/locations/global/builds?filter=${filter}`;
     return { message: `${api} has not been used in project before or it is disabled.`, permission: "", rawPermission: "", reason: "SERVICE_DISABLED", service: api, status: "403",
-      ...(phase === "deny" ? { skippedMutation: true, observedRequest: { method: "GET", url } } : {}),
+      skippedMutation: true, observedRequest: { method: "GET", url },
     };
   }
   if (phase === "control") return { message: "", permission: "", rawPermission: "", reason: "", service: "", status: "200" };
