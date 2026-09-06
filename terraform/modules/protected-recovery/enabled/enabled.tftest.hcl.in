@@ -78,6 +78,11 @@ mock_provider "google" {
 mock_provider "external" {}
 
 override_data {
+  target = data.external.apply_lease[0]
+  values = { result = { status = "200", key = "apply-11111111-1111-4111-8111-111111111111", plan_sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", owner = "gha-restore-cdbentley@recovery-test.iam.gserviceaccount.com", reason = "" } }
+}
+
+override_data {
   target = data.google_project.current
   values = {
     number = "123456789012"
@@ -216,17 +221,17 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
     error_message = "Exactly the consumer Compute and Cloud Build rows may rest on a disabled API, each beside its live read; every other row must be proven by the paired denial."
   }
 
-  # The twenty-seven rows whose request needs a second denied permission --
+  # The twenty-eight rows whose request needs a second denied permission --
   # every Cloud Run write (actAs) and the implicit-delegation chain (the
   # delegate's getAccessToken) -- are proven beside the isolated proof of
   # that permission's own row; every other row is proven on its own.
   assert {
-    condition     = length(local.co_denied_rows) == 27 && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.create") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.implicitDelegation") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/workerpools.update") && !contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs") && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs"] && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getAccessToken"] && alltrue(values(local.isolation_satisfied))
+    condition     = length(local.co_denied_rows) == 28 && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|run.googleapis.com/services.create") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.implicitDelegation") && contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/cdbentley|run.googleapis.com/workerpools.update") && !contains(local.co_denied_rows, "cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs") && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.actAs"] && local.deny_row_isolated["cloudresourcemanager.googleapis.com/projects/recovery-test|iam.googleapis.com/serviceAccounts.getAccessToken"] && alltrue(values(local.isolation_satisfied))
     error_message = "The Cloud Run writes and the delegation chain are the co-denied rows; actAs and getAccessToken are proven in isolation, so every co-denied row is satisfied."
   }
 
   assert {
-    condition     = local.allow_bound && local.evidence_checks.allows_bound && local.canary_allows_retired && length(data.external.allow_state) == 6 && length(local.allow_reads) == 6 && length(keys(local.canary_allows.control)) == 8 && length(local.canary_allows.control["organizations/100000000001"].canary) > 0 && length(local.canary_allows.control["projects/recovery-test/serviceAccounts/deny-canary-100000000001@recovery-test.iam.gserviceaccount.com"].delegate) == 1
+    condition     = local.allow_bound && local.evidence_checks.allows_bound && local.canary_allows_retired && length(data.external.allow_state) == 6 && length(local.allow_reads) == 6 && length(keys(local.canary_allows.control)) == 10 && length(local.canary_allows.control["organizations/100000000001"].canary) > 0 && length(local.canary_allows.control["projects/recovery-test/serviceAccounts/deny-canary-100000000001@recovery-test.iam.gserviceaccount.com"].delegate) == 1
     error_message = "Both exercise phases must record the same Allows at every attachment point and on the throwaway accounts, and the live read at every attachment point must find the canary's roles gone."
   }
 
@@ -896,6 +901,38 @@ run "a_consumer_project_outside_the_evidenced_organization_is_refused" {
   expect_failures = [data.google_project.consumer]
 }
 
+run "a_broker_project_outside_the_evidenced_organization_is_refused" {
+  command = apply
+  override_data {
+    target = data.google_project.current
+    values = { number = "123456789012", org_id = "200000000009" }
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "another_applying_identity_cannot_restore_bootstrap_authority" {
+  command = apply
+  @@LIVE_DENY_STATE:bootstrap@@
+  assert {
+    condition = local.live_overlay == "bootstrap" && !local.evidence_checks.applying_identity
+    error_message = "The current applying identity must match the bootstrap exception."
+  }
+  override_data {
+    target = data.google_client_openid_userinfo.deployer
+    values = { email = "other-owner@example.com" }
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "an_unread_apply_lease_blocks_authority_restoration" {
+  command = apply
+  override_data {
+    target = data.external.apply_lease[0]
+    values = { result = { status = "409", key = "", plan_sha256 = "", owner = "", reason = "lease unavailable" } }
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
 run "without_evidence_nothing_is_granted_even_with_every_identity_recorded" {
   command = plan
 
@@ -922,4 +959,69 @@ run "activation_step_three_revokes_authority_when_evidence_is_withdrawn" {
     condition     = length(google_project_iam_custom_role.actuator) == 0 && length(google_service_account_iam_member.actuator) == 0 && length(google_project_iam_member.broker_inventory) == 0 && length(google_organization_iam_member.broker_inventory) == 0 && length(google_service_account_iam_member.member_authority) == 61
     error_message = "Withdrawing the evidence must revoke every cross-project grant and keep the broker project's own identities."
   }
+}
+
+run "allow_removed_after_deny_start_is_refused" {
+  command = apply
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:allow-after-start-missing@@
+  }
+  assert {
+    condition = !local.allow_bound
+    error_message = "Incomplete canary evidence must not restore authority."
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "changed_role_definition_is_refused" {
+  command = apply
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:allow-role-definition-moved@@
+  }
+  assert {
+    condition = !local.allow_bound
+    error_message = "Incomplete canary evidence must not restore authority."
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "deleted_name_cannot_satisfy_fresh_create_prestate" {
+  command = apply
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:create-deleted@@
+  }
+  assert {
+    condition = length(local.unsatisfied_deny_rows) > 0
+    error_message = "Incomplete canary evidence must not restore authority."
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "account_enable_requires_identical_disabled_prestate" {
+  command = apply
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:account-state-mismatch@@
+  }
+  assert {
+    condition = length(local.unsatisfied_deny_rows) > 0
+    error_message = "Incomplete canary evidence must not restore authority."
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "project_move_requires_project_update_evidence" {
+  command = apply
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:move-dependency-missing@@
+  }
+  assert {
+    condition = length(local.unsatisfied_deny_rows) > 0
+    error_message = "Incomplete canary evidence must not restore authority."
+  }
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
 }

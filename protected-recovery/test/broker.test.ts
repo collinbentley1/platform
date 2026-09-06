@@ -37,7 +37,7 @@ describe.skipIf(!emulatorHost)("maintenance, the restore fence, and external dep
     expect(await ledger.readMaintenance()).toBeNull();
     // With a quarantine OPEN no ticket opens; once it is CLOSED one does; and an expired ticket blocks nothing.
     expect((await broker.handle(isolate, quarantine("q", "cdbentley", "k1"))).status).toBe(201);
-    expect(await broker.handle(restorer, { kind: "maintenance", action: "open", bodyHash: "h", key: "m3" })).toEqual({ status: 409, body: { detail: "QUARANTINE shards not CLOSED: q", error: "QUARANTINE_ACTIVE" } });
+    expect(await broker.handle(restorer, { kind: "maintenance", action: "open", bodyHash: "h", key: "m3" })).toEqual({ status: 409, body: { detail: "Recovery shards not CLOSED: q", error: "QUARANTINE_ACTIVE" } });
     await makeReady(w, "q");
     expect((await beginClose(w, "q", "c")).kind).toBe("closing");
     expect(await broker.handle(restorer, { kind: "maintenance", action: "open", bodyHash: "h", key: "m3" })).toMatchObject({ status: 409, body: { error: "QUARANTINE_ACTIVE" } });
@@ -93,7 +93,7 @@ describe.skipIf(!emulatorHost)("maintenance, the restore fence, and external dep
         expect((await other.closeMaintenance(`m-${race}`)).kind).toBe("closed");
       } else {
         accepted += 1;
-        expect(ticket).toEqual({ kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${shard}` });
+        expect(ticket).toEqual({ kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `Recovery shards not CLOSED: ${shard}` });
         expect(maintenance).toBeNull();
         expect(state.active).toEqual([shard]);
         // The acceptance commit wrote the shard into the coordination document in the same commit as the shard.
@@ -121,13 +121,13 @@ describe.skipIf(!emulatorHost)("maintenance, the restore fence, and external dep
     const attempts = await Promise.all(Array.from({ length: 20 }, (_, index) => (index % 2 === 0 ? ledger : other).openMaintenance(`burst-${index}`, "gha-restore-cdbentley")));
     expect(attempts.every((attempt) => attempt.kind === "refused" && attempt.reason === "QUARANTINE_ACTIVE")).toBe(true);
     expect(await ledger.readMaintenance()).toBeNull();
-    // A RESTORE shard is not a quarantine and never enters the document.
+    // A RESTORE shard remains coordinated until its own terminal close.
     await makeReady(w, "aa");
     expect((await beginClose(w, "aa", "c-aa")).kind).toBe("closing");
     expect((await broker.reconcileShard("aa") as { phase: string }).phase).toBe("CLOSED");
     expect((await ledger.readCoordination()).active).toEqual(["zz"]);
     expect((await ledger.append(restore("ra", "cdbentley", "k-ra", "aa"), targets, await freshOf(w, "aa"))).kind).toBe("accepted");
-    expect((await ledger.readCoordination()).active).toEqual(["zz"]);
+    expect((await ledger.readCoordination()).active).toEqual(["ra", "zz"]);
   }, 300_000);
 
   test("a RESTORE effect is prepared and written only under the steady Deny form, and a PREPARED one is re-admitted before it resumes", async () => {

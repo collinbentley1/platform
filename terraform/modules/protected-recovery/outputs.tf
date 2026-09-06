@@ -84,7 +84,8 @@ output "deny_canary_contract" {
     phases                    = sort(keys(local.canary_phases))
     predicate_type            = local.deny_canary_predicate_type
     schema                    = local.deny_canary_schema
-    unobservable_prestate     = local.unobservable_prestate
+    witness_service_account   = local.authority.broker.canaryWitnessServiceAccount
+    paired_create_permissions = local.paired_create_permissions
     unserviceable_permissions = local.unserviceable_permissions
     workflow                  = local.deny_canary_workflow
   }

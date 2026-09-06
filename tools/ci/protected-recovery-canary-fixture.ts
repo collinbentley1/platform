@@ -2,28 +2,15 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { brokerAttachment, consumerAttachment, denyCanaryPrincipal, denyMatrix, organizationAttachment, rulesByException, steadyFlags } from "../../protected-recovery/src/deny";
 import { type RecoveryAuthority, loadRecoveryAuthority } from "../../protected-recovery/src/model";
-import { canaryBodySha256, canaryDigest } from "./protected-recovery-canary-digest";
+import { canaryBodySha256, canaryCreateComparison, canaryDigest, canarySnapshotSha256 } from "./protected-recovery-canary-digest";
 import { manifestPath } from "./workflow-authority";
 
-// Render the predicate one phase of the Deny canary attests
-// (tools/ci/protected-recovery-deny-canary.sh, schema
-// protected-recovery/deny-canary/v3, or deny-canary-cleanup/v3 for the
-// cleanup phase) for one authority file, one platform commit set, and one
-// control run, exactly as the producer shapes it: the live rules of every
-// attachment point grouped by exception set (the canary principal added to
-// each set in the control phase), the allow policies the phase recorded, and
-// for every permission of every rule one observation of the request the
-// producer makes for it -- its method, URL, content type, canonical body
-// digest, required and observed pre-state, the permissions it needs, the
-// operation it started, and the digest of all of that -- answered ALLOWED in
-// the control phase and DENIED with an IAM permission denial naming the row's
-// permission in the deny phase, or, for the consumer Compute and Cloud Build
-// rows whose API the consumer projects do not enable, SERVICE_DISABLED in
-// both. The enabled-path Terraform harness renders every phase with this and
-// derives its adversarial variants from them, so the harness is judged
-// against the producer's own shape.
+// Synthetic valid evidence for the canary contract. This fixture shares the
+// producer's request and digest shapes; its custom roles and resource states
+// are mocked inputs, not claims about a live canary run. Negative variants
+// are rendered by protected-recovery-enabled-test.sh.
 //
-//   bun run tools/ci/protected-recovery-canary-fixture.ts <authority.json> <active-sha>[,<transition-sha>] <control|deny|cleanup> <control-run-id> <run-id> <broker-image>
+// bun run tools/ci/protected-recovery-canary-fixture.ts <authority.json> <active-sha>[,<transition-sha>] <control|deny|cleanup> <control-run-id> <run-id> <broker-image>
 
 const [authorityPath, shas, phase, controlRunId, runId, brokerImage] = Bun.argv.slice(2);
 if (!authorityPath || !shas || !phase || !controlRunId || !runId || !brokerImage) {
@@ -50,6 +37,9 @@ const delegate = `${throwaway}-d`;
 const roleId = `denyCanary${suffix}`;
 const roleNew = `${roleId}New`;
 const roleGone = `${roleId}Gone`;
+const createNew = `${throwawayNew}-${phase.slice(0, 1)}`;
+const createRoleNew = `${roleNew}${phase.slice(0, 1)}`;
+const enableAccount = `${throwaway}-e`;
 const canaryProject = throwaway;
 const folderId = "500100200300";
 const constraintNew = "compute.skipDefaultNetworkCreation";
@@ -88,7 +78,7 @@ const unserviceable: Readonly<Record<string, string>> = {
 };
 // The rows whose pre-state read is itself a denied row (datastore
 // entities.get): the deny phase records unknown.
-const unobservableInDeny = new Set(["datastore.googleapis.com/entities.create", "datastore.googleapis.com/entities.get", "datastore.googleapis.com/entities.update", "datastore.googleapis.com/entities.delete"]);
+const pairedCreatePermissions = new Set(["iam.googleapis.com/serviceAccounts.create", "iam.googleapis.com/workloadIdentityPools.create", "iam.googleapis.com/workloadIdentityPoolProviders.create", "iam.googleapis.com/roles.create"]);
 const actAs = "iam.googleapis.com/serviceAccounts.actAs";
 const organization = `organizations/${organizationId}`;
 
@@ -122,15 +112,14 @@ function multipart(): Uint8Array {
 // The request the producer makes for one permission at one attachment scope.
 function exercise(scope: Scope, project: string, permission: string): Exercise {
   const sa = `projects/-/serviceAccounts/${email(throwaway, project)}`;
-  const saNew = `projects/-/serviceAccounts/${email(throwawayNew, project)}`;
-  const saGone = `projects/-/serviceAccounts/${email(throwawayGone, project)}`;
+  const saNew = `projects/-/serviceAccounts/${email(createNew, project)}`;
   const saDelegate = `projects/-/serviceAccounts/${email(delegate, project)}`;
   const goneId = `1${project.length.toString().padStart(2, "0")}${suffix.padStart(18, "0")}`.slice(0, 21);
   const pool = `projects/${project}/locations/global/workloadIdentityPools/${throwaway}`;
-  const poolNew = `projects/${project}/locations/global/workloadIdentityPools/${throwawayNew}`;
+  const poolNew = `projects/${project}/locations/global/workloadIdentityPools/${createNew}`;
   const poolGone = `projects/${project}/locations/global/workloadIdentityPools/${throwawayGone}`;
   const provider = `${pool}/providers/${throwaway}`;
-  const providerNew = `${pool}/providers/${throwawayNew}`;
+  const providerNew = `${pool}/providers/${createNew}`;
   const providerGone = `${pool}/providers/${throwawayGone}`;
   const parent = `projects/${project}/locations/${region}`;
   const service = `${parent}/services/${throwaway}`;
@@ -152,7 +141,7 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
   const templateNew = `projects/${project}/global/instanceTemplates/${throwawayNew}`;
   const apiService = `projects/${project}/services/websecurityscanner.googleapis.com`;
   const role = `${organization}/roles/${roleId}`;
-  const roleNewName = `${organization}/roles/${roleNew}`;
+  const roleNewName = `${organization}/roles/${createRoleNew}`;
   const roleGoneName = `${organization}/roles/${roleGone}`;
   const policies = `projects/${brokerProject}/policies`;
   const runtime = email(throwaway, project);
@@ -163,7 +152,7 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
   const one = (method: string, url: string, body: unknown | Uint8Array | null, resource: string, expected: string, options: { readonly contentType?: string; readonly detail?: string; readonly lro?: boolean; readonly requires?: readonly string[] } = {}): Exercise => ({
     body,
     contentType: body === null ? "" : options.contentType ?? json,
-    detail: options.detail ?? "",
+    detail: options.detail ?? (resource.includes("/serviceAccounts/") && expected === "present" ? (permission === "iam.googleapis.com/serviceAccounts.enable" ? "disabled" : "enabled") : ""),
     expected,
     lro: options.lro ?? false,
     method,
@@ -174,7 +163,7 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
   const requests: Readonly<Record<string, () => Exercise>> = {
     "artifactregistry.googleapis.com/repositories.uploadArtifacts": () => one("POST", `${endpoints.registry}/upload/v1/${repository}/genericArtifacts:create?uploadType=multipart`, multipart(), version, "absent", { contentType: "multipart/related; boundary=protected-recovery-deny-canary", lro: true }),
     "cloudbuild.googleapis.com/builds.create": () => one("POST", `${endpoints.cloudbuild}/projects/${project}/locations/global/builds`, { options: { logging: "CLOUD_LOGGING_ONLY" }, steps: [{ args: ["version"], name: "gcr.io/cloud-builders/gcloud" }], tags: ["protected-recovery-deny-canary"] }, "-", "none"),
-    "cloudresourcemanager.googleapis.com/projects.move": () => one("POST", `${endpoints.crm}/projects/${canaryProject}:move`, { destinationParent: `folders/${folderId}` }, `projects/${canaryProject}`, "present", { detail: organization, lro: true }),
+    "cloudresourcemanager.googleapis.com/projects.move": () => one("POST", `${endpoints.crm}/projects/${canaryProject}:move`, { destinationParent: `folders/${folderId}` }, `projects/${canaryProject}`, "present", { detail: organization, lro: true, requires: [permission, "cloudresourcemanager.googleapis.com/projects.update"] }),
     "cloudresourcemanager.googleapis.com/projects.setIamPolicy": () => one("POST", `${endpoints.crm}/projects/${project}:setIamPolicy`, { policy: { bindings: [], etag: `etag-${phase}`, version: 3 }, updateMask: "bindings,etag" }, `projects/${project}`, "present", { detail: organization }),
     "cloudresourcemanager.googleapis.com/projects.update": () => one("PATCH", `${endpoints.crm}/projects/${canaryProject}?updateMask=labels`, { labels: { "protected-recovery": "deny-canary" } }, `projects/${canaryProject}`, "present", { detail: organization, lro: true }),
     "compute.googleapis.com/instanceTemplates.create": () => one("POST", `${endpoints.compute}/projects/${project}/global/instanceTemplates`, { name: throwawayNew, properties: { disks: [disk], machineType: "e2-micro", networkInterfaces: [{ network: "global/networks/default" }] } }, templateNew, "absent", { lro: true }),
@@ -185,28 +174,28 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
     "datastore.googleapis.com/entities.get": () => one("GET", `${endpoints.firestore}/${document}`, null, document, "present"),
     "datastore.googleapis.com/entities.list": () => one("GET", `${endpoints.firestore}/${documents}/canary?pageSize=1`, null, "-", "none"),
     "datastore.googleapis.com/entities.update": () => one("POST", `${endpoints.firestore}/${documents}:commit`, { writes: [{ currentDocument: { exists: true }, update: { fields: { run: { stringValue: "canary" } }, name: document } }] }, document, "present"),
-    "iam.googleapis.com/roles.create": () => one("POST", `${endpoints.iam}/organizations/${organizationId}/roles`, roleBody(roleNew), roleNewName, "inactive"),
+    "iam.googleapis.com/roles.create": () => one("POST", `${endpoints.iam}/organizations/${organizationId}/roles`, roleBody(createRoleNew), roleNewName, "absent"),
     "iam.googleapis.com/roles.delete": () => one("DELETE", `${endpoints.iam}/${role}`, null, role, "present"),
     "iam.googleapis.com/roles.undelete": () => one("POST", `${endpoints.iam}/${roleGoneName}:undelete`, {}, roleGoneName, "deleted"),
     "iam.googleapis.com/roles.update": () => one("PATCH", `${endpoints.iam}/${role}?updateMask=description`, { description: "protected-recovery deny canary" }, role, "present"),
     "iam.googleapis.com/serviceAccountKeys.create": () => one("POST", `${endpoints.iam}/${sa}/keys`, { keyAlgorithm: "KEY_ALG_RSA_2048", privateKeyType: "TYPE_GOOGLE_CREDENTIALS_FILE" }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.actAs": () => one("POST", `${endpoints.scheduler}/${parent}/jobs`, { httpTarget: { httpMethod: "GET", oidcToken: { serviceAccountEmail: runtime }, uri: "https://deny-canary.invalid/" }, name: `${parent}/jobs/${throwaway}`, schedule: "0 0 1 1 *", timeZone: "Etc/UTC" }, `${parent}/jobs/${throwaway}`, "absent"),
-    "iam.googleapis.com/serviceAccounts.create": () => one("POST", `${endpoints.iam}/projects/${project}/serviceAccounts`, accountBody(throwawayNew), saNew, "absent"),
+    "iam.googleapis.com/serviceAccounts.create": () => one("POST", `${endpoints.iam}/projects/${project}/serviceAccounts`, accountBody(createNew), saNew, "absent"),
     "iam.googleapis.com/serviceAccounts.delete": () => one("DELETE", `${endpoints.iam}/${sa}`, null, sa, "present"),
     "iam.googleapis.com/serviceAccounts.disable": () => one("POST", `${endpoints.iam}/${sa}:disable`, {}, sa, "present"),
-    "iam.googleapis.com/serviceAccounts.enable": () => one("POST", `${endpoints.iam}/${sa}:enable`, {}, sa, "present"),
+    "iam.googleapis.com/serviceAccounts.enable": () => one("POST", `${endpoints.iam}/projects/-/serviceAccounts/${email(enableAccount, project)}:enable`, {}, `projects/-/serviceAccounts/${email(enableAccount, project)}`, "present"),
     "iam.googleapis.com/serviceAccounts.getAccessToken": () => one("POST", `${endpoints.credentials}/${sa}:generateAccessToken`, { lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.getOpenIdToken": () => one("POST", `${endpoints.credentials}/${sa}:generateIdToken`, { audience: "https://deny-canary.invalid", includeEmail: false }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.implicitDelegation": () => one("POST", `${endpoints.credentials}/${sa}:generateAccessToken`, { delegates: [saDelegate], lifetime: "300s", scope: ["https://www.googleapis.com/auth/cloud-platform"] }, sa, "present", { requires: [permission, "iam.googleapis.com/serviceAccounts.getAccessToken"] }),
     "iam.googleapis.com/serviceAccounts.setIamPolicy": () => one("POST", `${endpoints.iam}/${sa}:setIamPolicy`, scope === "broker" ? { policy: { bindings: [{ members: [canaryMember, `serviceAccount:${email(delegate, project)}`], role: tokenCreator }], version: 3 }, updateMask: "bindings" } : { policy: { version: 3 }, updateMask: "bindings" }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.signBlob": () => one("POST", `${endpoints.credentials}/${sa}:signBlob`, { payload: "ZGVueS1jYW5hcnk=" }, sa, "present"),
     "iam.googleapis.com/serviceAccounts.signJwt": () => one("POST", `${endpoints.credentials}/${sa}:signJwt`, { payload: '{"iss":"deny-canary"}' }, sa, "present"),
-    "iam.googleapis.com/serviceAccounts.undelete": () => one("POST", `${endpoints.iam}/projects/-/serviceAccounts/${goneId}:undelete`, {}, saGone, "inactive"),
-    "iam.googleapis.com/workloadIdentityPoolProviders.create": () => one("POST", `${endpoints.iam}/${pool}/providers?workloadIdentityPoolProviderId=${throwawayNew}`, providerBody, providerNew, "inactive", { lro: true }),
+    "iam.googleapis.com/serviceAccounts.undelete": () => one("POST", `${endpoints.iam}/projects/-/serviceAccounts/${goneId}:undelete`, {}, `projects/${project}/serviceAccounts/${goneId}`, "absent"),
+    "iam.googleapis.com/workloadIdentityPoolProviders.create": () => one("POST", `${endpoints.iam}/${pool}/providers?workloadIdentityPoolProviderId=${createNew}`, providerBody, providerNew, "absent", { lro: true }),
     "iam.googleapis.com/workloadIdentityPoolProviders.delete": () => one("DELETE", `${endpoints.iam}/${provider}`, null, provider, "present", { lro: true }),
     "iam.googleapis.com/workloadIdentityPoolProviders.undelete": () => one("POST", `${endpoints.iam}/${providerGone}:undelete`, {}, providerGone, "deleted", { lro: true }),
     "iam.googleapis.com/workloadIdentityPoolProviders.update": () => one("PATCH", `${endpoints.iam}/${provider}?updateMask=description`, { description: "protected-recovery deny canary" }, provider, "present", { lro: true }),
-    "iam.googleapis.com/workloadIdentityPools.create": () => one("POST", `${endpoints.iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${throwawayNew}`, poolBody, poolNew, "inactive", { lro: true }),
+    "iam.googleapis.com/workloadIdentityPools.create": () => one("POST", `${endpoints.iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${createNew}`, poolBody, poolNew, "absent", { lro: true }),
     "iam.googleapis.com/workloadIdentityPools.delete": () => one("DELETE", `${endpoints.iam}/${pool}`, null, pool, "present", { lro: true }),
     "iam.googleapis.com/workloadIdentityPools.undelete": () => one("POST", `${endpoints.iam}/${poolGone}:undelete`, {}, poolGone, "deleted", { lro: true }),
     "iam.googleapis.com/workloadIdentityPools.update": () => one("PATCH", `${endpoints.iam}/${pool}?updateMask=description`, { description: "protected-recovery deny canary" }, pool, "present", { lro: true }),
@@ -255,14 +244,10 @@ function outcome(scope: Scope, permission: string): string {
   return phase === "control" ? "ALLOWED" : "DENIED";
 }
 
-// The pre-state each phase observes for a request: the required state, as
-// the control phase leaves it; the soft-deleted residue of a create row's
-// name in the deny phase; unknown where the API is disabled or the read is
-// itself the denied get row.
+// The witness sees the required actual state in both phases. An API that
+// is disabled cannot supply a readable resource state.
 function observed(scope: Scope, permission: string, request: Exercise): string {
   if (scope === "consumer" && unserviceable[permission] !== undefined) return request.expected === "none" ? "none" : "unknown";
-  if (phase === "deny" && unobservableInDeny.has(permission)) return "unknown";
-  if (request.expected === "inactive") return phase === "control" || request.resource.startsWith("projects/-/serviceAccounts/") ? "absent" : "deleted";
   return request.expected;
 }
 
@@ -272,7 +257,9 @@ function operation(scope: Scope, permission: string, request: Exercise): Record<
 }
 
 const run = { attempt: 1, event: "workflow_dispatch", headSha: active, id: Number(runId), repositoryId: authority.platformRepositoryId, workflow: ".github/workflows/protected-recovery-deny-canary.yml" };
-const throwaways = { delegate, folder: folderId, gone: throwawayGone, name: throwaway, new: throwawayNew, project: canaryProject, role: roleId };
+const throwaways = { delegate, folder: folderId, gone: throwawayGone, name: throwaway, new: throwawayNew, project: canaryProject, role: roleId,
+  goneUniqueIds: Object.fromEntries([brokerProject, ...authority.consumers.map((consumer) => consumer.projectId)].map((project) => [project, `1${project.length.toString().padStart(2, "0")}${suffix.padStart(18, "0")}`.slice(0, 21)])),
+};
 
 if (phase === "cleanup") {
   const removed = [
@@ -285,7 +272,7 @@ if (phase === "cleanup") {
     `throwaway project ${canaryProject}`,
     `throwaway folder folders/${folderId}`,
   ];
-  console.log(JSON.stringify({ schema: "protected-recovery/deny-canary-cleanup/v3", phase, controlRunId, brokerImage, organization, run, removed, leftovers: [] }, null, 2));
+  console.log(JSON.stringify({ schema: "protected-recovery/deny-canary-cleanup/v3", phase, controlRunId, brokerImage, organization, run, throwaways: { folder: folderId, project: canaryProject }, removed, leftovers: [] }, null, 2));
   process.exit(0);
 }
 
@@ -295,7 +282,7 @@ const scopes = new Map<string, { readonly project: string; readonly scope: Scope
   [organizationAttachment(authority), { project: brokerProject, scope: "organization" }],
   ...authority.consumers.map((consumer) => [consumerAttachment(consumer), { project: consumer.projectId, scope: "consumer" as const }] as const),
 ]);
-const observedAt = "2026-09-05T00:00:00Z";
+const observedAt = phase === "control" ? "2026-09-05T00:15:00Z" : "2026-09-05T01:15:00Z";
 const policies = [...rulesByException(matrix)].map(([attachment, rules]) => {
   const scope = scopes.get(attachment);
   if (!scope) throw new Error(`no scope for ${attachment}`);
@@ -316,7 +303,9 @@ const policies = [...rulesByException(matrix)].map(([attachment, rules]) => {
           preState: { resource: request.resource, expected: request.expected, observed: observed(scope.scope, permission, request), detail: request.detail },
           requires: [...request.requires],
           operation: operation(scope.scope, permission, request),
-          digest: canaryDigest(request.method, request.url, request.contentType, bodySha256, request.resource, request.expected, request.detail),
+          digest: canaryDigest(request.method, request.url, request.contentType, bodySha256, request.resource, request.expected, request.detail, observed(scope.scope, permission, request)),
+          comparison: pairedCreatePermissions.has(permission) ? canaryCreateComparison({ permission, url: request.url, body: request.body, resource: request.resource, current: permission === "iam.googleapis.com/roles.create" ? createRoleNew : createNew, canonical: permission === "iam.googleapis.com/roles.create" ? roleNew : throwawayNew, expected: request.expected, detail: request.detail, observed: observed(scope.scope, permission, request) }) : null,
+          resourcePair: pairedCreatePermissions.has(permission) ? { kind: permission, actualId: permission === "iam.googleapis.com/roles.create" ? createRoleNew : createNew, canonicalId: permission === "iam.googleapis.com/roles.create" ? roleNew : throwawayNew } : null,
           response: response(scope.scope, permission),
         };
       }),
@@ -334,15 +323,37 @@ const policies = [...rulesByException(matrix)].map(([attachment, rules]) => {
 // accounts, unchanged between the end of the control phase and the start of
 // the deny phase.
 const attachmentRoles: Readonly<Record<Scope, readonly string[]>> = {
-  broker: ["roles/artifactregistry.admin", "roles/cloudscheduler.admin", "roles/datastore.user", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/resourcemanager.projectIamAdmin", "roles/run.admin", "roles/storage.objectAdmin"],
-  consumer: ["roles/cloudscheduler.admin", "roles/iam.serviceAccountAdmin", "roles/iam.workloadIdentityPoolAdmin", "roles/resourcemanager.projectIamAdmin", "roles/run.admin", "roles/serviceusage.serviceUsageAdmin"],
-  organization: ["roles/iam.organizationRoleAdmin", "roles/orgpolicy.policyAdmin", "roles/resourcemanager.folderCreator", "roles/resourcemanager.projectCreator", "roles/resourcemanager.projectMover"],
+  broker: [`projects/${brokerProject}/roles/fixtureCanaryBroker`],
+  consumer: [`${organization}/roles/fixtureCanaryConsumer`],
+  organization: [`${organization}/roles/fixtureCanaryOrganization`],
 };
 const allowPolicies = [
   ...[...scopes].map(([attachment, scope]) => ({ resource: scope.scope === "organization" ? organization : `projects/${scope.project}`, etag: `allow-etag-${attachment.split("/").at(-1)}`, canaryRoles: [...attachmentRoles[scope.scope]], delegateRoles: [] as string[] })),
+  { resource: `projects/${canaryProject}`, etag: "allow-etag-move-project", canaryRoles: [] as string[], delegateRoles: [] as string[] },
+  { resource: `folders/${folderId}`, etag: "allow-etag-move-folder", canaryRoles: [] as string[], delegateRoles: [] as string[] },
   { resource: `projects/${brokerProject}/serviceAccounts/${email(throwaway, brokerProject)}`, etag: "allow-etag-throwaway", canaryRoles: [tokenCreator], delegateRoles: [tokenCreator] },
   { resource: `projects/${brokerProject}/serviceAccounts/${email(delegate, brokerProject)}`, etag: "allow-etag-delegate", canaryRoles: [tokenCreator], delegateRoles: [] as string[] },
 ].sort((left, right) => left.resource.localeCompare(right.resource));
+
+const hierarchy = [...authority.consumers.map((consumer) => consumer.projectId), brokerProject, canaryProject].map((project) => ({ resource: `projects/${project}`, parent: organization }));
+hierarchy.push({ resource: `folders/${folderId}`, parent: organization });
+hierarchy.sort((left, right) => left.resource.localeCompare(right.resource));
+const snapshot = {
+  policies: allowPolicies.map(({ etag: _etag, ...policy }) => ({ ...policy, bindings: [
+    ...policy.canaryRoles.map((role) => ({ role, members: [canaryMember], condition: null })),
+    ...policy.delegateRoles.map((role) => ({ role, members: [`serviceAccount:${email(delegate, brokerProject)}`], condition: null })),
+  ] })),
+  roles: [...new Set(allowPolicies.flatMap((policy) => [...policy.canaryRoles, ...policy.delegateRoles]))].sort().map((name) => ({
+    name, etag: `fixture-definition-${name}`, stage: "GA",
+    permissions: [...new Set(Object.values(matrix).filter((row) => name === tokenCreator ? ["iam.googleapis.com/serviceAccounts.getAccessToken", "iam.googleapis.com/serviceAccounts.getOpenIdToken", "iam.googleapis.com/serviceAccounts.implicitDelegation", "iam.googleapis.com/serviceAccounts.signBlob", "iam.googleapis.com/serviceAccounts.signJwt"].includes(row.permission) : name.endsWith("Broker") ? row.attachment === brokerAttachment(authority) : name.endsWith("Organization") ? row.attachment === organizationAttachment(authority) : [...authority.consumers].some((consumer) => row.attachment === consumerAttachment(consumer))).map((row) => row.permission))].sort(),
+  })),
+  hierarchy,
+  paths: hierarchy.map((edge) => ({ resource: edge.resource, ancestors: [edge.resource, edge.parent] })),
+};
+const witness = authority.broker.canaryWitnessServiceAccount;
+if (witness === null) throw new Error("the fixture authority must record a witness");
+const boundary = (position: string, attachment = "", permission = "") => ({ snapshotSha256: canarySnapshotSha256(snapshot), position, attachment, permission, witness, observedAt });
+const allowInterval = [boundary("start"), ...policies.flatMap((policy) => policy.rules.flatMap((rule) => rule.canary.flatMap((observation) => [boundary("before", policy.attachmentPoint, observation.permission), boundary("after", policy.attachmentPoint, observation.permission)]))), boundary("end")];
 
 console.log(JSON.stringify({
   schema: "protected-recovery/deny-canary/v3",
@@ -352,7 +363,10 @@ console.log(JSON.stringify({
   organization,
   run,
   throwaways,
+  witnessServiceAccount: witness,
   allowPolicies,
+  allowInterval,
+  allowSnapshot: snapshot,
   policies,
   unexercised: [],
   failures: [],

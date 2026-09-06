@@ -12,6 +12,7 @@ import {
   cachedJwks,
   deliveryBudgetSeconds,
   driveEffect,
+  classifyPreparedEffect,
   githubJwksUrl,
   verifyMemberCredential,
   verifyRs256Jwt,
@@ -34,6 +35,11 @@ import {
   RequestError,
   consumerNamed,
   controlValiditySeconds,
+  controlRoundFresh,
+  roundComplete,
+  roundPhaseBlockers,
+  roundProbeDigest,
+  canonicalJson,
   deliveryOwed,
   intentOf,
   loadRecoveryAuthority,
@@ -42,9 +48,11 @@ import {
   parseCloseBody,
   parseDeliverBody,
   parseMaintenanceBody,
+  parseProtectedApplyBody,
   parseReconcileBody,
   parseRoundBody,
   parseRoundId,
+  parseRoundRunsBody,
   parseShardId,
   probePermission,
   probesNeeded,
@@ -258,11 +266,35 @@ export class Broker {
         return await this.#deliver(purpose, request.token);
       case "round":
         return await this.#openRound(purpose, request);
+      case "round-runs": {
+        const round = await ledger.readRound(request.round);
+        if (!round) return notFound();
+        if (purpose.kind !== "recovery" || purpose.intent !== "QUARANTINE" || purpose.consumer.repository !== round.consumer) return forbidden();
+        const bound = await ledger.bindRoundRuns(request.round, request.runs);
+        if (bound.kind === "refused") return { status: 409, body: { error: "ROUND_RUNS_REFUSED", detail: bound.reason } };
+        return { status: 200, body: { round: await this.#refreshRound(request.round, bound.round) } };
+      }
       case "round-read": {
         const round = await ledger.readRound(request.round);
         if (!round) return notFound();
         if (!(purpose.kind === "reconciler" || (purpose.kind === "recovery" && purpose.consumer.repository === round.consumer))) return forbidden();
-        return { status: 200, body: { round: roundView(request.round, round) } };
+        return { status: 200, body: { round: await this.#refreshRound(request.round, round) } };
+      }
+      case "protected-apply-read": {
+        if (purpose.kind !== "recovery" || purpose.intent !== "RESTORE") return forbidden();
+        const owner = `${purpose.serviceAccount}@${authority.broker.projectId}.iam.gserviceaccount.com`;
+        const lease = await ledger.readProtectedApply();
+        if (lease && lease.openedBy !== owner) return forbidden();
+        return { status: 200, body: { lease } };
+      }
+      case "protected-apply": {
+        if (purpose.kind !== "recovery" || purpose.intent !== "RESTORE") return forbidden();
+        const owner = `${purpose.serviceAccount}@${authority.broker.projectId}.iam.gserviceaccount.com`;
+        const outcome = request.action === "acquire"
+          ? await ledger.acquireProtectedApply(request.key, request.planSha256, owner)
+          : await ledger.releaseProtectedApply(request.key, request.planSha256, owner);
+        if (outcome.kind === "refused") return { status: 409, body: { error: outcome.reason } };
+        return { status: outcome.kind === "acquired" ? 201 : 200, body: { lease: outcome.lease } };
       }
       case "maintenance": {
         // The maintenance ticket is the RESTORE direction's: it is the
@@ -287,7 +319,7 @@ export class Broker {
     const consumer = purpose.consumer;
     const id = roundId(consumer.repository, request.body.phase, request.body.shard, request.body.label);
     const existing = await ledger.readRound(id);
-    if (existing) return { status: 200, body: { round: roundView(id, existing) } };
+    if (existing) return { status: 200, body: { round: await this.#refreshRound(id, existing) } };
     let targets: readonly Target[] | undefined;
     if (request.body.shard === null) {
       targets = targetsFor(authority, consumer);
@@ -298,7 +330,8 @@ export class Broker {
       if (!allowed(purpose, shard)) return forbidden();
       if (shard.phase !== "OPEN") return { status: 409, body: { error: "SHARD_NOT_OPEN", phase: shard.phase } };
       const entries = await ledger.readEntries(request.body.shard, shard.nextSequence - 1);
-      targets = entries.flatMap((entry) => (entry.body.kind === "effect" && shard.targets[entry.body.account]?.effect.state === "ACKED" ? [targetOfEffect(authority, consumer, entry.body)] : []));
+      if (shard.pendingEffects !== 0 || Object.values(shard.targets).some((state) => state.effect.state !== "ACKED" || state.chain.inventory === null)) return { status: 409, body: { error: "NOT_READY", blockers: ["all shard effects and their inventory baselines must be committed before opening a phase round"] } };
+      targets = entries.flatMap((entry) => (entry.body.kind === "effect" ? [targetOfEffect(authority, consumer, entry.body)] : []));
       if (targets.length === 0) return { status: 409, body: { detail: "the shard has no acknowledged target to probe", error: "SHARD_NOT_OPEN", phase: shard.phase } };
     }
     const outcomes = await inventory.inventoryAll(targets, consumer);
@@ -329,11 +362,9 @@ export class Broker {
   // member-delivery identity. The broker verifies it exactly as the consumer
   // provider would, binds it to that consumer, requires enough remaining life
   // for the whole delivery, exchanges it at STS once, and mints as the member
-  // against every target it is bound to, right now: each outcome is a
-  // receipt in every open round of the consumer whose binding the delivery
-  // satisfies, and the revocation or post-horizon probe of every OPEN
-  // QUARANTINE shard that needs it. The bearer is discarded with the
-  // request; no reply and no document carries it.
+  // against every bound target now. Its outcomes can count in one current
+  // round, for the exact registered run and named phase. Successful mints
+  // invalidate every affected open chain. No bearer survives the request.
   async #deliver(purpose: Purpose, token: string): Promise<BrokerResponse> {
     const { authority, ledger, now, probe } = this.#deps;
     if (purpose.kind !== "member") return forbidden();
@@ -355,25 +386,88 @@ export class Broker {
     }
     const deliveredAt = now().toISOString();
     await ledger.putMemberControl({ consumer: verified.consumer.repository, deliveredAt, expiresAt: verified.expiresAt, member: verified.member, principal: minted.principal, targets: controls });
-    // The receipt goes to every round of the consumer that is open to it.
+    // The bounded consumer pointer identifies at most one receiving round.
+    // Receipts count only after its exact trigger run mapping is registered.
     const rounds: Record<string, unknown>[] = [];
-    for (const id of (await ledger.readRoundPointer(verified.consumer.repository)).open) {
-      const recorded = await ledger.recordReceipt(id, verified.member, { controls, deliveredAt, platformSha: verified.platformSha, principal: minted.principal, runAttempt: verified.runAttempt, runId: verified.runId });
-      rounds.push({ round: id, ...(recorded.kind === "recorded" ? { complete: recorded.complete, phase: recorded.round.phase, recorded: true } : { recorded: false, refused: recorded.reason }) });
-    }
     const probes: Record<string, unknown>[] = [];
-    const byAccount = new Map(targets.map((target) => [target.account, target]));
-    for (const shardId of await ledger.listOpenQuarantines(verified.consumer.repository)) {
-      const shard = await ledger.readShard(shardId);
-      if (!shard) continue;
-      for (const need of probesNeeded(shard, now(), (account) => byAccount.get(account))) {
-        const control = controls[need.account];
-        if (need.member !== verified.member || !control) continue;
-        const recorded = await ledger.recordProbe(shardId, { account: need.account, email: need.email, member: need.member, observedAt: control.observedAt, outcome: control.outcome, permission: probePermission, phase: need.phase, principal: minted.principal, uniqueId: need.uniqueId });
-        probes.push({ account: need.account, phase: need.phase, shard: shardId, ...(recorded.kind === "recorded" ? { role: recorded.role } : { refused: recorded.reason }) });
+    // A successful mint invalidates every affected recovery chain, even
+    // when its run was not selected for a round. It can never satisfy debt.
+    if (Object.values(controls).some((control) => control.outcome === "ALLOWED")) {
+      for (const shardId of await ledger.listOpenQuarantines(verified.consumer.repository)) {
+        for (const target of targets) {
+          const control = controls[target.account];
+          if (control?.outcome !== "ALLOWED") continue;
+          await ledger.recordProbe(shardId, { account: target.account, email: target.email, member: verified.member, observedAt: control.observedAt, outcome: "ALLOWED", permission: probePermission, phase: "REVOCATION", principal: minted.principal, uniqueId: target.uniqueId });
+        }
       }
     }
+    for (const id of (await ledger.readRoundPointer(verified.consumer.repository)).open) {
+      const recorded = await ledger.recordReceipt(id, verified.member, { controls, deliveredAt, platformSha: verified.platformSha, principal: minted.principal, runAttempt: verified.runAttempt, runId: verified.runId });
+      if (recorded.kind === "recorded") {
+        const view = await this.#refreshRound(id, recorded.round);
+        rounds.push({ round: id, complete: view.complete, phase: recorded.round.phase, recorded: true });
+      } else rounds.push({ round: id, recorded: false, refused: recorded.reason });
+    }
     return { status: 200, body: { controls: Object.fromEntries(Object.keys(controls).sort().map((account) => [account, controls[account]!.outcome])), member: verified.member, probes, rounds, unavailable } };
+  }
+
+  async #refreshRound(id: string, initial: RoundManifest): Promise<Record<string, unknown>> {
+    const { authority, inventory, ledger, now } = this.#deps;
+    let round = initial;
+    const blockers: string[] = [];
+    if (round.expiredAt !== null || Date.parse(round.expiresAt) <= now().getTime()) return roundView(id, round, ["the round expired"]);
+    if (round.runs === null) return roundView(id, round, ["the round awaits an exact trigger run mapping"]);
+    const consumer = consumerNamed(authority, round.consumer);
+    const canonical = consumer ? targetsFor(authority, consumer) : undefined;
+    if (!consumer || !canonical) return roundView(id, round, ["the consumer authority is unavailable"]);
+    const targets = canonical.filter((target) => round.targets[target.account] !== undefined);
+    const outcomes = await inventory.inventoryAll(targets, consumer);
+    const bound: Record<string, RoundBinding["targets"][string]> = {};
+    let denyState: RoundBinding["denyState"] | undefined;
+    for (const [index, target] of targets.entries()) {
+      const outcome = outcomes[index];
+      if (!outcome || outcome.kind !== "observed") { blockers.push(`${target.account}: current inventory unavailable`); continue; }
+      const record = outcome.inventory;
+      if (round.shard !== null && round.completedAt === null) await ledger.recordInventory(round.shard, record);
+      if (record.findings.length > 0) blockers.push(`${target.account}: ${record.findings.join(", ")}`);
+      const policy = record.summary.policies.find((candidate) => candidate.resource === target.resource);
+      if (!policy) blockers.push(`${target.account}: target policy unavailable`);
+      bound[target.account] = { inventoryHash: record.hash, members: target.members, policyEtag: policy?.etag ?? "", uniqueId: target.uniqueId };
+      denyState ??= record.summary.denyState;
+    }
+    const binding: RoundBinding = { denyState: denyState ?? { form: "unavailable", policies: [] }, members: [...new Set(targets.flatMap((target) => target.members))].sort(), platformShas: [consumer.activeWorkflowSha, consumer.transitionWorkflowSha].filter((sha): sha is string => sha !== null), targets: bound };
+    if (canonicalJson(binding) !== canonicalJson({ denyState: round.denyState, members: round.members, platformShas: round.platformShas, targets: round.targets })) blockers.push("the current inventory, identity, policy or platform binding changed");
+    if (blockers.length > 0) return roundView(id, round, blockers);
+    if (round.shard !== null) {
+      let shard = await ledger.readShard(round.shard);
+      if (!shard) return roundView(id, round, ["the shard does not exist"]);
+      blockers.push(...roundPhaseBlockers(round, shard, now()));
+      if (blockers.length === 0 && round.completedAt === null) {
+        for (const member of round.members) {
+          const receipt = round.receipts[member];
+          if (!receipt) continue;
+          for (const target of targets) {
+            const control = receipt.controls[target.account];
+            if (!control || control.outcome !== "DENIED" || !target.members.includes(member)) continue;
+            const existing = round.phase === "REVOCATION" ? shard.targets[target.account]?.chain.members[member]?.revocation : shard.targets[target.account]?.chain.members[member]?.post;
+            if (existing && round.committed[member]?.[target.account] === roundProbeDigest(round.phase, target.account, member, receipt)) continue;
+            const recorded = await ledger.recordProbe(round.shard, { account: target.account, email: target.email, member, observedAt: control.observedAt, outcome: control.outcome, permission: probePermission, phase: round.phase === "REVOCATION" ? "REVOCATION" : "HORIZON", principal: receipt.principal, uniqueId: target.uniqueId }, id);
+            if (recorded.kind === "refused") blockers.push(`${target.account}/${member}: ${recorded.reason}`);
+          }
+        }
+        shard = await ledger.readShard(round.shard);
+        round = await ledger.readRound(id) ?? round;
+      }
+      if (shard) blockers.push(...roundPhaseBlockers(round, shard, now(), round.receipts, round.committed));
+      else blockers.push("the shard does not exist");
+    }
+    if (!roundComplete(round)) blockers.push("the round still owes successful phase receipts");
+    if (blockers.length === 0 && round.completedAt === null) {
+      const completed = await ledger.completeRound(id, round.version, binding);
+      if (completed.kind === "recorded") round = completed.round;
+      else blockers.push(completed.reason);
+    }
+    return roundView(id, round, blockers);
   }
 
   // Sweep the complete reconcilable set in document-name order, one page at a
@@ -465,7 +559,7 @@ export class Broker {
       const pending = entries.flatMap((entry) => (entry.body.kind === "effect" && (entry.progress?.state === "RECORDED" || entry.progress?.state === "PREPARED") && consumer ? [targetOfEffect(authority, consumer, entry.body)] : []));
       if (pending.length > 0 && consumer) {
         if (shard.intent === "QUARANTINE") {
-          const verdict = await this.#admissible(consumer, pending);
+          const verdict = await this.#admissible(consumer, pending, shard.controlRound);
           if (verdict.kind === "refused") admission = `${String(verdict.response.body.error)}; ${describe(verdict.response.body)}`;
         } else {
           const deny = await inventory.denyState(consumer);
@@ -480,11 +574,17 @@ export class Broker {
             notes.push(`${entry.sequence}: pending; consumer ${shard.consumer} is not declared`);
             continue;
           }
-          if (admission !== undefined) {
-            notes.push(`${entry.sequence}: pending; not ${entry.progress.state === "RECORDED" ? "prepared" : "resumed"} because ${admission}`);
+          if (admission !== undefined && entry.progress.state === "RECORDED") {
+            notes.push(`${entry.sequence}: pending; not prepared because ${admission}`);
             continue;
           }
-          const driven = await driveEffect(ledger, iam, shardId, entry, targetOfEffect(authority, consumer, entry.body));
+          const driven = admission === undefined
+            ? await driveEffect(ledger, iam, shardId, entry, targetOfEffect(authority, consumer, entry.body))
+            : await classifyPreparedEffect(ledger, iam, shardId, entry, targetOfEffect(authority, consumer, entry.body));
+          if (admission !== undefined && driven.kind === "pending") {
+            notes.push(`${entry.sequence}: pending; not resumed because ${admission}`);
+            continue;
+          }
           entry = driven.entry;
           if (driven.kind === "pending") notes.push(`${entry.sequence}: pending; ${driven.reason}`);
           else if (driven.kind === "stale") notes.push(`${entry.sequence}: stale actuator; nothing written`);
@@ -538,17 +638,16 @@ export class Broker {
   // and the same form -- so the positive controls were established under
   // exactly the state the quarantine would act on. Otherwise the refusal
   // names exactly what is missing, and nothing has been mutated.
-  async #admissible(consumer: Consumer, targets: readonly Target[]): Promise<{ readonly kind: "admitted"; readonly round: string } | { readonly kind: "refused"; readonly response: BrokerResponse }> {
+  async #admissible(consumer: Consumer, targets: readonly Target[], admittingRound?: string | null): Promise<{ readonly kind: "admitted"; readonly round: string } | { readonly kind: "refused"; readonly response: BrokerResponse }> {
     const { inventory, ledger } = this.#deps;
     const refuse = (response: BrokerResponse): { readonly kind: "refused"; readonly response: BrokerResponse } => ({ kind: "refused", response });
     const ticket = await ledger.readMaintenance();
     if (ticket) return refuse({ status: 409, body: { detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}`, error: "MAINTENANCE_OPEN" } });
-    const pointer = await ledger.readRoundPointer(consumer.repository);
+    const pointer = admittingRound === undefined ? await ledger.readRoundPointer(consumer.repository) : { control: admittingRound };
     const round = pointer.control === null ? undefined : await ledger.readRound(pointer.control);
     if (!pointer.control || !round || round.completedAt === null) return refuse({ status: 409, body: { detail: `no complete CONTROL round of ${consumer.repository}: every canonical job that is a managed member must deliver its credential to POST /v1/members into one round opened at POST /v1/rounds, and mint ALLOWED against every target it is bound to, before any quarantine`, error: "PROBE_UNAVAILABLE" } });
     const missing: string[] = [];
-    const earliest = this.#deps.now().getTime() - controlValiditySeconds * 1000;
-    if (Date.parse(round.completedAt) < earliest) missing.push(`the CONTROL round ${pointer.control} completed at ${round.completedAt}, older than ${controlValiditySeconds}s`);
+    if (!controlRoundFresh(round, this.#deps.now())) missing.push(`the CONTROL round ${pointer.control} contains an expired, unbound or unsuccessful delivery outside its ${controlValiditySeconds}s validity window`);
     const pins = [consumer.activeWorkflowSha, ...(consumer.transitionWorkflowSha === null ? [] : [consumer.transitionWorkflowSha])].filter((sha): sha is string => sha !== null);
     if (pins.join(",") !== [...round.platformShas].join(",")) missing.push(`the CONTROL round ${pointer.control} bound the platform at ${round.platformShas.join(", ")}, not the recorded ${pins.join(", ")}`);
     for (const target of targets) {
@@ -655,9 +754,14 @@ function rejected(rejection: Rejection): BrokerResponse {
 
 // The round as its invoker and the orchestrator see it: the binding, every
 // receipt's outcomes (never a bearer), and every delivery still owed.
-function roundView(id: string, round: RoundManifest): Record<string, unknown> {
+function roundView(id: string, round: RoundManifest, blockers: readonly string[] = []): Record<string, unknown> {
   return {
-    complete: round.completedAt !== null,
+    complete: round.completedAt !== null && blockers.length === 0,
+    phaseReady: round.completedAt !== null && blockers.length === 0,
+    blockers,
+    expiredAt: round.expiredAt,
+    expiresAt: round.expiresAt,
+    runs: round.runs,
     completedAt: round.completedAt,
     consumer: round.consumer,
     denyState: round.denyState,
@@ -716,12 +820,14 @@ const routes = {
   append: /^\/v1\/shards\/([^/]+)\/entries$/,
   close: /^\/v1\/shards\/([^/]+)\/close$/,
   maintenance: /^\/v1\/maintenance$/,
+  protectedApply: /^\/v1\/protected-apply$/,
   members: /^\/v1\/members$/,
   read: /^\/v1\/shards\/([^/]+)$/,
   reconcileAll: /^\/v1\/reconcile$/,
   reconcileShard: /^\/v1\/shards\/([^/]+)\/reconcile$/,
   round: /^\/v1\/rounds\/([^/]+)$/,
   rounds: /^\/v1\/rounds$/,
+  roundRuns: /^\/v1\/rounds\/([^/]+)\/runs$/,
 } as const;
 
 export interface ServiceDependencies {
@@ -774,6 +880,7 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
     }
   };
   if (request.method === "GET") {
+    if (routes.protectedApply.test(path)) return { kind: "protected-apply-read" };
     const round = routes.round.exec(path);
     if (round) {
       try {
@@ -787,7 +894,9 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
     return { kind: "read", shard: decode(match[1]!) };
   }
   if (request.method !== "POST") throw new NotFound();
-  const body = await readJsonBody(request);
+  // The full transition-enabled runsetta mapping exceeds 8 KiB. Only this
+  // bounded 32-member registration route accepts a 16 KiB request.
+  const body = await readJsonBody(request, routes.roundRuns.test(path) ? 16 * 1024 : maxBodyBytes);
   let match = routes.append.exec(path);
   if (match) return parseAppendBody(decode(match[1]!), body);
   match = routes.close.exec(path);
@@ -797,15 +906,18 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
   if (routes.reconcileAll.test(path)) return parseReconcileBody(null, body);
   if (routes.members.test(path)) return parseDeliverBody(body);
   if (routes.maintenance.test(path)) return parseMaintenanceBody(body);
+  if (routes.protectedApply.test(path)) return parseProtectedApplyBody(body);
   if (routes.rounds.test(path)) return parseRoundBody(body);
+  match = routes.roundRuns.exec(path);
+  if (match) return parseRoundRunsBody(decodeURIComponent(match[1]!), body);
   throw new NotFound();
 }
 
-async function readJsonBody(request: Request): Promise<unknown> {
+async function readJsonBody(request: Request, limit = maxBodyBytes): Promise<unknown> {
   const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > maxBodyBytes) throw new BodyTooLarge();
+  if (declared > limit) throw new BodyTooLarge();
   const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength > maxBodyBytes) throw new BodyTooLarge();
+  if (bytes.byteLength > limit) throw new BodyTooLarge();
   if (bytes.byteLength === 0) return {};
   try {
     return JSON.parse(new TextDecoder().decode(bytes)) as unknown;

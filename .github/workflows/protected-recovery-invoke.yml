@@ -1,4 +1,5 @@
 name: Protected recovery invoke
+run-name: protected-recovery-${{ inputs.request_nonce }}
 
 # Owner-dispatched requests to the protected-recovery broker. Each consumer has
 # two jobs, one per effect direction, each with its own literal environment and
@@ -22,6 +23,10 @@ name: Protected recovery invoke
 on:
   workflow_dispatch:
     inputs:
+      request_nonce:
+        description: Unique request correlation nonce, retained in the run name and reply artifact.
+        required: true
+        type: string
       target_repository:
         description: Consumer repository whose federated authority is quarantined or restored.
         required: true
@@ -49,12 +54,13 @@ on:
           - status
           - round-open
           - round-status
+          - round-bind
       shard:
         description: Shard acted on; a new session ID for append; the OPEN quarantine shard a REVOCATION or HORIZON round probes, or "-" for a CONTROL round or round-status.
         required: true
         type: string
       argument:
-        description: For a restore append, the CLOSED and scan-ready quarantine shard to restore; for round-open, <CONTROL|REVOCATION|HORIZON>/<label>; for round-status, the round identifier; otherwise empty.
+        description: For a restore append, the CLOSED and scan-ready quarantine shard to restore; for round-open, <CONTROL|REVOCATION|HORIZON>/<label>; for round-status, the round identifier; for round-bind, JSON with round and runs; otherwise empty.
         required: false
         type: string
 
@@ -116,6 +122,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh cdbentley quarantine
@@ -180,6 +187,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh cdbentley restore
@@ -244,6 +252,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh critical-history quarantine
@@ -308,6 +317,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh critical-history restore
@@ -372,6 +382,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh healthmcp quarantine
@@ -436,6 +447,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh healthmcp restore
@@ -500,6 +512,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh runsetta quarantine
@@ -564,6 +577,7 @@ jobs:
           ID_TOKEN: ${{ steps.auth.outputs.id_token }}
           IDEMPOTENCY_KEY: ${{ inputs.direction }}/${{ inputs.operation }}/${{ github.run_id }}
           OPERATION: ${{ inputs.operation }}
+          REQUEST_NONCE: ${{ inputs.request_nonce }}
           REPLY_PATH: ${{ runner.temp }}/broker-reply.json
           SHARD: ${{ inputs.shard }}
         run: bash protected-recovery/invoke.sh runsetta restore

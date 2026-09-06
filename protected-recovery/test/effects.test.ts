@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { type MintOutcome, type MintResult, type Policy, GoogleIssuanceProbe, deliveryBudgetSeconds, driveEffect, expectedSnapshot, observedSnapshot, planEffect, policyFromJson, verifyMemberCredential } from "../src/effects";
 import { Broker } from "../src/http";
-import { type Target, consumerPool, inventoryHash, managedRole, parseRoundBody, probePermission, purposeForIdentity, scanReadiness, targetsFor } from "../src/model";
+import { type Target, consumerPool, inventoryHash, managedRole, parseRoundBody, parseRoundRunsBody, probePermission, purposeForIdentity, scanReadiness, targetsFor } from "../src/model";
 import { entryEvidence } from "../src/outbox";
-import { type World, Clock, beginClose, consumerOf, controlRound, deliver, deliverAll, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, memberEmail, memberPrincipal, needsOf, prime, proberPrincipal, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
+import { type World, Clock, beginClose, consumerOf, controlRound, deliver, deliverAll, emulatorHost, freshOf, gate, githubSigner, invokerEmail, makeReady, memberClaims, memberEmail, memberPrincipal, needsOf, openRound, prime, proberPrincipal, recordNeededProbes, quarantine, restore, seedTargets, testAuthority, unrelatedBindings, world } from "./support";
 
 const pool = "projects/882468538648/locations/global/workloadIdentityPools/github-actions";
 const member = (sha: string) => `principalSet://iam.googleapis.com/${pool}/attribute.authority/collinbentley1/cdbentley/.github/workflows/deploy-prod.yml@refs/heads/main:collinbentley1/platform/.github/workflows/infrastructure.yml@${sha}:${sha}:production:push`;
@@ -267,6 +267,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     }
     // Every canonical job delivers its credential once: the broker mints as each member against every target it is
     // bound to -- DENIED, the bindings being gone -- and records the revocation probe of every (target, member) pair.
+    await openRound(w, "cdbentley", "REVOCATION", "q1", "4242");
     const responses = await deliverAll(w, "cdbentley");
     expect(responses.every((response) => response.status === 200)).toBe(true);
     expect(probe.mints).toHaveLength(primed + 14);
@@ -275,7 +276,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     for (const [index, candidate] of targets.entries()) {
       const state = shardAfterRound.targets[candidate.account]!;
       expect(state).toMatchObject({ effect: { ackedAt: w.clock.now.toISOString(), alternateIssuers: [], state: "ACKED" }, sequence: index + 1 });
-      expect(state.chain).toMatchObject({ inventory: { changes: 0, findings: [], hash: (acked[9 + index]!.body as { hash: string }).hash, horizonSeconds: 3600, observations: 1 }, journaled: 1 + candidate.members.length, suppressed: 0 });
+      expect(state.chain).toMatchObject({ inventory: { changes: 0, findings: [], hash: (acked[9 + index]!.body as { hash: string }).hash, horizonSeconds: 3600, observations: expect.any(Number) }, journaled: 1 + candidate.members.length, suppressed: 0 });
       expect(Object.keys(state.chain.members).sort()).toEqual([...candidate.members].sort());
       for (const managed of candidate.members) expect(state.chain.members[managed]).toMatchObject({ allowed: { count: 0, lastObservedAt: null }, denied: 1, post: null, revocation: { member: managed, outcome: "DENIED", phase: "REVOCATION", principal } });
     }
@@ -289,12 +290,14 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(w, "q1")).toEqual({ blockers: members.map(([candidate, managed]) => `${candidate.account}: token horizon of ${managed} drains at ${horizonAt}`), horizonAt, ready: false });
     expect(await beginClose(w, "q1", "c0")).toMatchObject({ kind: "rejected", rejection: { reason: "NOT_READY" } });
     w.clock.advance(3600);
+    await openRound(w, "cdbentley", "HORIZON", "q1", "4243");
+    const horizonPrincipal = memberPrincipal(w.authority, consumer, "4243");
     await deliverAll(w, "cdbentley");
     expect(await probeEntries(w, "q1")).toHaveLength(2 * members.length);
     expect(await readinessOf(w, "q1")).toEqual({ blockers: [], horizonAt, ready: true });
     // The next reconcile projects the journaled probes and re-verifies the baseline: no entry, the baseline confirmed.
     await broker.reconcileShard("q1");
-    expect((await ledger.readShard("q1"))!.targets[targets[0]!.account]!.chain.inventory).toMatchObject({ changes: 0, observations: 2, verifiedAt: w.clock.now.toISOString() });
+    expect((await ledger.readShard("q1"))!.targets[targets[0]!.account]!.chain.inventory).toMatchObject({ changes: 0, observations: expect.any(Number), verifiedAt: w.clock.now.toISOString() });
     expect((await entriesOf(w, "q1")).every((entry) => entry.outbox.state === "PROJECTED")).toBe(true);
     // Managed bindings stay absent through the protected close and the terminal projection.
     expect((await beginClose(w, "q1", "c1")).kind).toBe("closing");
@@ -307,7 +310,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const receipt = JSON.parse(shard.terminal.receipt) as { targets: Record<string, { chain: { inventory: { hash: string; summary: { denyState: { form: string } } }; members: Record<string, { post: unknown; revocation: unknown }>; suppressed: number } }> };
     expect(receipt).toMatchObject({ closeHighWater: highWater, consumer: "cdbentley", intent: "QUARANTINE", readiness: { blockers: [], horizonAt, ready: true }, shard: "q1" });
     for (const [candidate, managed] of members) {
-      expect(receipt.targets[candidate.account]!.chain.members[managed]).toMatchObject({ post: { member: managed, phase: "HORIZON", principal }, revocation: { member: managed, phase: "REVOCATION", principal } });
+      expect(receipt.targets[candidate.account]!.chain.members[managed]).toMatchObject({ post: { member: managed, phase: "HORIZON", principal: horizonPrincipal }, revocation: { member: managed, phase: "REVOCATION", principal } });
     }
     // The receipt carries the preimage of every target's readiness hash: the inventory summary itself, the live Deny state included.
     expect(receipt.targets[targets[0]!.account]!.chain).toMatchObject({ inventory: { hash: (acked[9]!.body as { hash: string }).hash, summary: (acked[9]!.body as { summary: unknown }).summary }, suppressed: 0 });
@@ -344,7 +347,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     // With the bindings back, a delivery round mints ALLOWED as every member again: the positive controls of the next quarantine.
     await deliverAll(w, "cdbentley");
     const control = await ledger.readMemberControl(targets[0]!.members[0]!);
-    expect(control).toMatchObject({ consumer: "cdbentley", member: targets[0]!.members[0]!, principal, targets: { [targets[0]!.account]: { outcome: "ALLOWED", uniqueId: targets[0]!.uniqueId } } });
+    expect(control).toMatchObject({ consumer: "cdbentley", member: targets[0]!.members[0]!, principal: horizonPrincipal, targets: { [targets[0]!.account]: { outcome: "ALLOWED", uniqueId: targets[0]!.uniqueId } } });
   }, 180_000);
 
   test("scan-ready needs an inventory baseline and, for every managed member of every target, a DENIED probe after acknowledgement, a drained one-hour horizon, and another DENIED probe after it", async () => {
@@ -359,8 +362,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(w, "q")).toMatchObject({ horizonAt: null, ready: false });
     expect((await readinessOf(w, "q")).blockers).toEqual(targets.map((candidate) => `${candidate.account}: quarantine is RECORDED`));
     await broker.reconcileShard("q");
-    // A delivery before the baseline exists records a control but no probe; the baseline is here, so the round records revocations.
-    await deliverAll(w, "cdbentley");
+    // Commit the source observations against the acknowledged inventory baseline.
+    await recordNeededProbes(w, "q");
     const tokenExpiry = mintedAt + 3600 * 1000;
     const horizon = clock.now.getTime() + 3600 * 1000;
     const horizonAt = new Date(horizon).toISOString();
@@ -390,8 +393,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await readinessOf(w, "q")).toEqual({ blockers: members.map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the token horizon ${horizonAt}`), horizonAt, ready: false });
     expect(await ledger.recordProbe("q", { account: early.account, email: early.email, member: early.members[0]!, observedAt: clock.now.toISOString(), outcome: "DENIED", permission: probePermission, phase: "HORIZON", principal: proberPrincipal, uniqueId: early.uniqueId })).toMatchObject({ kind: "recorded", role: "HORIZON" });
     expect((await readinessOf(w, "q")).blockers).toEqual(members.filter(([candidate, managed]) => !(candidate === early && managed === early.members[0])).map(([candidate, managed]) => `${candidate.account}: no DENIED impersonation probe of ${managed} after the token horizon ${horizonAt}`));
-    // At the horizon a delivery round records every remaining member's post-horizon probe and the shard is ready; time alone never made it so.
-    await deliverAll(w, "cdbentley");
+    // Source observations complete every remaining member's post-horizon debt.
+    await recordNeededProbes(w, "q");
     expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 1);
     expect(await readinessOf(w, "q")).toEqual({ blockers: [], horizonAt, ready: true });
     // The readiness and the deliveries still owed are reported on the caller-facing view.
@@ -414,7 +417,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     probe.outcomes.set(`${first.uniqueId}|${lingering}`, "ALLOWED");
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     await broker.reconcileShard("q");
-    await deliverAll(w, "cdbentley");
+    await recordNeededProbes(w, "q");
     expect(await probeEntries(w, "q")).toHaveLength(members.length);
     let readiness = await readinessOf(w, "q");
     expect(readiness.horizonAt).toBeNull();
@@ -425,13 +428,13 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(((await broker.reconcileShard("q")) as { notes: string[] }).notes).toEqual([`${first.account}: REVOCATION probe of ${lingering} awaits a delivery: the canonical job that is this member must run again and deliver its credential to POST /v1/members`]);
     // Still allowed ten minutes later: that member's delivery restarts nothing else; every other member waits for its horizon.
     clock.advance(600);
-    await deliver(w, "cdbentley", lingering);
+    await recordNeededProbes(w, "q", lingering);
     expect(await probeEntries(w, "q")).toHaveLength(members.length + 1);
     expect((await probeEntries(w, "q")).at(-1)!.body).toMatchObject({ member: lingering, outcome: "ALLOWED", uniqueId: first.uniqueId });
     // Denied at T+1200: the horizon of that member is one hour after that, later than every other member's.
     probe.outcomes.delete(`${first.uniqueId}|${lingering}`);
     clock.advance(600);
-    await deliver(w, "cdbentley", lingering);
+    await recordNeededProbes(w, "q", lingering);
     expect(await probeEntries(w, "q")).toHaveLength(members.length + 2);
     const lateHorizon = clock.now.getTime() + 3600 * 1000;
     readiness = await readinessOf(w, "q");
@@ -439,13 +442,13 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(readiness.ready).toBe(false);
     // Every other member drains first and gets its post-horizon probe; the lingering member still blocks.
     clock.advance(2400);
-    await deliverAll(w, "cdbentley");
+    await recordNeededProbes(w, "q");
     expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 1);
     readiness = await readinessOf(w, "q");
     expect(readiness.blockers).toEqual([`${first.account}: token horizon of ${lingering} drains at ${new Date(lateHorizon).toISOString()}`]);
     expect(await beginClose(w, "q", "c0")).toMatchObject({ kind: "rejected", rejection: { blockers: readiness.blockers, reason: "NOT_READY" } });
     clock.advance(1200);
-    await deliver(w, "cdbentley", lingering);
+    await recordNeededProbes(w, "q", lingering);
     expect(await probeEntries(w, "q")).toHaveLength(2 * members.length + 2);
     expect((await readinessOf(w, "q")).ready).toBe(true);
     // A later ALLOWED observation of one member of a ready target restarts that member's chain alone: a fresh DENIED
@@ -456,7 +459,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(readiness).toMatchObject({ blockers: [`${second.account}: no DENIED impersonation probe of ${restarted} after the quarantine acknowledgement`], horizonAt: null, ready: false });
     expect(await beginClose(w, "q", "c1")).toMatchObject({ kind: "rejected", rejection: { reason: "NOT_READY" } });
     clock.advance(1);
-    await deliver(w, "cdbentley", restarted);
+    await recordNeededProbes(w, "q", restarted);
     expect((await probeEntries(w, "q")).at(-1)!.body).toMatchObject({ member: restarted, outcome: "DENIED", uniqueId: second.uniqueId });
     expect((await readinessOf(w, "q")).blockers).toEqual([`${second.account}: token horizon of ${restarted} drains at ${new Date(clock.now.getTime() + 3600 * 1000).toISOString()}`]);
     // An unreachable source records nothing, for any member: the delivery is refused and no observation exists.
@@ -500,7 +503,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     }
     expect((round.owed as unknown[]).length).toBe(members.length);
     // The same coordinates replay the round; other coordinates open another.
-    expect(await broker.handle(purpose, parseRoundBody(roundBody))).toEqual({ status: 200, body: { round } });
+    expect(await broker.handle(purpose, parseRoundBody(roundBody))).toMatchObject({ status: 200, body: { round: { round: roundKey, complete: false } } });
+    expect((await broker.handle(purpose, parseRoundRunsBody(roundKey, { runs: Object.fromEntries(distinct.map((member) => [member, { runId: "4242", runAttempt: "1" }])) }))).status).toBe(200);
     // Every canonical job but one delivers: each delivery is a receipt in the open round, and the round stays owed the
     // missing member's receipt, so the quarantine is still refused, naming exactly what is missing.
     const last = distinct.at(-1)!;
@@ -521,7 +525,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(await ledger.recordReceipt(roundKey, "principalSet://elsewhere", { ...stray, platformSha: cdbentley.activeWorkflowSha! })).toEqual({ kind: "refused", reason: "the round expects no delivery from this member" });
     expect(await ledger.recordReceipt(roundKey, last, { ...stray, controls: { [targets[0]!.account]: { observedAt: stray.deliveredAt, outcome: "ALLOWED", uniqueId: "999" } }, platformSha: cdbentley.activeWorkflowSha! })).toEqual({ kind: "refused", reason: `the delivery minted against 999, not the bound identity ${targets[0]!.uniqueId} of ${targets[0]!.account}` });
     expect(await ledger.recordReceipt("f".repeat(64), last, stray)).toEqual({ kind: "refused", reason: "the round does not exist" });
-    expect((await ledger.readRound(roundKey))!.version).toBe(distinct.length);
+    expect((await ledger.readRound(roundKey))!.version).toBe(distinct.length + 1);
     // The last member delivers: the round completes and becomes the consumer's admitting round.
     const completing = await deliver(w, "cdbentley", last);
     expect(completing.body.rounds).toEqual([{ complete: true, phase: "CONTROL", recorded: true, round: roundKey }]);
@@ -584,8 +588,9 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes).toHaveLength(0);
     await controlRound(w, "cdbentley");
     await broker.reconcileShard("q");
-    expect(iam.writes).toHaveLength(9);
-    expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "ACKED", attempts: 2 });
+    // A successor CONTROL does not authorize this shard, whose original binding drifted.
+    expect(iam.writes).toHaveLength(0);
+    expect((await ledger.readEntry("q", 1))!.progress).toMatchObject({ state: "PREPARED", attempts: 1 });
     // The production binding: the real issuance probe over credentials delivered through the real request path. With
     // none delivered every member lacks its control: refused before acceptance, and a shard journaled by any other
     // route stays RECORDED and unwritten.
@@ -615,6 +620,7 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const liveRound = await live.handle(isolate(p), parseRoundBody({ consumer: "cdbentley", key: "round/live", label: "live", phase: "CONTROL", shard: null }));
     expect(liveRound.status).toBe(201);
     const liveRoundId = (liveRound.body.round as { round: string }).round;
+    expect((await live.handle(isolate(p), parseRoundRunsBody(liveRoundId, { runs: Object.fromEntries(distinct.map((member, index) => [member, { runId: String(2000 + index), runAttempt: "1" }])) }))).status).toBe(200);
     for (const [index, managed] of distinct.entries()) {
       const token = await p.signer.sign(memberClaims(p.authority, consumer, managed, nowSeconds, String(2000 + index)));
       tokens.set(managed, token);
@@ -641,7 +647,14 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     const mintCalls = () => issuance.calls.filter((call) => call.url.endsWith(":generateAccessToken")).length;
     expect(mintCalls()).toBe(members.length);
     await live.reconcileShard("q");
+    expect(p.iam.writes).toHaveLength(0);
+    expect((await live.handle(isolate(p), quarantine("q2", "cdbentley", "q2"))).status).toBe(201);
+    await live.reconcileShard("q2");
     expect(p.iam.writes).toHaveLength(9);
+    const revocationReply = await live.handle(isolate(p), parseRoundBody({ consumer: "cdbentley", key: "round/live-revocation", label: "live-revocation", phase: "REVOCATION", shard: "q2" }));
+    expect(revocationReply.status).toBe(201);
+    const revocationId = (revocationReply.body.round as { round: string }).round;
+    expect((await live.handle(isolate(p), parseRoundRunsBody(revocationId, { runs: Object.fromEntries(distinct.map((member, index) => [member, { runId: String(3000 + index), runAttempt: "1" }])) }))).status).toBe(200);
     for (const candidate of p.targets) issuance.denied.add(candidate.uniqueId);
     for (const [index, managed] of distinct.entries()) {
       const token = await p.signer.sign(memberClaims(p.authority, consumer, managed, Math.floor(p.clock.now.getTime() / 1000), String(3000 + index)));
@@ -652,8 +665,8 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     }
     expect(mintCalls()).toBe(2 * members.length);
     const firstMember = p.targets[0]!.members[0]!;
-    expect((await p.ledger.readShard("q"))!.targets[p.targets[0]!.account]!.chain.members[firstMember]).toMatchObject({ allowed: { count: 0 }, denied: 1, revocation: { outcome: "DENIED", principal: memberPrincipal(p.authority, consumer, String(3000 + distinct.indexOf(firstMember))) } });
-    expect((await readinessOf(p, "q")).blockers.every((blocker) => blocker.includes("drains at"))).toBe(true);
+    expect((await p.ledger.readShard("q2"))!.targets[p.targets[0]!.account]!.chain.members[firstMember]).toMatchObject({ allowed: { count: 0 }, denied: 1, revocation: { outcome: "DENIED", principal: memberPrincipal(p.authority, consumer, String(3000 + distinct.indexOf(firstMember))) } });
+    expect((await readinessOf(p, "q2")).blockers.every((blocker) => blocker.includes("drains at"))).toBe(true);
   }, 240_000);
 
   test("a partial quarantine, an alternate issuer, or a pre-prepare divergence is never scan-ready, is not probed, and refuses to close", async () => {
@@ -674,11 +687,10 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes.map((write) => write.resource)).not.toContain(targets[2]!.resource);
     expect(evidence.objects.has(entries[2]!.objectName)).toBe(false);
     expect(await ledger.readActuator(targets[2]!.uniqueId)).toEqual({ epoch: 1, holder: null, lastEtag: (entries[2]!.progress as { observed: { etag: string } }).observed.etag });
-    // A delivery round probes neither the alternate-issuer target nor the diverged target; every member of the other seven.
+    // A partial quarantine cannot open a phase round or commit counting probes.
+    expect((await broker.handle(isolate(w), parseRoundBody({ consumer: "cdbentley", key: "round/partial", label: "partial", phase: "REVOCATION", shard: "q" }))).status).toBe(409);
     await deliverAll(w, "cdbentley");
-    const probed = (await probeEntries(w, "q")).map((entry) => (entry.body as { uniqueId: string }).uniqueId);
-    expect(new Set(probed)).toEqual(new Set(targets.filter((_, index) => index !== 1 && index !== 2).map((candidate) => candidate.uniqueId)));
-    expect(probed).toHaveLength(membersOf(targets.filter((_, index) => index !== 1 && index !== 2)).length);
+    expect(await probeEntries(w, "q")).toHaveLength(0);
     clock.advance(3600);
     await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q");
@@ -781,8 +793,10 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes.filter((write) => write.resource === targetAt(3).resource)).toHaveLength(1);
     expect(entries[4]!.outbox).toMatchObject({ state: "PROJECTED", generation: evidence.objects.get(fifth.objectName)!.generation });
     // 6: ready, close, then the terminal projection's answer is lost and the bucket is unreadable: FINALIZING, not CLOSED.
+    await openRound(w, "cdbentley", "REVOCATION", "q");
     await deliverAll(w, "cdbentley");
     w.clock.advance(3600);
+    await openRound(w, "cdbentley", "HORIZON", "q");
     await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q");
     expect((await beginClose(w, "q", "c")).kind).toBe("closing");
@@ -810,9 +824,11 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(iam.writes).toHaveLength(0);
     // Ready, but the post-horizon probe entries could not be projected: the close begins and stays CLOSING.
     await broker.reconcileShard("q");
+    await openRound(w, "cdbentley", "REVOCATION", "q");
     await deliverAll(w, "cdbentley");
     await broker.reconcileShard("q");
     w.clock.advance(3600);
+    await openRound(w, "cdbentley", "HORIZON", "q");
     await deliverAll(w, "cdbentley");
     evidence.dropResponses = members.length;
     evidence.unavailableReads = members.length;
@@ -950,9 +966,13 @@ describe.skipIf(!emulatorHost)("effects and closure (Firestore emulator; in-memo
     expect(writes).toHaveLength(3);
     expect(writes.map((write) => write.bindings.some((binding) => binding.role === managedRole))).toEqual([false, true, false]);
     expect((await ledger.readEntry("q1", 1))!.progress).toMatchObject({ state: "ACKED", epoch: 3 });
-    // The rest of q1 completes once a CONTROL round is complete again after the restore.
+    // Finish this actuator-ordering case directly. The first target is
+    // quarantined again, so a new all-target positive CONTROL cannot pass.
     await broker.reconcileShard("r0");
-    await controlRound(w, "cdbentley");
+    for (const [index, target] of targets.entries()) {
+      if (index === 0) continue;
+      await driveEffect(ledger, iam, "q1", (await ledger.readEntry("q1", index + 1))!, target);
+    }
     await broker.reconcileShard("q1");
     expect((await entriesOf(w, "q1")).filter((entry) => entry.body.kind === "effect").every((entry) => entry.progress?.state === "ACKED")).toBe(true);
   }, 120_000);

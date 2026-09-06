@@ -18,6 +18,10 @@ set -euo pipefail
 consumer="$1"
 direction="$2"
 : "${BROKER_URL:?}" "${ID_TOKEN:?}" "${IDEMPOTENCY_KEY:?}" "${OPERATION:?}" "${SHARD:?}"
+: "${REQUEST_NONCE:?}" "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}"
+[[ "$REQUEST_NONCE" =~ ^[0-9a-f]{64}$ ]]
+[[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+[[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
 [[ "$SHARD" =~ ^(-|[a-z0-9][a-z0-9-]{0,62})$ ]]
 case "$direction" in
   quarantine) intent=QUARANTINE ;;
@@ -71,6 +75,13 @@ case "$OPERATION" in
     jq -n --arg key "$IDEMPOTENCY_KEY" --arg consumer "$consumer" --arg label "$label" --arg phase "$phase" --arg shard "$SHARD" \
       '{key: $key, consumer: $consumer, label: $label, phase: $phase, shard: (if $shard == "-" then null else $shard end)}' > "$body"
     ;;
+  round-bind)
+    [ "$intent" = QUARANTINE ]
+    printf '%s' "${ARGUMENT:?}" > "$workdir/binding.json"
+    round="$(jq -er '.round | select(test("^[0-9a-f]{64}$"))' "$workdir/binding.json")"
+    path="/v1/rounds/$round/runs"
+    jq -e '{runs: .runs}' "$workdir/binding.json" > "$body"
+    ;;
   round-status)
     [[ "${ARGUMENT:?}" =~ ^[0-9a-f]{64}$ ]]
     method=GET
@@ -96,7 +107,11 @@ if [ -f "$reply" ]; then
   cat "$reply"
   echo
   if [ -n "${REPLY_PATH:-}" ]; then
-    install -m 0600 "$reply" "$REPLY_PATH"
+    jq -n --arg nonce "$REQUEST_NONCE" --arg runId "$GITHUB_RUN_ID" --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+      --arg consumer "$consumer" --arg direction "$direction" --arg operation "$OPERATION" \
+      --arg shard "$SHARD" --arg argument "${ARGUMENT:-}" --slurpfile reply "$reply" \
+      '{nonce: $nonce, runId: $runId, runAttempt: $runAttempt, request: {consumer: $consumer, direction: $direction, operation: $operation, shard: $shard, argument: $argument}, reply: $reply[0]}' > "$workdir/envelope.json"
+    install -m 0600 "$workdir/envelope.json" "$REPLY_PATH"
   fi
 fi
 exit "$status"

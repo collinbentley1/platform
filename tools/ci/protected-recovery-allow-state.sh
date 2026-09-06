@@ -35,12 +35,61 @@ printf 'header = "Authorization: Bearer %s"\n' "$token" > "$workdir/auth.cfg"
 unset token
 
 printf '{"options":{"requestedPolicyVersion":3}}' > "$workdir/request.json"
-status="$(curl --silent --show-error --config "$workdir/auth.cfg" --request POST --header 'Content-Type: application/json' --data-binary "@$workdir/request.json" --output "$workdir/body" --write-out '%{http_code}' "${endpoint}/v3/${resource}:getIamPolicy" || echo 000)"
-if [ "$status" != 200 ]; then
-  jq -cn --arg status "$status" '{status: $status, etag: "", roles: "[]", reason: ("reading the allow policy answered HTTP " + $status)}'
+: > "$workdir/roles.jsonl"
+original="$resource"
+root_etag=""
+read_resource() {
+  local method="$1" name="$2"
+  local args=(--silent --show-error --max-time 30 --max-filesize 1048576 --config "$workdir/auth.cfg" --request "$method" --output "$workdir/body" --write-out '%{http_code}')
+  if [ "$method" = POST ]; then args+=(--header 'Content-Type: application/json' --data-binary "@$workdir/request.json"); fi
+  status="$(curl "${args[@]}" "${endpoint}/v3/${name}" || echo 000)"
+}
+unread() {
+  jq -cn --arg status "$1" --arg reason "$2" '{status: $status, etag: "", roles: "[]", cleanup_status: "UNREAD", reason: $reason}'
   exit 0
+}
+# A project can inherit the canary grant from any folder or the organization.
+# Every parent read is mandatory; a direct empty policy alone is insufficient.
+seen="|"
+for depth in $(seq 1 20); do
+  [[ "$resource" =~ ^(projects/[A-Za-z0-9._-]+|(folders|organizations)/[1-9][0-9]*)$ ]] || unread 502 "malformed ancestor"
+  [[ "$seen" != *"|${resource}|"* ]] || unread 502 "ancestry cycle"
+  seen="${seen}${resource}|"
+  read_resource POST "${resource}:getIamPolicy"
+  [ "$status" = 200 ] || unread "$status" "an Allow attachment could not be read"
+  jq -ce --arg member "serviceAccount:${principal}" '
+    if (.etag | type) != "string" or .etag == "" then error("missing etag") else
+      [.bindings[]? | select((.members // []) | index($member)) | .role] end
+  ' "$workdir/body" >> "$workdir/roles.jsonl" || unread 502 "the Allow policy is malformed"
+  if [ -z "$root_etag" ]; then root_etag="$(jq -r '.etag' "$workdir/body")"; fi
+  if [[ "$resource" == organizations/* ]]; then break; fi
+  read_resource GET "$resource"
+  [ "$status" = 200 ] || unread "$status" "an Allow ancestor could not be read"
+  resource="$(jq -r '.parent // ""' "$workdir/body")"
+  [[ "$resource" =~ ^(folders|organizations)/[1-9][0-9]*$ ]] || unread 502 "the Allow ancestry is incomplete"
+  [ "$depth" != 20 ] || unread 502 "the Allow ancestry exceeds the read bound"
+done
+roles="$(jq -sc 'add | unique' "$workdir/roles.jsonl")"
+cleanup_status=NOT_REQUESTED
+folder="$(jq -r '.folder_id // ""' <<< "$query")"
+project="$(jq -r '.canary_project // ""' <<< "$query")"
+display="$(jq -r '.expected_display // ""' <<< "$query")"
+if [ -n "$folder" ] || [ -n "$project" ]; then
+  [[ "$original" =~ ^organizations/[1-9][0-9]*$ && "$folder" =~ ^[1-9][0-9]*$ && "$project" =~ ^deny-canary-[0-9]{1,12}$ && "$display" = "$project" ]] || unread 400 "the cleanup identity is malformed"
+  if [ "$roles" != '[]' ]; then
+    cleanup_status=NOT_RETIRED
+  else
+    cleanup_status=CLEAN
+    for resource in "folders/${folder}" "projects/${project}"; do
+      read_resource GET "$resource"
+      if [ "$status" = 404 ]; then continue; fi
+      [ "$status" = 200 ] || unread "$status" "the exact cleanup identity is unreadable after Allow retirement"
+      if [[ "$resource" == folders/* ]]; then
+        jq -e --arg name "$resource" --arg parent "$original" --arg display "$display" '.name == $name and .parent == $parent and .displayName == $display and .state == "DELETE_REQUESTED"' "$workdir/body" > /dev/null || cleanup_status=RETAINED
+      else
+        jq -e --arg id "$project" --arg parent "$original" '.projectId == $id and .parent == $parent and .state == "DELETE_REQUESTED"' "$workdir/body" > /dev/null || cleanup_status=RETAINED
+      fi
+    done
+  fi
 fi
-jq -c --arg member "serviceAccount:${principal}" '
-  if (.etag | type) != "string" then {status: "502", etag: "", roles: "[]", reason: "the allow policy carries no etag"}
-  else {status: "200", etag: .etag, roles: ([.bindings[]? | select((.members // []) | index($member)) | .role] | unique | tojson), reason: ""} end
-' "$workdir/body" 2> /dev/null || jq -cn '{status: "502", etag: "", roles: "[]", reason: "the allow policy is malformed"}'
+jq -cn --arg etag "$root_etag" --arg roles "$roles" --arg cleanup "$cleanup_status" '{status: "200", etag: $etag, roles: $roles, cleanup_status: $cleanup, reason: ""}'

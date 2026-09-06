@@ -6,7 +6,7 @@ import { type IdentityOutcome, type ImpersonationProbe, type Jwk, type MemberCre
 import { Broker, type BrokerResponse, type Deadlines, type Identity, type IdentityVerifier } from "../src/http";
 import { type CredentialInventory, type DenyStateOutcome, type InventoryOutcome, inventoryFindings } from "../src/inventory";
 import { type Fresh, Ledger } from "../src/ledger";
-import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type RoundPhase, type Target, consumerPool, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, parseRoundBody, probesNeeded, purposeForIdentity, targetOfEffect, targetsFor } from "../src/model";
+import { type Consumer, type FreshInventory, type InventorySummary, type ProbeOutcome, type RecoveryAuthority, type RoundPhase, type Target, consumerPool, inventoryHash, loadRecoveryAuthority, managedRole, parseAppendBody, parseCloseBody, parseRoundBody, parseRoundRunsBody, probePermission, probesNeeded, purposeForIdentity, targetOfEffect, targetsFor } from "../src/model";
 import { type EvidenceStore, type GetOutcome, type PutOutcome } from "../src/outbox";
 
 // Test support. The ledger is the real Firestore emulator (FIRESTORE_EMULATOR_HOST);
@@ -498,7 +498,9 @@ export function consumerOf(w: World, repository: string): Consumer {
 // One canonical job delivering its credential: a token of the exact member,
 // minted now for the consumer provider's audience, through the consumer's
 // member-delivery identity and the real request path.
-export async function deliver(w: World, repository: string, member: string, runId = "4242"): Promise<BrokerResponse> {
+const deliveryRuns = new WeakMap<World, Map<string, string>>();
+
+export async function deliver(w: World, repository: string, member: string, runId = deliveryRuns.get(w)?.get(repository) ?? "4242"): Promise<BrokerResponse> {
   const consumer = consumerOf(w, repository);
   const token = await w.signer.sign(memberClaims(w.authority, consumer, member, Math.floor(w.clock.now.getTime() / 1000), runId));
   return await w.broker.handle(purposeForIdentity(w.authority, memberEmail(repository))!, { kind: "deliver", token });
@@ -506,7 +508,7 @@ export async function deliver(w: World, repository: string, member: string, runI
 
 // Every canonical job of a consumer delivering once, in member order: one
 // delivery round.
-export async function deliverAll(w: World, repository: string, runId = "4242"): Promise<readonly BrokerResponse[]> {
+export async function deliverAll(w: World, repository: string, runId?: string): Promise<readonly BrokerResponse[]> {
   const consumer = consumerOf(w, repository);
   const members = [...new Set((targetsFor(w.authority, consumer) ?? []).flatMap((target) => target.members))].sort();
   const responses: BrokerResponse[] = [];
@@ -534,13 +536,21 @@ let roundCounter = 0;
 
 // Open one delivery round through the consumer's QUARANTINE invoker and the
 // real request path, at fresh coordinates; returns the round identifier.
-export async function openRound(w: World, repository: string, phase: RoundPhase, shard: string | null): Promise<string> {
+export async function openRound(w: World, repository: string, phase: RoundPhase, shard: string | null, selectedRunId?: string): Promise<string> {
   roundCounter += 1;
   const label = `${phase.toLowerCase()}-${roundCounter}`;
   const request = parseRoundBody({ consumer: repository, key: `round/${label}`, label, phase, shard });
   const response = await w.broker.handle(purposeForIdentity(w.authority, invokerEmail(repository))!, request);
   if (response.status !== 201) throw new Error(`opening the ${phase} round answered ${response.status}: ${JSON.stringify(response.body)}`);
-  return (response.body.round as { round: string }).round;
+  const id = (response.body.round as { round: string }).round;
+  const runId = selectedRunId ?? String(100000 + roundCounter);
+  const byConsumer = deliveryRuns.get(w) ?? new Map<string, string>();
+  byConsumer.set(repository, runId);
+  deliveryRuns.set(w, byConsumer);
+  const members = (await w.ledger.readRound(id))!.members;
+  const registered = await w.broker.handle(purposeForIdentity(w.authority, invokerEmail(repository))!, parseRoundRunsBody(id, { runs: Object.fromEntries(members.map((member) => [member, { runId, runAttempt: "1" }])) }));
+  if (registered.status !== 200) throw new Error(`binding round runs answered ${registered.status}`);
+  return id;
 }
 
 // One complete CONTROL round: opened, then every canonical job delivers once
@@ -636,4 +646,22 @@ export function livePoliciesFromMatrix(matrix: DenyMatrix, etag = (attachment: s
     documents[name] = { etag: etag(attachment), name, rules: projected.map((rule) => ({ denyRule: { deniedPermissions: rule.permissions, deniedPrincipals: rule.denied, exceptionPrincipals: rule.exceptions } })) };
   }
   return { documents, policies };
+}
+
+// Direct source observations for ledger capacity and chain-folding tests.
+// Broker delivery and run correlation are exercised separately in rounds.test.
+export async function recordNeededProbes(w: World, shardId: string, selectedMember?: string): Promise<void> {
+  const shard = await w.ledger.readShard(shardId);
+  if (!shard) throw new Error("shard missing");
+  const consumer = consumerOf(w, shard.consumer);
+  const targets = targetsFor(w.authority, consumer)!;
+  const members = selectedMember === undefined ? [...new Set(targets.flatMap((target) => target.members))].sort() : [selectedMember];
+  for (const member of members) {
+    const current = (await w.ledger.readShard(shardId))!;
+    for (const need of probesNeeded(current, w.clock.now, (account) => targets.find((target) => target.account === account)).filter((need) => need.member === member)) {
+      const outcome = w.probe.outcomes.get(`${need.uniqueId}|${member}`) ?? w.probe.outcomes.get(need.uniqueId) ?? "DENIED";
+      const recorded = await w.ledger.recordProbe(shardId, { account: need.account, email: need.email, member, observedAt: w.clock.now.toISOString(), outcome, permission: probePermission, phase: need.phase, principal: memberPrincipal(w.authority, consumer), uniqueId: need.uniqueId });
+      if (recorded.kind !== "recorded") throw new Error(recorded.reason);
+    }
+  }
 }

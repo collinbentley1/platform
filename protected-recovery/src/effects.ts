@@ -248,12 +248,30 @@ export async function driveEffect(ledger: Ledger, iam: ServiceAccountIam, shard:
   return await diverge(ledger, shard, entry, facts, observed, `${written.kind}; the observed policy is neither the exact before nor the expected after state`);
 }
 
+// Classification makes no IAM write. It can finish an already landed
+// PREPARED operation even when fresh admission no longer permits retrying CAS.
+export async function classifyPreparedEffect(ledger: Ledger, iam: ServiceAccountIam, shard: string, entry: Entry, target: Target): Promise<DriveOutcome> {
+  const progress = entry.progress;
+  if (progress?.state !== "PREPARED") return { kind: "terminal", entry };
+  const facts = { effectId: progress.effectId, epoch: progress.epoch };
+  const identity = await iam.getIdentity(target.resource);
+  if (identity.kind === "unavailable") return { kind: "pending", entry, reason: identity.reason };
+  const mismatch = identityMismatch(identity, target);
+  if (mismatch !== undefined) return await diverge(ledger, shard, entry, facts, null, mismatch);
+  const read = await iam.getPolicy(target.resource);
+  if (read.kind === "unavailable") return { kind: "pending", entry, reason: read.reason };
+  const observed = observedSnapshot(read.policy);
+  if (observed.hash === progress.after.hash) return await acknowledge(ledger, shard, entry, facts, observed, false);
+  if (observed.hash === progress.before.hash && observed.etag === progress.before.etag) return { kind: "pending", entry, reason: "the exact before state remains; a write requires current admission" };
+  return await diverge(ledger, shard, entry, facts, observed, "the observed policy is neither the exact before nor the expected after state");
+}
+
 async function acknowledge(ledger: Ledger, shard: string, entry: Entry, facts: { readonly effectId: string; readonly epoch: number }, observed: ObservedSnapshot, mutated: boolean): Promise<DriveOutcome> {
   const outcome = await ledger.acknowledgeEffect(shard, entry.sequence, { ...facts, mutated, observed });
   return outcome.kind === "transitioned" ? { kind: "acked", entry: outcome.entry } : { kind: "stale", entry: outcome.entry };
 }
 
-async function diverge(ledger: Ledger, shard: string, entry: Entry, facts: { readonly effectId: string; readonly epoch: number }, observed: ObservedSnapshot, reason: string): Promise<DriveOutcome> {
+async function diverge(ledger: Ledger, shard: string, entry: Entry, facts: { readonly effectId: string; readonly epoch: number }, observed: ObservedSnapshot | null, reason: string): Promise<DriveOutcome> {
   const outcome = await ledger.divergeEffect(shard, entry.sequence, { ...facts, observed, reason });
   return outcome.kind === "transitioned" ? { kind: "diverged", entry: outcome.entry, reason } : { kind: "stale", entry: outcome.entry };
 }

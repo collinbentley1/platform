@@ -326,6 +326,7 @@ function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, p
   const allowedAccounts = entry.trustDomain === "recovery" ? entry.serviceAccounts : serviceAccountIds;
   const minted = new Set<string>();
   let attests = false;
+  let witnesses = 0;
   steps.forEach((step, index) => {
     const uses = isRecord(step) ? step.uses : undefined;
     if (uses === undefined) return;
@@ -335,6 +336,10 @@ function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, p
     if (typeof uses !== "string") return;
     if (uses.startsWith(attestAction)) attests = true;
     if (!uses.startsWith(authAction)) return;
+    if (reviewedCanaryWitness(entry, step, steps.slice(0, index))) {
+      witnesses += 1;
+      return;
+    }
     const account = resolvedServiceAccount(isRecord(step) && isRecord(step.with) ? step.with.service_account : undefined, steps, allowedAccounts);
     if (account === undefined) failures.push(`${where} step ${index} service_account must resolve to one known gha-* account through a same-job step output.`);
     else minted.add(account);
@@ -346,6 +351,7 @@ function checkJob(entry: WorkflowAuthorityEntry, job: Record<string, unknown>, p
   } else if (!sameList(exchanged, entry.serviceAccounts)) {
     failures.push(`${where} exchanges for [${exchanged.join(", ")}] but the manifest binds [${entry.serviceAccounts.join(", ")}].`);
   }
+  if (entry.purpose === "deny-canary" && witnesses !== 1) failures.push(`${where} must exchange once for the separately reviewed read-only canary witness.`);
   if (entry.purpose === "deny-canary" && !attests) failures.push(`${where} is declared deny-canary but never runs actions/attest.`);
   if (entry.purpose !== "attestation" && entry.purpose !== "deny-canary" && attests) failures.push(`${where} runs actions/attest but is not declared attestation or deny-canary.`);
 }
@@ -377,6 +383,30 @@ async function checkCaller(root: string, entry: WorkflowAuthorityEntry, caller: 
   if (calls.length !== 1) {
     failures.push(`${path}: exactly one job must call ${platformRepository}/${entry.workflow}@__PLATFORM_SHA__ with id-token: write; found ${calls.length}.`);
   }
+}
+
+// The witness has no authority grant from the shared manifest. Its existing
+// read-only mapping is an activation prerequisite bound in authority.json and
+// verified in each canary predicate. Only this literal exchange may read it.
+function reviewedCanaryWitness(entry: WorkflowAuthorityEntry, step: unknown, preceding: readonly unknown[]): boolean {
+  if (entry.purpose !== "deny-canary" || entry.workflow !== ".github/workflows/protected-recovery-deny-canary.yml" || entry.job !== "exercise" || !isRecord(step) || step.id !== "witness" || !isRecord(step.with)) return false;
+  const expected = {
+    workload_identity_provider: "${{ steps.broker.outputs.workload_identity_provider }}",
+    service_account: "${{ steps.broker.outputs.witness }}",
+    token_format: "access_token",
+    access_token_lifetime: "3600s",
+    create_credentials_file: false,
+    export_environment_variables: false,
+  };
+  if (!sameList(Object.keys(step.with).sort(), Object.keys(expected).sort()) || Object.entries(expected).some(([key, value]) => step.with && isRecord(step.with) && step.with[key] !== value)) return false;
+  const producers = preceding.filter((candidate) => isRecord(candidate) && candidate.id === "broker");
+  if (producers.length !== 1 || !isRecord(producers[0]) || typeof producers[0].run !== "string") return false;
+  const lines = producers[0].run.split("\n").map((line) => line.trim()).filter((line) => line.includes("witness") || line.startsWith("authority="));
+  return sameList(lines, [
+    "authority=protected-recovery/authority.json",
+    `witness="$(jq -er '.broker.canaryWitnessServiceAccount | select(type == "string" and length > 0)' "$authority")"`,
+    'echo "witness=$witness"',
+  ]);
 }
 
 function resolvedServiceAccount(value: unknown, steps: readonly unknown[], allowed: readonly string[]): string | undefined {

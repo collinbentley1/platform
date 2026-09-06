@@ -48,7 +48,7 @@ interface Fixture {
   // The lifetime-extension policy resource set at each ancestor, if any.
   lifetimePolicies: Record<string, { readonly etag: string; readonly updateTime: string } | undefined>;
   deny: { status: number; documents: Record<string, Record<string, unknown>> };
-  compute: { status: number; body?: unknown; instances: Record<string, unknown>; templates: Record<string, unknown> };
+  compute: { status: number; templatesStatus?: number; body?: unknown; instances: Record<string, unknown>; templates: Record<string, unknown> };
   run: { status: number; body?: unknown; locations: unknown[] | { status: number }; regions: Record<string, RunRegion> };
   build: { status: number; body?: unknown; discovery: unknown | { status: number }; regions: Record<string, BuildRegion> };
   scheduler: { status: number; locations: unknown[]; regions: Record<string, unknown[]> };
@@ -187,7 +187,7 @@ function routes(f: Fixture, target: Target, consumer: Consumer, others: readonly
       case endpoints.compute:
         if (f.compute.status !== 200) return json(f.compute.status, f.compute.body ?? disabled("compute.googleapis.com"));
         if (path === `/compute/v1/projects/${consumer.projectId}/aggregated/instances`) return json(200, { items: f.compute.instances });
-        if (path === `/compute/v1/projects/${consumer.projectId}/aggregated/instanceTemplates`) return json(200, { items: f.compute.templates });
+        if (path === `/compute/v1/projects/${consumer.projectId}/aggregated/instanceTemplates`) return f.compute.templatesStatus === 403 ? json(403, disabled("compute.googleapis.com")) : json(200, { items: f.compute.templates });
         return json(404, {});
       case endpoints.run: {
         if (f.run.status !== 200) return json(f.run.status, f.run.body ?? disabled("run.googleapis.com"));
@@ -255,6 +255,13 @@ async function harness(account = 0, edit?: (authority: Record<string, unknown>) 
 }
 
 describe("credential inventory", () => {
+  test("Compute instances enabled followed by templates disabled is unavailable", async () => {
+    const { fixture, observe } = await harness();
+    fixture.compute.status = 200;
+    fixture.compute.templatesStatus = 403;
+    expect(await observe()).toMatchObject({ kind: "unavailable", reason: expect.stringContaining("Compute became disabled") });
+  });
+
   test("a clean target: every ancestry policy with its etag, every role expanded exactly once with its definition version, the lifetime policy at every ancestor, the live Deny state, no keys, no attachment in any listed region, a stable hash", async () => {
     const { authority, clock, findingsOf, fixture, observe, target } = await harness();
     const first = await observe();

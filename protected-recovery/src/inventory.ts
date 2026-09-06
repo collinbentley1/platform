@@ -436,7 +436,8 @@ export class GoogleCredentialInventory implements CredentialInventory {
     const instances = await this.#aggregated(`${compute}/aggregated/instances`, "instances", bearer, consumer.projectId);
     if (instances.kind === "disabled") return "disabled";
     const templates = await this.#aggregated(`${compute}/aggregated/instanceTemplates`, "instanceTemplates", bearer, consumer.projectId);
-    return { instances: instances.items, templates: templates.kind === "items" ? templates.items : [] };
+    if (templates.kind === "disabled") throw new Unavailable("Compute became disabled while enumerating instance templates");
+    return { instances: instances.items, templates: templates.items };
   }
 
   // Cloud Run: the regions the project can use, from the API's own location

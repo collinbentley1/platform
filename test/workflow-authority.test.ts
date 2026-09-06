@@ -259,6 +259,19 @@ describe("workflow authority manifest", () => {
     ]);
   });
 
+  test("only the canary's exact reviewed witness coordinate may add a read-only exchange", async () => {
+    const path = ".github/workflows/protected-recovery-deny-canary.yml";
+    for (const [before, after] of [
+      [".broker.canaryWitnessServiceAccount", ".broker.unreviewedWitness"],
+      ["service_account: ${{ steps.broker.outputs.witness }}", "service_account: ${{ inputs.witness }}"],
+      ['echo "witness=$witness"', 'echo "witness=other@foreign.iam.gserviceaccount.com"'],
+    ]) {
+      const root = await fixtureRoot();
+      await editFile(root, path, (text) => text.replace(before!, after!));
+      expect(await failuresOf(root)).toContain(`${path}: job exercise must exchange once for the separately reviewed read-only canary witness.`);
+    }
+  });
+
   test("every action of a declared job must be pinned to a full commit SHA", async () => {
     const root = await fixtureRoot();
     await editFile(root, ".github/workflows/deploy-prod.yml", (text) =>

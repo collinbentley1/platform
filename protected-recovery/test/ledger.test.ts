@@ -4,7 +4,7 @@ import { boundedFetch } from "../src/http";
 import { LedgerUnavailable } from "../src/ledger";
 import { type InventoryRecord, type ProbeRecord, type Target, emptyChain, inventoryHash, maxEntriesPerShard, probeKey, probePermission, scanReadiness, targetsFor } from "../src/model";
 import { inventoryFindings } from "../src/inventory";
-import { Clock, beginClose, close, consumerOf, deliver, deliverAll, emulatorHost, emulatorLedger, freshOf, makeReady, memberPrincipal, prime, proberPrincipal, quarantine, restore, seedTargets, testAuthority, world } from "./support";
+import { Clock, beginClose, close, consumerOf, deliver, deliverAll, emulatorHost, emulatorLedger, freshOf, makeReady, memberPrincipal, prime, proberPrincipal, recordNeededProbes, quarantine, restore, seedTargets, testAuthority, world } from "./support";
 
 const membersOf = (targets: readonly Target[]) => targets.flatMap((target) => target.members.map((member) => [target, member] as const));
 
@@ -251,7 +251,7 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     expect((await ledger.append(quarantine("q", "cdbentley", "k1"), targets)).kind).toBe("accepted");
     const firstPassAt = clock.now.getTime();
     await broker.reconcileShard("q");
-    await deliverAll(w, "cdbentley");
+    await recordNeededProbes(w, "q");
     expect((await ledger.readShard("q"))!.nextSequence).toBe(19 + members.length);
     // The lingering member keeps being ALLOWED until the journal is full.
     const allowed = (observedAt: string): ProbeRecord => ({ account: first.account, email: first.email, member: lingering, observedAt, outcome: "ALLOWED", permission: probePermission, phase: "REVOCATION", principal: proberPrincipal, uniqueId: first.uniqueId });
@@ -271,7 +271,7 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     // records it anyway.
     probe.outcomes.delete(`${first.uniqueId}|${lingering}`);
     clock.advance(1);
-    expect((await deliver(w, "cdbentley", lingering)).status).toBe(200);
+    await recordNeededProbes(w, "q", lingering);
     const revoked = (await ledger.readShard("q"))!;
     expect(revoked.nextSequence).toBe(maxEntriesPerShard + 1);
     expect(revoked.targets[first.account]!.chain).toMatchObject({ members: { [lingering]: { post: null, revocation: { member: lingering, observedAt: clock.now.toISOString(), outcome: "DENIED", phase: "REVOCATION", principal } } }, suppressed: 1 });
@@ -292,10 +292,10 @@ describe.skipIf(!emulatorHost)("ledger (Firestore emulator)", () => {
     // The second target's members deliver again after the change and rebuild their chains; then the post-horizon
     // probes of every member are likewise folded in, and the shard is ready, closes, and restores.
     clock.advance(1);
-    for (const member of second.members) expect((await deliver(w, "cdbentley", member)).status).toBe(200);
+    for (const member of second.members) await recordNeededProbes(w, "q", member);
     for (const member of second.members) expect((await ledger.readShard("q"))!.targets[second.account]!.chain.members[member]).toMatchObject({ post: null, revocation: { observedAt: clock.now.toISOString(), outcome: "DENIED" } });
     clock.advance(3600);
-    await deliverAll(w, "cdbentley");
+    await recordNeededProbes(w, "q");
     await broker.reconcileShard("q");
     const ready = (await ledger.readShard("q"))!;
     expect(ready.nextSequence).toBe(maxEntriesPerShard + 1);

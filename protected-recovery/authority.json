@@ -1,5 +1,6 @@
 {
   "broker": {
+    "canaryWitnessServiceAccount": null,
     "projectId": null,
     "projectNumber": null,
     "region": "us-east4",

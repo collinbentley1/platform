@@ -48,10 +48,9 @@ import {
 //   POST /v1/members                   the consumer's member-delivery identity   {"token": "<GitHub OIDC token>"}
 //     200                             -> {"member", "controls", "probes", "rounds"}   the canonical job's own credential,
 //                                        verified, exchanged at STS, and used at once to mint as the member against every
-//                                        target it is bound to; the outcomes are recorded (a receipt in every open round of
-//                                        the consumer whose binding the delivery satisfies, the revocation or post-horizon
-//                                        probe of every OPEN quarantine that needs it) and the bearer is discarded -- it is
-//                                        never stored
+//                                        target it is bound to. The current round buffers or records only its exact runs;
+//                                        counted DENIED probes belong to that round's named shard and phase. ALLOWED
+//                                        outcomes invalidate affected open chains. The bearer is discarded, never stored.
 //     409 MEMBER_UNVERIFIED | MEMBER_EXPIRING   refused before any exchange
 //   POST /v1/maintenance               a RESTORE invoker   {"key", "action": "open" | "close"}
 //     200                             -> {"ticket": {...} | null}   the maintenance ticket under which the root may widen the
@@ -137,6 +136,7 @@ export interface Consumer {
 }
 
 export interface Broker {
+  readonly canaryWitnessServiceAccount: string | null;
   readonly firestoreDatabase: string;
   // The provider of the broker pool through which the consumers' canonical
   // jobs reach their member-delivery identity; distinct from the platform
@@ -343,7 +343,14 @@ export interface RoundBinding {
   readonly targets: Readonly<Record<string, RoundTarget>>;
 }
 
+export type RoundRuns = Readonly<Record<string, { readonly runId: string; readonly runAttempt: string }>>;
+
 export interface RoundManifest extends RoundBinding {
+  readonly committed: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  readonly expiresAt: string;
+  readonly expiredAt: string | null;
+  readonly runs: RoundRuns | null;
+  readonly pending: readonly { readonly member: string; readonly receipt: RoundReceipt }[];
   readonly completedAt: string | null;
   readonly consumer: string;
   readonly key: string;
@@ -375,12 +382,9 @@ export interface RoundDebt {
   readonly reason: string;
 }
 
-// What a round still owes: for every member and every target it is bound
-// to, a receipt whose control was minted against that target's exact
-// identity. The outcome is judged where it matters -- admission needs
-// ALLOWED in the CONTROL round for each target it admits; a shard's chains
-// need DENIED after its acknowledgement -- so a round is complete when every
-// expected delivery has happened, whatever each mint answered.
+// Receipt debt requires the exact trigger run, target identity, validity
+// interval and expected phase outcome. Phase completion additionally reads
+// the committed shard chains and transactionally recorded proof digests.
 export function roundOwed(round: RoundManifest): readonly RoundDebt[] {
   const owed: RoundDebt[] = [];
   for (const member of round.members) {
@@ -393,6 +397,10 @@ export function roundOwed(round: RoundManifest): readonly RoundDebt[] {
         continue;
       }
       const control = receipt.controls[account];
+      const expected = round.phase === "CONTROL" ? "ALLOWED" : "DENIED";
+      if (!round.runs || round.runs[member]?.runId !== receipt.runId || round.runs[member]?.runAttempt !== receipt.runAttempt) owed.push({ account, member, reason: "the delivery is not bound to the round's exact trigger run and attempt" });
+      if (!receiptWithinRound(round, receipt)) owed.push({ account, member, reason: "the delivery or observation is outside the round's validity interval" });
+      if (control && control.outcome !== expected) owed.push({ account, member, reason: `the phase requires ${expected}, observed ${control.outcome}` });
       if (!control) owed.push({ account, member, reason: "the delivery did not mint against this target" });
       else if (control.uniqueId !== target.uniqueId) owed.push({ account, member, reason: `the delivery minted against ${control.uniqueId}, not the bound identity ${target.uniqueId}` });
     }
@@ -401,8 +409,70 @@ export function roundOwed(round: RoundManifest): readonly RoundDebt[] {
 }
 
 export function roundComplete(round: RoundManifest): boolean {
-  return roundOwed(round).length === 0;
+  return round.expiredAt === null && roundOwed(round).length === 0;
 }
+
+export function receiptWithinRound(round: Pick<RoundManifest, "openedAt" | "expiresAt">, receipt: RoundReceipt): boolean {
+  const start = Date.parse(round.openedAt);
+  const end = Date.parse(round.expiresAt);
+  const delivered = Date.parse(receipt.deliveredAt);
+  return delivered >= start && delivered <= end && Object.values(receipt.controls).every((control) => Date.parse(control.observedAt) >= start && Date.parse(control.observedAt) <= delivered);
+}
+
+export function controlRoundFresh(round: RoundManifest, now: Date): boolean {
+  const earliest = now.getTime() - controlValiditySeconds * 1000;
+  return round.phase === "CONTROL" && round.completedAt !== null && roundComplete(round) && Date.parse(round.openedAt) >= earliest && Date.parse(round.completedAt) <= now.getTime() && Object.values(round.receipts).every((receipt) => Date.parse(receipt.deliveredAt) >= earliest && Date.parse(receipt.deliveredAt) <= now.getTime() && Object.values(receipt.controls).every((control) => Date.parse(control.observedAt) >= earliest));
+}
+
+// The same committed target and member set gates opening and completion.
+export function roundPhaseBlockers(round: Pick<RoundManifest, "phase" | "targets" | "members" | "denyState">, shard: Shard, now: Date, receipts?: RoundManifest["receipts"], committed?: RoundManifest["committed"]): readonly string[] {
+  const blockers: string[] = [];
+  if (shard.phase !== "OPEN" || shard.intent !== "QUARANTINE") blockers.push("the phase requires an OPEN QUARANTINE shard");
+  if (shard.pendingEffects !== 0) blockers.push("all quarantine effects must be acknowledged");
+  if (Object.keys(round.targets).sort().join(",") !== Object.keys(shard.targets).sort().join(",")) blockers.push("the round must bind every journaled target");
+  const members = [...new Set(Object.values(shard.targets).flatMap((state) => Object.keys(state.chain.members)))].sort();
+  if (members.join(",") !== [...round.members].sort().join(",")) blockers.push("the round must bind every journaled member");
+  for (const [account, bound] of Object.entries(round.targets)) {
+    const state = shard.targets[account];
+    if (!state || state.effect.state !== "ACKED" || state.effect.alternateIssuers.length > 0) {
+      blockers.push(`${account}: quarantine is not clean and acknowledged`);
+      continue;
+    }
+    const inventory = state.chain.inventory;
+    if (!inventory || inventory.findings.length > 0 || inventory.hash !== bound.inventoryHash || canonicalJson(inventory.summary.denyState) !== canonicalJson(round.denyState)) {
+      blockers.push(`${account}: the committed inventory baseline does not match the round`);
+      continue;
+    }
+    if (Object.keys(state.chain.members).sort().join(",") !== [...bound.members].sort().join(",")) blockers.push(`${account}: the bound members differ from the committed chain`);
+    for (const member of bound.members) {
+      const chain = state.chain.members[member];
+      if (!chain) continue;
+      if (round.phase === "HORIZON" && (!chain.revocation || now.getTime() < horizonOf(chain.revocation, inventory.horizonSeconds))) blockers.push(`${account}/${member}: the token horizon is not due`);
+      if (receipts) {
+        const receipt = receipts[member];
+        const control = receipt?.controls[account];
+        const probe = round.phase === "REVOCATION" ? chain.revocation : chain.post;
+        if (!probe || !receipt || !control || probe.outcome !== "DENIED" || probe.phase !== round.phase || Date.parse(probe.observedAt) > Date.parse(control.observedAt) || Date.parse(control.observedAt) < chainFloor(state) || probe.uniqueId !== bound.uniqueId || committed?.[member]?.[account] !== roundProbeDigest(round.phase, account, member, receipt)) blockers.push(`${account}/${member}: the round owes a matching committed DENIED ${round.phase} probe`);
+      }
+    }
+  }
+  return blockers;
+}
+
+export function roundProbeDigest(phase: RoundPhase, account: string, member: string, receipt: RoundReceipt): string {
+  return sha256Hex(canonicalJson({ account, control: receipt.controls[account], member, phase, principal: receipt.principal, runAttempt: receipt.runAttempt, runId: receipt.runId }));
+}
+
+export interface ProtectedApplyLease {
+  readonly key: string;
+  readonly planSha256: string;
+  readonly openedAt: string;
+  readonly openedBy: string;
+}
+
+export type ProtectedApplyRequest =
+  | { readonly kind: "protected-apply-read" }
+  | { readonly kind: "protected-apply"; readonly action: "acquire" | "release"; readonly key: string; readonly planSha256: string };
 
 export interface MaintenanceTicket {
   readonly expiresAt: string;
@@ -628,12 +698,18 @@ export interface RoundRequest {
   readonly key: string;
 }
 
+export interface RoundRunsRequest {
+  readonly kind: "round-runs";
+  readonly round: string;
+  readonly runs: RoundRuns;
+}
+
 export interface RoundReadRequest {
   readonly kind: "round-read";
   readonly round: string;
 }
 
-export type ParsedRequest = AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest | MaintenanceRequest | RoundRequest | RoundReadRequest;
+export type ParsedRequest = ProtectedApplyRequest | AppendRequest | CloseRequest | ReconcileRequest | ReadRequest | DeliverRequest | MaintenanceRequest | RoundRequest | RoundReadRequest | RoundRunsRequest;
 
 export function intentOf(body: AppendBody): Intent {
   return body.kind === "restore" ? "RESTORE" : "QUARANTINE";
@@ -777,8 +853,11 @@ function parseUniqueIds(value: unknown, label: string, targetAccounts: readonly 
 function parseBroker(value: unknown): Broker {
   const label = `${authorityPath}.broker`;
   const broker = record(value, label);
-  exactKeys(broker, ["firestoreDatabase", "memberWorkloadIdentityProviderId", "projectId", "projectNumber", "reconcilerServiceAccount", "region", "serviceName", "workloadIdentityPoolId", "workloadIdentityProviderId"], label);
+  exactKeys(broker, ["canaryWitnessServiceAccount", "firestoreDatabase", "memberWorkloadIdentityProviderId", "projectId", "projectNumber", "reconcilerServiceAccount", "region", "serviceName", "workloadIdentityPoolId", "workloadIdentityProviderId"], label);
+  const witness = broker.canaryWitnessServiceAccount;
+  if (witness !== null && (typeof witness !== "string" || !/^[a-z][a-z0-9-]+@[a-z][a-z0-9-]+\.iam\.gserviceaccount\.com$/.test(witness))) throw new AuthorityError(`${label}.canaryWitnessServiceAccount must be null or one service account email.`);
   const shared = {
+    canaryWitnessServiceAccount: witness,
     firestoreDatabase: string(broker.firestoreDatabase, `${label}.firestoreDatabase`),
     memberWorkloadIdentityProviderId: string(broker.memberWorkloadIdentityProviderId, `${label}.memberWorkloadIdentityProviderId`),
     reconcilerServiceAccount: string(broker.reconcilerServiceAccount, `${label}.reconcilerServiceAccount`),
@@ -1003,9 +1082,34 @@ export function parseRoundBody(body: unknown): RoundRequest {
   return { kind: "round", body: { consumer, label: source.label, phase, shard }, bodyHash: sha256Hex(canonicalJson({ consumer, key, label: source.label, phase, shard })), key };
 }
 
+export function parseRoundRunsBody(id: string, body: unknown): RoundRunsRequest {
+  const source = requestRecord(body, "body");
+  requestKeys(source, ["runs"]);
+  const raw = requestRecord(source.runs, "runs");
+  const entries = Object.entries(raw);
+  if (entries.length === 0 || entries.length > 32) throw new RequestError("runs must bind between 1 and 32 canonical members");
+  const runs: Record<string, { runId: string; runAttempt: string }> = {};
+  for (const [member, value] of entries) {
+    const run = requestRecord(value, "run");
+    requestKeys(run, ["runId", "runAttempt"]);
+    if (typeof run.runId !== "string" || !/^[1-9][0-9]{0,19}$/.test(run.runId) || typeof run.runAttempt !== "string" || !/^[1-9][0-9]{0,9}$/.test(run.runAttempt)) throw new RequestError("runId and runAttempt must be positive decimal strings");
+    runs[member] = { runId: run.runId, runAttempt: run.runAttempt };
+  }
+  return { kind: "round-runs", round: parseRoundId(id), runs };
+}
+
 export function parseRoundId(value: string): string {
   if (!roundDocumentId.test(value)) throw new RequestError("round must be one round identifier");
   return value;
+}
+
+export function parseProtectedApplyBody(body: unknown): Extract<ProtectedApplyRequest, { kind: "protected-apply" }> {
+  const source = requestRecord(body, "body");
+  requestKeys(source, ["action", "key", "planSha256"]);
+  if (source.action !== "acquire" && source.action !== "release") throw new RequestError("protected apply action must be acquire or release");
+  if (typeof source.key !== "string" || !/^apply-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(source.key)) throw new RequestError("protected apply key must be apply- followed by a UUIDv4");
+  if (typeof source.planSha256 !== "string" || !/^[0-9a-f]{64}$/.test(source.planSha256)) throw new RequestError("protected apply must bind one saved plan digest");
+  return { kind: "protected-apply", action: source.action, key: source.key, planSha256: source.planSha256 };
 }
 
 export function parseMaintenanceBody(body: unknown): MaintenanceRequest {

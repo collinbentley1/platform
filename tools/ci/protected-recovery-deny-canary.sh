@@ -1,103 +1,43 @@
 #!/bin/bash
-# The Deny canary producer of the protected-recovery deployment: one phase of
-# the two-phase, paired exercise of every IAM Deny rule attached to the
-# broker project, to the organization, and to every consumer project, as the
-# canary identity, written as the predicate the deny-canary workflow attests
-# (schema protected-recovery/deny-canary/v3), plus the attested cleanup that
-# follows them (schema protected-recovery/deny-canary-cleanup/v3).
+# Produce the control, deny, or cleanup predicate for the reviewed Deny
+# canary workflow. The control prepares every retained resource and grant
+# before observing any request. It restores each exercise's state before the
+# next observation; the deny phase makes the same requests under Deny.
 #
-# The two attested phases make the same requests against the same throwaway
-# resources in the same pre-state and differ in exactly one thing, the live
-# exception set:
+# A separate, reviewed read-only witness reads actual preconditions and
+# brackets every observation and its restoration with Allow evidence. Each
+# snapshot binds project/folder ancestry, full Allow bindings, and the exact
+# permission sets and versions of their roles. Only unconditional grants
+# count. Policy etags are retained at phase boundaries; semantic policy
+# hashes permit the observed no-op IAM writes to advance their etags.
 #
-#   control   the root has excepted the canary principal from every rule and
-#             granted it the routine allow roles the requests need. Every
-#             request must succeed (ALLOWED) and, where it starts a
-#             long-running operation, that operation must end without error;
-#             the success proves the Allow is in place and the request is
-#             well-formed against a resource in the attachment scope, so a
-#             later refusal of the same request cannot be a missing Allow or
-#             a bad request.
-#   deny      the root has removed the canary from every exception set and
-#             left the allow roles in place. The same request, as the same
-#             principal, against the same resource in the same pre-state must
-#             now be refused with an IAM permission denial that names exactly
-#             the row's permission (DENIED). The pairing attributes the
-#             refusal to the Deny rule and to nothing else.
-#   cleanup   the throwaway resources of the control run are removed, under
-#             the control form again, and the removal is attested: a leftover
-#             fails the phase and is never attested away.
+# Every observation retains the raw request, body hash, actual pre-state,
+# digest, required permissions, and terminal response. Four IAM create APIs
+# reserve deleted names. Those rows use fresh control/deny names, with a
+# comparison that substitutes only the documented create identifier and its
+# matching resource name. All other bytes remain bound. The account-enable
+# row uses its own prepared disabled account. The witness reads ledger state
+# even when the canary cannot. Unknown state is never a positive precondition.
 #
-# What binds the two phases to each other and to the live state:
+# Cleanup uses the persisted numeric folder identity and requires a readable
+# terminal result. A disabled API or unread resource is unresolved. The live
+# retirement reader subsequently checks inherited grants and rereads the
+# exact folder/project IDs. Neither predicate includes a bearer credential.
 #
-#   digest        every observation carries the canonical digest of its
-#                 request -- method, URL, content type, the canonical body,
-#                 and the required pre-state (tools/ci/protected-recovery-
-#                 canary-digest.sh) -- and the module pairs a denial only
-#                 with the control success of the same digest.
-#   pre-state     every request names the resource its permission is judged
-#                 on and the existence state it requires of it -- present,
-#                 absent, deleted, inactive (absent or soft-deleted, for the
-#                 create rows of kinds whose deletion keeps the name for
-#                 thirty days), enabled, disabled, or none -- and observes it
-#                 with a read immediately before the request in both phases.
-#                 The control phase leaves every resource in the state the
-#                 deny phase's request requires: a create row addresses a
-#                 name that is created and removed again, an undelete row a
-#                 name that is created and deleted, a delete row a retained
-#                 name that is restored after the observed delete. A ledger
-#                 document's pre-state cannot be read in the deny phase
-#                 because that read is itself a denied row; it is recorded as
-#                 unknown there and the module accepts exactly that.
-#   Allows        each phase records the allow policy -- etag and the roles
-#                 bound to the canary principal (and to the delegate, on the
-#                 throwaway target) -- at every attachment point and on the
-#                 throwaway accounts, at the end of the control phase and at
-#                 the start of the deny phase, so the module can require the
-#                 same Allows, unchanged, to stand at both.
-#   isolation     every observation lists the deny-matrix permissions its
-#                 request needs (`requires`). Compute and Cloud Build
-#                 requests attach no service account, so they need their own
-#                 permission alone; the actAs row is exercised through Cloud
-#                 Scheduler, which needs actAs and nothing the matrix denies;
-#                 Cloud Run always checks actAs beside its own permission and
-#                 the implicit-delegation chain needs the delegate's own
-#                 getAccessToken, so those rows declare the co-denied
-#                 permission and the module requires each such permission to
-#                 be proven by an isolated exercise of its own row, beside
-#                 the denial naming this row's permission.
-#   delegation    the implicit-delegation row is a real two-account chain:
-#                 the canary holds Token Creator on the throwaway delegate,
-#                 the delegate holds Token Creator on the throwaway target,
-#                 and the request mints for the target through the delegate.
-#   attribution   a refusal whose IAM permission denial names a permission
-#                 other than the row's is recorded as an error, never as a
-#                 denial of the row.
-#
-# Every throwaway resource lives in the attachment scope of the row it
-# exercises and is named deterministically from the CONTROL run: <t> is the
-# retained resource of a kind (update and delete rows), <t>-new the name the
-# create rows address, <t>-gone the deleted name the undelete rows address,
-# <t>-d the delegate account, and at the organization a throwaway custom
-# role, a throwaway project and folder for the movement rows, and
-# organization policies set on the broker project, which the organization's
-# rules govern as a descendant. The control phase records what later phases
-# cannot rederive -- the unique ID of a deleted account, the folder's number
-# -- in the description of the retained throwaway account of each project.
-#
-# Inputs (environment): PHASE (control|deny|cleanup), CONTROL_RUN_ID (the run
-# ID of the control phase; the deny and cleanup phases derive every throwaway
-# name from it, the control phase must be given its own run ID), ACCESS_TOKEN
-# of the canary identity, CANARY_SERVICE_ACCOUNT, ORGANIZATION_ID,
-# BROKER_IMAGE, and the GitHub run context. The one argument is the output
-# path. With TRANSIENT_CLEANUP=1 the script only removes what a phase creates
-# and deletes within itself -- user-managed keys of the throwaway accounts,
-# queued canary builds -- and fails on anything it could not remove or list:
-# it is the always() step of every run.
+# Required environment: PHASE, CONTROL_RUN_ID, ACCESS_TOKEN,
+# CANARY_SERVICE_ACCOUNT, CANARY_WITNESS_ACCESS_TOKEN,
+# CANARY_WITNESS_SERVICE_ACCOUNT, ORGANIZATION_ID, BROKER_IMAGE, and the
+# GitHub run context. The witness must match authority.json and must differ
+# from the canary. The workflow's existing controller mapping and read-only
+# permissions are deployment prerequisites; this script grants neither.
+# TRANSIENT_CLEANUP=1 removes this run's keys and queued builds and fails
+# closed when it cannot enumerate or remove them. The sole argument is the
+# output predicate path.
 set -euo pipefail
 
 output="${1:?output path}"
 : "${PHASE:?}" "${CONTROL_RUN_ID:?}" "${ACCESS_TOKEN:?}" "${CANARY_SERVICE_ACCOUNT:?}" "${ORGANIZATION_ID:?}" "${BROKER_IMAGE:?}"
+: "${CANARY_WITNESS_ACCESS_TOKEN:?}" "${CANARY_WITNESS_SERVICE_ACCOUNT:?}"
 : "${GITHUB_RUN_ID:?}" "${GITHUB_RUN_ATTEMPT:?}" "${GITHUB_SHA:?}" "${GITHUB_EVENT_NAME:?}" "${GITHUB_REPOSITORY_ID:?}" "${GITHUB_WORKFLOW_REF:?}"
 [[ "$PHASE" =~ ^(control|deny|cleanup)$ ]] || { echo "PHASE must be control, deny, or cleanup." >&2; exit 2; }
 [[ "$CONTROL_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "CONTROL_RUN_ID must be a run ID." >&2; exit 2; }
@@ -113,11 +53,15 @@ fi
 [[ "$BROKER_IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
 [[ "$CANARY_SERVICE_ACCOUNT" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$ ]]
 transient_cleanup="${TRANSIENT_CLEANUP:-0}"
+prepare_only=0
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=tools/ci/protected-recovery-canary-digest.sh
 . "$root/tools/ci/protected-recovery-canary-digest.sh"
 authority="$root/protected-recovery/authority.json"
+reviewed_witness="$(jq -er '.broker.canaryWitnessServiceAccount | select(type == "string")' "$authority")"
+[ "$CANARY_WITNESS_SERVICE_ACCOUNT" = "$reviewed_witness" ] || { echo "The witness differs from reviewed authority." >&2; exit 2; }
+[ "$CANARY_WITNESS_SERVICE_ACCOUNT" != "$CANARY_SERVICE_ACCOUNT" ] || { echo "The read witness must differ from the mutating canary." >&2; exit 2; }
 broker_project="$(jq -er '.broker.projectId | select(type == "string")' "$authority")"
 broker_region="$(jq -er '.broker.region' "$authority")"
 ledger_database="$(jq -er '.broker.firestoreDatabase' "$authority")"
@@ -129,9 +73,12 @@ throwaway="deny-canary-${suffix}"
 throwaway_new="${throwaway}-new"
 throwaway_gone="${throwaway}-gone"
 delegate="${throwaway}-d"
+enable_account="${throwaway}-e"
 role_id="denyCanary${suffix}"
 role_new="${role_id}New"
 role_gone="${role_id}Gone"
+create_new="${throwaway_new}-${PHASE:0:1}"
+create_role_new="${role_new}${PHASE:0:1}"
 canary_project="$throwaway"
 constraint_new="compute.skipDefaultNetworkCreation"
 constraint_kept="compute.requireOsLogin"
@@ -145,6 +92,9 @@ trap 'rm -rf -- "$workdir"' EXIT
 umask 077
 printf 'header = "Authorization: Bearer %s"\n' "$ACCESS_TOKEN" > "$workdir/auth.cfg"
 unset ACCESS_TOKEN
+printf 'header = "Authorization: Bearer %s"\n' "$CANARY_WITNESS_ACCESS_TOKEN" > "$workdir/witness-auth.cfg"
+unset CANARY_WITNESS_ACCESS_TOKEN
+request_auth="$workdir/auth.cfg"
 
 iam="https://iam.googleapis.com/v1"
 credentials="https://iamcredentials.googleapis.com/v1"
@@ -164,6 +114,8 @@ token_creator="roles/iam.serviceAccountTokenCreator"
 
 observations="$workdir/observations.jsonl"
 : > "$observations"
+allow_interval="$workdir/allow-interval.jsonl"
+: > "$allow_interval"
 allow_policies="$workdir/allow-policies.jsonl"
 : > "$allow_policies"
 removed="$workdir/removed"
@@ -177,6 +129,8 @@ pre_observed=unknown
 pre_detail=""
 folder_id=""
 declare -A manifest_gone=()
+manifest_ids="$workdir/manifest-ids.jsonl"
+: > "$manifest_ids"
 
 fail() {
   echo "$1" >> "$failures"
@@ -187,13 +141,26 @@ fail() {
 # The optional body is a file; a body's content type defaults to JSON.
 call() {
   local method="$1" url="$2" body="${3:-}" content_type="${4:-}"
-  local args=(--silent --show-error --max-time 120 --config "$workdir/auth.cfg" --request "$method" --output "$workdir/body" --write-out '%{http_code}')
+  local args=(--silent --show-error --max-time 120 --config "$request_auth" --request "$method" --output "$workdir/body" --write-out '%{http_code}')
   if [ -n "$body" ]; then
     [ -n "$content_type" ] || content_type=application/json
     args+=(--header "Content-Type: ${content_type}" --data-binary "@$body")
   fi
   : > "$workdir/body"
   last_status="$(curl "${args[@]}" "$url" || echo 000)"
+}
+
+# The witness only reads. Its reviewed identity has no canary mutation role.
+witness_call() {
+  local method="$1" url="$2"
+  if [ "$method" != GET ] && ! { [ "$method" = POST ] && [[ "$url" == *:getIamPolicy ]]; }; then
+    fail "the witness may only read resource state and Allow policies"
+    last_status=000
+    return 1
+  fi
+  request_auth="$workdir/witness-auth.cfg"
+  call "$@"
+  request_auth="$workdir/auth.cfg"
 }
 
 json_body() {
@@ -285,16 +252,24 @@ pre_state() {
   pre_detail=""
   case "$kind" in
     none) pre_observed=none; return 0 ;;
-    iam) call GET "${iam}/${name}" ;;
-    run) call GET "${run}/${name}" ;;
-    scheduler) call GET "${scheduler}/${name}" ;;
-    registry) call GET "${registry}/v1/${name}" ;;
-    firestore) call GET "${firestore}/${name}" ;;
-    gcs) call GET "${gcs}/storage/v1/${name}" ;;
-    compute) call GET "${compute}/${name}" ;;
-    project) call GET "${crm}/${name}" ;;
-    orgpolicy) call GET "${orgpolicy}/${name}" ;;
-    service) call GET "${serviceusage}/${name}" ;;
+    iam)
+      local read_name="$name"
+      if [[ "$name" == projects/-/serviceAccounts/*@*.iam.gserviceaccount.com ]]; then
+        local account_project="${name##*@}"
+        account_project="${account_project%.iam.gserviceaccount.com}"
+        read_name="projects/${account_project}/serviceAccounts/${name##*/}"
+      fi
+      witness_call GET "${iam}/${read_name}"
+      ;;
+    run) witness_call GET "${run}/${name}" ;;
+    scheduler) witness_call GET "${scheduler}/${name}" ;;
+    registry) witness_call GET "${registry}/v1/${name}" ;;
+    firestore) witness_call GET "${firestore}/${name}" ;;
+    gcs) witness_call GET "${gcs}/storage/v1/${name}" ;;
+    compute) witness_call GET "${compute}/${name}" ;;
+    project) witness_call GET "${crm}/${name}" ;;
+    orgpolicy) witness_call GET "${orgpolicy}/${name}" ;;
+    service) witness_call GET "${serviceusage}/${name}" ;;
     *) fail "unknown pre-state kind ${kind}"; return 0 ;;
   esac
   if [ "$last_status" = 404 ]; then
@@ -310,6 +285,16 @@ pre_state() {
       project)
         pre_observed=present
         pre_detail="$(jq -r '.parent // ""' "$workdir/body")"
+        ;;
+      iam)
+        if jq -e '(.state == "DELETED") or (.deleted == true)' "$workdir/body" > /dev/null 2>&1; then
+          pre_observed=deleted
+        else
+          pre_observed=present
+          if [[ "$name" == */serviceAccounts/* ]]; then
+            pre_detail="$(jq -r 'if .disabled == true then "disabled" else "enabled" end' "$workdir/body")"
+          fi
+        fi
         ;;
       *)
         if jq -e '(.state == "DELETED") or (.deleted == true)' "$workdir/body" > /dev/null 2>&1; then pre_observed=deleted; else pre_observed=present; fi
@@ -328,10 +313,26 @@ pre_state() {
 observe() {
   local attachment="$1" permission="$2" method="$3" url="$4" body="${5:-}" content_type="${6:-}" pre_kind="$7" pre_name="$8" expected="$9" requires="${10}" lro="${11:-}"
   [ -z "$body" ] || [ -n "$content_type" ] || content_type=application/json
+  if [ -n "${pending_attachment:-}" ]; then record_allow_boundary after "$pending_attachment" "$pending_permission"; fi
+  record_allow_boundary before "$attachment" "$permission"
+  [ ! -s "$failures" ] || return 1
+  pending_attachment="$attachment"
+  pending_permission="$permission"
   pre_state "$pre_kind" "$pre_name"
   local body_sha digest classified
   body_sha="$(canary_body_sha256 "$body" "$content_type")"
-  digest="$(canary_digest "$method" "$url" "$content_type" "$body_sha" "$pre_name" "$expected" "$pre_detail")"
+  digest="$(canary_digest "$method" "$url" "$content_type" "$body_sha" "$pre_name" "$expected" "$pre_detail" "$pre_observed")"
+  local comparison=null pair=null current_id canonical_id
+  case "$permission" in
+    iam.googleapis.com/serviceAccounts.create|iam.googleapis.com/workloadIdentityPools.create|iam.googleapis.com/workloadIdentityPoolProviders.create)
+      current_id="$create_new"; canonical_id="$throwaway_new" ;;
+    iam.googleapis.com/roles.create) current_id="$create_role_new"; canonical_id="$role_new" ;;
+    *) current_id=""; canonical_id="" ;;
+  esac
+  if [ -n "$current_id" ]; then
+    comparison="$(canary_create_comparison "$permission" "$url" "$body" "$pre_name" "$current_id" "$canonical_id" "$expected" "$pre_detail" "$pre_observed")" || { fail "the create request does not match its exact paired identifier"; return 0; }
+    pair="$(jq -cn --arg kind "$permission" --arg actual "$current_id" --arg canonical "$canonical_id" '{kind: $kind, actualId: $actual, canonicalId: $canonical}')"
+  fi
   call "$method" "$url" "$body" "$content_type"
   classified="$(classify)"
   last_outcome="$(jq -r '.outcome' <<< "$classified")"
@@ -346,10 +347,11 @@ observe() {
     last_outcome=ERROR
   fi
   jq -cn --arg attachment "$attachment" --arg permission "$permission" --arg principal "$canary_principal" --arg method "$method" --arg url "$url" --arg content_type "$content_type" --arg body_sha "$body_sha" \
-    --arg resource "$pre_name" --arg expected "$expected" --arg observed "$pre_observed" --arg detail "$pre_detail" --arg requires "$requires" --arg digest "$digest" --argjson operation "$operation_json" --argjson answer "$classified" \
+    --arg resource "$pre_name" --arg expected "$expected" --arg observed "$pre_observed" --arg detail "$pre_detail" --arg requires "$requires" --arg digest "$digest" --argjson comparison "$comparison" --argjson pair "$pair" --argjson operation "$operation_json" --argjson answer "$classified" \
     '{attachment: $attachment, permission: $permission, principal: $principal, observedAt: (now | todateiso8601), outcome: $answer.outcome,
       request: {method: $method, url: $url, contentType: $content_type, bodySha256: $body_sha},
       preState: {resource: $resource, expected: $expected, observed: $observed, detail: $detail},
+      comparison: $comparison, resourcePair: $pair,
       requires: ($requires | split(",") | map(select(length > 0))), operation: $operation, digest: $digest, response: ($answer | del(.outcome))}' >> "$observations"
   echo "${PHASE}: ${attachment#cloudresourcemanager.googleapis.com/} ${permission} -> ${last_outcome} (${last_status}; pre-state ${pre_observed}, required ${expected})"
 }
@@ -376,34 +378,97 @@ provisioning() {
   [ "$PHASE" = control ]
 }
 
-# The allow policy of one resource as it stands now: its etag and the roles
-# bound to the canary principal and, on the throwaway target, to the
-# delegate. Recorded at the end of the control phase and at the start of the
-# deny phase; the module requires them equal.
+preparing() {
+  [ "$prepare_only" = 1 ]
+}
+
+# Snapshot the unconditional grant paths used by the exercises. The witness
+# binds every project ancestor and every role definition, including custom
+# roles. Policy etags are retained; semantic hashes permit only the canary's
+# observed no-op policy writes to advance their compare-and-set tokens.
 allow_snapshot() {
   local resource="$1" url="$2" delegate_member="${3:-}"
-  call POST "$url" "$(json_body '{"options":{"requestedPolicyVersion":3}}')"
+  witness_call POST "$url" "$(json_body '{"options":{"requestedPolicyVersion":3}}')"
   if [ "$last_status" != 200 ]; then
     fail "the allow policy of ${resource} could not be read: HTTP ${last_status}"
     return 0
   fi
-  jq -c --arg resource "$resource" --arg canary "$canary_member" --arg delegate "$delegate_member" '{
-    resource: $resource, etag: (.etag // ""),
-    canaryRoles: ([.bindings[]? | select((.members // []) | index($canary)) | .role] | unique),
-    delegateRoles: (if $delegate == "" then [] else ([.bindings[]? | select((.members // []) | index($delegate)) | .role] | unique) end)
-  }' "$workdir/body" >> "$allow_policies"
+  jq -ce --arg resource "$resource" --arg canary "$canary_member" --arg delegate "$delegate_member" '
+    if (.etag | type) != "string" or .etag == "" then error("missing policy etag") else . end
+    | {resource: $resource, etag: .etag,
+      bindings: ([.bindings[]? | {role, members: (.members | sort), condition: (.condition // null)}] | sort_by(.role, .condition)),
+      canaryRoles: ([.bindings[]? | select((.members // []) | index($canary)) | select(.condition == null) | .role] | unique),
+      delegateRoles: (if $delegate == "" then [] else ([.bindings[]? | select((.members // []) | index($delegate)) | select(.condition == null) | .role] | unique) end)}
+  ' "$workdir/body" >> "$allow_policies" || fail "the Allow policy of ${resource} is malformed"
 }
 
 allow_snapshots() {
-  local attachment project scope
+  : > "$allow_policies"
+  : > "$workdir/hierarchy.jsonl"
+  local attachment project scope resource parent depth
+  declare -A seen=()
   while IFS=$'\t' read -r attachment project scope; do
-    case "$scope" in
-      organization) allow_snapshot "organizations/${ORGANIZATION_ID}" "${crm}/organizations/${ORGANIZATION_ID}:getIamPolicy" ;;
-      *) allow_snapshot "projects/${project}" "${crm}/projects/${project}:getIamPolicy" ;;
-    esac
+    if [ "$scope" = organization ]; then resource="organizations/${ORGANIZATION_ID}"; else resource="projects/${project}"; fi
+    for depth in $(seq 1 20); do
+      if [ -n "${seen[$resource]:-}" ]; then break; fi
+      seen[$resource]=1
+      allow_snapshot "$resource" "${crm}/${resource}:getIamPolicy"
+      if [[ "$resource" == organizations/* ]]; then
+        [ "$resource" = "organizations/${ORGANIZATION_ID}" ] || fail "${resource}: ancestor differs from reviewed organization"
+        break
+      fi
+      witness_call GET "${crm}/${resource}"
+      parent="$(jq -r '.parent // ""' "$workdir/body")"
+      if [ "$last_status" != 200 ] || ! [[ "$parent" =~ ^(folders|organizations)/[1-9][0-9]*$ ]]; then
+        fail "${resource}: ancestry is unreadable"
+        break
+      fi
+      jq -cn --arg resource "$resource" --arg parent "$parent" '{resource: $resource, parent: $parent}' >> "$workdir/hierarchy.jsonl"
+      resource="$parent"
+      if [ "$depth" = 20 ]; then fail "the project ancestry exceeds the read bound"; fi
+    done
   done < "$attachments"
-  allow_snapshot "projects/${broker_project}/serviceAccounts/$(service_account_email "$throwaway" "$broker_project")" "${iam}/projects/-/serviceAccounts/$(service_account_email "$throwaway" "$broker_project"):getIamPolicy" "serviceAccount:$(service_account_email "$delegate" "$broker_project")"
-  allow_snapshot "projects/${broker_project}/serviceAccounts/$(service_account_email "$delegate" "$broker_project")" "${iam}/projects/-/serviceAccounts/$(service_account_email "$delegate" "$broker_project"):getIamPolicy"
+  # Movement exercises also inherit from their created project and folder.
+  allow_snapshot "projects/${canary_project}" "${crm}/projects/${canary_project}:getIamPolicy"
+  allow_snapshot "folders/${folder_id}" "${crm}/folders/${folder_id}:getIamPolicy"
+  witness_call GET "${crm}/projects/${canary_project}"
+  if [ "$last_status" != 200 ] || [ "$(jq -r '.parent // ""' "$workdir/body")" != "organizations/${ORGANIZATION_ID}" ]; then fail "the movement project was not restored to its original parent"; fi
+  jq -cn --arg resource "projects/${canary_project}" --arg parent "organizations/${ORGANIZATION_ID}" '{resource: $resource, parent: $parent}' >> "$workdir/hierarchy.jsonl"
+  witness_call GET "${crm}/folders/${folder_id}"
+  if [ "$last_status" != 200 ] || ! jq -e --arg name "folders/${folder_id}" --arg parent "organizations/${ORGANIZATION_ID}" --arg display "$throwaway" '.name == $name and .parent == $parent and .displayName == $display and .state == "ACTIVE"' "$workdir/body" > /dev/null; then fail "the movement folder identity or parent changed"; fi
+  jq -cn --arg resource "folders/${folder_id}" --arg parent "organizations/${ORGANIZATION_ID}" '{resource: $resource, parent: $parent}' >> "$workdir/hierarchy.jsonl"
+  allow_snapshot "projects/${broker_project}/serviceAccounts/$(service_account_email "$throwaway" "$broker_project")" "${iam}/projects/${broker_project}/serviceAccounts/$(service_account_email "$throwaway" "$broker_project"):getIamPolicy" "serviceAccount:$(service_account_email "$delegate" "$broker_project")"
+  allow_snapshot "projects/${broker_project}/serviceAccounts/$(service_account_email "$delegate" "$broker_project")" "${iam}/projects/${broker_project}/serviceAccounts/$(service_account_email "$delegate" "$broker_project"):getIamPolicy"
+  : > "$workdir/roles.jsonl"
+  local role
+  while IFS= read -r role; do
+    [[ "$role" =~ ^(roles/[A-Za-z0-9._]+|(projects|organizations)/[A-Za-z0-9._-]+/roles/[A-Za-z0-9._]+)$ ]] || { fail "malformed role in Allow evidence"; continue; }
+    witness_call GET "${iam}/${role}"
+    if [ "$last_status" != 200 ]; then fail "${role}: role definition is unreadable"; continue; fi
+    jq -ce --arg name "$role" '
+      def v2(p): (p | split(".")) as $parts | (if $parts[0] == "resourcemanager" then "cloudresourcemanager" else $parts[0] end) + ".googleapis.com/" + ($parts[1:] | join("."));
+      if .name != $name or (.includedPermissions | type) != "array" or .deleted == true or .stage == "DISABLED" then error("unusable role") else . end
+      | {name, etag: (.etag // ""), stage, permissions: ([.includedPermissions[] | v2(.)] | unique)}
+    ' "$workdir/body" >> "$workdir/roles.jsonl" || fail "${role}: role definition cannot confer the exercised permissions"
+  done < <(jq -sr '[.[] | (.canaryRoles + .delegateRoles)[]] | unique[]' "$allow_policies")
+  jq -scS --slurpfile roles "$workdir/roles.jsonl" --slurpfile hierarchy "$workdir/hierarchy.jsonl" '
+    ($hierarchy | map({key: .resource, value: .parent}) | from_entries) as $parents
+    | {policies: (sort_by(.resource) | map(del(.etag))), roles: ($roles | sort_by(.name)), hierarchy: ($hierarchy | sort_by(.resource)),
+      paths: ([$parents | keys[] | {resource: ., ancestors: [limit(21; recurse($parents[.] // empty))]}] | sort_by(.resource))}
+  ' "$allow_policies" > "$workdir/allow-snapshot.json"
+}
+
+record_allow_boundary() {
+  local position="$1" attachment="${2:-}" permission="${3:-}"
+  allow_snapshots
+  local snapshot_sha
+  snapshot_sha="$(canary_snapshot_sha256 "$workdir/allow-snapshot.json")"
+  jq -cn --arg snapshot "$snapshot_sha" --arg position "$position" --arg attachment "$attachment" --arg permission "$permission" --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" '{snapshotSha256: $snapshot, position: $position, attachment: $attachment, permission: $permission, witness: $witness, observedAt: (now | todateiso8601)}' >> "$allow_interval"
+  if [ ! -f "$workdir/allow-baseline.json" ]; then
+    cp "$workdir/allow-snapshot.json" "$workdir/allow-baseline.json"
+  elif ! cmp -s "$workdir/allow-baseline.json" "$workdir/allow-snapshot.json"; then
+    fail "the effective Allow policies, ancestry, or role definitions changed during the exercise"
+  fi
 }
 
 service_account_email() {
@@ -417,22 +482,34 @@ manifest_write() {
   local project="$1"
   local email
   email="$(service_account_email "$throwaway" "$project")"
-  provision PATCH "${iam}/projects/-/serviceAccounts/${email}?updateMask=description" "$(json_body "$(jq -cn --arg gone "${manifest_gone[$project]:-}" --arg folder "$folder_id" '{description: ({gone: $gone, folder: $folder} | tojson)}')")" || true
+  jq -cn --arg project "$project" --arg id "${manifest_gone[$project]:-}" '{key: $project, value: $id}' >> "$manifest_ids"
+  provision PATCH "${iam}/projects/-/serviceAccounts/${email}?updateMask=description" "$(json_body "$(jq -cn --arg gone "${manifest_gone[$project]:-}" --arg folder "$folder_id" --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" '{description: ({gone: $gone, folder: $folder, controlRunId: $control, headSha: $sha} | tojson)}')")" || true
 }
 
 manifest_read() {
   local project="$1"
-  local email
-  email="$(service_account_email "$throwaway" "$project")"
-  call GET "${iam}/projects/-/serviceAccounts/${email}"
-  if [ "$last_status" != 200 ]; then
-    fail "the retained throwaway account of ${project} cannot be read: HTTP ${last_status}"
+  if [ -z "${CONTROL_PREDICATE:-}" ] || [ ! -f "$CONTROL_PREDICATE" ]; then
+    # Failed controls still need cleanup. Their prepared carrier records the
+    # exact folder ID. Successful controls use the immutable signed artifact,
+    # which remains available after the carrier has been deleted.
+    [ "$PHASE" = cleanup ] || { fail "the verified control artifact is required"; return 1; }
+    witness_call GET "${iam}/projects/${project}/serviceAccounts/$(service_account_email "$throwaway" "$project")"
+    if [ "$last_status" != 200 ] || ! jq -e --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" '(.description | fromjson) | .controlRunId == $control and .headSha == $sha and (.folder | test("^[1-9][0-9]*$"))' "$workdir/body" > /dev/null; then
+      fail "the failed control's cleanup identities are unreadable"
+      return 1
+    fi
+    folder_id="$(jq -r '.description | fromjson | .folder' "$workdir/body")"
+    manifest_gone[$project]="$(jq -r '.description | fromjson | .gone' "$workdir/body")"
     return 0
   fi
-  manifest_gone[$project]="$(jq -r '(.description // "{}") | try (fromjson | .gone // "") catch ""' "$workdir/body")"
-  local folder
-  folder="$(jq -r '(.description // "{}") | try (fromjson | .folder // "") catch ""' "$workdir/body")"
-  [ -z "$folder" ] || folder_id="$folder"
+  if ! jq -e --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --arg image "$BROKER_IMAGE" --arg name "$throwaway" --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" '.schema == "protected-recovery/deny-canary/v3" and .phase == "control" and .controlRunId == $control and .run.headSha == $sha and .brokerImage == $image and .throwaways.name == $name and .throwaways.project == $name and .witnessServiceAccount == $witness and (.throwaways.folder | test("^[1-9][0-9]*$"))' "$CONTROL_PREDICATE" > /dev/null; then
+    fail "the verified control manifest does not match this phase"
+    return 1
+  fi
+  manifest_gone[$project]="$(jq -er --arg project "$project" '.throwaways.goneUniqueIds[$project] | select(type == "string" and test("^[1-9][0-9]*$"))' "$CONTROL_PREDICATE")" || { fail "the control manifest has no permanent deleted-account identity for ${project}"; return 1; }
+  folder_id="$(jq -r '.throwaways.folder' "$CONTROL_PREDICATE")"
+  jq -cn --arg project "$project" --arg id "${manifest_gone[$project]}" '{key: $project, value: $id}' >> "$manifest_ids"
+
 }
 
 # ---------------------------------------------------------------------------
@@ -446,23 +523,23 @@ identity_rows() {
   local email sa email_new sa_new email_gone sa_gone email_delegate sa_delegate pool pool_new pool_gone provider provider_new provider_gone unique_id
   email="$(service_account_email "$throwaway" "$project")"
   sa="projects/-/serviceAccounts/${email}"
-  email_new="$(service_account_email "$throwaway_new" "$project")"
+  email_new="$(service_account_email "$create_new" "$project")"
   sa_new="projects/-/serviceAccounts/${email_new}"
   email_gone="$(service_account_email "$throwaway_gone" "$project")"
   sa_gone="projects/-/serviceAccounts/${email_gone}"
   email_delegate="$(service_account_email "$delegate" "$project")"
   sa_delegate="projects/-/serviceAccounts/${email_delegate}"
   pool="projects/${project}/locations/global/workloadIdentityPools/${throwaway}"
-  pool_new="projects/${project}/locations/global/workloadIdentityPools/${throwaway_new}"
+  pool_new="projects/${project}/locations/global/workloadIdentityPools/${create_new}"
   pool_gone="projects/${project}/locations/global/workloadIdentityPools/${throwaway_gone}"
   provider="${pool}/providers/${throwaway}"
-  provider_new="${pool}/providers/${throwaway_new}"
+  provider_new="${pool}/providers/${create_new}"
   provider_gone="${pool}/providers/${throwaway_gone}"
   local account_body='{"serviceAccount":{"displayName":"Protected recovery Deny canary throwaway"}}'
   local pool_body='{"displayName":"Protected recovery Deny canary throwaway"}'
   local provider_body='{"displayName":"Protected recovery Deny canary throwaway","oidc":{"issuerUri":"https://token.actions.githubusercontent.com/"},"attributeMapping":{"google.subject":"assertion.sub"},"attributeCondition":"false"}'
 
-  if provisioning; then
+  if preparing; then
     provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$throwaway" --argjson base "$account_body" '$base + {accountId: $id}')")" || true
     if [ "$scope" = broker ]; then
       provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$delegate" --argjson base "$account_body" '$base + {accountId: $id}')")" || true
@@ -475,14 +552,22 @@ identity_rows() {
     provision POST "${iam}/${pool}/providers?workloadIdentityPoolProviderId=${throwaway}" "$(json_body "$provider_body")" "" iam || true
     provision POST "${iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${throwaway_gone}" "$(json_body "$pool_body")" "" iam && provision DELETE "${iam}/${pool_gone}" "" "" iam || true
     provision POST "${iam}/${pool}/providers?workloadIdentityPoolProviderId=${throwaway_gone}" "$(json_body "$provider_body")" "" iam && provision DELETE "${iam}/${provider_gone}" "" "" iam || true
+    provision POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$enable_account" --argjson base "$account_body" '$base + {accountId: $id}')")" && provision POST "${iam}/projects/-/serviceAccounts/$(service_account_email "$enable_account" "$project"):disable" "$(json_body '{}')" || true
     # New accounts and pools propagate before they are addressed.
     sleep 15
-  else
+  elif [ "$PHASE" = deny ]; then
     manifest_read "$project"
   fi
   local gone_id="${manifest_gone[$project]:-0}"
 
-  observe "$attachment" iam.googleapis.com/serviceAccounts.create POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$throwaway_new" --argjson base "$account_body" '$base + {accountId: $id}')")" "" iam "$sa_new" absent iam.googleapis.com/serviceAccounts.create
+  if preparing; then
+    if [ "$scope" = broker ]; then
+      provision POST "${iam}/${sa_delegate}:setIamPolicy" "$(json_body "$(jq -cn --arg role "$token_creator" --arg canary "$canary_member" '{policy: {bindings: [{role: $role, members: [$canary]}], version: 3}, updateMask: "bindings"}')")" || true
+      provision POST "${iam}/${sa}:setIamPolicy" "$(json_body "$(jq -cn --arg role "$token_creator" --arg canary "$canary_member" --arg delegate "serviceAccount:${email_delegate}" '{policy: {bindings: [{role: $role, members: [$canary, $delegate]}], version: 3}, updateMask: "bindings"}')")" || true
+    fi
+    return 0
+  fi
+  observe "$attachment" iam.googleapis.com/serviceAccounts.create POST "${iam}/projects/${project}/serviceAccounts" "$(json_body "$(jq -cn --arg id "$create_new" --argjson base "$account_body" '$base + {accountId: $id}')")" "" iam "$sa_new" absent iam.googleapis.com/serviceAccounts.create
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${iam}/${sa_new}" || true; fi
 
   observe "$attachment" iam.googleapis.com/serviceAccountKeys.create POST "${iam}/${sa}/keys" "$(json_body '{"privateKeyType":"TYPE_GOOGLE_CREDENTIALS_FILE","keyAlgorithm":"KEY_ALG_RSA_2048"}')" "" iam "$sa" present iam.googleapis.com/serviceAccountKeys.create
@@ -497,9 +582,6 @@ identity_rows() {
     # may mint for the target, and the canary may mint for the target
     # directly. The observed policy write on the target is the provisioning
     # of the target's edge; the delegate's edge is provisioned quietly.
-    if provisioning; then
-      provision POST "${iam}/${sa_delegate}:setIamPolicy" "$(json_body "$(jq -cn --arg role "$token_creator" --arg canary "$canary_member" '{policy: {bindings: [{role: $role, members: [$canary]}], version: 3}, updateMask: "bindings"}')")" || true
-    fi
     observe "$attachment" iam.googleapis.com/serviceAccounts.setIamPolicy POST "${iam}/${sa}:setIamPolicy" "$(json_body "$(jq -cn --arg role "$token_creator" --arg canary "$canary_member" --arg delegate "serviceAccount:${email_delegate}" '{policy: {bindings: [{role: $role, members: [$canary, $delegate]}], version: 3}, updateMask: "bindings"}')")" "" iam "$sa" present iam.googleapis.com/serviceAccounts.setIamPolicy
     # A new grant propagates before the token requests that rest on it.
     if provisioning && [ "$last_outcome" = ALLOWED ]; then sleep 60; fi
@@ -513,18 +595,25 @@ identity_rows() {
   fi
 
   observe "$attachment" iam.googleapis.com/serviceAccounts.disable POST "${iam}/${sa}:disable" "$(json_body '{}')" "" iam "$sa" present iam.googleapis.com/serviceAccounts.disable
-  observe "$attachment" iam.googleapis.com/serviceAccounts.enable POST "${iam}/${sa}:enable" "$(json_body '{}')" "" iam "$sa" present iam.googleapis.com/serviceAccounts.enable
+  if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/${sa}:enable" "$(json_body '{}')" || true; fi
+  local sa_enable="projects/-/serviceAccounts/$(service_account_email "$enable_account" "$project")"
+  observe "$attachment" iam.googleapis.com/serviceAccounts.enable POST "${iam}/${sa_enable}:enable" "$(json_body '{}')" "" iam "$sa_enable" present iam.googleapis.com/serviceAccounts.enable
+  if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/${sa_enable}:disable" "$(json_body '{}')" || true; fi
 
   call GET "${iam}/${sa}"
   unique_id="$(jq -r '.uniqueId // ""' "$workdir/body")"
   observe "$attachment" iam.googleapis.com/serviceAccounts.delete DELETE "${iam}/${sa}" "" "" iam "$sa" present iam.googleapis.com/serviceAccounts.delete
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/projects/-/serviceAccounts/${unique_id:-0}:undelete" "$(json_body '{}')" || true; fi
-  observe "$attachment" iam.googleapis.com/serviceAccounts.undelete POST "${iam}/projects/-/serviceAccounts/${gone_id}:undelete" "$(json_body '{}')" "" iam "$sa_gone" inactive iam.googleapis.com/serviceAccounts.undelete
+  # IAM get does not expose a deleted-account tombstone. Read the permanent
+  # ID from the control manifest, never a reusable email. The successful
+  # control undelete and subsequent delete bind this ID; Terraform limits
+  # the control-to-deny interval to 24 hours, within the recovery window.
+  observe "$attachment" iam.googleapis.com/serviceAccounts.undelete POST "${iam}/projects/-/serviceAccounts/${gone_id}:undelete" "$(json_body '{}')" "" iam "projects/${project}/serviceAccounts/${gone_id}" absent iam.googleapis.com/serviceAccounts.undelete
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${iam}/${sa_gone}" || true; fi
 
-  observe "$attachment" iam.googleapis.com/workloadIdentityPools.create POST "${iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${throwaway_new}" "$(json_body "$pool_body")" "" iam "$pool_new" inactive iam.googleapis.com/workloadIdentityPools.create iam
+  observe "$attachment" iam.googleapis.com/workloadIdentityPools.create POST "${iam}/projects/${project}/locations/global/workloadIdentityPools?workloadIdentityPoolId=${create_new}" "$(json_body "$pool_body")" "" iam "$pool_new" absent iam.googleapis.com/workloadIdentityPools.create iam
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${iam}/${pool_new}" "" "" iam || true; fi
-  observe "$attachment" iam.googleapis.com/workloadIdentityPoolProviders.create POST "${iam}/${pool}/providers?workloadIdentityPoolProviderId=${throwaway_new}" "$(json_body "$provider_body")" "" iam "$provider_new" inactive iam.googleapis.com/workloadIdentityPoolProviders.create iam
+  observe "$attachment" iam.googleapis.com/workloadIdentityPoolProviders.create POST "${iam}/${pool}/providers?workloadIdentityPoolProviderId=${create_new}" "$(json_body "$provider_body")" "" iam "$provider_new" absent iam.googleapis.com/workloadIdentityPoolProviders.create iam
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${iam}/${provider_new}" "" "" iam || true; fi
   observe "$attachment" iam.googleapis.com/workloadIdentityPools.update PATCH "${iam}/${pool}?updateMask=description" "$(json_body '{"description":"protected-recovery deny canary"}')" "" iam "$pool" present iam.googleapis.com/workloadIdentityPools.update iam
   observe "$attachment" iam.googleapis.com/workloadIdentityPoolProviders.update PATCH "${iam}/${provider}?updateMask=description" "$(json_body '{"description":"protected-recovery deny canary"}')" "" iam "$provider" present iam.googleapis.com/workloadIdentityPoolProviders.update iam
@@ -559,7 +648,7 @@ act_as_row() {
 # its etag, which the canonical body excludes.
 project_iam_row() {
   local attachment="$1" project="$2"
-  call POST "${crm}/projects/${project}:getIamPolicy" "$(json_body '{"options":{"requestedPolicyVersion":3}}')"
+  witness_call POST "${crm}/projects/${project}:getIamPolicy" "$(json_body '{"options":{"requestedPolicyVersion":3}}')"
   local policy
   policy="$(mktemp "$workdir/request.XXXXXX")"
   jq -c '{policy: ., updateMask: "bindings,etag"}' "$workdir/body" > "$policy"
@@ -586,13 +675,14 @@ run_rows() {
   service_body="$(jq -cn --arg image "$hello_image" --arg email "$email" '{template: {serviceAccount: $email, containers: [{image: $image}]}, ingress: "INGRESS_TRAFFIC_INTERNAL_ONLY"}')"
   job_body="$(jq -cn --arg image "$hello_image" --arg email "$email" '{template: {template: {serviceAccount: $email, containers: [{image: $image}]}}}')"
   pool_body="$(jq -cn --arg image "$hello_image" --arg email "$email" '{template: {serviceAccount: $email, containers: [{image: $image}]}, scaling: {scalingMode: "MANUAL", manualInstanceCount: 0}}')"
-  if provisioning; then
+  if preparing; then
     provision POST "${run}/${parent}/services?serviceId=${throwaway}" "$(json_body "$service_body")" "" run || true
     if [ "$scope" = consumer ]; then
       provision POST "${run}/${parent}/jobs?jobId=${throwaway}" "$(json_body "$job_body")" "" run || true
       provision POST "${run}/${parent}/workerPools?workerPoolId=${throwaway}" "$(json_body "$pool_body")" "" run || true
     fi
   fi
+  if preparing; then return 0; fi
   observe "$attachment" run.googleapis.com/services.create POST "${run}/${parent}/services?serviceId=${throwaway_new}" "$(json_body "$service_body")" "" run "$service_new" absent "run.googleapis.com/services.create,iam.googleapis.com/serviceAccounts.actAs" run
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${run}/${service_new}" "" "" run || true; fi
   observe "$attachment" run.googleapis.com/services.update PATCH "${run}/${service}?updateMask=description" "$(json_body '{"description":"protected-recovery deny canary"}')" "" run "$service" present "run.googleapis.com/services.update,iam.googleapis.com/serviceAccounts.actAs" run
@@ -617,7 +707,7 @@ registry_row() {
   local attachment="$1" project="$2"
   local repository="projects/${project}/locations/${broker_region}/repositories/${throwaway}"
   local version="${repository}/packages/deny-canary/versions/${suffix}"
-  if provisioning; then
+  if preparing; then
     provision POST "${registry}/v1/projects/${project}/locations/${broker_region}/repositories?repositoryId=${throwaway}" "$(json_body '{"format":"GENERIC","description":"protected-recovery deny canary throwaway"}')" "" registry || true
   fi
   local boundary="protected-recovery-deny-canary"
@@ -626,14 +716,15 @@ registry_row() {
     jq -cn --arg version "$suffix" '{package_id: "deny-canary", version_id: $version, filename: "canary.txt"}'
     printf '\r\n--%s\r\nContent-Type: text/plain\r\n\r\nprotected-recovery deny canary %s\r\n--%s--\r\n' "$boundary" "$suffix" "$boundary"
   } > "$workdir/upload.body"
+  if preparing; then return 0; fi
   observe "$attachment" artifactregistry.googleapis.com/repositories.uploadArtifacts POST "${registry}/upload/v1/${repository}/genericArtifacts:create?uploadType=multipart" "$workdir/upload.body" "multipart/related; boundary=${boundary}" registry "$version" absent artifactregistry.googleapis.com/repositories.uploadArtifacts registry
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${registry}/v1/${version}" "" "" registry || true; fi
 }
 
 # The ledger rows: one retained document, read, listed, updated, and deleted
 # (and created again), and one document the create row creates and the
-# control phase removes. The deny phase cannot read a document's pre-state
-# because that read is the denied get row; it records unknown.
+# control phase removes. The independent witness reads the same actual
+# document state before both phases' requests.
 ledger_rows() {
   local attachment="$1" project="$2"
   local documents="projects/${project}/databases/${ledger_database}/documents"
@@ -645,7 +736,8 @@ ledger_rows() {
   update="$(jq -cn --arg name "$name" '{writes: [{update: {name: $name, fields: {run: {stringValue: "canary"}}}, currentDocument: {exists: true}}]}')"
   delete="$(jq -cn --arg name "$name" '{writes: [{delete: $name}]}')"
   delete_new="$(jq -cn --arg name "$name_new" '{writes: [{delete: $name}]}')"
-  if provisioning; then provision POST "${firestore}/${documents}:commit" "$(json_body "$create")" || true; fi
+  if preparing; then provision POST "${firestore}/${documents}:commit" "$(json_body "$create")" || true; fi
+  if preparing; then return 0; fi
   observe "$attachment" datastore.googleapis.com/entities.create POST "${firestore}/${documents}:commit" "$(json_body "$create_new")" "" firestore "$name_new" absent datastore.googleapis.com/entities.create
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${firestore}/${documents}:commit" "$(json_body "$delete_new")" || true; fi
   observe "$attachment" datastore.googleapis.com/entities.get GET "${firestore}/${name}" "" "" firestore "$name" present datastore.googleapis.com/entities.get
@@ -663,7 +755,8 @@ evidence_rows() {
   local object="canary%2F${suffix}"
   local object_new="canary%2F${suffix}-new"
   local bucket="b/${evidence_bucket}"
-  if provisioning; then provision POST "${gcs}/upload/storage/v1/${bucket}/o?uploadType=media&name=${object}&ifGenerationMatch=0" "$(json_body '{"canary":true}')" || true; fi
+  if preparing; then provision POST "${gcs}/upload/storage/v1/${bucket}/o?uploadType=media&name=${object}&ifGenerationMatch=0" "$(json_body '{"canary":true}')" || true; fi
+  if preparing; then return 0; fi
   observe "$attachment" storage.googleapis.com/objects.create POST "${gcs}/upload/storage/v1/${bucket}/o?uploadType=media&name=${object_new}&ifGenerationMatch=0" "$(json_body '{"canary":true}')" "" gcs "${bucket}/o/${object_new}" absent storage.googleapis.com/objects.create
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${gcs}/storage/v1/${bucket}/o/${object_new}" || true; fi
   observe "$attachment" storage.googleapis.com/objects.update PATCH "${gcs}/storage/v1/${bucket}/o/${object}" "$(json_body '{"metadata":{"protected-recovery":"deny-canary"}}')" "" gcs "${bucket}/o/${object}" present storage.googleapis.com/objects.update
@@ -691,12 +784,13 @@ freeze_rows() {
   local instance_body template_body
   instance_body="$(jq -cn --arg name "$throwaway_new" --arg zone "$zone" '{name: $name, machineType: ("zones/" + $zone + "/machineTypes/e2-micro"), disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}')"
   template_body="$(jq -cn --arg name "$throwaway_new" '{name: $name, properties: {machineType: "e2-micro", disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}}')"
-  if provisioning; then
+  if preparing; then
     call GET "${compute}/projects/${project}/zones/${zone}"
     if [[ "$last_status" =~ ^2 ]]; then
       provision POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$(jq -c --arg name "$throwaway" '.name = $name' <<< "$instance_body")")" "" compute && provision POST "${compute}/${instance}/stop" "" "" compute || true
     fi
   fi
+  if preparing; then return 0; fi
   observe "$attachment" compute.googleapis.com/instances.create POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$instance_body")" "" compute "$instance_new" absent compute.googleapis.com/instances.create compute
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${compute}/${instance_new}" "" "" compute || true; fi
   observe "$attachment" compute.googleapis.com/instances.setServiceAccount POST "${compute}/${instance}/setServiceAccount" "$(json_body '{}')" "" compute "$instance" present compute.googleapis.com/instances.setServiceAccount compute
@@ -721,11 +815,11 @@ freeze_rows() {
 organization_rows() {
   local attachment="$1"
   local role="organizations/${ORGANIZATION_ID}/roles/${role_id}"
-  local role_new_name="organizations/${ORGANIZATION_ID}/roles/${role_new}"
+  local role_new_name="organizations/${ORGANIZATION_ID}/roles/${create_role_new}"
   local role_gone_name="organizations/${ORGANIZATION_ID}/roles/${role_gone}"
   local policies="projects/${broker_project}/policies"
   local role_body='{"role":{"title":"Protected recovery Deny canary throwaway","includedPermissions":["resourcemanager.projects.get"],"stage":"DISABLED"}}'
-  if provisioning; then
+  if preparing; then
     provision POST "${iam}/organizations/${ORGANIZATION_ID}/roles" "$(json_body "$(jq -cn --arg id "$role_id" --argjson base "$role_body" '$base + {roleId: $id}')")" || true
     provision POST "${iam}/organizations/${ORGANIZATION_ID}/roles" "$(json_body "$(jq -cn --arg id "$role_gone" --argjson base "$role_body" '$base + {roleId: $id}')")" && provision DELETE "${iam}/${role_gone_name}" || true
     provision POST "${orgpolicy}/${policies}" "$(json_body "$(jq -cn --arg name "${policies}/${constraint_kept}" '{name: $name, spec: {rules: [{enforce: true}]}}')")" || true
@@ -735,11 +829,12 @@ organization_rows() {
       [ -n "$folder_id" ] || folder_id="$(jq -r '.response.name // "" | sub("^folders/"; "")' "$workdir/body")"
     fi
     [ -n "$folder_id" ] || fail "the throwaway folder was not created"
-  else
+  elif [ "$PHASE" = deny ]; then
     manifest_read "$broker_project"
     [ -n "$folder_id" ] || fail "the retained throwaway account names no folder"
   fi
-  observe "$attachment" iam.googleapis.com/roles.create POST "${iam}/organizations/${ORGANIZATION_ID}/roles" "$(json_body "$(jq -cn --arg id "$role_new" --argjson base "$role_body" '$base + {roleId: $id}')")" "" iam "$role_new_name" inactive iam.googleapis.com/roles.create
+  if preparing; then return 0; fi
+  observe "$attachment" iam.googleapis.com/roles.create POST "${iam}/organizations/${ORGANIZATION_ID}/roles" "$(json_body "$(jq -cn --arg id "$create_role_new" --argjson base "$role_body" '$base + {roleId: $id}')")" "" iam "$role_new_name" absent iam.googleapis.com/roles.create
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${iam}/${role_new_name}" || true; fi
   observe "$attachment" iam.googleapis.com/roles.update PATCH "${iam}/${role}?updateMask=description" "$(json_body '{"description":"protected-recovery deny canary"}')" "" iam "$role" present iam.googleapis.com/roles.update
   observe "$attachment" iam.googleapis.com/roles.delete DELETE "${iam}/${role}" "" "" iam "$role" present iam.googleapis.com/roles.delete
@@ -755,7 +850,7 @@ organization_rows() {
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${crm_v1}/projects/${broker_project}:clearOrgPolicy" "$(json_body "$(jq -cn --arg constraint "constraints/${constraint_v1}" '{constraint: $constraint}')")" || true; fi
   observe "$attachment" cloudresourcemanager.googleapis.com/projects.update PATCH "${crm}/projects/${canary_project}?updateMask=labels" "$(json_body '{"labels":{"protected-recovery":"deny-canary"}}')" "" project "projects/${canary_project}" present cloudresourcemanager.googleapis.com/projects.update crm
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision PATCH "${crm}/projects/${canary_project}?updateMask=labels" "$(json_body '{"labels":{}}')" "" crm || true; fi
-  observe "$attachment" cloudresourcemanager.googleapis.com/projects.move POST "${crm}/projects/${canary_project}:move" "$(json_body "$(jq -cn --arg parent "folders/${folder_id}" '{destinationParent: $parent}')")" "" project "projects/${canary_project}" present cloudresourcemanager.googleapis.com/projects.move crm
+  observe "$attachment" cloudresourcemanager.googleapis.com/projects.move POST "${crm}/projects/${canary_project}:move" "$(json_body "$(jq -cn --arg parent "folders/${folder_id}" '{destinationParent: $parent}')")" "" project "projects/${canary_project}" present "cloudresourcemanager.googleapis.com/projects.move,cloudresourcemanager.googleapis.com/projects.update" crm
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${crm}/projects/${canary_project}:move" "$(json_body "$(jq -cn --arg parent "organizations/${ORGANIZATION_ID}" '{destinationParent: $parent}')")" "" crm || true; fi
 }
 
@@ -764,8 +859,8 @@ organization_rows() {
 # Every deletion is attempted; what could not be deleted is a leftover, the
 # phase fails, and the leftover is never attested away.
 # ---------------------------------------------------------------------------
-# One deletion: 2xx, 404, an API disabled in the project, and a name already
-# soft-deleted are clean; anything else is a leftover.
+# One deletion: completed success or authoritative absence is clean.
+# Disabled APIs and authorization failures leave resource state unresolved.
 remove() {
   local method="$1" url="$2" what="$3" kind="${4:-}" body="${5:-}"
   call "$method" "$url" "$body"
@@ -778,8 +873,6 @@ remove() {
     echo "cleanup: removed ${what}"
   elif [ "$last_status" = 404 ]; then
     echo "cleanup: ${what} is absent"
-  elif service_disabled; then
-    echo "cleanup: ${what} rests on an API the project does not enable"
   else
     echo "${what}: HTTP ${last_status} $(jq -r '.error.message // "" | .[0:200]' "$workdir/body" 2> /dev/null)" >> "$failures"
     echo "cleanup: ${what} answered HTTP ${last_status}"
@@ -797,6 +890,10 @@ remove_unless_deleted() {
   fi
   if [[ "$last_status" =~ ^2 ]] && jq -e '(.state == "DELETED") or (.deleted == true)' "$workdir/body" > /dev/null 2>&1; then
     echo "cleanup: ${what} is already deleted"
+    return 0
+  fi
+  if ! [[ "$last_status" =~ ^2 ]]; then
+    fail "${what}: state unread before cleanup: HTTP ${last_status}"
     return 0
   fi
   remove DELETE "$url" "$what" "$kind"
@@ -829,23 +926,59 @@ cleanup_project() {
     done
   fi
   pool="projects/${project}/locations/global/workloadIdentityPools/${throwaway}"
-  for name in "$throwaway" "$throwaway_new" "$throwaway_gone"; do
+  for name in "$throwaway" "$throwaway_new" "${throwaway_new}-c" "${throwaway_new}-d" "$throwaway_gone"; do
     remove_unless_deleted "${iam}/${pool}/providers/${name}" "pool provider ${name} of ${project}" iam
   done
-  for name in "$throwaway" "$throwaway_new" "$throwaway_gone"; do
+  for name in "$throwaway" "$throwaway_new" "${throwaway_new}-c" "${throwaway_new}-d" "$throwaway_gone"; do
     remove_unless_deleted "${iam}/projects/${project}/locations/global/workloadIdentityPools/${name}" "pool ${name} of ${project}" iam
   done
   transient_keys "$project"
-  for name in "$throwaway" "$throwaway_new" "$throwaway_gone" "$delegate"; do
+  for name in "$throwaway" "$throwaway_new" "${throwaway_new}-c" "${throwaway_new}-d" "$throwaway_gone" "$delegate" "$enable_account"; do
     email="$(service_account_email "$name" "$project")"
     if [ "$name" = "$delegate" ] && [ "$scope" != broker ]; then continue; fi
-    remove DELETE "${iam}/projects/-/serviceAccounts/${email}" "account ${name} of ${project}"
+    if [ "$scope" = broker ] && [ "$name" = "$throwaway" ] && [ -s "$failures" ]; then
+      fail "account ${name} of ${project}: retained to preserve unresolved cleanup identities"
+      continue
+    fi
+    remove DELETE "${iam}/projects/${project}/serviceAccounts/${email}" "account ${name} of ${project}"
   done
+}
+
+# The manifest owns this numeric identity. An unread or mismatched object
+# cannot authorize deletion, and an accepted delete is followed by a read.
+cleanup_folder() {
+  if ! [[ "$folder_id" =~ ^[1-9][0-9]*$ ]]; then
+    fail "throwaway folder: the control manifest has no numeric folder identity"
+    return 0
+  fi
+  local name="folders/${folder_id}" state
+  call GET "${crm}/${name}"
+  if [ "$last_status" = 404 ]; then return 0; fi
+  if [ "$last_status" != 200 ]; then
+    fail "${name}: state unread before cleanup: HTTP ${last_status}"
+    return 0
+  fi
+  if ! jq -e --arg name "$name" --arg parent "organizations/${ORGANIZATION_ID}" --arg display "$throwaway" '.name == $name and .parent == $parent and .displayName == $display' "$workdir/body" > /dev/null; then
+    fail "${name}: identity, parent, or display name differs from the control manifest"
+    return 0
+  fi
+  state="$(jq -r '.state // ""' "$workdir/body")"
+  if [ "$state" = DELETE_REQUESTED ]; then return 0; fi
+  if [ "$state" != ACTIVE ]; then
+    fail "${name}: unknown folder state ${state}"
+    return 0
+  fi
+  remove DELETE "${crm}/${name}" "throwaway folder ${name}" crm
+  call GET "${crm}/${name}"
+  if [ "$last_status" = 404 ]; then return 0; fi
+  if [ "$last_status" != 200 ] || ! jq -e --arg name "$name" --arg parent "organizations/${ORGANIZATION_ID}" --arg display "$throwaway" '.name == $name and .parent == $parent and .displayName == $display and .state == "DELETE_REQUESTED"' "$workdir/body" > /dev/null; then
+    fail "${name}: terminal deletion state is not readable after cleanup: HTTP ${last_status}"
+  fi
 }
 
 cleanup_organization() {
   local name
-  for name in "$role_id" "$role_new" "$role_gone"; do
+  for name in "$role_id" "$role_new" "${role_new}c" "${role_new}d" "$role_gone"; do
     remove_unless_deleted "${iam}/organizations/${ORGANIZATION_ID}/roles/${name}" "custom role ${name} of organizations/${ORGANIZATION_ID}"
   done
   # The throwaway project: moved back under the organization if a move stood, then deleted.
@@ -853,27 +986,31 @@ cleanup_organization() {
   if [ "$last_status" = 200 ]; then
     if [ "$(jq -r '.parent // ""' "$workdir/body")" != "organizations/${ORGANIZATION_ID}" ] && [ "$(jq -r '.state // ""' "$workdir/body")" = ACTIVE ]; then
       provision POST "${crm}/projects/${canary_project}:move" "$(json_body "$(jq -cn --arg parent "organizations/${ORGANIZATION_ID}" '{destinationParent: $parent}')")" "" crm || echo "throwaway project ${canary_project}: could not be moved back under the organization" >> "$failures"
+      call GET "${crm}/projects/${canary_project}"
+      if [ "$last_status" != 200 ]; then
+        fail "throwaway project ${canary_project}: state unread after move: HTTP ${last_status}"
+        cleanup_folder
+        return 0
+      fi
     fi
     if [ "$(jq -r '.state // ""' "$workdir/body")" = ACTIVE ]; then
       remove DELETE "${crm}/projects/${canary_project}" "throwaway project ${canary_project}" crm
-    else
+      call GET "${crm}/projects/${canary_project}"
+      if [ "$last_status" != 404 ] && { [ "$last_status" != 200 ] || ! jq -e --arg id "$canary_project" --arg parent "organizations/${ORGANIZATION_ID}" '.projectId == $id and .parent == $parent and .state == "DELETE_REQUESTED"' "$workdir/body" > /dev/null; }; then
+        fail "throwaway project ${canary_project}: terminal deletion state is not readable"
+      fi
+    elif [ "$(jq -r ' .state // "" ' "$workdir/body")" = DELETE_REQUESTED ]; then
       echo "cleanup: throwaway project ${canary_project} is already deleted"
+    else
+      fail "throwaway project ${canary_project}: unknown deletion state"
     fi
-  elif [ "$last_status" = 404 ] || [ "$last_status" = 403 ]; then
+  elif [ "$last_status" = 404 ]; then
     echo "cleanup: throwaway project ${canary_project} is absent"
   else
     echo "throwaway project ${canary_project}: HTTP ${last_status}" >> "$failures"
   fi
-  # The throwaway folder, found by its name under the organization.
-  call GET "${crm}/folders?parent=organizations%2F${ORGANIZATION_ID}&pageSize=300"
-  if [ "$last_status" = 200 ]; then
-    while IFS= read -r name; do
-      [ -n "$name" ] || continue
-      remove DELETE "${crm}/${name}" "throwaway folder ${name}" crm
-    done < <(jq -r --arg display "$throwaway" '.folders[]? | select(.displayName == $display and .state == "ACTIVE") | .name' "$workdir/body")
-  else
-    echo "folders of organizations/${ORGANIZATION_ID}: could not be listed: HTTP ${last_status}" >> "$failures"
-  fi
+  cleanup_folder
+
 }
 
 # The keys of the throwaway accounts, if any survived a phase. A listing that
@@ -883,7 +1020,7 @@ transient_keys() {
   for name in "$throwaway" "$delegate"; do
     email="$(service_account_email "$name" "$project")"
     if [ "$name" = "$delegate" ] && [ "$project" != "$broker_project" ]; then continue; fi
-    call GET "${iam}/projects/-/serviceAccounts/${email}/keys?keyTypes=USER_MANAGED"
+    call GET "${iam}/projects/${project}/serviceAccounts/${email}/keys?keyTypes=USER_MANAGED"
     if [ "$last_status" = 404 ]; then
       continue
     elif [ "$last_status" != 200 ]; then
@@ -899,15 +1036,13 @@ transient_keys() {
 }
 
 # Canary builds still queued or working, if any survived a phase. A listing
-# that fails is a leftover; an API the project does not enable hosts none.
+# that fails is a leftover, including a disabled API with unenumerated resources.
 transient_builds() {
   local project="$1"
   local filter
   filter="$(jq -rn '"(status=\"QUEUED\" OR status=\"WORKING\") AND tags=\"protected-recovery-deny-canary\"" | @uri')"
   call GET "${cloudbuild}/projects/${project}/locations/global/builds?filter=${filter}"
-  if service_disabled; then
-    return 0
-  elif [ "$last_status" != 200 ]; then
+  if [ "$last_status" != 200 ]; then
     echo "builds of ${project}: could not be listed: HTTP ${last_status}" >> "$failures"
     return 0
   fi
@@ -935,13 +1070,17 @@ if [ "$transient_cleanup" = 1 ]; then
 fi
 
 if [ "$PHASE" = cleanup ]; then
+  # Recover numeric identities from the verified control artifact even if
+  # an earlier cleanup already deleted the account that carried the manifest.
+  manifest_read "$broker_project"
+  cleanup_organization
   cleanup_project "$broker_project" broker
   while IFS= read -r project; do
     cleanup_project "$project" consumer
   done < <(consumer_projects)
-  cleanup_organization
   jq -n \
     --arg control "$CONTROL_RUN_ID" \
+    --arg folder "$folder_id" --arg project "$canary_project" \
     --arg brokerImage "$BROKER_IMAGE" \
     --arg organization "organizations/${ORGANIZATION_ID}" \
     --argjson attempt "$GITHUB_RUN_ATTEMPT" \
@@ -958,6 +1097,7 @@ if [ "$PHASE" = cleanup ]; then
       brokerImage: $brokerImage,
       organization: $organization,
       run: {attempt: $attempt, event: $event, headSha: $headSha, id: $id, repositoryId: $repositoryId, workflow: $workflow},
+      throwaways: {folder: $folder, project: $project},
       removed: ($removed | split("\n") | map(select(length > 0))),
       leftovers: ($failures | split("\n") | map(select(length > 0)))
     }' > "$output"
@@ -997,10 +1137,33 @@ while IFS=$'\t' read -r attachment project scope; do
   done < "$workdir/names"
 done < "$attachments"
 
-if ! provisioning; then
-  manifest_read "$broker_project"
-  allow_snapshots
+if provisioning; then
+  prepare_only=1
+  while IFS=$'\t' read -r attachment project scope; do
+    case "$scope" in
+      broker)
+        identity_rows "$attachment" "$project" broker
+        run_rows "$attachment" "$project" broker
+        registry_row "$attachment" "$project"
+        ledger_rows "$attachment" "$project"
+        evidence_rows "$attachment"
+        ;;
+      consumer)
+        identity_rows "$attachment" "$project" consumer
+        run_rows "$attachment" "$project" consumer
+        freeze_rows "$attachment" "$project"
+        manifest_write "$project"
+        ;;
+      organization) organization_rows "$attachment" ;;
+    esac
+  done < "$attachments"
+  manifest_write "$broker_project"
+  prepare_only=0
+  [ ! -s "$failures" ] || exit 1
 fi
+
+if ! provisioning; then manifest_read "$broker_project"; fi
+record_allow_boundary start
 
 while IFS=$'\t' read -r attachment project scope; do
   case "$scope" in
@@ -1029,8 +1192,9 @@ done < "$attachments"
 
 if provisioning; then
   manifest_write "$broker_project"
-  allow_snapshots
 fi
+if [ -n "${pending_attachment:-}" ]; then record_allow_boundary after "$pending_attachment" "$pending_permission"; fi
+record_allow_boundary end
 
 jq -n \
   --arg phase "$PHASE" \
@@ -1053,6 +1217,10 @@ jq -n \
   --slurpfile policies "$policies" \
   --slurpfile observations "$observations" \
   --slurpfile allow "$allow_policies" \
+  --slurpfile allow_interval "$allow_interval" \
+  --slurpfile allow_snapshot "$workdir/allow-baseline.json" \
+  --slurpfile manifest_ids "$manifest_ids" \
+  --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" \
   --rawfile failures "$failures" '
     ($observations) as $seen
     | {
@@ -1062,8 +1230,11 @@ jq -n \
       brokerImage: $brokerImage,
       organization: $organization,
       run: {attempt: $attempt, event: $event, headSha: $headSha, id: $id, repositoryId: $repositoryId, workflow: $workflow},
-      throwaways: {name: $throwaway, new: $throwaway_new, gone: $throwaway_gone, delegate: $delegate, role: $role, project: $project, folder: $folder},
+      throwaways: {name: $throwaway, new: $throwaway_new, gone: $throwaway_gone, delegate: $delegate, role: $role, project: $project, folder: $folder, goneUniqueIds: ($manifest_ids | from_entries)},
+      witnessServiceAccount: $witness,
       allowPolicies: ($allow | sort_by(.resource)),
+      allowInterval: $allow_interval,
+      allowSnapshot: $allow_snapshot[0],
       policies: [$policies[] | .attachmentPoint as $attachment | .rules |= [.[] | .deniedPermissions as $permissions | . + {canary: [$seen[] | select(.attachment == $attachment and (.permission | IN($permissions[]))) | del(.attachment)]}]],
       failures: ($failures | split("\n") | map(select(length > 0)))
     }

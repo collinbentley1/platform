@@ -37,7 +37,7 @@ transition="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 image="us-east4-docker.pkg.dev/recovery-test/broker/protected-recovery@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 authority="$copy/protected-recovery/authority.json"
 jq --arg active "$active" --arg transition "$transition" '
-  .broker.projectId = "recovery-test" | .broker.projectNumber = "123456789012" | .organizationId = "100000000001"
+  .broker.canaryWitnessServiceAccount = "recovery-witness@recovery-test.iam.gserviceaccount.com" | .broker.projectId = "recovery-test" | .broker.projectNumber = "123456789012" | .organizationId = "100000000001"
   | .bootstrapPrincipal = "principal://goog/subject/cloud-root@cdbentley.com"
   | .consumers |= [range(0; length) as $c | .[$c]
     | .activeWorkflowSha = $active
@@ -69,11 +69,11 @@ consumers="$(jq -r '[.consumers[].repository] | join(",")' "$authority")"
 test "$(jq 'length' "$fixtures/matrix-steady.json")" = "$((35 + 4 * 29 + 10))"
 test "$(jq '[.policies[].rules[].canary[]] | length' "$fixtures/deny.json")" = "$((35 + 4 * 29 + 10))"
 test "$(jq '[.policies[].rules[].canary[] | select(.outcome == "UNSERVICEABLE")] | length' "$fixtures/deny.json")" = 16
-test "$(jq '[.policies[].rules[].canary[] | select(.requires | length > 1)] | length' "$fixtures/deny.json")" = 27
-test "$(jq '.allowPolicies | length' "$fixtures/deny.json")" = 8
+test "$(jq '[.policies[].rules[].canary[] | select(.requires | length > 1)] | length' "$fixtures/deny.json")" = 28
+test "$(jq '.allowPolicies | length' "$fixtures/deny.json")" = 10
 test "$(jq '.leftovers | length' "$fixtures/cleanup.json")" = 0
 # The two exercise phases pair on every row's digest.
-test "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.digest)"] | sort | join("\n")' "$fixtures/control.json" | openssl dgst -sha256 -r | cut -d' ' -f1)" = "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.digest)"] | sort | join("\n")' "$fixtures/deny.json" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+test "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.comparison.digest // .digest)"] | sort | join("\n")' "$fixtures/control.json" | openssl dgst -sha256 -r | cut -d' ' -f1)" = "$(jq -r '[.policies[].rules[].canary[] | "\(.permission)|\(.comparison.digest // .digest)"] | sort | join("\n")' "$fixtures/deny.json" | openssl dgst -sha256 -r | cut -d' ' -f1)"
 
 # The digests each phase's evidence names: the raw digest of the fixture
 # bytes the attestation signs, and a distinct archive digest GitHub would
@@ -157,6 +157,11 @@ predicate() {
     pre-state-mismatch) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .preState.observed) |= \"absent\"" "$fixtures/$phase.json" ;;
     pre-state-unknown) jq -c --arg key "$key" --arg broker "$broker" "(${row} | .preState.observed) |= \"unknown\"" "$fixtures/$phase.json" ;;
     operation-error) jq -c --arg key "$pool" --arg broker "$broker" "(${row} | .operation) |= {name: \"operations/deny-canary-failed\", done: true, error: {code: 13, message: \"internal error\"}}" "$fixtures/$phase.json" ;;
+    allow-after-start-missing) jq -c '.allowInterval[-1].snapshotSha256 = ("0" * 64)' "$fixtures/$phase.json" ;;
+    allow-role-definition-moved) jq -c '.allowSnapshot.roles[0].etag += "-changed"' "$fixtures/$phase.json" ;;
+    create-deleted) jq -c --arg key "$pool" --arg broker "$broker" "(${row} | .preState.observed) = \"deleted\"" "$fixtures/$phase.json" ;;
+    account-state-mismatch) jq -c --arg key "iam.googleapis.com/serviceAccounts.enable" --arg broker "$broker" "(${row} | .preState.detail) = \"enabled\"" "$fixtures/$phase.json" ;;
+    move-dependency-missing) jq -c '(.policies[].rules[].canary[] | select(.permission == "cloudresourcemanager.googleapis.com/projects.move") | .requires) = ["cloudresourcemanager.googleapis.com/projects.move"]' "$fixtures/$phase.json" ;;
     allow-etag-moved) jq -c '.allowPolicies[0].etag |= (. + "-moved")' "$fixtures/$phase.json" ;;
     allow-missing) jq -c '(.allowPolicies[] | select(.resource == "projects/recovery-test") | .canaryRoles) |= []' "$fixtures/$phase.json" ;;
     actas-unisolated) jq -c --arg key "$act_as" --arg broker "$broker" "(${row} | .requires) |= (. + [\"run.googleapis.com/services.create\"])" "$fixtures/$phase.json" ;;
@@ -234,6 +239,7 @@ live_policies() {
     condition-added) jq -c '.[0].rules[0].denialCondition = { expression: "!resource.matchTag(\"100000000001/env\", \"canary\")" }' ;;
     permission-missing) jq -c '.[0].rules[] |= (.deniedPermissions -= ["cloudresourcemanager.googleapis.com/projects.setIamPolicy"])' ;;
     missing) jq -c '[]' ;;
+    bootstrap) jq -c --arg attachment "$attachment" --slurpfile matrix "$fixtures/matrix-bootstrap.json" '.[0].rules = ([$matrix[0][] | select(.attachment == $attachment)] | group_by(.exceptions | tojson) | map({denialCondition: null, deniedPermissions: (map(.permission) | sort), deniedPrincipals: .[0].denied, exceptionPermissions: [], exceptionPrincipals: .[0].exceptions}))' ;;
     consistent) cat ;;
     *) echo "unknown live policy variant $variant" >&2; exit 1 ;;
   esac
@@ -246,7 +252,7 @@ broker_attachment="cloudresourcemanager.googleapis.com/projects/recovery-test"
 live_deny_state() {
   local attachment
   while IFS= read -r attachment; do
-    override_deny_state "$attachment"
+    override_deny_state "$attachment" "${1:-consistent}"
   done < <(jq -r '.policies[].attachmentPoint' "$fixtures/deny.json")
 }
 
@@ -275,7 +281,7 @@ live_service_state() {
 override_allow_state() {
   local attachment="$1" variant="${2:-retired}"
   case "$variant" in
-    retired) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "200", etag = "allow-etag-retired", roles = "[]", reason = "" } }\n}\n' "$attachment" ;;
+    retired) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "200", etag = "allow-etag-retired", roles = "[]", cleanup_status = "CLEAN", reason = "" } }\n}\n' "$attachment" ;;
     standing) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "200", etag = "allow-etag-standing", roles = %s, reason = "" } }\n}\n' "$attachment" "$(jq -cn '["roles/run.admin"]' | jq -R -r '@json')" ;;
     unread) printf 'override_data {\n  target = data.external.allow_state["%s"]\n  values = { result = { status = "503", etag = "", roles = "[]", reason = "reading the allow policy answered HTTP 503" } }\n}\n' "$attachment" ;;
     *) echo "unknown live allow variant $variant" >&2; exit 1 ;;
@@ -315,6 +321,9 @@ while IFS= read -r line; do
       ;;
     @@LIVE_DENY_STATE@@)
       live_deny_state
+      ;;
+    @@LIVE_DENY_STATE:bootstrap@@)
+      live_deny_state bootstrap
       ;;
     @@LIVE_DENY_POLICY:*@@)
       variant="${trimmed#@@LIVE_DENY_POLICY:}"

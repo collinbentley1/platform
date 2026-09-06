@@ -281,7 +281,7 @@ describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
     // No maintenance ticket can open while the quarantine shard is not CLOSED.
     const active = await call("POST", "/v1/maintenance", restorer, { action: "open", key: "m" });
     expect(active.status).toBe(409);
-    expect(await active.json()).toMatchObject({ detail: "QUARANTINE shards not CLOSED: s", error: "QUARANTINE_ACTIVE" });
+    expect(await active.json()).toMatchObject({ detail: "Recovery shards not CLOSED: s", error: "QUARANTINE_ACTIVE" });
   });
 });
 

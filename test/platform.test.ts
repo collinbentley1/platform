@@ -52,7 +52,7 @@ describe("platform scaffold and doctor", () => {
           }
           const maximumTimeout = entry === "deploy-prod.yml" && jobName === "deploy"
             ? 60
-            : protectedOwner ? 43 : 35;
+            : protectedOwner ? 43 : entry === "platform.yml" && jobName === "terraform-enabled" ? 120 : 35;
           expect(
             timeout as number,
             `${entry}:${jobName} timeout must not exceed ${maximumTimeout} minutes`,
@@ -1949,6 +1949,47 @@ describe("platform scaffold and doctor", () => {
     }
   });
 
+  test("independent Terraform gates aggregate every failure under the required check", async () => {
+    const field = (value: unknown, key: string): unknown => {
+      if (value === null || typeof value !== "object" || !(key in value)) return undefined;
+      return value[key];
+    };
+    const workflow: unknown = Bun.YAML.parse(await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8"));
+    const jobs = field(workflow, "jobs");
+    const gates = ["terraform-validation", "terraform-enabled", "terraform-state-scan", "terraform-checkov"];
+    const aggregate = field(jobs, "terraform");
+    expect(field(aggregate, "name")).toBe("Terraform modules");
+    expect(field(aggregate, "needs")).toEqual(gates);
+    expect(field(aggregate, "if")).toBe("always()");
+    expect(field(aggregate, "permissions")).toEqual({});
+    for (const gate of gates) {
+      const job = field(jobs, gate);
+      expect(field(job, "needs")).toBeUndefined();
+      expect(field(job, "if")).toBeUndefined();
+      expect(field(job, "permissions")).toEqual({ contents: "read" });
+      expect(field(job, "continue-on-error")).toBeUndefined();
+    }
+    const steps = field(aggregate, "steps");
+    if (!Array.isArray(steps)) throw new Error("Terraform aggregate steps are missing");
+    const script = field(steps[1], "run");
+    if (typeof script !== "string") throw new Error("Terraform aggregate script is missing");
+    const successes = Object.fromEntries(gates.map((gate) => [gate, { result: "success" }]));
+    const run = (results: unknown) => Bun.spawnSync(["/bin/bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script], {
+      env: { PATH: process.env.PATH, GATE_RESULTS: JSON.stringify(results) },
+      stdout: "pipe",
+      stderr: "pipe",
+    }).exitCode;
+    expect(run(successes)).toBe(0);
+    for (const gate of gates) {
+      for (const result of ["failure", "cancelled", "skipped", "", null]) {
+        expect(run({ ...successes, [gate]: { result } })).not.toBe(0);
+      }
+      expect(run(Object.fromEntries(Object.entries(successes).filter(([key]) => key !== gate)))).not.toBe(0);
+    }
+    expect(run({ ...successes, unexpected: { result: "success" } })).not.toBe(0);
+    expect(run({})).not.toBe(0);
+  });
+
   test("Checkov bypasses the action wrapper and accepts only trusted policy mounts", async () => {
     const workflow = await readFile(join(repoRoot, ".github/workflows/platform.yml"), "utf8");
     expect(workflow).toContain(
@@ -3280,7 +3321,7 @@ describe("platform scaffold and doctor", () => {
     const guardedJobs = new Map<string, string[]>([
       ["application.yml", ["verify"]],
       ["socket-firewall.yml", ["firewall"]],
-      ["platform.yml", ["verify", "terraform"]],
+      ["platform.yml", ["verify", "terraform-validation", "terraform-enabled", "terraform-state-scan", "terraform-checkov", "terraform"]],
       [
         "deploy-preview.yml",
         [
@@ -3319,7 +3360,7 @@ describe("platform scaffold and doctor", () => {
     const expectedJobConditions: Record<string, Record<string, string | null>> = {
       "application.yml": { verify: null },
       "socket-firewall.yml": { firewall: null },
-      "platform.yml": { terraform: null, verify: null },
+      "platform.yml": { terraform: "always()", verify: null, "terraform-validation": null, "terraform-enabled": null, "terraform-state-scan": null, "terraform-checkov": null },
       "deploy-preview.yml": {
         "rerun-guard": null,
         "prefetch-bases":

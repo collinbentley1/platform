@@ -45,6 +45,9 @@ const server = Bun.serve({
     if (path === "/v2/policies/" + encodeURIComponent(attachment) + "/denypolicies") return Response.json({ policies: [{ name, etag: "scan-etag" }] });
     if (path === "/v2/" + name) return Response.json({ name, etag: "scan-etag", rules: [{ denyRule: { deniedPrincipals: ["principalSet://goog/public:all"], deniedPermissions: ["iam.googleapis.com/roles.create"], exceptionPrincipals: [] } }] });
     if (path === "/v1/projects/scan-test/services/compute.googleapis.com") return Response.json({ name: "projects/scan-test/services/compute.googleapis.com", state: "DISABLED" });
+    if (path === "/v3/projects/scan-test") return Response.json({ name: "projects/scan-test", parent: "folders/12345" });
+    if (path === "/v3/folders/12345") return Response.json({ name: "folders/12345", parent: "organizations/99999" });
+    if ((path === "/v3/folders/12345:getIamPolicy" || path === "/v3/organizations/99999:getIamPolicy") && request.method === "POST") return Response.json({ etag: "ancestor-etag", version: 3, bindings: [] });
     if (path === "/v3/projects/scan-test:getIamPolicy" && request.method === "POST") return Response.json({ etag: "allow-etag", version: 3, bindings: [{ role: "roles/run.admin", members: ["serviceAccount:gha-deny-canary@scan-test.iam.gserviceaccount.com"] }, { role: "roles/viewer", members: ["user:someone@example.com"] }] });
     return Response.json({ error: { status: "NOT_FOUND" } }, { status: 404 });
   },

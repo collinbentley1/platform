@@ -21,12 +21,14 @@ import {
   type ObservedSnapshot,
   type OutboxProgress,
   type PreparedFacts,
+  type ProtectedApplyLease,
   type ProbeRecord,
   type RoundBinding,
   type RoundManifest,
   type RoundPointer,
   type RoundReceipt,
   type RoundRequest,
+  type RoundRuns,
   type ScanReadiness,
   type Shard,
   type Target,
@@ -53,6 +55,12 @@ import {
   probePermission,
   probePhases,
   roundComplete,
+  receiptWithinRound,
+  controlValiditySeconds,
+  controlRoundFresh,
+  roundPhaseBlockers,
+  roundProbeDigest,
+  chainFloor,
   roundId,
   roundPhases,
   scanReadiness,
@@ -60,10 +68,15 @@ import {
   terminalObjectName,
 } from "./model";
 
+export type ProtectedApplyOutcome =
+  | { readonly kind: "acquired"; readonly lease: ProtectedApplyLease }
+  | { readonly kind: "released"; readonly lease: null }
+  | { readonly kind: "refused"; readonly reason: "PROTECTED_APPLY_ACTIVE" | "PROTECTED_APPLY_MISMATCH" | "PROTECTED_APPLY_KEY_USED" | "MAINTENANCE_OPEN" | "RECOVERY_ACTIVE" };
+
 export type MaintenanceOutcome =
   | { readonly kind: "opened"; readonly ticket: MaintenanceTicket }
   | { readonly kind: "closed"; readonly ticket: MaintenanceTicket | null }
-  | { readonly kind: "refused"; readonly reason: "MAINTENANCE_OPEN" | "QUARANTINE_ACTIVE"; readonly detail: string };
+  | { readonly kind: "refused"; readonly reason: "MAINTENANCE_OPEN" | "QUARANTINE_ACTIVE" | "PROTECTED_APPLY_ACTIVE"; readonly detail: string };
 
 // The ledger is Firestore, spoken through its REST API so the broker carries no
 // dependencies. Every state change is one transaction over the shard document
@@ -102,7 +115,7 @@ export interface LedgerDependencies {
 export type Rejection =
   | { readonly reason: "SHARD_NOT_OPEN"; readonly phase: Shard["phase"] }
   | { readonly reason: "NOT_READY"; readonly blockers: readonly string[] }
-  | { readonly reason: "MAINTENANCE_OPEN" | "NOT_FOUND" | "PINS_UNRECORDED" | "ROUND_INCOMPLETE" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
+  | { readonly reason: "PROTECTED_APPLY_ACTIVE" | "MAINTENANCE_OPEN" | "NOT_FOUND" | "PINS_UNRECORDED" | "ROUND_INCOMPLETE" | "SHARD_FULL" | "SHARD_MISMATCH" | "SOURCE_NOT_COMPLETE"; readonly detail: string };
 
 export type RoundOpenOutcome =
   | { readonly kind: "opened"; readonly id: string; readonly round: RoundManifest }
@@ -147,9 +160,9 @@ export type FinishCloseOutcome =
 
 export type Fresh = Readonly<Record<string, FreshInventory>>;
 
-// The one document that orders quarantine acceptance, terminal close, and
-// maintenance opening against each other: the QUARANTINE shards accepted and
-// not yet CLOSED, and a version advanced by every transition.
+// One document orders recovery admission, terminal close, maintenance, and
+// protected apply. It names all QUARANTINE and RESTORE shards not yet CLOSED.
+// Each admission and projected terminal close advances its version.
 export interface Coordination {
   readonly active: readonly string[];
   readonly version: number;
@@ -237,23 +250,22 @@ export class Ledger {
       }
       if (Object.keys(shard.targets).length > 0) return reject({ reason: "SHARD_MISMATCH", detail: "targets are already journaled in this shard" });
       let bodies: EntryBody[];
-      let coordination: { readonly doc: StoredDocument | null; readonly state: Coordination } | undefined;
+      const [leaseDoc, coordinationDoc, ticketDoc] = await tx.get([this.#protectedApplyName(), this.#coordinationName(), this.#maintenanceName()]);
+      if (leaseDoc && protectedApplyFromDocument(leaseDoc) !== null) return reject({ reason: "PROTECTED_APPLY_ACTIVE", detail: "an exclusive protected Terraform apply is active" });
+      const coordination = { doc: coordinationDoc ?? null, state: coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination };
+      const ticket = ticketDoc ? maintenanceFromDocument(ticketDoc) : undefined;
+      if (ticket && ticket.open && Date.parse(ticket.expiresAt) > now.getTime()) return reject({ reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}` });
       if (request.body.kind === "quarantine") {
         if (!targets) return reject({ reason: "PINS_UNRECORDED", detail: "the consumer's workflow SHA pins or target identities are not recorded" });
-        // The ticket and the coordination document are read in this
-        // transaction: a ticket that opens after this read makes this commit
-        // contend, and the coordination write below makes any concurrent
-        // opening contend, so acceptance and opening are ordered.
-        const [ticketDoc, coordinationDoc] = await tx.get([this.#maintenanceName(), this.#coordinationName()]);
-        const ticket = ticketDoc ? maintenanceFromDocument(ticketDoc) : undefined;
-        if (ticket && ticket.open && Date.parse(ticket.expiresAt) > now.getTime()) return reject({ reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${ticket.openedAt} by ${ticket.openedBy} is open until ${ticket.expiresAt}` });
-        coordination = { doc: coordinationDoc ?? null, state: coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination };
-        if (controlRound !== undefined) {
-          const [roundDoc] = await tx.get([this.#roundName(controlRound)]);
-          if (!roundDoc) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${controlRound} does not exist` });
+        const [controlPointerDoc] = await tx.get([this.#roundPointerName(request.consumer)]);
+        const admittingRound = controlRound ?? (controlPointerDoc ? roundPointerFromDocument(controlPointerDoc).control : null);
+        if (admittingRound !== null) {
+          shard = { ...shard, controlRound: admittingRound };
+          const [roundDoc] = await tx.get([this.#roundName(admittingRound)]);
+          if (!roundDoc) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${admittingRound} does not exist` });
           const round = roundFromDocument(roundDoc);
-          if (round.consumer !== request.consumer || round.phase !== "CONTROL") return reject({ reason: "ROUND_INCOMPLETE", detail: `round ${controlRound} is the ${round.phase} round of ${round.consumer}` });
-          if (round.completedAt === null) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${controlRound} is not complete` });
+          if (round.consumer !== request.consumer || round.phase !== "CONTROL") return reject({ reason: "ROUND_INCOMPLETE", detail: `round ${admittingRound} is the ${round.phase} round of ${round.consumer}` });
+          if (!controlRoundFresh(round, now)) return reject({ reason: "ROUND_INCOMPLETE", detail: `the CONTROL round ${admittingRound} is incomplete or expired` });
         }
         bodies = targets.map((target) => ({ kind: "effect", account: target.account, email: target.email, intent: "QUARANTINE", members: target.members, resource: target.resource, uniqueId: target.uniqueId }));
       } else {
@@ -305,7 +317,7 @@ export class Ledger {
       tx.put(shardName, shardToJson(next), shardDoc);
       for (const entry of entries) tx.put(this.#entryName(request.shard, entry.sequence), entryToJson(entry), null);
       tx.put(keyName, keyToJson({ bodyHash: request.bodyHash, key: request.key, operation: "append", result }), null);
-      if (coordination) tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination.state, [...coordination.state.active, request.shard])), coordination.doc);
+      tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination.state, [...coordination.state.active, request.shard])), coordination.doc);
       return { kind: "accepted", entries, result };
     });
   }
@@ -320,8 +332,8 @@ export class Ledger {
   // room and otherwise folded into the chain alone, so a redundant ALLOWED
   // observation can restart a chain but never make the DENIED observations
   // that complete one unrecordable.
-  async recordProbe(shardId: string, probe: ProbeRecord): Promise<ObservationOutcome> {
-    return await this.#observe(shardId, { kind: "probe", probe });
+  async recordProbe(shardId: string, probe: ProbeRecord, roundId?: string): Promise<ObservationOutcome> {
+    return await this.#observe(shardId, { kind: "probe", probe }, roundId);
   }
 
   // A credential inventory is recorded by the broker from its own inventory
@@ -333,7 +345,7 @@ export class Ledger {
     return await this.#observe(shardId, { kind: "inventory", inventory });
   }
 
-  async #observe(shardId: string, observation: Observation): Promise<ObservationOutcome> {
+  async #observe(shardId: string, observation: Observation, roundId?: string): Promise<ObservationOutcome> {
     return await this.#transact(shardId, async (tx) => {
       const shardName = this.#shardName(shardId);
       const [shardDoc] = await tx.get([shardName]);
@@ -373,7 +385,29 @@ export class Ledger {
         if (observedUntil < observedAt) return refuse("the inventory interval ends before it begins");
         if (observedUntil > now.getTime()) return refuse("the observation is in the ledger's future");
       }
+      let boundRound: { readonly doc: StoredDocument; readonly round: RoundManifest; readonly receipt: RoundReceipt } | undefined;
+      if (roundId !== undefined && observation.kind === "probe") {
+        const [doc] = await tx.get([this.#roundName(roundId)]);
+        if (!doc) return refuse("the phase round does not exist");
+        const round = roundFromDocument(doc);
+        const probe = observation.probe;
+        const receipt = round.receipts[probe.member];
+        const control = receipt?.controls[probe.account];
+        if (round.shard !== shardId || round.phase !== probe.phase || round.completedAt !== null || round.expiredAt !== null || Date.parse(round.expiresAt) <= now.getTime() || !receipt || !control || round.runs?.[probe.member]?.runId !== receipt.runId || round.runs?.[probe.member]?.runAttempt !== receipt.runAttempt || receipt.principal !== probe.principal || control.uniqueId !== probe.uniqueId || control.observedAt !== probe.observedAt || control.outcome !== probe.outcome) return refuse("the probe does not match this open round's bound receipt");
+        if (state.chain.inventory?.hash !== round.targets[probe.account]?.inventoryHash) return refuse("the round inventory baseline changed");
+        boundRound = { doc, round, receipt };
+      }
       const applied = applyObservation(state, observation);
+      if (boundRound && roundId !== undefined && observation.kind === "probe") {
+        const probe = observation.probe;
+        const chain = applied.chain.members[probe.member];
+        const counted = probe.phase === "REVOCATION" ? chain?.revocation : chain?.post;
+        if (probe.outcome === "DENIED" && counted !== null && counted !== undefined && Date.parse(counted.observedAt) <= observedAt && observedAt >= chainFloor(state)) {
+          const { round, receipt, doc } = boundRound;
+          const committed = { ...round.committed, [probe.member]: { ...round.committed[probe.member], [probe.account]: roundProbeDigest(round.phase, probe.account, probe.member, receipt) } };
+          tx.put(this.#roundName(roundId), roundToJson({ ...round, committed, version: round.version + 1 }), doc);
+        }
+      }
       // Inventory folding is monotonic by observation time: a delayed older
       // observation never replaces the newer state, whatever its hash.
       if (applied.role === "STALE") return refuse(`the observation at ${named.observedAt} is older than the inventory recorded at ${state.chain.inventory?.verifiedAt ?? ""}`);
@@ -600,11 +634,9 @@ export class Ledger {
       };
       tx.put(shardName, shardToJson(closed), shardDoc);
       // The terminal close is the one exit from the coordination document.
-      if (shard.intent === "QUARANTINE") {
-        const [coordinationDoc] = await tx.get([this.#coordinationName()]);
-        const coordination = coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination;
-        tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination, coordination.active.filter((active) => active !== shardId))), coordinationDoc);
-      }
+      const [coordinationDoc] = await tx.get([this.#coordinationName()]);
+      const coordination = coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination;
+      tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination, coordination.active.filter((active) => active !== shardId))), coordinationDoc);
       return closed;
     });
   }
@@ -726,11 +758,8 @@ export class Ledger {
     return `${this.#documents}/members/${sha256Hex(member)}`;
   }
 
-  // A round is opened once at its coordinates with the binding the broker
-  // observed at that moment; a second opening replays it. A REVOCATION or
-  // HORIZON round is opened only against an OPEN QUARANTINE shard of the
-  // consumer, read in the same transaction. The consumer's pointer document
-  // gains the round while it is open to receipts.
+  // One live round per consumer bounds synchronous delivery work. Expiry
+  // removes the pointer transactionally; historical manifests remain receipts.
   async openRound(request: RoundRequest, openedBy: string, binding: RoundBinding): Promise<RoundOpenOutcome> {
     const { consumer, label, phase, shard } = request.body;
     const id = roundId(consumer, phase, shard, label);
@@ -739,27 +768,61 @@ export class Ledger {
     return await this.#transact(`rounds/${id}`, async (tx) => {
       const [roundDoc, pointerDoc] = await tx.get([roundName, pointerName]);
       if (roundDoc) return { kind: "replayed", id, round: roundFromDocument(roundDoc) };
+      const now = this.#deps.now();
+      const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
+      const openDocs = await tx.get(pointer.open.map((open) => this.#roundName(open)));
+      const live: string[] = [];
+      for (const [index, doc] of openDocs.entries()) {
+        if (!doc) continue;
+        const open = roundFromDocument(doc);
+        if (open.completedAt !== null || open.expiredAt !== null) continue;
+        if (Date.parse(open.expiresAt) <= now.getTime()) tx.put(this.#roundName(pointer.open[index]!), roundToJson({ ...open, expiredAt: now.toISOString(), pending: [], version: open.version + 1 }), doc);
+        else live.push(pointer.open[index]!);
+      }
+      if (live.length > 0) return { kind: "rejected", rejection: { reason: "ROUND_INCOMPLETE", detail: `the consumer already has an open round ${live[0]}` } };
       if (shard !== null) {
         const [shardDoc] = await tx.get([this.#shardName(shard)]);
         if (!shardDoc) return { kind: "rejected", rejection: { reason: "NOT_FOUND", detail: `the shard ${shard} does not exist` } };
         const journaled = shardFromDocument(shardDoc);
         if (journaled.consumer !== consumer || journaled.intent !== "QUARANTINE") return { kind: "rejected", rejection: { reason: "SHARD_MISMATCH", detail: `shard ${shard} is ${journaled.consumer} ${journaled.intent}` } };
-        if (journaled.phase !== "OPEN") return { kind: "rejected", rejection: { reason: "SHARD_NOT_OPEN", phase: journaled.phase } };
+        const blockers = roundPhaseBlockers({ ...binding, phase }, journaled, now);
+        if (blockers.length > 0) return { kind: "rejected", rejection: { reason: "NOT_READY", blockers } };
       }
-      const now = this.#deps.now().toISOString();
-      const round: RoundManifest = { ...binding, completedAt: null, consumer, key: request.key, label, openedAt: now, openedBy, phase, receipts: {}, shard, version: 1 };
-      const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
+      const round: RoundManifest = { ...binding, committed: {}, completedAt: null, consumer, expiredAt: null, expiresAt: new Date(now.getTime() + controlValiditySeconds * 1000).toISOString(), key: request.key, label, openedAt: now.toISOString(), openedBy, pending: [], phase, receipts: {}, runs: null, shard, version: 1 };
       tx.put(roundName, roundToJson(round), null);
-      tx.put(pointerName, roundPointerToJson({ control: pointer.control, open: [...new Set([...pointer.open, id])].sort() }), pointerDoc ?? null);
+      tx.put(pointerName, roundPointerToJson({ control: pointer.control, open: [id] }), pointerDoc ?? null);
       return { kind: "opened", id, round };
     });
   }
 
-  // A receipt is admitted into an open round only from an expected member,
-  // from a run of a platform commit the round binds, minting against exactly
-  // the bound identities it is a member of. The receipt that completes the
-  // round completes it in the same transaction and, for a CONTROL round,
-  // makes it the consumer's admitting round.
+  // The operator selects exact authenticated runs after GitHub assigns IDs.
+  // Every member/run/attempt is permanently claimed by at most one round.
+  async bindRoundRuns(id: string, runs: RoundRuns): Promise<ReceiptOutcome> {
+    return await this.#transact(`rounds/${id}`, async (tx) => {
+      const name = this.#roundName(id);
+      const [doc] = await tx.get([name]);
+      if (!doc) return { kind: "refused", reason: "the round does not exist" };
+      const round = roundFromDocument(doc);
+      if (round.expiredAt !== null || Date.parse(round.expiresAt) <= this.#deps.now().getTime()) return { kind: "refused", reason: "the round expired" };
+      if (Object.keys(runs).sort().join(",") !== [...round.members].sort().join(",")) return { kind: "refused", reason: "runs must bind exactly every expected member" };
+      if (round.runs !== null) return canonicalJson(round.runs) === canonicalJson(runs) ? { kind: "recorded", complete: round.completedAt !== null, round } : { kind: "refused", reason: "the round already binds different trigger runs" };
+      const claims = round.members.map((member) => `${this.#documents}/roundRunClaims/${sha256Hex(canonicalJson({ consumer: round.consumer, member, ...runs[member] }))}`);
+      const claimed = await tx.get(claims);
+      if (claimed.some((claim) => claim !== null && claim !== undefined && str(decodeFields(claim.fields), "round") !== id)) return { kind: "refused", reason: "a member run and attempt is already claimed by another round" };
+      const receipts: Record<string, RoundReceipt> = {};
+      for (const { member, receipt } of round.pending) {
+        const run = runs[member];
+        if (run?.runId === receipt.runId && run.runAttempt === receipt.runAttempt) receipts[member] = receipt;
+      }
+      const next: RoundManifest = { ...round, pending: [], receipts, runs, version: round.version + 1 };
+      for (const [index, claim] of claims.entries()) if (!claimed[index]) tx.put(claim, { round: id }, null);
+      tx.put(name, roundToJson(next), doc);
+      return { kind: "recorded", complete: false, round: next };
+    });
+  }
+
+  // Retain at most four early deliveries per expected member until the
+  // immutable run mapping arrives. Unrelated concurrent runs cannot count.
   async recordReceipt(id: string, member: string, receipt: RoundReceipt): Promise<ReceiptOutcome> {
     const roundName = this.#roundName(id);
     return await this.#transact(`rounds/${id}`, async (tx) => {
@@ -767,36 +830,90 @@ export class Ledger {
       if (!roundDoc) return { kind: "refused", reason: "the round does not exist" };
       const round = roundFromDocument(roundDoc);
       if (round.completedAt !== null) return { kind: "refused", reason: `the round completed at ${round.completedAt}` };
+      if (round.expiredAt !== null || Date.parse(round.expiresAt) <= this.#deps.now().getTime()) return { kind: "refused", reason: "the round expired" };
       if (!round.members.includes(member)) return { kind: "refused", reason: "the round expects no delivery from this member" };
       if (!round.platformShas.includes(receipt.platformSha)) return { kind: "refused", reason: `the delivery ran the platform at ${receipt.platformSha}, which the round does not bind` };
+      if (!receiptWithinRound(round, receipt) || Date.parse(receipt.deliveredAt) > this.#deps.now().getTime()) return { kind: "refused", reason: "the delivery or observation is outside the round's validity interval" };
       for (const [account, control] of Object.entries(receipt.controls)) {
         const target = round.targets[account];
         if (!target) return { kind: "refused", reason: `the delivery minted against ${account}, which the round does not bind` };
         if (target.uniqueId !== control.uniqueId) return { kind: "refused", reason: `the delivery minted against ${control.uniqueId}, not the bound identity ${target.uniqueId} of ${account}` };
         if (!target.members.includes(member)) return { kind: "refused", reason: `${member} is not a bound member of ${account}` };
       }
-      const next: RoundManifest = { ...round, receipts: { ...round.receipts, [member]: receipt }, version: round.version + 1 };
-      const complete = roundComplete(next);
-      const completed: RoundManifest = complete ? { ...next, completedAt: this.#deps.now().toISOString() } : next;
-      if (complete) {
-        const pointerName = this.#roundPointerName(round.consumer);
-        const [pointerDoc] = await tx.get([pointerName]);
-        const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
-        tx.put(pointerName, roundPointerToJson({ control: round.phase === "CONTROL" ? id : pointer.control, open: pointer.open.filter((open) => open !== id) }), pointerDoc ?? null);
+      let next: RoundManifest;
+      if (round.runs === null) {
+        const others = round.pending.filter((pending) => pending.member !== member);
+        const previous = round.pending.filter((pending) => pending.member === member && (pending.receipt.runId !== receipt.runId || pending.receipt.runAttempt !== receipt.runAttempt));
+        next = { ...round, pending: [...others, ...previous.slice(-3), { member, receipt }], version: round.version + 1 };
+      } else {
+        const run = round.runs[member];
+        if (run?.runId !== receipt.runId || run.runAttempt !== receipt.runAttempt) return { kind: "refused", reason: "the delivery is not from the bound trigger run and attempt" };
+        next = { ...round, receipts: { ...round.receipts, [member]: receipt }, version: round.version + 1 };
       }
-      tx.put(roundName, roundToJson(completed), roundDoc);
-      return { kind: "recorded", complete, round: completed };
+      tx.put(roundName, roundToJson(next), roundDoc);
+      return { kind: "recorded", complete: false, round: next };
+    });
+  }
+
+  // Receipt completion is committed only after the broker rereads the live
+  // binding and the named phase's probes are present in this shard snapshot.
+  async completeRound(id: string, version: number, binding: RoundBinding): Promise<ReceiptOutcome> {
+    return await this.#transact(`rounds/${id}`, async (tx) => {
+      const name = this.#roundName(id);
+      const [doc] = await tx.get([name]);
+      if (!doc) return { kind: "refused", reason: "the round does not exist" };
+      const round = roundFromDocument(doc);
+      if (round.completedAt !== null) return { kind: "recorded", complete: true, round };
+      if (round.version !== version) return { kind: "refused", reason: "the round changed during verification" };
+      if (round.expiredAt !== null || Date.parse(round.expiresAt) <= this.#deps.now().getTime()) return { kind: "refused", reason: "the round expired" };
+      if (!roundComplete(round)) return { kind: "refused", reason: "the round still owes successful phase receipts" };
+      if (canonicalJson(binding) !== canonicalJson({ denyState: round.denyState, members: round.members, platformShas: round.platformShas, targets: round.targets })) return { kind: "refused", reason: "the live round binding changed" };
+      if (round.shard !== null) {
+        const [shardDoc] = await tx.get([this.#shardName(round.shard)]);
+        if (!shardDoc) return { kind: "refused", reason: "the shard does not exist" };
+        const blockers = roundPhaseBlockers(round, shardFromDocument(shardDoc), this.#deps.now(), round.receipts, round.committed);
+        if (blockers.length > 0) return { kind: "refused", reason: blockers.join("; ") };
+      }
+      const pointerName = this.#roundPointerName(round.consumer);
+      const [pointerDoc] = await tx.get([pointerName]);
+      const pointer = pointerDoc ? roundPointerFromDocument(pointerDoc) : emptyRoundPointer;
+      const completed = { ...round, completedAt: this.#deps.now().toISOString(), pending: [], version: round.version + 1 };
+      tx.put(pointerName, roundPointerToJson({ control: round.phase === "CONTROL" ? id : pointer.control, open: pointer.open.filter((open) => open !== id) }), pointerDoc ?? null);
+      tx.put(name, roundToJson(completed), doc);
+      return { kind: "recorded", complete: true, round: completed };
     });
   }
 
   async readRound(id: string): Promise<RoundManifest | undefined> {
     const [doc] = await this.#batchGet([this.#roundName(id)], undefined);
-    return doc ? roundFromDocument(doc) : undefined;
+    if (!doc) return undefined;
+    const round = roundFromDocument(doc);
+    if (round.completedAt === null && round.expiredAt === null && Date.parse(round.expiresAt) <= this.#deps.now().getTime()) {
+      await this.readRoundPointer(round.consumer);
+      const [updated] = await this.#batchGet([this.#roundName(id)], undefined);
+      return updated ? roundFromDocument(updated) : undefined;
+    }
+    return round;
   }
 
   async readRoundPointer(consumer: string): Promise<RoundPointer> {
-    const [doc] = await this.#batchGet([this.#roundPointerName(consumer)], undefined);
-    return doc ? roundPointerFromDocument(doc) : emptyRoundPointer;
+    const name = this.#roundPointerName(consumer);
+    return await this.#transact(name, async (tx) => {
+      const [doc] = await tx.get([name]);
+      const pointer = doc ? roundPointerFromDocument(doc) : emptyRoundPointer;
+      const docs = await tx.get(pointer.open.map((id) => this.#roundName(id)));
+      const open: string[] = [];
+      const now = this.#deps.now();
+      for (const [index, roundDoc] of docs.entries()) {
+        if (!roundDoc) continue;
+        const round = roundFromDocument(roundDoc);
+        if (round.completedAt !== null || round.expiredAt !== null) continue;
+        if (Date.parse(round.expiresAt) <= now.getTime()) tx.put(this.#roundName(pointer.open[index]!), roundToJson({ ...round, expiredAt: now.toISOString(), pending: [], version: round.version + 1 }), roundDoc);
+        else open.push(pointer.open[index]!);
+      }
+      if (open.join(",") !== pointer.open.join(",")) tx.put(name, roundPointerToJson({ ...pointer, open }), doc ?? null);
+      return { ...pointer, open };
+    });
   }
 
   #roundName(id: string): string {
@@ -847,6 +964,48 @@ export class Ledger {
   // these transactions touches a common document, so Firestore orders them
   // and no interleaving admits an open ticket beside a quarantine that is
   // not CLOSED. An out-of-transaction query could not establish that.
+  // A protected apply never expires or replays acquisition. A fresh key is
+  // consumed permanently, and only its authenticated owner can release it.
+  // Both admissions read this lease and write the shared coordination record.
+  async readProtectedApply(): Promise<ProtectedApplyLease | null> {
+    const [doc] = await this.#batchGet([this.#protectedApplyName()], undefined);
+    return doc ? protectedApplyFromDocument(doc) : null;
+  }
+
+  async acquireProtectedApply(key: string, planSha256: string, openedBy: string): Promise<ProtectedApplyOutcome> {
+    return this.#transact(this.#protectedApplyName(), async (tx) => {
+      const name = this.#protectedApplyName();
+      const claimName = `${this.#documents}/protectedApplyKeys/${sha256Hex(key)}`;
+      const [doc, claim, ticketDoc, coordinationDoc] = await tx.get([name, claimName, this.#maintenanceName(), this.#coordinationName()]);
+      if (doc && protectedApplyFromDocument(doc) !== null) return { kind: "refused", reason: "PROTECTED_APPLY_ACTIVE" };
+      if (claim) return { kind: "refused", reason: "PROTECTED_APPLY_KEY_USED" };
+      const ticket = ticketDoc ? maintenanceFromDocument(ticketDoc) : null;
+      if (ticket?.open && Date.parse(ticket.expiresAt) > this.#deps.now().getTime()) return { kind: "refused", reason: "MAINTENANCE_OPEN" };
+      const coordination = coordinationDoc ? coordinationFromDocument(coordinationDoc) : emptyCoordination;
+      if (coordination.active.length > 0) return { kind: "refused", reason: "RECOVERY_ACTIVE" };
+      const lease: ProtectedApplyLease = { key, planSha256, openedAt: this.#deps.now().toISOString(), openedBy };
+      tx.put(name, { lease: { ...lease } }, doc);
+      tx.put(claimName, { ...lease }, null);
+      tx.put(this.#coordinationName(), coordinationToJson(withActive(coordination, [])), coordinationDoc);
+      return { kind: "acquired", lease };
+    });
+  }
+
+  async releaseProtectedApply(key: string, planSha256: string, openedBy: string): Promise<ProtectedApplyOutcome> {
+    return this.#transact(this.#protectedApplyName(), async (tx) => {
+      const name = this.#protectedApplyName();
+      const [doc] = await tx.get([name]);
+      const lease = doc ? protectedApplyFromDocument(doc) : null;
+      if (!lease || lease.key !== key || lease.planSha256 !== planSha256 || lease.openedBy !== openedBy) return { kind: "refused", reason: "PROTECTED_APPLY_MISMATCH" };
+      tx.put(name, { lease: null }, doc);
+      return { kind: "released", lease: null };
+    });
+  }
+
+  #protectedApplyName(): string {
+    return `${this.#documents}/maintenance/protected-apply`;
+  }
+
   async readMaintenance(): Promise<MaintenanceTicket | null> {
     const [doc] = await this.#batchGet([this.#maintenanceName()], undefined);
     if (!doc) return null;
@@ -857,7 +1016,8 @@ export class Ledger {
   async openMaintenance(key: string, openedBy: string): Promise<MaintenanceOutcome> {
     return await this.#transact(this.#maintenanceName(), async (tx) => {
       const name = this.#maintenanceName();
-      const [doc, coordinationDoc] = await tx.get([name, this.#coordinationName()]);
+      const [doc, coordinationDoc, leaseDoc] = await tx.get([name, this.#coordinationName(), this.#protectedApplyName()]);
+      if (leaseDoc && protectedApplyFromDocument(leaseDoc) !== null) return { kind: "refused", reason: "PROTECTED_APPLY_ACTIVE", detail: "an exclusive protected Terraform apply is active" };
       const now = this.#deps.now();
       const current = doc ? maintenanceFromDocument(doc) : undefined;
       if (current && current.open && Date.parse(current.expiresAt) > now.getTime()) {
@@ -868,15 +1028,15 @@ export class Ledger {
         return { kind: "refused", reason: "MAINTENANCE_OPEN", detail: `a maintenance ticket opened at ${current.openedAt} by ${current.openedBy} is open until ${current.expiresAt}` };
       }
       const active = coordinationDoc ? coordinationFromDocument(coordinationDoc).active : emptyCoordination.active;
-      if (active.length > 0) return { kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `QUARANTINE shards not CLOSED: ${active.join(", ")}` };
+      if (active.length > 0) return { kind: "refused", reason: "QUARANTINE_ACTIVE", detail: `Recovery shards not CLOSED: ${active.join(", ")}` };
       const ticket: MaintenanceTicket = { expiresAt: new Date(now.getTime() + maintenanceTicketSeconds * 1000).toISOString(), key, openedAt: now.toISOString(), openedBy };
       tx.put(name, { ...ticket, open: true }, doc);
       return { kind: "opened", ticket };
     });
   }
 
-  // The coordination document as committed: every QUARANTINE shard accepted
-  // and not yet CLOSED, and the version every such transition advanced.
+  // Every recovery shard not yet CLOSED, including RESTORE effects, and the
+  // version advanced by its admission and projected terminal close.
   async readCoordination(): Promise<Coordination> {
     const [doc] = await this.#batchGet([this.#coordinationName()], undefined);
     return doc ? coordinationFromDocument(doc) : emptyCoordination;
@@ -1045,6 +1205,7 @@ export class Ledger {
   // transaction's to rerun; a read outside one has no transaction to rerun
   // and fails as the generic ledger error it is.
   async #batchGet(names: readonly string[], transaction: string | undefined): Promise<ReadonlyArray<StoredDocument | null>> {
+    if (names.length === 0) return [];
     const response = await this.#request("batchGet", transaction === undefined ? { documents: names } : { documents: names, transaction });
     if (!response.ok) {
       if (transaction !== undefined && contended(response.status)) throw new TransactionContended(`batchGet answered ${response.status}`);
@@ -1481,6 +1642,7 @@ const emptyRoundPointer: RoundPointer = { control: null, open: [] };
 function roundToJson(round: RoundManifest): Record<string, Json> {
   return {
     completedAt: round.completedAt,
+    committed: Object.fromEntries(Object.entries(round.committed).map(([member, proofs]) => [member, { ...proofs }])),
     consumer: round.consumer,
     denyState: { form: round.denyState.form, policies: round.denyState.policies.map((policy) => ({ attachment: policy.attachment, etag: policy.etag, name: policy.name })) },
     key: round.key,
@@ -1490,20 +1652,11 @@ function roundToJson(round: RoundManifest): Record<string, Json> {
     openedBy: round.openedBy,
     phase: round.phase,
     platformShas: [...round.platformShas],
-    receipts: Object.fromEntries(Object.keys(round.receipts).sort().map((member) => {
-      const receipt = round.receipts[member]!;
-      return [member, {
-        controls: Object.fromEntries(Object.keys(receipt.controls).sort().map((account) => {
-          const control = receipt.controls[account]!;
-          return [account, { observedAt: control.observedAt, outcome: control.outcome, uniqueId: control.uniqueId }];
-        })),
-        deliveredAt: receipt.deliveredAt,
-        platformSha: receipt.platformSha,
-        principal: receipt.principal,
-        runAttempt: receipt.runAttempt,
-        runId: receipt.runId,
-      }];
-    })),
+    expiredAt: round.expiredAt,
+    expiresAt: round.expiresAt,
+    runs: round.runs === null ? null : Object.fromEntries(Object.entries(round.runs).map(([member, run]) => [member, { runId: run.runId, runAttempt: run.runAttempt }])),
+    pending: round.pending.map(({ member, receipt }) => ({ member, receipt: roundReceiptToJson(receipt) })),
+    receipts: Object.fromEntries(Object.entries(round.receipts).map(([member, receipt]) => [member, roundReceiptToJson(receipt)])),
     shard: round.shard,
     targets: Object.fromEntries(Object.keys(round.targets).sort().map((account) => {
       const target = round.targets[account]!;
@@ -1524,6 +1677,7 @@ function roundFromDocument(doc: StoredDocument): RoundManifest {
   const targets = obj(json, "targets");
   return {
     completedAt: nullableStr(json, "completedAt"),
+    committed: Object.fromEntries(Object.keys(obj(json, "committed")).map((member) => { const proofs = obj(obj(json, "committed"), member); return [member, Object.fromEntries(Object.keys(proofs).map((account) => [account, str(proofs, account)]))]; })),
     consumer: str(json, "consumer"),
     denyState: {
       form: str(denyState, "form"),
@@ -1540,29 +1694,40 @@ function roundFromDocument(doc: StoredDocument): RoundManifest {
     openedBy: str(json, "openedBy"),
     phase: phase as RoundManifest["phase"],
     platformShas: strings(json, "platformShas"),
-    receipts: Object.fromEntries(Object.keys(receipts).sort().map((member) => {
-      const receipt = obj(receipts, member);
-      const controls = obj(receipt, "controls");
-      return [member, {
-        controls: Object.fromEntries(Object.keys(controls).sort().map((account) => {
-          const control = obj(controls, account);
-          const outcome = str(control, "outcome");
-          if (!(probeOutcomes as readonly string[]).includes(outcome)) throw new LedgerError("Stored receipt carries an unknown outcome.");
-          return [account, { observedAt: str(control, "observedAt"), outcome: outcome as MemberControl["outcome"], uniqueId: str(control, "uniqueId") }];
-        })),
-        deliveredAt: str(receipt, "deliveredAt"),
-        platformSha: str(receipt, "platformSha"),
-        principal: str(receipt, "principal"),
-        runAttempt: str(receipt, "runAttempt"),
-        runId: str(receipt, "runId"),
-      }];
-    })),
+    expiredAt: nullableStr(json, "expiredAt"),
+    expiresAt: str(json, "expiresAt"),
+    runs: json.runs === null ? null : Object.fromEntries(Object.entries(obj(json, "runs")).map(([member]) => { const run = obj(obj(json, "runs"), member); return [member, { runId: str(run, "runId"), runAttempt: str(run, "runAttempt") }]; })),
+    pending: arrayObjects(json, "pending").map((pending) => ({ member: str(pending, "member"), receipt: roundReceiptFromJson(obj(pending, "receipt")) })),
+    receipts: Object.fromEntries(Object.keys(receipts).map((member) => [member, roundReceiptFromJson(obj(receipts, member))])),
     shard: nullableStr(json, "shard"),
     targets: Object.fromEntries(Object.keys(targets).sort().map((account) => {
       const target = obj(targets, account);
       return [account, { inventoryHash: str(target, "inventoryHash"), members: strings(target, "members"), policyEtag: str(target, "policyEtag"), uniqueId: str(target, "uniqueId") }];
     })),
     version: int(json, "version"),
+  };
+}
+
+function arrayObjects(json: Record<string, Json>, key: string): Record<string, Json>[] {
+  const values = json[key];
+  if (!Array.isArray(values) || !values.every(isRecord)) throw new LedgerError(`${key} must be a list of objects`);
+  return values as Record<string, Json>[];
+}
+
+function roundReceiptToJson(receipt: RoundReceipt): Record<string, Json> {
+  return { controls: Object.fromEntries(Object.entries(receipt.controls).map(([account, control]) => [account, { observedAt: control.observedAt, outcome: control.outcome, uniqueId: control.uniqueId }])), deliveredAt: receipt.deliveredAt, platformSha: receipt.platformSha, principal: receipt.principal, runAttempt: receipt.runAttempt, runId: receipt.runId };
+}
+
+function roundReceiptFromJson(receipt: Record<string, Json>): RoundReceipt {
+  const controls = obj(receipt, "controls");
+  return {
+    controls: Object.fromEntries(Object.keys(controls).map((account) => {
+      const control = obj(controls, account);
+      const outcome = str(control, "outcome");
+      if (outcome !== "ALLOWED" && outcome !== "DENIED") throw new LedgerError("Stored receipt carries an unknown outcome.");
+      return [account, { observedAt: str(control, "observedAt"), outcome, uniqueId: str(control, "uniqueId") }];
+    })),
+    deliveredAt: str(receipt, "deliveredAt"), platformSha: str(receipt, "platformSha"), principal: str(receipt, "principal"), runAttempt: str(receipt, "runAttempt"), runId: str(receipt, "runId"),
   };
 }
 
@@ -1603,14 +1768,22 @@ function memberControlFromDocument(doc: StoredDocument): MemberControlRecord {
 }
 
 function coordinationToJson(coordination: Coordination): Record<string, Json> {
-  return { active: [...coordination.active], version: coordination.version };
+  return { active: [...coordination.active], tracksRestores: true, version: coordination.version };
 }
 
 function coordinationFromDocument(doc: StoredDocument): Coordination {
   const json = decodeFields(doc.fields);
+  if (json.tracksRestores !== true) throw new LedgerError("Legacy recovery coordination does not prove restoration exclusion; reconcile its complete shard set before activation.");
   const active = strings(json, "active");
   if (new Set(active).size !== active.length || [...active].sort().join(",") !== active.join(",")) throw new LedgerError("Coordination document is malformed.");
   return { active, version: int(json, "version") };
+}
+
+function protectedApplyFromDocument(doc: StoredDocument): ProtectedApplyLease | null {
+  const json = decodeFields(doc.fields);
+  if (json.lease === null) return null;
+  const lease = obj(json, "lease");
+  return { key: str(lease, "key"), planSha256: str(lease, "planSha256"), openedAt: str(lease, "openedAt"), openedBy: str(lease, "openedBy") };
 }
 
 function maintenanceFromDocument(doc: StoredDocument): MaintenanceTicket & { readonly open: boolean } {
