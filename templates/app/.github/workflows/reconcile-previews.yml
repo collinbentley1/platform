@@ -1,4 +1,5 @@
 name: Reconcile previews
+run-name: ${{ inputs.delivery_nonce && format('recovery-dispatch-{0}', inputs.delivery_nonce) || github.workflow }}
 
 on:
   push:
@@ -9,6 +10,11 @@ on:
     # this is the durable backstop for interrupted or externally drifted runs.
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      delivery_nonce:
+        description: Correlation nonce for a protected recovery delivery round.
+        required: false
+        type: string
 
 permissions: {}
 
