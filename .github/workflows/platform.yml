@@ -476,7 +476,7 @@ jobs:
 
   terraform-enabled:
     # The predecessor took about 25 minutes locally and up to 95 seconds per
-    # case on Linux. The 54 cases can consume 86 minutes; reserve 120 including setup.
+    # case on Linux. The 61 cases can consume 97 minutes; reserve 120 including setup.
     name: Terraform enabled recovery
     runs-on: ubuntu-24.04
     timeout-minutes: 120

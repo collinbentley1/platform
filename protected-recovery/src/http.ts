@@ -914,13 +914,36 @@ async function parseRequest(request: Request): Promise<ParsedRequest> {
 }
 
 async function readJsonBody(request: Request, limit = maxBodyBytes): Promise<unknown> {
-  const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > limit) throw new BodyTooLarge();
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength > limit) throw new BodyTooLarge();
-  if (bytes.byteLength === 0) return {};
+  const declared = request.headers.get("content-length");
+  if (declared !== null && !/^[0-9]+$/.test(declared)) {
+    void request.body?.cancel().catch(() => undefined);
+    throw new RequestError("content-length must be a nonnegative integer");
+  }
+  if (Number(declared) > limit) {
+    void request.body?.cancel().catch(() => undefined);
+    throw new BodyTooLarge();
+  }
+  if (!request.body) return {};
+  const reader = request.body.getReader();
+  const bytes = new Uint8Array(limit);
+  let length = 0;
   try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      if (chunk.value.byteLength > limit - length) {
+        void reader.cancel().catch(() => undefined);
+        throw new BodyTooLarge();
+      }
+      bytes.set(chunk.value, length);
+      length += chunk.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (length === 0) return {};
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes.subarray(0, length))) as unknown;
   } catch {
     throw new RequestError("body must be JSON");
   }

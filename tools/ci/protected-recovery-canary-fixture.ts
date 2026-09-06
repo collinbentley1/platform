@@ -162,7 +162,7 @@ function exercise(scope: Scope, project: string, permission: string): Exercise {
   });
   const requests: Readonly<Record<string, () => Exercise>> = {
     "artifactregistry.googleapis.com/repositories.uploadArtifacts": () => one("POST", `${endpoints.registry}/upload/v1/${repository}/genericArtifacts:create?uploadType=multipart`, multipart(), version, "absent", { contentType: "multipart/related; boundary=protected-recovery-deny-canary", lro: true }),
-    "cloudbuild.googleapis.com/builds.create": () => one("POST", `${endpoints.cloudbuild}/projects/${project}/locations/global/builds`, { options: { logging: "CLOUD_LOGGING_ONLY" }, steps: [{ args: ["version"], name: "gcr.io/cloud-builders/gcloud" }], tags: ["protected-recovery-deny-canary"] }, "-", "none"),
+    "cloudbuild.googleapis.com/builds.create": () => one("POST", `${endpoints.cloudbuild}/projects/${project}/locations/global/builds`, { options: { logging: "CLOUD_LOGGING_ONLY" }, steps: [{ args: ["version"], name: "gcr.io/cloud-builders/gcloud" }], tags: [`protected-recovery-deny-canary-${controlRunId}`] }, `projects/${project}/locations/global/builds`, "none"),
     "cloudresourcemanager.googleapis.com/projects.move": () => one("POST", `${endpoints.crm}/projects/${canaryProject}:move`, { destinationParent: `folders/${folderId}` }, `projects/${canaryProject}`, "present", { detail: organization, lro: true, requires: [permission, "cloudresourcemanager.googleapis.com/projects.update"] }),
     "cloudresourcemanager.googleapis.com/projects.setIamPolicy": () => one("POST", `${endpoints.crm}/projects/${project}:setIamPolicy`, { policy: { bindings: [], etag: `etag-${phase}`, version: 3 }, updateMask: "bindings,etag" }, `projects/${project}`, "present", { detail: organization }),
     "cloudresourcemanager.googleapis.com/projects.update": () => one("PATCH", `${endpoints.crm}/projects/${canaryProject}?updateMask=labels`, { labels: { "protected-recovery": "deny-canary" } }, `projects/${canaryProject}`, "present", { detail: organization, lro: true }),
@@ -229,10 +229,14 @@ function rawPermission(permission: string): string {
   return `${prefix}.${rest}`;
 }
 
-function response(scope: Scope, permission: string): Record<string, string> {
+function response(scope: Scope, project: string, permission: string): Record<string, unknown> {
   const api = unserviceable[permission];
   if (scope === "consumer" && api !== undefined) {
-    return { message: `${api} has not been used in project before or it is disabled.`, permission: "", rawPermission: "", reason: "SERVICE_DISABLED", service: api, status: "403" };
+    const filter = encodeURIComponent(`(status="QUEUED" OR status="WORKING") AND tags="protected-recovery-deny-canary-${controlRunId}"`).replaceAll("(", "%28").replaceAll(")", "%29");
+    const url = api === "compute.googleapis.com" ? `${endpoints.compute}/projects/${project}/zones/${zone}` : `${endpoints.cloudbuild}/projects/${project}/locations/global/builds?filter=${filter}`;
+    return { message: `${api} has not been used in project before or it is disabled.`, permission: "", rawPermission: "", reason: "SERVICE_DISABLED", service: api, status: "403",
+      ...(phase === "deny" ? { skippedMutation: true, observedRequest: { method: "GET", url } } : {}),
+    };
   }
   if (phase === "control") return { message: "", permission: "", rawPermission: "", reason: "", service: "", status: "200" };
   const raw = rawPermission(permission);
@@ -306,7 +310,7 @@ const policies = [...rulesByException(matrix)].map(([attachment, rules]) => {
           digest: canaryDigest(request.method, request.url, request.contentType, bodySha256, request.resource, request.expected, request.detail, observed(scope.scope, permission, request)),
           comparison: pairedCreatePermissions.has(permission) ? canaryCreateComparison({ permission, url: request.url, body: request.body, resource: request.resource, current: permission === "iam.googleapis.com/roles.create" ? createRoleNew : createNew, canonical: permission === "iam.googleapis.com/roles.create" ? roleNew : throwawayNew, expected: request.expected, detail: request.detail, observed: observed(scope.scope, permission, request) }) : null,
           resourcePair: pairedCreatePermissions.has(permission) ? { kind: permission, actualId: permission === "iam.googleapis.com/roles.create" ? createRoleNew : createNew, canonicalId: permission === "iam.googleapis.com/roles.create" ? roleNew : throwawayNew } : null,
-          response: response(scope.scope, permission),
+          response: response(scope.scope, scope.project, permission),
         };
       }),
       denialCondition: null,
@@ -363,6 +367,10 @@ console.log(JSON.stringify({
   organization,
   run,
   throwaways,
+  resourceCreation: authority.consumers.flatMap((consumer) => [
+    ...[`projects/${consumer.projectId}/zones/${zone}/instances/${throwaway}`, `projects/${consumer.projectId}/zones/${zone}/instances/${throwawayNew}`, `projects/${consumer.projectId}/global/instanceTemplates/${throwawayNew}`].map((resource) => ({ resource, service: "compute.googleapis.com", state: "NEVER_CREATED", reason: "SERVICE_DISABLED", tag: "" })),
+    { resource: `projects/${consumer.projectId}/locations/global/builds`, service: "cloudbuild.googleapis.com", state: "NEVER_CREATED", reason: "SERVICE_DISABLED", tag: `protected-recovery-deny-canary-${controlRunId}` },
+  ]),
   witnessServiceAccount: witness,
   allowPolicies,
   allowInterval,

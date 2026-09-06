@@ -213,9 +213,9 @@ run "verified_evidence_and_verified_identities_grant_exactly_the_thirty_six_actu
   # Every required row is proven by the pair -- a DENIED observation naming
   # the row's permission beside an ALLOWED observation of the request of the
   # same digest in the same pre-state -- except the sixteen consumer Compute
-  # and Cloud Build rows, which rest on the identical request answering
-  # SERVICE_DISABLED in both phases beside the live read proving each API
-  # disabled.
+  # and Cloud Build rows, whose actual control mutation answered
+  # SERVICE_DISABLED and whose deny mutation was explicitly skipped after
+  # an exact disabled-API read, beside the live read proving each API disabled.
   assert {
     condition     = length([for key, satisfied in local.deny_pair_satisfied : key if satisfied]) == 35 + 10 + 4 * 25 && local.unserviceable_rows == sort(flatten([for attachment in values(local.consumer_attachments) : [for permission in keys(local.unserviceable_permissions) : "${attachment}|${permission}"]])) && length(local.unserviceable_rows) == 16 && length(data.external.service_state) == 8 && length(local.service_reads) == 8
     error_message = "Exactly the consumer Compute and Cloud Build rows may rest on a disabled API, each beside its live read; every other row must be proven by the paired denial."
@@ -854,6 +854,118 @@ run "an_unserviceable_row_whose_api_cannot_be_read_is_refused" {
   assert {
     condition     = contains(local.evidence_failures, "services_read") && contains(local.unsatisfied_deny_rows, "cloudresourcemanager.googleapis.com/projects/cdbentley|cloudbuild.googleapis.com/builds.create")
     error_message = "A service state that cannot be read must fail services_read and leave the row unsatisfied."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_row_without_explicit_skipped_mutation_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:disabled-missing-skip@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_row_with_another_read_endpoint_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:disabled-other-read@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_row_naming_another_response_service_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:disabled-other-service@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_control_that_did_not_execute_its_mutation_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:disabled-control-skipped@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_resource_that_control_created_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:disabled-resource-created@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_manifest_for_another_resource_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["control"]
+    @@VERIFICATION:control:disabled-other-resource@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
+  }
+
+  expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]
+}
+
+run "a_disabled_api_build_manifest_for_another_tag_is_refused" {
+  command = apply
+
+  override_data {
+    target = data.external.canary_verification["deny"]
+    @@VERIFICATION:deny:disabled-other-build-tag@@
+  }
+
+  assert {
+    condition     = contains(local.evidence_failures, "coverage_complete") && length(local.unsatisfied_deny_rows) > 0
+    error_message = "Disabled-API fallback requires the actual control response, exact signed never-created identity, and explicit deny read proof."
   }
 
   expect_failures = [google_project_iam_custom_role.actuator, google_project_iam_custom_role.inventory, google_organization_iam_custom_role.inventory, google_organization_iam_member.broker_deny_reviewer]

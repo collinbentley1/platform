@@ -20,7 +20,8 @@
 # even when the canary cannot. Unknown state is never a positive precondition.
 #
 # Cleanup uses the persisted numeric folder identity and requires a readable
-# terminal result. A disabled API or unread resource is unresolved. The live
+# terminal result. Only exact control-proven never-created resources may be
+# skipped while an authoritative read still proves their API disabled. The live
 # retirement reader subsequently checks inherited grants and rereads the
 # exact folder/project IDs. Neither predicate includes a bearer credential.
 #
@@ -47,6 +48,10 @@ if [ "$PHASE" = control ] && [ "$CONTROL_RUN_ID" != "$GITHUB_RUN_ID" ]; then
 fi
 if [ "$PHASE" != control ] && [ "$CONTROL_RUN_ID" = "$GITHUB_RUN_ID" ]; then
   echo "The ${PHASE} phase must name the control run, not itself." >&2
+  exit 2
+fi
+if [ "$PHASE" = control ] && [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+  echo "Control retries cannot prove a resource was never created by an earlier attempt; dispatch cleanup and use a fresh control run." >&2
   exit 2
 fi
 [[ "$ORGANIZATION_ID" =~ ^[1-9][0-9]*$ ]]
@@ -131,6 +136,8 @@ folder_id=""
 declare -A manifest_gone=()
 manifest_ids="$workdir/manifest-ids.jsonl"
 : > "$manifest_ids"
+resource_creation="$workdir/resource-creation.json"
+printf '[]\n' > "$resource_creation"
 
 fail() {
   echo "$1" >> "$failures"
@@ -195,6 +202,75 @@ classify() {
 
 service_disabled() {
   [ "$last_status" = 403 ] && jq -e '[.error.details[]? | select(.reason == "SERVICE_DISABLED")] | length > 0' "$workdir/body" > /dev/null 2>&1
+}
+
+# Only completed producer predicates can prove that no create ever succeeded
+# or had an ambiguous result. Later phases may use the verified control proof
+# because the deny observer structurally suppresses those mutations.
+creation_record() {
+  local resource="$1" service="$2" state="$3" reason="${4:-}" tag="${5:-}"
+  jq --arg resource "$resource" --arg service "$service" --arg state "$state" --arg reason "$reason" --arg tag "$tag" '
+    ([.[] | select(.resource == $resource)] | .[0]) as $prior
+    | if $prior.state == "CREATED" or $prior.state == "UNKNOWN" then .
+      else [.[] | select(.resource != $resource)] + [{resource: $resource, service: $service, state: $state, reason: $reason, tag: $tag}] end
+  ' "$resource_creation" > "$workdir/creation-next.json"
+  mv "$workdir/creation-next.json" "$resource_creation"
+}
+
+creation_answer() {
+  local resource="$1" service="$2" tag="${3:-}"
+  if [ "$last_outcome" = UNSERVICEABLE ] && service_disabled_exact "$service"; then
+    creation_record "$resource" "$service" NEVER_CREATED SERVICE_DISABLED "$tag"
+  elif [ "$last_outcome" = ALLOWED ]; then
+    creation_record "$resource" "$service" CREATED "" "$tag"
+  else
+    creation_record "$resource" "$service" UNKNOWN "" "$tag"
+  fi
+}
+
+service_disabled_exact() {
+  [ "$last_status" = 403 ] && jq -e --arg service "$1" '[.error.details[]? | select(.reason == "SERVICE_DISABLED" and .metadata.service == $service and ((."@type" // "") | endswith("ErrorInfo")))] | length == 1' "$workdir/body" > /dev/null 2>&1
+}
+
+never_created() {
+  local resource="$1" service="$2" tag="${3:-}" predicate="${CONTROL_PREDICATE:-}" expected_phase=control expected_run="$CONTROL_RUN_ID" expected_attempt=1
+  if [ "$PHASE" = control ]; then
+    [ "$GITHUB_RUN_ATTEMPT" = 1 ] || return 1
+    predicate="${CURRENT_PREDICATE:-}"
+    expected_run="$GITHUB_RUN_ID"
+    expected_attempt="$GITHUB_RUN_ATTEMPT"
+  fi
+  [ -n "$predicate" ] && [ -f "$predicate" ] || return 1
+  jq -e --arg phase "$expected_phase" --arg run "$expected_run" --argjson attempt "$expected_attempt" --arg control "$CONTROL_RUN_ID" --arg sha "$GITHUB_SHA" --arg image "$BROKER_IMAGE" --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" --arg resource "$resource" --arg service "$service" --arg tag "$tag" '
+    .schema == "protected-recovery/deny-canary/v3" and .phase == $phase and .controlRunId == $control and (.run.id | tostring) == $run and .run.attempt == $attempt and .run.headSha == $sha and .brokerImage == $image and .witnessServiceAccount == $witness
+    and ([.resourceCreation[]? | select(.resource == $resource)] | length == 1 and .[0] == {resource: $resource, service: $service, state: "NEVER_CREATED", reason: "SERVICE_DISABLED", tag: $tag})
+  ' "$predicate" > /dev/null
+}
+
+build_filter() {
+  jq -rn --arg tag "protected-recovery-deny-canary-${CONTROL_RUN_ID}" '"(status=\"QUEUED\" OR status=\"WORKING\") AND tags=\"" + $tag + "\"" | @uri'
+}
+
+capability_url() {
+  local resource="$1" service="$2" project
+  project="$(cut -d/ -f2 <<< "$resource")"
+  case "$service" in
+    compute.googleapis.com) printf '%s/projects/%s/zones/%s' "$compute" "$project" "$zone" ;;
+    cloudbuild.googleapis.com) printf '%s/projects/%s/locations/global/builds?filter=%s' "$cloudbuild" "$project" "$(build_filter)" ;;
+    *) return 1 ;;
+  esac
+}
+
+skip_never_created() {
+  local resource="$1" service="$2" tag="${3:-}"
+  never_created "$resource" "$service" "$tag" || return 1
+  witness_call GET "$(capability_url "$resource" "$service")"
+  if ! service_disabled_exact "$service"; then
+    fail "${resource}: never-created proof requires the authoritative API to remain disabled; HTTP ${last_status}"
+    return 0
+  fi
+  echo "never created: ${resource}" >> "$removed"
+  return 0
 }
 
 # Wait for the long-running operation the last answer named. IAM, Cloud Run,
@@ -333,8 +409,20 @@ observe() {
     comparison="$(canary_create_comparison "$permission" "$url" "$body" "$pre_name" "$current_id" "$canonical_id" "$expected" "$pre_detail" "$pre_observed")" || { fail "the create request does not match its exact paired identifier"; return 0; }
     pair="$(jq -cn --arg kind "$permission" --arg actual "$current_id" --arg canonical "$canonical_id" '{kind: $kind, actualId: $actual, canonicalId: $canonical}')"
   fi
-  call "$method" "$url" "$body" "$content_type"
-  classified="$(classify)"
+  local observed_url="" service="${permission%%/*}" tag=""
+  [ "$service" != cloudbuild.googleapis.com ] || tag="protected-recovery-deny-canary-${CONTROL_RUN_ID}"
+  if [ "$PHASE" = deny ] && never_created "$pre_name" "$service" "$tag"; then
+    observed_url="$(capability_url "$pre_name" "$service")"
+    witness_call GET "$observed_url"
+    classified="$(classify)"
+    if ! service_disabled_exact "$service"; then
+      classified="$(jq -c '.outcome = "ERROR" | .message = "the unexecuted mutation requires its control-proven API to remain disabled"' <<< "$classified")"
+    fi
+    classified="$(jq -c --arg url "$observed_url" '. + {skippedMutation: true, observedRequest: {method: "GET", url: $url}}' <<< "$classified")"
+  else
+    call "$method" "$url" "$body" "$content_type"
+    classified="$(classify)"
+  fi
   last_outcome="$(jq -r '.outcome' <<< "$classified")"
   operation_json=null
   if [ "$last_outcome" = ALLOWED ] && [ -n "$lro" ] && ! wait_operation "$lro"; then
@@ -508,6 +596,7 @@ manifest_read() {
   fi
   manifest_gone[$project]="$(jq -er --arg project "$project" '.throwaways.goneUniqueIds[$project] | select(type == "string" and test("^[1-9][0-9]*$"))' "$CONTROL_PREDICATE")" || { fail "the control manifest has no permanent deleted-account identity for ${project}"; return 1; }
   folder_id="$(jq -r '.throwaways.folder' "$CONTROL_PREDICATE")"
+  jq '.resourceCreation // []' "$CONTROL_PREDICATE" > "$resource_creation"
   jq -cn --arg project "$project" --arg id "${manifest_gone[$project]}" '{key: $project, value: $id}' >> "$manifest_ids"
 
 }
@@ -596,7 +685,8 @@ identity_rows() {
 
   observe "$attachment" iam.googleapis.com/serviceAccounts.disable POST "${iam}/${sa}:disable" "$(json_body '{}')" "" iam "$sa" present iam.googleapis.com/serviceAccounts.disable
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/${sa}:enable" "$(json_body '{}')" || true; fi
-  local sa_enable="projects/-/serviceAccounts/$(service_account_email "$enable_account" "$project")"
+  local sa_enable
+  sa_enable="projects/-/serviceAccounts/$(service_account_email "$enable_account" "$project")"
   observe "$attachment" iam.googleapis.com/serviceAccounts.enable POST "${iam}/${sa_enable}:enable" "$(json_body '{}')" "" iam "$sa_enable" present iam.googleapis.com/serviceAccounts.enable
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision POST "${iam}/${sa_enable}:disable" "$(json_body '{}')" || true; fi
 
@@ -767,8 +857,9 @@ evidence_rows() {
 # The attachment-freeze rows of a consumer: Compute instances and templates,
 # Cloud Build builds, and API enablement. The Compute and Cloud Build
 # requests attach no service account, so each needs its own permission alone.
-# Compute and Cloud Build are not enabled in the consumer projects; the
-# identical request then answers SERVICE_DISABLED in both phases. Where an
+# When control proves an exact resource was never created because its API
+# is disabled, deny records a read-only capability preflight and never issues
+# that mutation. An enabled or unreadable API fails the preflight. Where an
 # API is enabled the exercise is real: an instance created and removed, a
 # stopped retained instance whose account is detached, a template created
 # and removed, a build created and cancelled at once. The API rows disable
@@ -776,27 +867,42 @@ evidence_rows() {
 # state, and the control phase disables it again.
 freeze_rows() {
   local attachment="$1" project="$2"
-  local instance instance_new template_new service
+  local instance instance_new template_new service builds build_tag
   instance="projects/${project}/zones/${zone}/instances/${throwaway}"
   instance_new="projects/${project}/zones/${zone}/instances/${throwaway_new}"
   template_new="projects/${project}/global/instanceTemplates/${throwaway_new}"
   service="projects/${project}/services/websecurityscanner.googleapis.com"
+  builds="projects/${project}/locations/global/builds"
+  build_tag="protected-recovery-deny-canary-${CONTROL_RUN_ID}"
   local instance_body template_body
   instance_body="$(jq -cn --arg name "$throwaway_new" --arg zone "$zone" '{name: $name, machineType: ("zones/" + $zone + "/machineTypes/e2-micro"), disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}')"
   template_body="$(jq -cn --arg name "$throwaway_new" '{name: $name, properties: {machineType: "e2-micro", disks: [{boot: true, autoDelete: true, initializeParams: {sourceImage: "projects/debian-cloud/global/images/family/debian-12"}}], networkInterfaces: [{network: "global/networks/default"}]}}')"
   if preparing; then
     call GET "${compute}/projects/${project}/zones/${zone}"
     if [[ "$last_status" =~ ^2 ]]; then
-      provision POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$(jq -c --arg name "$throwaway" '.name = $name' <<< "$instance_body")")" "" compute && provision POST "${compute}/${instance}/stop" "" "" compute || true
+      if provision POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$(jq -c --arg name "$throwaway" '.name = $name' <<< "$instance_body")")" "" compute; then
+        creation_record "$instance" compute.googleapis.com CREATED
+        provision POST "${compute}/${instance}/stop" "" "" compute || true
+      else
+        creation_record "$instance" compute.googleapis.com UNKNOWN
+      fi
+    elif service_disabled_exact compute.googleapis.com; then
+      creation_record "$instance" compute.googleapis.com NEVER_CREATED SERVICE_DISABLED
+    else
+      creation_record "$instance" compute.googleapis.com UNKNOWN
+      fail "${instance}: preparation capability is unreadable"
     fi
   fi
   if preparing; then return 0; fi
   observe "$attachment" compute.googleapis.com/instances.create POST "${compute}/projects/${project}/zones/${zone}/instances" "$(json_body "$instance_body")" "" compute "$instance_new" absent compute.googleapis.com/instances.create compute
+  if provisioning; then creation_answer "$instance_new" compute.googleapis.com; fi
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${compute}/${instance_new}" "" "" compute || true; fi
   observe "$attachment" compute.googleapis.com/instances.setServiceAccount POST "${compute}/${instance}/setServiceAccount" "$(json_body '{}')" "" compute "$instance" present compute.googleapis.com/instances.setServiceAccount compute
   observe "$attachment" compute.googleapis.com/instanceTemplates.create POST "${compute}/projects/${project}/global/instanceTemplates" "$(json_body "$template_body")" "" compute "$template_new" absent compute.googleapis.com/instanceTemplates.create compute
+  if provisioning; then creation_answer "$template_new" compute.googleapis.com; fi
   if provisioning && [ "$last_outcome" = ALLOWED ]; then provision DELETE "${compute}/${template_new}" "" "" compute || true; fi
-  observe "$attachment" cloudbuild.googleapis.com/builds.create POST "${cloudbuild}/projects/${project}/locations/global/builds" "$(json_body '{"steps":[{"name":"gcr.io/cloud-builders/gcloud","args":["version"]}],"tags":["protected-recovery-deny-canary"],"options":{"logging":"CLOUD_LOGGING_ONLY"}}')" "" none - none cloudbuild.googleapis.com/builds.create
+  observe "$attachment" cloudbuild.googleapis.com/builds.create POST "${cloudbuild}/projects/${project}/locations/global/builds" "$(json_body "$(jq -cn --arg tag "$build_tag" '{steps:[{name:"gcr.io/cloud-builders/gcloud",args:["version"]}],tags:[$tag],options:{logging:"CLOUD_LOGGING_ONLY"}}')")" "" none "$builds" none cloudbuild.googleapis.com/builds.create
+  if provisioning; then creation_answer "$builds" cloudbuild.googleapis.com "$build_tag"; fi
   if [ "$last_outcome" = ALLOWED ]; then
     local build
     build="$(jq -r '.metadata.build.id // ""' "$workdir/body")"
@@ -911,9 +1017,13 @@ cleanup_project() {
     for name in "$throwaway" "$throwaway_new"; do
       remove DELETE "${run}/${parent}/jobs/${name}" "Cloud Run job ${name} of ${project}" run
       remove DELETE "${run}/${parent}/workerPools/${name}" "Cloud Run worker pool ${name} of ${project}" run
-      remove DELETE "${compute}/projects/${project}/zones/${zone}/instances/${name}" "Compute instance ${name} of ${project}" compute
+      if ! skip_never_created "projects/${project}/zones/${zone}/instances/${name}" compute.googleapis.com; then
+        remove DELETE "${compute}/projects/${project}/zones/${zone}/instances/${name}" "Compute instance ${name} of ${project}" compute
+      fi
     done
-    remove DELETE "${compute}/projects/${project}/global/instanceTemplates/${throwaway_new}" "Compute template of ${project}" compute
+    if ! skip_never_created "projects/${project}/global/instanceTemplates/${throwaway_new}" compute.googleapis.com; then
+      remove DELETE "${compute}/projects/${project}/global/instanceTemplates/${throwaway_new}" "Compute template of ${project}" compute
+    fi
     remove POST "${serviceusage}/projects/${project}/services/websecurityscanner.googleapis.com:disable" "web security scanner API of ${project}" serviceusage "$(json_body '{"disableDependentServices":false}')"
   else
     remove DELETE "${registry}/v1/${parent}/repositories/${throwaway}" "registry repository of ${project}" registry
@@ -1040,7 +1150,8 @@ transient_keys() {
 transient_builds() {
   local project="$1"
   local filter
-  filter="$(jq -rn '"(status=\"QUEUED\" OR status=\"WORKING\") AND tags=\"protected-recovery-deny-canary\"" | @uri')"
+  if skip_never_created "projects/${project}/locations/global/builds" cloudbuild.googleapis.com "protected-recovery-deny-canary-${CONTROL_RUN_ID}"; then return 0; fi
+  filter="$(build_filter)"
   call GET "${cloudbuild}/projects/${project}/locations/global/builds?filter=${filter}"
   if [ "$last_status" != 200 ]; then
     echo "builds of ${project}: could not be listed: HTTP ${last_status}" >> "$failures"
@@ -1220,6 +1331,7 @@ jq -n \
   --slurpfile allow_interval "$allow_interval" \
   --slurpfile allow_snapshot "$workdir/allow-baseline.json" \
   --slurpfile manifest_ids "$manifest_ids" \
+  --slurpfile resource_creation "$resource_creation" \
   --arg witness "$CANARY_WITNESS_SERVICE_ACCOUNT" \
   --rawfile failures "$failures" '
     ($observations) as $seen
@@ -1232,6 +1344,7 @@ jq -n \
       run: {attempt: $attempt, event: $event, headSha: $headSha, id: $id, repositoryId: $repositoryId, workflow: $workflow},
       throwaways: {name: $throwaway, new: $throwaway_new, gone: $throwaway_gone, delegate: $delegate, role: $role, project: $project, folder: $folder, goneUniqueIds: ($manifest_ids | from_entries)},
       witnessServiceAccount: $witness,
+      resourceCreation: $resource_creation[0],
       allowPolicies: ($allow | sort_by(.resource)),
       allowInterval: $allow_interval,
       allowSnapshot: $allow_snapshot[0],

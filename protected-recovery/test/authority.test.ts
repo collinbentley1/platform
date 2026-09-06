@@ -213,6 +213,94 @@ describe("recovery authority", () => {
 });
 
 describe.skipIf(!emulatorHost)("request boundary (Firestore emulator)", () => {
+  test("streamed bodies stop at each route's byte limit regardless of Content-Length", async () => {
+    const { authority, broker } = await world();
+    const deps = { authority, broker, verifier: new FakeVerifier() };
+    for (const [path, limit] of [["/v1/members", 8192], ["/v1/rounds/round/runs", 16384]] as const) {
+      for (const declared of [undefined, "1"]) {
+        let reads = 0;
+        let cancelled = false;
+        const body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            reads += 1;
+            if (reads === 1) controller.enqueue(new Uint8Array(limit));
+            else if (reads === 2) controller.enqueue(new Uint8Array(1));
+            else throw new Error("body was read after exceeding its limit");
+          },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 });
+        const headers = new Headers({ authorization: `Bearer ${invokerEmail("cdbentley")}` });
+        if (declared !== undefined) headers.set("content-length", declared);
+        const response = await handleRequest(deps, new Request(`http://broker${path}`, { body, headers, method: "POST" }));
+        expect(response.status).toBe(413);
+        expect(await response.json()).toEqual({ error: "BODY_TOO_LARGE" });
+        expect(reads).toBe(2);
+        expect(cancelled).toBe(true);
+      }
+    }
+  });
+
+  test("an oversized declared body is cancelled without reading it", async () => {
+    const { authority, broker } = await world();
+    let reads = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull() { reads += 1; },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const response = await handleRequest({ authority, broker, verifier: new FakeVerifier() }, new Request("http://broker/v1/members", {
+      body,
+      headers: { authorization: `Bearer ${invokerEmail("cdbentley")}`, "content-length": "8193" },
+      method: "POST",
+    }));
+    expect(response.status).toBe(413);
+    expect(reads).toBe(0);
+    expect(cancelled).toBe(true);
+  });
+
+  test("JSON at the exact byte limit is decoded across chunk and UTF-8 boundaries", async () => {
+    const { authority, broker } = await world();
+    for (const [path, limit, status] of [["/v1/unknown", 8192, 404], ["/v1/rounds/round/runs", 16384, 400]] as const) {
+      const value = new TextEncoder().encode(`"é"${" ".repeat(limit - 4)}`);
+      let chunk = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (chunk === 0) controller.enqueue(value.subarray(0, 2));
+          else if (chunk === 1) controller.enqueue(value.subarray(2));
+          else controller.close();
+          chunk += 1;
+        },
+      }, { highWaterMark: 0 });
+      const response = await handleRequest({ authority, broker, verifier: new FakeVerifier() }, new Request(`http://broker${path}`, {
+        body,
+        headers: { authorization: `Bearer ${invokerEmail("cdbentley")}` },
+        method: "POST",
+      }));
+      expect(response.status).toBe(status);
+      expect(chunk).toBe(3);
+    }
+  });
+
+  test("invalid declared lengths are refused without reading the stream", async () => {
+    const { authority, broker } = await world();
+    for (const declared of ["-1", "1.5", "unknown"]) {
+      let reads = 0;
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull() { reads += 1; },
+        cancel() { cancelled = true; },
+      }, { highWaterMark: 0 });
+      const response = await handleRequest({ authority, broker, verifier: new FakeVerifier() }, new Request("http://broker/v1/members", {
+        body,
+        headers: { authorization: `Bearer ${invokerEmail("cdbentley")}`, "content-length": declared },
+        method: "POST",
+      }));
+      expect(response.status).toBe(400);
+      expect(reads).toBe(0);
+      expect(cancelled).toBe(true);
+    }
+  });
+
   test("identity, purpose, grammar, permission, and direction are enforced in order", async () => {
     const w = await world();
     const { authority, broker } = w;

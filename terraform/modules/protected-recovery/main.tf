@@ -365,8 +365,9 @@ data "external" "deny_state" {
 
 # Whether each consumer project enables the two attachment APIs the Deny
 # canary cannot reach through IAM when they are disabled: a Compute or Cloud
-# Build row whose identical request answered SERVICE_DISABLED in both canary
-# phases is accepted only beside this read proving the API disabled now, at
+# Build row whose control request answered SERVICE_DISABLED and whose deny
+# phase explicitly skipped the mutation is accepted only beside this read
+# proving the API disabled now, at
 # apply (locals unserviceable_row_satisfied). Read through the same
 # credential-free reader pattern as the Deny state.
 data "external" "service_state" {
@@ -610,28 +611,32 @@ locals {
           exceptions  = try([for principal in rule.exceptionPrincipals : tostring(principal)], [])
           permissions = try([for permission in rule.deniedPermissions : tostring(permission)], [])
           observed = try([for observation in rule.canary : {
-            outcome      = tostring(observation.outcome)
-            permission   = tostring(observation.permission)
-            principal    = tostring(observation.principal)
-            digest       = try(tostring(observation.comparison.digest), tostring(observation.digest), "")
-            raw_digest   = try(tostring(observation.digest), "")
-            pair_kind    = try(tostring(observation.resourcePair.kind), "")
-            pair_actual  = try(tostring(observation.resourcePair.actualId), "")
-            pair_base    = try(tostring(observation.resourcePair.canonicalId), "")
-            observed_at  = try(tostring(observation.observedAt), "")
-            method       = try(tostring(observation.comparison.request.method), tostring(observation.request.method), "")
-            url          = try(tostring(observation.comparison.request.url), tostring(observation.request.url), "")
-            content_type = try(tostring(observation.comparison.request.contentType), tostring(observation.request.contentType), "")
-            body         = try(tostring(observation.comparison.request.bodySha256), tostring(observation.request.bodySha256), "")
-            pre_resource = try(tostring(observation.comparison.resource), tostring(observation.preState.resource), "")
-            pre_expected = try(tostring(observation.preState.expected), "")
-            pre_observed = try(tostring(observation.preState.observed), "")
-            pre_detail   = try(tostring(observation.preState.detail), "")
-            requires     = try([for permission in observation.requires : tostring(permission)], [])
-            operation_ok = try(observation.operation == null, false) || try(observation.operation.done == true && observation.operation.error == null, false)
-            reason       = try(tostring(observation.response.reason), "")
-            denied       = try(tostring(observation.response.permission), "")
-            service      = try(tostring(observation.response.service), "")
+            outcome          = tostring(observation.outcome)
+            permission       = tostring(observation.permission)
+            principal        = tostring(observation.principal)
+            digest           = try(tostring(observation.comparison.digest), tostring(observation.digest), "")
+            raw_digest       = try(tostring(observation.digest), "")
+            pair_kind        = try(tostring(observation.resourcePair.kind), "")
+            pair_actual      = try(tostring(observation.resourcePair.actualId), "")
+            pair_base        = try(tostring(observation.resourcePair.canonicalId), "")
+            observed_at      = try(tostring(observation.observedAt), "")
+            method           = try(tostring(observation.comparison.request.method), tostring(observation.request.method), "")
+            url              = try(tostring(observation.comparison.request.url), tostring(observation.request.url), "")
+            content_type     = try(tostring(observation.comparison.request.contentType), tostring(observation.request.contentType), "")
+            body             = try(tostring(observation.comparison.request.bodySha256), tostring(observation.request.bodySha256), "")
+            pre_resource     = try(tostring(observation.comparison.resource), tostring(observation.preState.resource), "")
+            pre_expected     = try(tostring(observation.preState.expected), "")
+            pre_observed     = try(tostring(observation.preState.observed), "")
+            pre_detail       = try(tostring(observation.preState.detail), "")
+            requires         = try([for permission in observation.requires : tostring(permission)], [])
+            operation_ok     = try(observation.operation == null, false) || try(observation.operation.done == true && observation.operation.error == null, false)
+            reason           = try(tostring(observation.response.reason), "")
+            denied           = try(tostring(observation.response.permission), "")
+            service          = try(tostring(observation.response.service), "")
+            status           = try(tostring(observation.response.status), "")
+            skipped_mutation = try(observation.response.skippedMutation == true, false)
+            has_skip_proof   = try(contains(keys(observation.response), "skippedMutation") || contains(keys(observation.response), "observedRequest"), false)
+            observed_request = try(observation.response.observedRequest, null)
           }], [])
         }
       ]
@@ -898,10 +903,11 @@ locals {
     alltrue([for resource in values(local.allow_reads) : try(length(local.canary_allows.control[resource].canary) > 0, false)])
   )
 
-  # A consumer attachment row the canary could not reach through IAM: the
-  # identical request answered SERVICE_DISABLED naming the row's API in the
-  # deny phase and in the control phase, and the live read says the API is
-  # disabled in that project now. No attachment can be created through a
+  # The control mutation actually answered SERVICE_DISABLED. Its signed
+  # manifest records that exact resource as never created; the deny phase
+  # explicitly skips the mutation and instead observes SERVICE_DISABLED
+  # through the exact read endpoint. The live read must also say that API
+  # is disabled in that project now. No attachment can be created through a
   # disabled API, the broker's inventory records every attachment API's
   # enablement in the hash of every gate, and every attachment path also
   # needs actAs, which is proven denied on its own.
@@ -919,7 +925,8 @@ locals {
           observation.outcome == "UNSERVICEABLE" &&
           observation.principal == local.canary_principal &&
           observation.reason == "SERVICE_DISABLED" &&
-          observation.service == lookup(local.unserviceable_permissions, row.permission, "")
+          observation.service == lookup(local.unserviceable_permissions, row.permission, "") &&
+          observation.status == "403" && observation.skipped_mutation
         ]
       ]
     ])[0], null)
@@ -938,12 +945,41 @@ locals {
           observation.outcome == "UNSERVICEABLE" &&
           observation.principal == local.canary_principal &&
           observation.reason == "SERVICE_DISABLED" &&
-          observation.service == lookup(local.unserviceable_permissions, row.permission, "")
+          observation.service == lookup(local.unserviceable_permissions, row.permission, "") &&
+          observation.status == "403" && !observation.has_skip_proof
         ]
       ]
     ])[0], null)
   }
-  service_states = { for key, read in data.external.service_state : key => try(read.result.state, "") }
+  service_states   = { for key, read in data.external.service_state : key => try(read.result.state, "") }
+  canary_build_tag = local.authority_enabled ? "protected-recovery-deny-canary-${local.evidence.deny_control.run_id}" : "unrecorded"
+  unserviceable_identities = {
+    for key, row in local.required_deny_matrix : key => {
+      service = local.unserviceable_permissions[row.permission]
+      resource = row.permission == "cloudbuild.googleapis.com/builds.create" ? "projects/${local.deny_attachments[row.attachment]}/locations/global/builds" : (
+        row.permission == "compute.googleapis.com/instanceTemplates.create" ? "projects/${local.deny_attachments[row.attachment]}/global/instanceTemplates/deny-canary-${local.canary_run_suffix}-new" :
+        "projects/${local.deny_attachments[row.attachment]}/zones/${local.region}-a/instances/deny-canary-${local.canary_run_suffix}${row.permission == "compute.googleapis.com/instances.create" ? "-new" : ""}"
+      )
+      read_url = row.permission == "cloudbuild.googleapis.com/builds.create" ? "https://cloudbuild.googleapis.com/v1/projects/${local.deny_attachments[row.attachment]}/locations/global/builds?filter=${replace(urlencode("(status=\"QUEUED\" OR status=\"WORKING\") AND tags=\"${local.canary_build_tag}\""), "+", "%20")}" : "https://compute.googleapis.com/compute/v1/projects/${local.deny_attachments[row.attachment]}/zones/${local.region}-a"
+      mutation_url = row.permission == "cloudbuild.googleapis.com/builds.create" ? "https://cloudbuild.googleapis.com/v1/projects/${local.deny_attachments[row.attachment]}/locations/global/builds" : (
+        row.permission == "compute.googleapis.com/instanceTemplates.create" ? "https://compute.googleapis.com/compute/v1/projects/${local.deny_attachments[row.attachment]}/global/instanceTemplates" :
+        "https://compute.googleapis.com/compute/v1/projects/${local.deny_attachments[row.attachment]}/zones/${local.region}-a/instances${row.permission == "compute.googleapis.com/instances.setServiceAccount" ? "/deny-canary-${local.canary_run_suffix}/setServiceAccount" : ""}"
+      )
+    } if contains(keys(local.unserviceable_permissions), row.permission) && contains(values(local.consumer_attachments), row.attachment)
+  }
+  unserviceable_creation_bound = {
+    for key, identity in local.unserviceable_identities : key => alltrue([
+      for phase in local.exercise_phases : try(length([
+        for creation in local.predicates[phase].resourceCreation : creation
+        if creation.resource == identity.resource
+        ]) == 1 && alltrue([
+        for creation in local.predicates[phase].resourceCreation :
+        creation.service == identity.service && creation.state == "NEVER_CREATED" && creation.reason == "SERVICE_DISABLED" &&
+        creation.tag == (identity.service == "cloudbuild.googleapis.com" ? local.canary_build_tag : "")
+        if creation.resource == identity.resource
+      ]), false)
+    ])
+  }
   unserviceable_row_satisfied = {
     for key, row in local.required_deny_matrix : key => (
       contains(keys(local.unserviceable_permissions), row.permission) &&
@@ -956,7 +992,13 @@ locals {
         local.unserviceable_observation[key].method == local.control_unserviceable_observation[key].method &&
         local.unserviceable_observation[key].url == local.control_unserviceable_observation[key].url &&
         local.unserviceable_observation[key].content_type == local.control_unserviceable_observation[key].content_type &&
-        local.unserviceable_observation[key].body == local.control_unserviceable_observation[key].body,
+        local.unserviceable_observation[key].body == local.control_unserviceable_observation[key].body &&
+        local.unserviceable_observation[key].pre_resource == local.control_unserviceable_observation[key].pre_resource &&
+        local.control_unserviceable_observation[key].method == "POST" &&
+        local.control_unserviceable_observation[key].url == local.unserviceable_identities[key].mutation_url &&
+        local.control_unserviceable_observation[key].pre_resource == local.unserviceable_identities[key].resource &&
+        local.unserviceable_observation[key].observed_request == { method = "GET", url = local.unserviceable_identities[key].read_url } &&
+        local.unserviceable_creation_bound[key],
         false,
       ) &&
       try(local.service_states["${local.deny_attachments[row.attachment]}|${local.unserviceable_permissions[row.permission]}"] == "DISABLED", false)

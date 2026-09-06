@@ -145,7 +145,15 @@ predicate() {
   local act_as="iam.googleapis.com/serviceAccounts.actAs"
   local broker="cloudresourcemanager.googleapis.com/projects/recovery-test"
   local row='(.policies[] | select(.attachmentPoint == $broker) | .rules[].canary[] | select(.permission == $key))'
+  local disabled='(.policies[].rules[].canary[] | select(.outcome == "UNSERVICEABLE"))'
   case "$variant" in
+    disabled-missing-skip) jq -c "${disabled} |= (.response |= del(.skippedMutation, .observedRequest))" "$fixtures/$phase.json" ;;
+    disabled-other-read) jq -c "(${disabled} | .response.observedRequest.url) += \"?other-project=1\"" "$fixtures/$phase.json" ;;
+    disabled-other-service) jq -c "(${disabled} | .response.service) = \"unrelated.googleapis.com\"" "$fixtures/$phase.json" ;;
+    disabled-control-skipped) jq -c "(${disabled} | .response.skippedMutation) = true" "$fixtures/$phase.json" ;;
+    disabled-resource-created) jq -c '.resourceCreation[] |= (if .state == "NEVER_CREATED" then .state = "CREATED" else . end)' "$fixtures/$phase.json" ;;
+    disabled-other-resource) jq -c '.resourceCreation[] |= (if .state == "NEVER_CREATED" then .resource += "-unrelated" else . end)' "$fixtures/$phase.json" ;;
+    disabled-other-build-tag) jq -c '(.resourceCreation[] | select(.service == "cloudbuild.googleapis.com") | .tag) = "protected-recovery-deny-canary-another-run"' "$fixtures/$phase.json" ;;
     extra-exception) jq -c '.policies[0].rules[0].exceptionPrincipals += ["principalSet://goog/group/daily-humans@example.com"]' "$fixtures/$phase.json" ;;
     unrelated-resource) jq -c '.policies[0].attachmentPoint = "cloudresourcemanager.googleapis.com/projects/unrelated-project"' "$fixtures/$phase.json" ;;
     missing-observation) jq -c --arg key "$key" '.policies[].rules[] |= (.canary |= map(select(.permission != $key)))' "$fixtures/$phase.json" ;;

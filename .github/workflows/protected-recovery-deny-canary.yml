@@ -17,8 +17,12 @@ name: Protected recovery deny canary
 #             place. The same requests -- the same canonical digest -- against
 #             equivalent resources in the same actual pre-state must be refused with
 #             IAM permission denials naming the rows' own permissions. Four
-#             reserved-name IAM create APIs use explicit fresh-name pairs;
-#             raw requests remain attested beside the exact comparison.
+#             reserved-name IAM create APIs use explicit fresh-name pairs.
+#             For exact resources the signed control proves were never
+#             created because their API was disabled, deny executes only a
+#             read-only capability preflight. It records that GET separately
+#             from the unexecuted mutation; enabled or unreadable APIs fail.
+#             Raw requests remain attested beside the exact comparison.
 #   cleanup   dispatched last, naming the control run, under the control form
 #             again: removes every throwaway resource the control run created
 #             and attests the removal; a leftover fails the run.
@@ -257,7 +261,9 @@ jobs:
       # creates and removes within itself -- keys of the throwaway accounts,
       # queued canary builds -- is removed again here. A key or build that
       # could not be removed, or a listing that could not be made, is a
-      # leftover, and a leftover fails this step and the run.
+      # leftover, and a leftover fails this step and the run. The control's
+      # completed local predicate can prove its own build was never created;
+      # later phases require the verified immutable control predicate.
       - name: Remove this run's transient resources
         if: always() && steps.phase.outcome == 'success' && steps.auth.outcome == 'success' && steps.witness.outcome == 'success'
         env:
@@ -270,6 +276,7 @@ jobs:
           CONTROL_PREDICATE: ${{ steps.control_manifest.outcome == 'success' && format('{0}/control-canary/deny-canary.json', runner.temp) || '' }}
           ORGANIZATION_ID: ${{ inputs.organization_id }}
           PHASE: ${{ inputs.phase }}
+          CURRENT_PREDICATE: ${{ format('{0}/deny-canary.json', runner.temp) }}
           TRANSIENT_CLEANUP: "1"
         run: |
           set -euo pipefail
