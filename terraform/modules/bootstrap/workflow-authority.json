@@ -4,6 +4,7 @@
     "job": "cleanup",
     "environment": "preview-operations",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/cleanup-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] },
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
@@ -16,6 +17,7 @@
     "job": "attest",
     "environment": "supply-chain",
     "purpose": "attestation",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -27,6 +29,7 @@
     "job": "canary",
     "environment": "preview-cloud-canary",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -38,6 +41,7 @@
     "job": "deploy",
     "environment": "preview-cloud",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -49,6 +53,7 @@
     "job": "invalidate",
     "environment": "preview-operations",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -60,6 +65,7 @@
     "job": "publish",
     "environment": "preview-publish",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -71,6 +77,7 @@
     "job": "publish-canary",
     "environment": "preview-publish-canary",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-preview.yml", "ref": "refs/heads/main", "events": ["pull_request_target"] }
     ],
@@ -82,6 +89,7 @@
     "job": "attest",
     "environment": "supply-chain",
     "purpose": "attestation",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
     ],
@@ -93,6 +101,7 @@
     "job": "canary",
     "environment": "production-canary",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
     ],
@@ -104,6 +113,7 @@
     "job": "deploy",
     "environment": "production",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
     ],
@@ -115,6 +125,7 @@
     "job": "publish",
     "environment": "production-publish",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
     ],
@@ -126,6 +137,7 @@
     "job": "terraform-convergence",
     "environment": "production",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/deploy-prod.yml", "ref": "refs/heads/main", "events": ["push"] }
     ],
@@ -133,10 +145,135 @@
     "serviceAccounts": ["gha-terraform", "gha-wif-canary"]
   },
   {
+    "workflow": ".github/workflows/protected-recovery-deny-canary.yml",
+    "job": "exercise",
+    "environment": "protected-recovery-deny-canary",
+    "purpose": "deny-canary",
+    "trustDomain": "recovery",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-deny-canary.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": false,
+    "serviceAccounts": ["gha-deny-canary"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "cdbentley-quarantine",
+    "environment": "recovery-cdbentley-quarantine",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "cdbentley",
+    "intent": "QUARANTINE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-isolate-cdbentley"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "cdbentley-restore",
+    "environment": "recovery-cdbentley-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "cdbentley",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-cdbentley"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "critical-history-quarantine",
+    "environment": "recovery-critical-history-quarantine",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "critical-history",
+    "intent": "QUARANTINE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-isolate-critical-history"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "critical-history-restore",
+    "environment": "recovery-critical-history-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "critical-history",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-critical-history"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "healthmcp-quarantine",
+    "environment": "recovery-healthmcp-quarantine",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "healthmcp",
+    "intent": "QUARANTINE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-isolate-healthmcp"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "healthmcp-restore",
+    "environment": "recovery-healthmcp-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "healthmcp",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-healthmcp"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "runsetta-quarantine",
+    "environment": "recovery-runsetta-quarantine",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "runsetta",
+    "intent": "QUARANTINE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-isolate-runsetta"]
+  },
+  {
+    "workflow": ".github/workflows/protected-recovery-invoke.yml",
+    "job": "runsetta-restore",
+    "environment": "recovery-runsetta-restore",
+    "purpose": "recovery",
+    "trustDomain": "recovery",
+    "consumer": "runsetta",
+    "intent": "RESTORE",
+    "callers": [
+      { "workflow": ".github/workflows/protected-recovery-invoke.yml", "ref": "refs/heads/main", "events": ["workflow_dispatch"] }
+    ],
+    "transitionEligible": true,
+    "serviceAccounts": ["gha-restore-runsetta"]
+  },
+  {
     "workflow": ".github/workflows/reconcile-previews.yml",
     "job": "reconcile",
     "environment": "preview-operations",
     "purpose": "gcp",
+    "trustDomain": "consumer",
     "callers": [
       { "workflow": ".github/workflows/reconcile-previews.yml", "ref": "refs/heads/main", "events": ["push", "schedule", "workflow_dispatch"] }
     ],
