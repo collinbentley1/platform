@@ -5,6 +5,7 @@ variable "repository_id" {
   validation {
     condition = contains([
       "1255553151",
+      "1362801465",
       "711292980",
       "1025243085",
       "280932482",
@@ -101,6 +102,31 @@ locals {
       runtime_project_roles = []
       runtime_description   = "Runtime identity for the cdbentley Cloud Run services."
     }
+    "1362801465" = {
+      app                         = "virtual-care-mcp"
+      project_id                  = "virtual-care-mcp"
+      region                      = "us-east4"
+      state_bucket_name           = "virtual-care-mcp-tfstate"
+      bootstrap_state_bucket_name = "virtual-care-mcp-tfstate-bootstrap"
+      state_bucket_location       = "US-EAST4"
+      github_repo                 = "virtual-care-mcp"
+      github_repository_id        = "1362801465"
+      required_services = [
+        "artifactregistry.googleapis.com",
+        "cloudasset.googleapis.com",
+        "cloudresourcemanager.googleapis.com",
+        "firestore.googleapis.com",
+        "iam.googleapis.com",
+        "iamcredentials.googleapis.com",
+        "run.googleapis.com",
+        "serviceusage.googleapis.com",
+        "storage.googleapis.com",
+        "sts.googleapis.com",
+      ]
+      manage_firestore_field_ttl = true
+      runtime_project_roles      = ["roles/datastore.user"]
+      runtime_description        = "Runtime identity for the virtual-care-mcp Cloud Run services."
+    }
     "711292980" = {
       app                         = "runsetta"
       project_id                  = "runsetta"
@@ -155,8 +181,7 @@ locals {
         "storage.googleapis.com",
         "sts.googleapis.com",
       ]
-      # Medlock is the only application declaring google_firestore_field, so it
-      # is the only one whose apply identity may patch field TTL policies.
+      # Medlock's waitlist declares google_firestore_field and needs TTL writes.
       manage_firestore_field_ttl = true
       runtime_project_roles = [
         "roles/datastore.user",

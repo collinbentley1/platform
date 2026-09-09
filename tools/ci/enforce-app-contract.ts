@@ -2,6 +2,7 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
+  reviewedPackageLimitForRepository,
   validateAppScripts,
   validateRegistryOnlyDependencySpecs,
   validateRegistryOnlyLock,
@@ -11,7 +12,6 @@ import {
 import { validateTerraformMirrorContract } from "./terraform-mirror-contract";
 
 const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
-const maximumReviewedPackages = 128;
 const canonicalFiles = [
   "Dockerfile",
   ".dockerignore",
@@ -184,8 +184,8 @@ const terraformMirrorFailures = validateTerraformMirrorContract(
 if (terraformMirrorFailures.length > 0) {
   throw new Error(terraformMirrorFailures.join("\n"));
 }
-if (packageJson.packageManager !== "bun@1.4.0") {
-  throw new Error("package.json packageManager must be bun@1.4.0.");
+if (packageJson.packageManager !== "bun@1.4.2") {
+  throw new Error("package.json packageManager must be bun@1.4.2.");
 }
 const registryDependencyFailures = validateRegistryOnlyDependencySpecs(packageJson);
 if (registryDependencyFailures.length > 0) {
@@ -234,6 +234,7 @@ if (registryLockFailures.length > 0) {
 if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
   throw new Error("bun.lock must not resolve the quota-exhausting published Socket scanner.");
 }
+const maximumReviewedPackages = reviewedPackageLimitForRepository(trustedRepositoryId);
 if (Object.keys(lock.packages ?? {}).length > maximumReviewedPackages) {
   throw new Error(
     `bun.lock exceeds the reviewed ${maximumReviewedPackages}-package Socket request limit.`,

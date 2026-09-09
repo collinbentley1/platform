@@ -4,13 +4,19 @@ import { access, cp, lstat, mkdir, readFile, readdir, stat, writeFile } from "no
 import { basename, join, relative, resolve } from "node:path";
 import {
   isForbiddenTerraformArtifact,
+  reviewedPackageLimitForRepository,
   validateAppScripts,
   validateRegistryOnlyDependencySpecs,
   validateRegistryOnlyLock,
   validateTerraformGitignore,
   validateTypeScriptLock,
 } from "./ci/app-contract";
-import { validateTerraformMirrorContract } from "./ci/terraform-mirror-contract";
+import {
+  hasReviewedTerraformContract,
+  renderReviewedTerraformMirrors,
+  type TerraformMirrorSources,
+  validateTerraformMirrorContract,
+} from "./ci/terraform-mirror-contract";
 
 type PlatformConfig = {
   readonly name?: string;
@@ -200,6 +206,10 @@ async function doctor(repoArgs: string[]): Promise<void> {
       }
     }
 
+    const config = await readJson<PlatformConfig>(join(repoPath, ".platform/config.json"));
+    const maximumReviewedPackages = reviewedPackageLimitForRepository(
+      trustedRepositoryId ?? config?.githubRepositoryId ?? "",
+    );
     const scanner = "./tools/socket-security-scanner.ts";
     const forbiddenPublishedScanner = "@socketsecurity/bun-security-scanner";
     const lockText = await readText(join(repoPath, "bun.lock"));
@@ -220,8 +230,8 @@ async function doctor(repoArgs: string[]): Promise<void> {
           if (Object.hasOwn(lock.packages ?? {}, forbiddenPublishedScanner)) {
             messages.push("bun.lock resolves the quota-exhausting published Socket scanner");
           }
-          if (Object.keys(lock.packages ?? {}).length > 128) {
-            messages.push("bun.lock exceeds the reviewed 128-package Socket request limit");
+          if (Object.keys(lock.packages ?? {}).length > maximumReviewedPackages) {
+            messages.push(`bun.lock exceeds the reviewed ${maximumReviewedPackages}-package Socket request limit`);
           }
           if (Object.hasOwn(lock, "patchedDependencies")) {
             messages.push("bun.lock patchedDependencies are forbidden for trusted CI dependencies");
@@ -263,7 +273,6 @@ async function doctor(repoArgs: string[]): Promise<void> {
       }
     }
 
-    const config = await readJson<PlatformConfig>(join(repoPath, ".platform/config.json"));
     if (!config) {
       messages.push("missing .platform/config.json");
     } else {
@@ -352,8 +361,8 @@ async function doctor(repoArgs: string[]): Promise<void> {
           patchedDependencies?: unknown;
           workspaces?: unknown;
         };
-        if (packageJson.packageManager !== "bun@1.4.0") {
-          messages.push("package.json packageManager must be bun@1.4.0");
+        if (packageJson.packageManager !== "bun@1.4.2") {
+          messages.push("package.json packageManager must be bun@1.4.2");
         }
         if (packageJson.devDependencies?.typescript !== "7.0.2") {
           messages.push("package.json must pin the reviewed TypeScript version");
@@ -583,6 +592,15 @@ async function scaffold(args: string[]): Promise<void> {
   }
 
   const target = resolve(targetArg ?? name);
+  const reviewedMirrors = hasReviewedTerraformContract(githubRepositoryId)
+    ? renderReviewedTerraformMirrors({
+      expectedPlatformSha: platformSha,
+      githubRepositoryId,
+      name,
+      projectId: name,
+      serviceName: name,
+    })
+    : undefined;
 
   if (await exists(target)) {
     const targetStat = await stat(target);
@@ -613,6 +631,21 @@ async function scaffold(args: string[]): Promise<void> {
     __GITHUB_REPOSITORY_ID__: githubRepositoryId,
     __PLATFORM_SHA__: platformSha,
   });
+  if (reviewedMirrors) {
+    const mirrorPaths: Readonly<Record<keyof TerraformMirrorSources, string>> = {
+      bootstrapMain: "bootstrap/main.tf",
+      bootstrapOutputs: "bootstrap/outputs.tf",
+      bootstrapVariables: "bootstrap/variables.tf",
+      bootstrapVersions: "bootstrap/versions.tf",
+      productionMain: "prod/main.tf",
+      productionOutputs: "prod/outputs.tf",
+      productionVariables: "prod/variables.tf",
+      productionVersions: "prod/versions.tf",
+    };
+    for (const name of Object.keys(mirrorPaths) as Array<keyof TerraformMirrorSources>) {
+      await writeFile(join(target, "infra/terraform", mirrorPaths[name]), `${reviewedMirrors[name]}\n`);
+    }
+  }
   console.log(`Created ${name} scaffold at ${target}`);
 }
 

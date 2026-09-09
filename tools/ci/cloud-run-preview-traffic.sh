@@ -40,7 +40,7 @@ for identity in "$BASELINE_REVISION" "$EXPECTED_REVISION"; do
   [[ "$identity" =~ ^[a-z][a-z0-9-]{0,62}$ ]]
 done
 [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-[[ "$EXPECTED_REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]]
+[[ "$EXPECTED_REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482|1362801465)$ ]]
 if [ "$EXPECTED_REPOSITORY_ID" = 280932482 ]; then
   test "${STABLE_PREVIEW_DOMAIN:-}" = preview.ycriticalhistory.org
 else

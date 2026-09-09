@@ -79,8 +79,8 @@ the catalog license is pinned to commit
 The resulting runtime is deliberately described as a hybrid: the immutable DHI
 Community Bun image supplies the signed hardened Alpine rootfs and exact layer,
 history, and configuration prefix, while the Dockerfile overlays the separately
-digest-bound Oven Bun 1.4.0+34cbb binary. The final image advertises
-`BUN_VERSION=1.4.0` and immutable OCI base name/digest labels; the DHI signature
+digest-bound Oven Bun 1.4.2+744846f84 binary. The final image advertises
+`BUN_VERSION=1.4.2` and immutable OCI base name/digest labels; the DHI signature
 does not attest the overlaid Oven binary. Preview and production are required to
 use byte-identical base contexts and exporter/provenance settings, though their
 application source and final image digest naturally differ.
@@ -254,6 +254,14 @@ orchestration. Doctor also rejects committed Terraform state, saved plans,
 variable/override files, CLI config, and crash logs.
 
 ## Local Verification
+
+The scaffold renders registered applications from their reviewed Terraform
+contract, including data resources and role bounds. New repository
+`1362801465` (`virtual-care-mcp`) uses Firestore with visits TTL and memory-only
+previews. Its first bootstrap is the fixed-identity
+[`virtual-care-enrollment` root](terraform/deployments/virtual-care-enrollment/README.md),
+which keeps federation disabled until reviewed activation and leaves the
+existing recovery cohort unchanged.
 
 The canary cleanup fixtures require Bash 4 or newer and `jq`. Put the modern
 Bash installation's `bin` directory first in `PATH` before running `bun test`.

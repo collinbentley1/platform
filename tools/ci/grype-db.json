@@ -1,6 +1,6 @@
 {
   "schemaVersion": "v6.1.9",
-  "built": "2026-09-06T06:27:35Z",
-  "url": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-06T00:36:16Z_1788676055.tar.zst?checksum=sha256%3A3c93034d0475d25fc82addd47b2300f99564ea4f35fd9e0b957b701049a15020",
-  "sha256": "3c93034d0475d25fc82addd47b2300f99564ea4f35fd9e0b957b701049a15020"
+  "built": "2026-09-08T06:30:10Z",
+  "url": "https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-08T00:33:13Z_1788849010.tar.zst?checksum=sha256%3A3564b57fd65da3cba50174d9fdab8b4e8dab6f7f7b798ebd3cec3085ea10c7e6",
+  "sha256": "3564b57fd65da3cba50174d9fdab8b4e8dab6f7f7b798ebd3cec3085ea10c7e6"
 }

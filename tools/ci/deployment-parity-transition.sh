@@ -19,7 +19,7 @@ readonly TRANSITION_OBJECT="${TRANSITION_OBJECT:-deployment-parity-transition}"
 readonly TRANSITION_LEASE_FILE="${TRANSITION_LEASE_FILE:-${RUNNER_TEMP}/deployment-parity-transition-lease.json}"
 
 [[ "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,29}$ ]]
-[[ "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482)$ ]]
+[[ "$REPOSITORY_ID" =~ ^(1255553151|711292980|1025243085|280932482|1362801465)$ ]]
 [[ "$TRANSITION_BUCKET" =~ ^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$ ]]
 [[ "$TRANSITION_OBJECT" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]
 [[ "$TRANSITION_LEASE_FILE" == "$RUNNER_TEMP"/* ]]

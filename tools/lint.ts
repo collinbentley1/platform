@@ -496,10 +496,10 @@ try {
     !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.url !== "string" ||
     manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-06T00:36:16Z_1788676055.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "3c93034d0475d25fc82addd47b2300f99564ea4f35fd9e0b957b701049a15020" ||
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-08T00:33:13Z_1788849010.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "3564b57fd65da3cba50174d9fdab8b4e8dab6f7f7b798ebd3cec3085ea10c7e6" ||
     manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-09-06T06:27:35Z"
+    manifest.built !== "2026-09-08T06:30:10Z"
   ) {
     failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
   }
@@ -596,7 +596,7 @@ for (const [path, workflow] of [
 }
 const artifactContract = await read("tools/ci/container-artifact-contract.sh");
 for (const boundary of [
-  "GRYPE_DB_MANIFEST_SHA256=2e0d9d6de5cdd6c75a5c8b976f410d8c114fefeaf0b9b48268142a7e2528c14d",
+  "GRYPE_DB_MANIFEST_SHA256=8f57ede4357c121883016b4ca50b0a110abfdc455a58ab073575d1b0189c9446",
   'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
   'test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST"',
   'verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"',
@@ -957,8 +957,8 @@ for (const workflow of ["application.yml", "socket-firewall.yml", "platform.yml"
   requireContains(
     path,
     text,
-    "2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452",
-    "Bun 1.4.0 archive checksum must be pinned.",
+    "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
+    "Bun 1.4.2 archive checksum must be pinned.",
   );
 }
 
@@ -1834,7 +1834,7 @@ requireContains(
   "FROM platform.invalid/bun-release AS bun-release",
   "The Bun binary stage must use only the platform-supplied closed OCI context.",
 );
-if (dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676").length !== 3) {
+if (dockerfile.split("744846f844374847c902b5e7fd59b4342a51ef99").length !== 3) {
   failures.push(
     "templates/app/Dockerfile: both executable stages must verify the exact Bun revision.",
   );
@@ -1978,8 +1978,10 @@ for (const moduleName of ["cloud-run-service", "bootstrap"]) {
 }
 const bootstrapModuleTests = join(root, "terraform/modules/bootstrap/tests");
 const bootstrapTestFiles = (await readdir(bootstrapModuleTests)).sort();
-if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify(["workflow_authority.tftest.hcl"])) {
-  failures.push("terraform/modules/bootstrap/tests: only the reviewed workflow-authority test is allowed.");
+if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify([
+  "virtual_care_enrollment.tftest.hcl", "workflow_authority.tftest.hcl",
+])) {
+  failures.push("terraform/modules/bootstrap/tests: only the reviewed enrollment and workflow-authority tests are allowed.");
 }
 const workflowAuthorityTest = await readFile(
   join(bootstrapModuleTests, "workflow_authority.tftest.hcl"),
@@ -2607,7 +2609,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926"
+  "3a73f20a4afce688de16fe8cf126574c4230d950daf9bd924a593a67edf41331"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",

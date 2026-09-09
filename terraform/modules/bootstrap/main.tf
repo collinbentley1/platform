@@ -38,7 +38,9 @@ locals {
   # each repository-local auditor. A preview transaction can therefore prove
   # that none of the four preview runtime identities gained access in a sibling
   # project without giving the traffic committer any IAM-read capability.
-  preview_iam_auditor_members = toset([
+  preview_iam_auditor_members = var.github_repository_id == "1362801465" && var.project_id == "virtual-care-mcp" ? toset([
+    "serviceAccount:gha-preview-operator@virtual-care-mcp.iam.gserviceaccount.com",
+    ]) : toset([
     "serviceAccount:gha-preview-operator@cdbentley.iam.gserviceaccount.com",
     "serviceAccount:gha-preview-operator@critical-history-16823277.iam.gserviceaccount.com",
     "serviceAccount:gha-preview-operator@medlock-1025243085.iam.gserviceaccount.com",
@@ -725,6 +727,8 @@ resource "google_project_iam_member" "terraform_convergence_reader" {
 
 resource "google_project_iam_member" "preview_iam_auditors" {
   for_each = local.preview_iam_auditor_members
+
+  depends_on = [google_service_account.preview_operator]
 
   project = var.project_id
   role    = google_project_iam_custom_role.preview_iam_auditor.name

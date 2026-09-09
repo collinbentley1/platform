@@ -339,6 +339,50 @@ describe("durable preview/production DHI parity", () => {
     expect(childResult.exitCode).not.toBe(0);
   });
 
+  test("Virtual Care production binds its canonical origin and exact Firestore environment", async () => {
+    const service = virtualCareFixture(productionService());
+    service.status.url = "https://virtual-care-mcp-894875537243.us-east4.run.app";
+    const revision = virtualCareFixture(productionRevision());
+    revision.spec.containers[0].env.push(
+      { name: "PUBLIC_BASE_URL", value: service.status.url },
+      { name: "VISIT_STORE", value: "firestore" },
+      { name: "FIRESTORE_PROJECT_ID", value: "virtual-care-mcp" },
+      { name: "FIRESTORE_DATABASE_ID", value: "(default)" },
+      { name: "FIRESTORE_COLLECTION", value: "visits" },
+    );
+    const accepted = await runCloudContract("prove-production", { service, revisions: [revision] }, true);
+    expect(accepted.exitCode, accepted.stderr).toBe(0);
+    for (const value of ["http://localhost:8080", "https://attacker.example", "https://virtual-care-mcp-894875537243.us-east4.run.app/path"]) {
+      const changed = structuredClone(revision);
+      changed.spec.containers[0].env.find((entry: any) => entry.name === "PUBLIC_BASE_URL").value = value;
+      expect((await runCloudContract("prove-production", { service, revisions: [changed] }, true)).exitCode).not.toBe(0);
+    }
+    const missing = structuredClone(revision);
+    missing.spec.containers[0].env = missing.spec.containers[0].env.filter((entry: any) => entry.name !== "PUBLIC_BASE_URL");
+    expect((await runCloudContract("prove-production", { service, revisions: [missing] }, true)).exitCode).not.toBe(0);
+    service.status.url = "https://virtual-care-mcp-hash-uk.a.run.app";
+    expect((await runCloudContract("prove-production", { service, revisions: [revision] }, true)).exitCode).toBe(0);
+  });
+
+  test("Virtual Care preview binds its own PR origin and refuses production storage", async () => {
+    const service = virtualCareFixture(previewService());
+    const revisions = [virtualCareFixture(baselineRevision()), virtualCareFixture(previewRevision())];
+    const env = revisions[1].spec.containers[0].env;
+    env.push(
+      { name: "PUBLIC_BASE_URL", value: "https://pr-31---virtual-care-mcp-preview-894875537243.us-east4.run.app" },
+      { name: "VISIT_STORE", value: "memory" },
+    );
+    const accepted = await runCloudContract("prove-preview-tags", { service, revisions }, true);
+    expect(accepted.exitCode, accepted.stderr).toBe(0);
+    for (const value of ["http://localhost:8080", "https://pr-32---virtual-care-mcp-preview-894875537243.us-east4.run.app", "https://virtual-care-mcp-894875537243.us-east4.run.app"]) {
+      const changed = structuredClone(revisions);
+      changed[1].spec.containers[0].env.find((entry: any) => entry.name === "PUBLIC_BASE_URL").value = value;
+      expect((await runCloudContract("prove-preview-tags", { service, revisions: changed }, true)).exitCode).not.toBe(0);
+    }
+    env.push({ name: "FIRESTORE_PROJECT_ID", value: "virtual-care-mcp" });
+    expect((await runCloudContract("prove-preview-tags", { service, revisions }, true)).exitCode).not.toBe(0);
+  });
+
   test("production rejects missing or different preview parity metadata before OCI inspection", async () => {
     const service = previewService();
     const revisions = [baselineRevision(), previewRevision()];
@@ -513,6 +557,13 @@ function productionService(): any {
   };
 }
 
+function virtualCareFixture(value: any): any {
+  return JSON.parse(JSON.stringify(value)
+    .replaceAll("cdbentley", "virtual-care-mcp")
+    .replaceAll(projectNumber, "894875537243")
+    .replaceAll(repositoryId, "1362801465"));
+}
+
 function productionRevision(): any {
   return revision("cdbentley-00007-abc", "cdbentley", "production", productionImage);
 }
@@ -644,6 +695,7 @@ function revision(name: string, service: string, environment: string, image: str
 async function runCloudContract(
   command: "prove-production" | "inspect-preview-routes" | "prove-preview-routes" | "prove-preview-tags",
   fixture: { service: any; revisions: any[] },
+  virtualCare = false,
 ): Promise<{ exitCode: number; stderr: string; outputs: Record<string, string> }> {
   const root = await mkdtemp(join(tmpdir(), "platform-dhi-parity-"));
   temporaryRoots.push(root);
@@ -671,6 +723,17 @@ async function runCloudContract(
       EXPECTED_PROJECT_NUMBER: projectNumber,
       EXPECTED_REPOSITORY_ID: repositoryId,
       EXPECTED_SERVICE_NAME: "cdbentley",
+      ...(virtualCare ? virtualCareFixture({
+        EXPECTED_PREVIEW_IMAGE_NAME: previewImage,
+        EXPECTED_PREVIEW_SERVICE_NAME: "cdbentley-preview",
+        EXPECTED_PREVIEW_RUNTIME_SERVICE_ACCOUNT: previewRuntime,
+        EXPECTED_PRODUCTION_IMAGE_NAME: productionImage,
+        EXPECTED_BASELINE_PRODUCTION_INDEX_IMAGE: `${productionImage}@${indexDigest}`,
+        EXPECTED_BASELINE_PRODUCTION_RUNNABLE_IMAGE: `${productionImage}@${runnableDigest}`,
+        EXPECTED_PROJECT_NUMBER: projectNumber,
+        EXPECTED_REPOSITORY_ID: repositoryId,
+        EXPECTED_SERVICE_NAME: "cdbentley",
+      }) : {}),
       GITHUB_OUTPUT: output,
       PARITY_REVISION_DIR: revisionDir,
       PARITY_REVISION_JSON: productionRevisionFixture

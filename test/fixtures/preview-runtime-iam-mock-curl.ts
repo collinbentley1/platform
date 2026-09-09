@@ -17,6 +17,7 @@ if (/\/v1\/projects\/[^:]+$/.test(url)) {
     runsetta: "601124730704",
     "medlock-1025243085": "229383559510",
     "critical-history-16823277": "422714632513",
+    "virtual-care-mcp": "894875537243",
   }[project] ?? "1";
   const response: any = { lifecycleState: "ACTIVE", projectId: project, projectNumber };
   if (process.env.MOCK_MODE === "parent") {
@@ -36,16 +37,16 @@ if (url.includes(":getIamPolicy")) {
   writeFileSync(process.env.MOCK_COUNTS!, JSON.stringify(counts));
   const drift = process.env.MOCK_MODE === "etag-drift" && counts[project] > 1;
   const bindings: any[] = [];
-  if (process.env.MOCK_MODE === "direct-binding" && project === "runsetta") {
+  if (process.env.MOCK_MODE === "direct-binding" && ["runsetta", "virtual-care-mcp"].includes(project)) {
     bindings.push({
-      members: ["serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com"],
+      members: [`serviceAccount:cloud-run-preview@${project === "virtual-care-mcp" ? project : "cdbentley"}.iam.gserviceaccount.com`],
       role: "roles/viewer",
     });
   }
-  if (process.env.MOCK_MODE === "broad-principal" && project === "runsetta") {
+  if (process.env.MOCK_MODE === "broad-principal" && ["runsetta", "virtual-care-mcp"].includes(project)) {
     bindings.push({ members: ["group:developers@example.com"], role: "roles/viewer" });
   }
-  if (process.env.MOCK_MODE === "project-service-accounts" && project === "runsetta") {
+  if (process.env.MOCK_MODE === "project-service-accounts" && ["runsetta", "virtual-care-mcp"].includes(project)) {
     bindings.push({
       members: ["principalSet://cloudresourcemanager.googleapis.com/projects/601124730704/type/ServiceAccount"],
       role: "roles/viewer",
@@ -70,8 +71,17 @@ const response: any = {
   serviceAccountImpersonationAnalysis: [],
   fullyExplored: true,
 };
-if (mode === "binding" && project === "runsetta") main.analysisResults.push({ iamBinding: { role: "roles/viewer" } });
-if (mode === "group-binding" && project === "runsetta") {
+if (mode === "binding" && ["runsetta", "virtual-care-mcp"].includes(project)) main.analysisResults.push({ iamBinding: { role: "roles/viewer" } });
+if (mode === "cross-group-child-binding" && (
+  (project === "virtual-care-mcp" && identity === "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com") ||
+  (project === "cdbentley" && identity === "serviceAccount:cloud-run-preview@virtual-care-mcp.iam.gserviceaccount.com")
+)) {
+  main.analysisResults.push({
+    attachedResourceFullName: `//artifactregistry.googleapis.com/projects/${project}/locations/us-east4/repositories/private`,
+    iamBinding: { members: [identity], role: "roles/artifactregistry.reader" },
+  });
+}
+if (mode === "group-binding" && ["runsetta", "virtual-care-mcp"].includes(project)) {
   main.analysisResults.push({
     iamBinding: { members: ["group:preview-runtime@example.com"], role: "roles/viewer" },
   });

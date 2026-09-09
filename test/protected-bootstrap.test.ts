@@ -1347,7 +1347,7 @@ describe("protected owner Terraform bridge", () => {
     );
     expect(workflow).not.toContain("actions/checkout");
     expect(workflow).toContain(
-      "BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452",
+      "BUN_SHA256: 36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
     );
     expect(workflow).toContain(
       "TERRAFORM_SHA256: ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280",
@@ -12207,7 +12207,7 @@ function validEnvironment(): NodeJS.ProcessEnv {
     TERRAFORM_PROVIDER_DIRECTORY: "/tmp/terraform-provider-google",
     TERRAFORM_ROOT: "bootstrap",
     TERRAFORM_SANDBOX_IMAGE:
-      "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b",
+      "docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023",
     TRANSITION_PLATFORM_ROOT: "/tmp/transition-platform",
     TRANSITION_WORKFLOW_SHA: "",
   };

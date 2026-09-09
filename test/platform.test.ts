@@ -1258,7 +1258,7 @@ describe("platform scaffold and doctor", () => {
       PROTECTED_BOOTSTRAP_DOCKER_BINARY: "/usr/bin/docker",
       PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1",
       TERRAFORM_SANDBOX_IMAGE:
-        "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b",
+        "docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023",
     });
     expect(gate?.run).toBeString();
     const run = gate?.run as string;
@@ -2924,7 +2924,7 @@ describe("platform scaffold and doctor", () => {
       "utf8",
     );
     expect(createHash("sha256").update(bootstrap).digest("hex")).toBe(
-      "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926",
+      "3a73f20a4afce688de16fe8cf126574c4230d950daf9bd924a593a67edf41331",
     );
     const expectedImageRole = [
       'resource "google_project_iam_custom_role" "preview_traffic_image_downloader" {',

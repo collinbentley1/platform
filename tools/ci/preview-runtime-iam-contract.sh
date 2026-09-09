@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Read-only admission check for the four standalone preview projects. The caller
-# needs cloudasset.assets.analyzeIamPolicy and serviceusage.services.use on every
-# project, plus resourcemanager.projects.get/getIamPolicy for standalone-parent
+# Read-only admission check for every registered preview identity in the caller's
+# selected project scopes. The caller needs cloudasset.assets.analyzeIamPolicy
+# and serviceusage.services.use on each selected project, plus
+# resourcemanager.projects.get/getIamPolicy for standalone-parent
 # and exact direct-policy brackets.
 # cloudasset.googleapis.com and cloudresourcemanager.googleapis.com must already
 # be enabled. WIF should authenticate a dedicated CI verifier with only those
@@ -24,7 +25,16 @@ command -v curl >/dev/null
 command -v jq >/dev/null
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 
-projects=(cdbentley runsetta medlock-1025243085 critical-history-16823277)
+case "${REPOSITORY_ID:-}" in
+  1362801465) scope_projects=(virtual-care-mcp) ;;
+  ''|1255553151|711292980|1025243085|280932482)
+    scope_projects=(cdbentley runsetta medlock-1025243085 critical-history-16823277)
+    ;;
+  *) echo "Unregistered preview IAM audit repository." >&2; exit 64 ;;
+esac
+identity_projects=(cdbentley runsetta medlock-1025243085 critical-history-16823277 virtual-care-mcp)
+readonly -a scope_projects identity_projects
+readonly scope_count="${#scope_projects[@]}" identity_count="${#identity_projects[@]}"
 umask 077
 token_file="$RUNNER_TEMP/preview-runtime-iam-token"
 header_file="$RUNNER_TEMP/preview-runtime-iam-header"
@@ -51,7 +61,7 @@ printf 'Authorization: Bearer %s\n' "$(<"$token_file")" > "$header_file"
 snapshot_projects() {
   local destination="$1" project response
   : > "$destination"
-  for project in "${projects[@]}"; do
+  for project in "${scope_projects[@]}"; do
     response="$RUNNER_TEMP/preview-runtime-iam-analysis-project-${project}.json"
     curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
       --header "@$header_file" --output "$response" \
@@ -66,13 +76,13 @@ snapshot_projects() {
       {projectId,projectNumber,lifecycleState,parent:(.parent // null)}
     ' "$response" >> "$destination"
   done
-  test "$(wc -l < "$destination" | tr -d ' ')" -eq 4
+  test "$(wc -l < "$destination" | tr -d ' ')" -eq "$scope_count"
 }
 
 snapshot_project_policies() {
   local destination="$1" project response
   : > "$destination"
-  for project in "${projects[@]}"; do
+  for project in "${scope_projects[@]}"; do
     response="$RUNNER_TEMP/preview-runtime-iam-analysis-policy-${project}.json"
     curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
       --request POST --header "@$header_file" --header 'Content-Type: application/json' \
@@ -84,7 +94,7 @@ snapshot_project_policies() {
         test("^(deleted:)?(group|domain):") or
         test("^project(Owner|Editor|Viewer):") or
         test("^principalSet://cloudresourcemanager\\.googleapis\\.com/(projects|folders|organizations)/[^/]+/type/ServiceAccount$") or
-        test("^(deleted:)?serviceAccount:cloud-run-preview@(cdbentley|runsetta|medlock-1025243085|critical-history-16823277)\\.iam\\.gserviceaccount\\.com$");
+        test("^(deleted:)?serviceAccount:cloud-run-preview@(cdbentley|runsetta|medlock-1025243085|critical-history-16823277|virtual-care-mcp)\\.iam\\.gserviceaccount\\.com$");
       select(
         (.etag | type == "string" and length > 0) and
         ((.version // 1) == 1 or (.version // 1) == 3) and
@@ -103,7 +113,7 @@ snapshot_project_policies() {
       }
     ' "$response" >> "$destination"
   done
-  test "$(wc -l < "$destination" | tr -d ' ')" -eq 4
+  test "$(wc -l < "$destination" | tr -d ' ')" -eq "$scope_count"
 }
 
 analyze_identity_in_scope() {
@@ -140,8 +150,8 @@ analyze_identity_in_scope() {
 
 snapshot_projects "$projects_before"
 snapshot_project_policies "$snapshot_before"
-for identity_project in "${projects[@]}"; do
-  for scope_project in "${projects[@]}"; do
+for identity_project in "${identity_projects[@]}"; do
+  for scope_project in "${scope_projects[@]}"; do
     analyze_identity_in_scope "$identity_project" "$scope_project"
   done
 done
@@ -151,4 +161,4 @@ cmp "$snapshot_before" "$snapshot_after" >/dev/null
 cmp "$projects_before" "$projects_after" >/dev/null
 
 echo "preview_runtime_iam_admitted=true"
-echo "preview_runtime_iam_analyses=16"
+echo "preview_runtime_iam_analyses=$((identity_count * scope_count))"

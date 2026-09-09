@@ -1,7 +1,57 @@
 import { describe, expect, test } from "bun:test";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createSocketScanner } from "../tools/socket-security-scanner";
 
 describe("platform Socket security scanner", () => {
+  test("allows 135 packages only for the exact new-app identity and still scans every package", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "virtual-care-scanner-"));
+    try {
+      await mkdir(join(directory, "tools"));
+      await mkdir(join(directory, ".platform"));
+      const scannerPath = join(directory, "tools/socket-security-scanner.ts");
+      await cp(new URL("../tools/socket-security-scanner.ts", import.meta.url), scannerPath);
+      const implementation: typeof import("../tools/socket-security-scanner") = await import(pathToFileURL(scannerPath).href);
+      const configuration = {
+        githubRepositoryId: "1362801465", name: "virtual-care-mcp",
+        projectId: "virtual-care-mcp", serviceName: "virtual-care-mcp",
+      };
+      const configPath = join(directory, ".platform/config.json");
+      await writeFile(configPath, JSON.stringify(configuration));
+      let requests = 0;
+      const scanner = implementation.createSocketScanner({
+        fetcher: async (input) => {
+          requests++;
+          return new Response(publicBody(decodeURIComponent(String(input).split("/").at(-1)!)));
+        },
+        logger: () => {},
+      });
+      const packages = Array.from({ length: 135 }, (_, index) => packageEntry(`pkg-${index}`, "1.0.0"));
+      expect(await scanner.scan({ packages })).toEqual([]);
+      expect(requests).toBe(135);
+      requests = 0;
+      await expect(scanner.scan({ packages: [...packages, packageEntry("extra", "1.0.0")] })).rejects.toThrow(
+        "the reviewed limit is 135",
+      );
+      expect(requests).toBe(0);
+      for (const drift of [
+        { ...configuration, githubRepositoryId: "1255553151" },
+        { ...configuration, name: "foreign" },
+        { ...configuration, projectId: "foreign" },
+        { ...configuration, serviceName: "foreign" },
+        {},
+      ]) {
+        await writeFile(configPath, JSON.stringify(drift));
+        await expect(scanner.scan({ packages })).rejects.toThrow("the reviewed limit is 128");
+        expect(requests).toBe(0);
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("scans the maximum reviewed package set only through credentialless public requests", async () => {
     const requests: Array<{
       body: BodyInit | null | undefined;

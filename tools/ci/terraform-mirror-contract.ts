@@ -32,6 +32,7 @@ type ReviewedTerraformContract = {
   readonly containerEnv?: readonly (readonly [string, string | TerraformExpression])[];
   readonly firestoreDatabase?: readonly (readonly [string, string])[];
   readonly githubRepo?: string;
+  readonly manageFirestoreFieldTtl?: boolean;
   readonly name?: string;
   readonly previewIngress: "INGRESS_TRAFFIC_ALL" | "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER";
   readonly projectId?: string;
@@ -62,6 +63,53 @@ const defaultContract: ReviewedTerraformContract = {
 };
 
 const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
+  "1362801465": {
+    ...defaultContract,
+    additionalProductionResources: `resource "google_firestore_field" "virtual_care_visit_ttl" {
+  project = var.project_id
+  database = "(default)"
+  collection = "visits"
+  field = "expiresAt"
+
+  ttl_config {}
+  index_config {}
+
+  depends_on = [module.site]
+}`,
+    artifactRegistryDescription: "Container images for Virtual Care MCP.",
+    artifactRegistryRepositoryId: "site",
+    containerEnv: [
+      ["VISIT_STORE", "firestore"],
+      ["FIRESTORE_PROJECT_ID", "virtual-care-mcp"],
+      ["PUBLIC_BASE_URL", "https://virtual-care-mcp-894875537243.us-east4.run.app"],
+    ],
+    firestoreDatabase: [
+      ["name", "(default)"],
+      ["location_id", "us-east4"],
+      ["runtime_collection_env_name", "FIRESTORE_COLLECTION"],
+      ["runtime_collection_env_value", "visits"],
+    ],
+    githubRepo: "virtual-care-mcp",
+    manageFirestoreFieldTtl: true,
+    name: "virtual-care-mcp",
+    projectId: "virtual-care-mcp",
+    requiredServicesOverride: [
+      "artifactregistry.googleapis.com",
+      "cloudasset.googleapis.com",
+      "cloudresourcemanager.googleapis.com",
+      "firestore.googleapis.com",
+      "iam.googleapis.com",
+      "iamcredentials.googleapis.com",
+      "run.googleapis.com",
+      "serviceusage.googleapis.com",
+      "storage.googleapis.com",
+      "sts.googleapis.com",
+    ],
+    runtimeDescription: "Runtime identity for the virtual-care-mcp Cloud Run services.",
+    runtimeProjectRolesOverride: ["roles/datastore.user"],
+    serviceName: "virtual-care-mcp",
+    stateBucketName: "virtual-care-mcp-tfstate",
+  },
   "1255553151": {
     ...defaultContract,
     artifactRegistryDescription: "Container images for the cdbentley personal site.",
@@ -269,6 +317,33 @@ const forbiddenPreMigrationWorkflowShas = new Set([
   "92c73184bc527388b5e10ccb5e4f0222a84e68b5",
   "33ab9b9a5f3d8a0553372980c22540cad001f776",
 ]);
+
+export function hasReviewedTerraformContract(repositoryId: string): boolean {
+  return Object.hasOwn(reviewedContracts, repositoryId);
+}
+
+export function renderReviewedTerraformMirrors(
+  identity: TerraformMirrorIdentity & { readonly expectedPlatformSha: string },
+): TerraformMirrorSources {
+  const contract = reviewedContracts[identity.githubRepositoryId];
+  if (!contract) throw new Error("Repository is not registered for reviewed Terraform rendering.");
+  const productionModule = renderProductionModule(identity, contract, identity.expectedPlatformSha);
+  const sources: TerraformMirrorSources = {
+    bootstrapMain: renderBootstrapModule(identity, contract, identity.expectedPlatformSha),
+    bootstrapOutputs: renderBootstrapOutputs(),
+    bootstrapVariables: renderBootstrapVariables(identity, contract),
+    bootstrapVersions: renderBootstrapVersions(identity, contract),
+    productionMain: contract.additionalProductionResources === undefined
+      ? productionModule
+      : `${productionModule}\n${contract.additionalProductionResources}`,
+    productionOutputs: renderProductionOutputs(),
+    productionVariables: renderProductionVariables(identity, contract),
+    productionVersions: renderProductionVersions(identity, contract),
+  };
+  const failures = validateTerraformMirrorContract(identity, sources);
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+  return sources;
+}
 
 export function validateTerraformMirrorContract(
   identity: TerraformMirrorIdentity,
@@ -1093,6 +1168,9 @@ function renderBootstrapModule(
   }
   if (contract.runtimeProjectRolesOverride !== null) {
     lines.push("runtime_project_roles = " + renderStringList(contract.runtimeProjectRolesOverride));
+  }
+  if (contract.manageFirestoreFieldTtl !== undefined) {
+    lines.push(`manage_firestore_field_ttl = ${String(contract.manageFirestoreFieldTtl)}`);
   }
   lines.push(
     "manage_automatic_default_service_account_grants_policy = var.manage_automatic_default_service_account_grants_policy",

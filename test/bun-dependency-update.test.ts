@@ -12,7 +12,7 @@ const baseManifest = {
   dependencies: { "fixture-package": "1.0.0" },
   devDependencies: { typescript: "7.0.2" },
   name: "bun-update-fixture",
-  packageManager: "bun@1.4.0",
+  packageManager: "bun@1.4.2",
   private: true,
   scripts: { test: "bun test" },
   version: "1.0.0",

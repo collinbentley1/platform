@@ -295,22 +295,22 @@ jobs:
               --porcelain=v1 --untracked-files=all)"
           fi
 
-      - name: Install checksum-pinned Bun 1.4.0
+      - name: Install checksum-pinned Bun 1.4.2
         if: ${{ success() && !cancelled() }}
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+          BUN_SHA256: 36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/bun.zip"
           destination="$RUNNER_TEMP/bun-bin"
           curl --fail --show-error --silent --location \
             --output "$archive" \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip
           echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
           mkdir -m 0700 "$destination"
           unzip -q "$archive" -d "$destination"
-          test "$("$destination/bun-linux-x64/bun" --revision | cut -d+ -f1)" = "1.4.0"
+          "$destination/bun-linux-x64/bun" --no-env-file -e 'if (Bun.version !== "1.4.2" || Bun.revision !== "744846f844374847c902b5e7fd59b4342a51ef99") process.exit(1)'
           echo "$destination/bun-linux-x64" >> "$GITHUB_PATH"
 
       - name: Extract checksum-pinned Terraform 1.14.5 without host execution
@@ -363,7 +363,7 @@ jobs:
         if: ${{ success() && !cancelled() }}
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
+          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023
         run: |
           set -euo pipefail
           canonical_image="${TERRAFORM_SANDBOX_IMAGE#docker.io/}"
@@ -406,7 +406,7 @@ jobs:
           TERRAFORM_PROVIDER_ARCHIVE: ${{ runner.temp }}/terraform-provider-google-7.45.0-linux-amd64.zip
           TERRAFORM_PROVIDER_DIRECTORY: ${{ runner.temp }}/terraform-provider-google
           TERRAFORM_ROOT: ${{ inputs.terraform_root }}
-          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
+          TERRAFORM_SANDBOX_IMAGE: docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023
           TRANSITION_PLATFORM_ROOT: ${{ runner.temp }}/transition-platform
           TRANSITION_WORKFLOW_SHA: ${{ inputs.transition_workflow_sha }}
           CONSUMER_ACTIONS_READ_TOKEN: ${{ secrets.CONSUMER_ACTIONS_READ_TOKEN }}
@@ -780,7 +780,7 @@ jobs:
         timeout-minutes: 1
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
-          BUN_SHA256: 2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452
+          BUN_SHA256: 36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913
           GITHUB_ACTOR_ID_EXACT: ${{ github.actor_id }}
           GITHUB_EVENT_NAME_EXACT: ${{ github.event_name }}
           GITHUB_REF_EXACT: ${{ github.ref }}
@@ -848,11 +848,11 @@ jobs:
           (
             curl --connect-timeout 10 --max-time 30 --fail --show-error --silent --location \
               --output "$archive" \
-              https://github.com/oven-sh/bun/releases/download/bun-v1.4.0/bun-linux-x64.zip
+              https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip
             echo "${BUN_SHA256}  ${archive}" | sha256sum --check --strict
             mkdir -m 0700 "$destination"
             unzip -q "$archive" -d "$destination"
-            test "$("$destination/bun-linux-x64/bun" --revision | cut -d+ -f1)" = "1.4.0"
+            "$destination/bun-linux-x64/bun" --no-env-file -e 'if (Bun.version !== "1.4.2" || Bun.revision !== "744846f844374847c902b5e7fd59b4342a51ef99") process.exit(1)'
           ) &
           bun_pid=$!
 

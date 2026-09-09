@@ -21,7 +21,7 @@ const exactRuntimeConfigFixture = join(
 const headSha = "0123456789abcdef0123456789abcdef01234567";
 const platformWorkflowSha = "3".repeat(40);
 const dhiParityId = "1a4cho1elzg84pavos8mbanvvpmkieiht7kyhpjdofzpivf3k8";
-const ovenChild = "8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b";
+const ovenChild = "d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023";
 const devChild = "58a392f5dec3be5cb20a2495baca84ac785f237a2d2904c5b9cad7ba11f3e475";
 const runtimeChild = "0f9e5f506d653e0f87e44bb5c24fece19f9fb7253016f6e49d7a4783026f876d";
 const temporaryRoots: string[] = [];
@@ -882,7 +882,7 @@ function deriveApplicationConfig(runtimeConfig: JsonObject): JsonObject {
   config.config.Env = [
     ...config.config.Env.filter(
       (value: string) => !/^(NODE_ENV|PORT|PUBLIC_DIR)=/.test(value),
-    ).map((value: string) => value.startsWith("BUN_VERSION=") ? "BUN_VERSION=1.4.0" : value),
+    ).map((value: string) => value.startsWith("BUN_VERSION=") ? "BUN_VERSION=1.4.2" : value),
     "NODE_ENV=production",
     "PORT=8080",
     "PUBLIC_DIR=/app/dist/public",
