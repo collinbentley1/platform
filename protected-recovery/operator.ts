@@ -147,9 +147,24 @@ export function callerPins(content: string, file: string, platform: string, pins
     exact(events.push, { branches: ["main"] }, `${file} push trigger`);
   }
   if (file === "reconcile-previews.yml") {
+    exact(Object.keys(document).sort(), ["jobs", "name", "on", "permissions", "run-name"], "reconcile top-level shape");
+    exact(document.name, "Reconcile previews", "reconcile workflow name");
+    exact(document.permissions, {}, "reconcile workflow permissions");
+    exact(Object.keys(jobs), ["reconcile"], "reconcile job set");
+    const reconcile = object(jobs.reconcile);
+    exact(Object.keys(reconcile).sort(), ["permissions", "uses"], "reconcile job shape");
+    exact(reconcile.permissions, { actions: "read", "id-token": "write", "pull-requests": "read" }, "reconcile job permissions");
     exact(document["run-name"], "${{ inputs.delivery_nonce && format('recovery-dispatch-{0}', inputs.delivery_nonce) || github.workflow }}", "reconcile run-name");
-    const input = object(object(object(events.workflow_dispatch).inputs).delivery_nonce);
-    exact(input.type, "string", "reconcile delivery nonce input");
+    exact(Object.keys(events).sort(), ["push", "schedule", "workflow_dispatch"], "reconcile event set");
+    const dispatch = object(events.workflow_dispatch);
+    exact(Object.keys(dispatch), ["inputs"], "reconcile dispatch shape");
+    const inputs = object(dispatch.inputs);
+    exact(Object.keys(inputs), ["delivery_nonce"], "reconcile dispatch inputs");
+    exact(object(inputs.delivery_nonce), {
+      description: "Correlation nonce for a protected recovery delivery round.",
+      required: false,
+      type: "string",
+    }, "reconcile delivery nonce input");
     const schedules = events.schedule;
     if (!Array.isArray(schedules) || schedules.length !== 1 || !/^[0-5]?[0-9] \* \* \* \*$/.test(string(object(schedules[0]).cron))) throw new Error("reconcile delivery requires one hourly schedule");
   }

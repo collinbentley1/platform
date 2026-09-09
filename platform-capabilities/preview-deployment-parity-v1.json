@@ -12,7 +12,7 @@
     ".github/workflows/cleanup-preview.yml": "sha256:7c0e62b7837adeb52f1f1b2bf300e7f063b7def6ad39ad2a5def39262f58b1b2",
     ".github/workflows/deploy-preview.yml": "sha256:9be6dc66c1f11bfa0e3fffd12de865172380796f7867270c7b079188b7d66720",
     ".github/workflows/deploy-prod.yml": "sha256:676b34de32e1e1a9f174f07c0d5b46ac5aca11c6d4700a7e67ded5f671512763",
-    ".github/workflows/infrastructure.yml": "sha256:334ca8c4aec71a47d73a42e3176c82a0547396ac60074d31740523b342a55662",
+    ".github/workflows/infrastructure.yml": "sha256:3d77f69f66d984ce9ec358e7666972d6677885c6530783ab0047525bd09d90a5",
     ".github/workflows/reconcile-previews.yml": "sha256:4728dd716aed256a32e2c2aeaa92c6eaf6e44f00b106657a549d5675b25cd7e4",
     "terraform/modules/bootstrap/main.tf": "sha256:3a73f20a4afce688de16fe8cf126574c4230d950daf9bd924a593a67edf41331",
     "terraform/modules/bootstrap/variables.tf": "sha256:f5c98ec81aee156ae102b142ba490d15c2f1dcd3c9e1b5515221060313f9f619",

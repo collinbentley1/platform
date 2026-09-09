@@ -76,6 +76,9 @@ describe("durable delivery operator", () => {
       expect(() => callerPins(content.replace(/^run-name:/m, "# run-name:"), file, "collinbentley1/platform", [sha])).toThrow();
       if (file === "reconcile-previews.yml") {
         expect(() => callerPins(content.replace("delivery_nonce:", "unrelated_input:"), file, "collinbentley1/platform", [sha])).toThrow();
+        expect(() => callerPins(content.replace("    uses:", "    with:\n      leak: ${{ toJSON(inputs) }}\n    uses:"), file, "collinbentley1/platform", [sha])).toThrow("job shape");
+        expect(() => callerPins(content.replace("    uses:", "    env:\n      LEAK: ${{ toJSON(github.event.inputs) }}\n    uses:"), file, "collinbentley1/platform", [sha])).toThrow("job shape");
+        expect(() => callerPins(content.replace("  workflow_dispatch:", "  pull_request:\n  workflow_dispatch:"), file, "collinbentley1/platform", [sha])).toThrow("event set");
         expect(() => callerPins(content.replace("17 * * * *", "17 1 * * *"), file, "collinbentley1/platform", [sha])).toThrow("hourly");
         expect(() => callerPins(content.replace("  push:", "  unused_push:"), file, "collinbentley1/platform", [sha])).toThrow();
       } else {
