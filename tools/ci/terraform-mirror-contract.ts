@@ -81,6 +81,7 @@ const reviewedContracts: Readonly<Record<string, ReviewedTerraformContract>> = {
     containerEnv: [
       ["VISIT_STORE", "firestore"],
       ["FIRESTORE_PROJECT_ID", "virtual-care-mcp"],
+      ["PUBLIC_BASE_URL", "https://virtual-care-mcp-894875537243.us-east4.run.app"],
     ],
     firestoreDatabase: [
       ["name", "(default)"],

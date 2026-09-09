@@ -33,7 +33,8 @@ prove_production() {
   require_json "$service"
   require_json "$revision"
 
-  jq -e --arg name "$service_name" --arg namespace "$project_number" --arg parity "$DHI_PARITY_ID" '
+  jq -e --arg name "$service_name" --arg namespace "$project_number" --arg parity "$DHI_PARITY_ID" \
+    --arg repository_id "$repository_id" '
     .apiVersion == "serving.knative.dev/v1" and .kind == "Service" and
     .metadata.name == $name and .metadata.namespace == $namespace and
     .metadata.generation == .status.observedGeneration and
@@ -51,7 +52,10 @@ prove_production() {
     (.status.traffic | length) == 1 and
     .status.traffic[0].latestRevision == true and .status.traffic[0].percent == 100 and
     .status.traffic[0].revisionName == .status.latestReadyRevisionName and
-    (.status.traffic[0] | has("tag") | not)
+    (.status.traffic[0] | has("tag") | not) and
+    (if $repository_id == "1362801465" then
+      .status.url == "https://virtual-care-mcp-894875537243.us-east4.run.app"
+    else true end)
   ' "$service" >/dev/null || die "Production is not exactly one healthy, untagged, 100%-served latest revision."
 
   local revision_name
@@ -80,7 +84,19 @@ prove_production() {
     ($index | test("^sha256:[0-9a-f]{64}$")) and
     ($runnable | test("^sha256:[0-9a-f]{64}$")) and
     .spec.containers[0].image == ($image_name + "@" + $runnable) and
-    .status.imageDigest == .spec.containers[0].image
+    .status.imageDigest == .spec.containers[0].image and
+    (if $repository_id == "1362801465" then
+      $service == "virtual-care-mcp" and $namespace == "894875537243" and
+      ([.spec.containers[0].env[] | .name] | sort) == [
+        "FIRESTORE_COLLECTION","FIRESTORE_DATABASE_ID","FIRESTORE_PROJECT_ID",
+        "PLATFORM_IMAGE_INDEX_DIGEST","PLATFORM_IMAGE_RUNNABLE_DIGEST","PUBLIC_BASE_URL","VISIT_STORE"
+      ] and
+      exact_value("PUBLIC_BASE_URL") == "https://virtual-care-mcp-894875537243.us-east4.run.app" and
+      exact_value("VISIT_STORE") == "firestore" and
+      exact_value("FIRESTORE_PROJECT_ID") == "virtual-care-mcp" and
+      exact_value("FIRESTORE_DATABASE_ID") == "(default)" and
+      exact_value("FIRESTORE_COLLECTION") == "visits"
+    else true end)
   ' "$revision" >/dev/null || die "The exact 100%-served production revision lacks a bound OCI index, runnable child, or trusted DHI provenance metadata."
 
   local index_digest runnable_digest
@@ -255,7 +271,8 @@ validate_preview_routes() {
       local tag_pr
       tag_pr="$(jq -er --arg revision "$revision_name" '.status.traffic[] | select(has("tag") and .revisionName == $revision) | .tag | sub("^pr-"; "")' "$service")"
       if ! jq -e --arg repository_id "$repository_id" --arg image_name "$image_name" --arg parity "$DHI_PARITY_ID" \
-        --arg workflow_sha "$platform_workflow_sha" --arg pr "$tag_pr" '
+        --arg workflow_sha "$platform_workflow_sha" --arg pr "$tag_pr" \
+        --arg service "$service_name" --arg namespace "$project_number" '
         def exact_value($name):
           [.spec.containers[0].env[]? | select(.name == $name and (keys | sort) == ["name","value"]) | .value]
           | if length == 1 then .[0] else error("missing or duplicate immutable image identity") end;
@@ -280,8 +297,10 @@ validate_preview_routes() {
           elif $repository_id == "1362801465" then
             ([.spec.containers[0].env[] | .name] | sort) == [
               "PLATFORM_DEPLOY_ENVIRONMENT","PLATFORM_DEPLOY_NONCE","PLATFORM_IMAGE_INDEX_DIGEST",
-              "PLATFORM_IMAGE_RUNNABLE_DIGEST","PLATFORM_PREVIEW_NUMBER","VISIT_STORE"
+              "PLATFORM_IMAGE_RUNNABLE_DIGEST","PLATFORM_PREVIEW_NUMBER","PUBLIC_BASE_URL","VISIT_STORE"
             ] and
+            $service == "virtual-care-mcp-preview" and $namespace == "894875537243" and
+            exact_value("PUBLIC_BASE_URL") == ("https://pr-" + $pr + "---virtual-care-mcp-preview-894875537243.us-east4.run.app") and
             exact_value("VISIT_STORE") == "memory"
           elif $repository_id == "711292980" then
             ([.spec.containers[0].env[] | .name] | sort) == [

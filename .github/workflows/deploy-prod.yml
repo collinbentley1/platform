@@ -1472,8 +1472,18 @@ jobs:
               # cdbentley has no product-specific runtime configuration.
               ;;
             1362801465)
+              gcloud run services describe "$SERVICE_NAME" \
+                --project="$PROJECT_ID" --region="$REGION" --format=json > "$service_snapshot"
+              jq -e '
+                .metadata.name == "virtual-care-mcp" and .metadata.namespace == "894875537243" and
+                .status.url == "https://virtual-care-mcp-894875537243.us-east4.run.app"
+              ' "$service_snapshot" >/dev/null || {
+                echo "Virtual Care MCP canonical origin is not advertised by its registered Cloud Run service." >&2
+                exit 1
+              }
               jq '. + {
                 VISIT_STORE: "firestore",
+                PUBLIC_BASE_URL: "https://virtual-care-mcp-894875537243.us-east4.run.app",
                 FIRESTORE_PROJECT_ID: "virtual-care-mcp",
                 FIRESTORE_DATABASE_ID: "(default)",
                 FIRESTORE_COLLECTION: "visits"

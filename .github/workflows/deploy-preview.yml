@@ -1591,7 +1591,10 @@ jobs:
               # cdbentley has no product-specific preview configuration.
               ;;
             1362801465)
-              jq '. + { VISIT_STORE: "memory" }' "$env_file" > "$env_file.next"
+              public_base_url="https://pr-${PR_NUMBER}---${PREVIEW_SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
+              jq --arg public_base_url "$public_base_url" '. + {
+                VISIT_STORE: "memory", PUBLIC_BASE_URL: $public_base_url
+              }' "$env_file" > "$env_file.next"
               mv "$env_file.next" "$env_file"
               ;;
             711292980)

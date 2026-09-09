@@ -52,6 +52,7 @@ locals {
       container_env = {
         VISIT_STORE          = "firestore"
         FIRESTORE_PROJECT_ID = "virtual-care-mcp"
+        PUBLIC_BASE_URL      = "https://virtual-care-mcp-894875537243.us-east4.run.app"
       }
       runtime_secret_ids               = []
       runtime_secret_accessor_ids      = []
