@@ -612,6 +612,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243" ;;
             711292980) project_id="runsetta"; project_number="601124730704" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513" ;;
@@ -705,6 +706,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243" ;;
             711292980) project_id="runsetta"; project_number="601124730704" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513" ;;
@@ -844,6 +846,7 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site-preview" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243"; service_name="virtual-care-mcp"; repository="site-preview" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api-preview" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site-preview" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site-preview" ;;
@@ -1121,6 +1124,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243"; service_name="virtual-care-mcp"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api"; preview_ingress="all"; stable_preview_domain="" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site"; preview_ingress="internal-and-cloud-load-balancing"; stable_preview_domain="preview.ycriticalhistory.org" ;;
@@ -1462,7 +1466,7 @@ jobs:
                 exit 1
               fi
               ;;
-            1255553151|711292980|1025243085)
+            1255553151|711292980|1025243085|1362801465)
               if [ "$PREVIEW_INGRESS" != "all" ] || [ -n "$STABLE_PREVIEW_DOMAIN" ]; then
                 echo "Unexpected stable preview exposure for repository $REPOSITORY_ID." >&2
                 exit 1
@@ -1585,6 +1589,10 @@ jobs:
           case "$REPOSITORY_ID" in
             1255553151)
               # cdbentley has no product-specific preview configuration.
+              ;;
+            1362801465)
+              jq '. + { VISIT_STORE: "memory" }' "$env_file" > "$env_file.next"
+              mv "$env_file.next" "$env_file"
               ;;
             711292980)
               # Runsetta is intentionally offline. Preview code must never gain
@@ -1970,6 +1978,7 @@ jobs:
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           ACCESS_TOKEN: ${{ steps.iam-audit-auth.outputs.access_token }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
           set +x
@@ -2180,6 +2189,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243"; service_name="virtual-care-mcp"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api"; preview_ingress="all"; stable_preview_domain="" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site"; preview_ingress="all"; stable_preview_domain="" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site"; preview_ingress="internal-and-cloud-load-balancing"; stable_preview_domain="preview.ycriticalhistory.org" ;;
@@ -2335,6 +2345,7 @@ jobs:
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
           ACCESS_TOKEN: ${{ steps.iam-audit-auth.outputs.access_token }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
         run: |
           set -euo pipefail
           set +x

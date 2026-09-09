@@ -508,6 +508,14 @@ jobs:
               state_bucket="cdbentley-tfstate-882468538648"
               state_prefix="cdbentley/prod"
               ;;
+            1362801465)
+              project_id="virtual-care-mcp"
+              project_number="894875537243"
+              service_name="virtual-care-mcp"
+              preview_ingress="INGRESS_TRAFFIC_ALL"
+              state_bucket="virtual-care-mcp-tfstate"
+              state_prefix="virtual-care-mcp/prod"
+              ;;
             711292980)
               project_id="runsetta"
               project_number="601124730704"

@@ -7,6 +7,7 @@ COPY --from=bun-release /usr/local/bin/bun /usr/local/bin/bun
 RUN bun -e 'if (Bun.version !== "1.4.0" || Bun.revision !== "34cbb9a40b4bd1bd767d134a7065e66c2432a676") throw new Error("Bun image requires 1.4.0+34cbb9a40, got " + Bun.version + "+" + Bun.revision.slice(0, 9))'
 
 COPY package.json bun.lock bunfig.toml tsconfig.json ./
+COPY .platform/config.json ./.platform/config.json
 COPY tools/socket-security-scanner.ts ./tools/socket-security-scanner.ts
 RUN unset SOCKET_API_TOKEN SOCKET_API_KEY; \
   unset BUN_CONFIG_SKIP_LOAD_LOCKFILE BUN_FEATURE_FLAG_DISABLE_IGNORE_SCRIPTS BUN_CONFIG_REGISTRY NPM_CONFIG_REGISTRY; \

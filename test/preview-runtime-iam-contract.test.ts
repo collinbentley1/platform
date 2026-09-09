@@ -11,6 +11,21 @@ const temporary: string[] = [];
 afterEach(async () => Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
 describe("preview runtime effective IAM admission", () => {
+  test("checks the isolated new project without entering the legacy audit group", async () => {
+    const result = await run("clean", "1362801465");
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain("preview_runtime_iam_analyses=1");
+    expect(result.log.match(/:analyzeIamPolicy/g)?.length).toBe(1);
+    expect(result.log).toContain("projects/virtual-care-mcp");
+    expect(result.log).not.toMatch(/cdbentley|runsetta|medlock|critical-history/);
+  });
+
+  test("rejects an unknown audit repository before reading cloud state", async () => {
+    const result = await run("clean", "999999999");
+    expect(result.code).toBe(64);
+    expect(result.log).toBe("");
+  });
+
   test("admits only after 16 complete empty cross-project analyses", async () => {
     const result = await run("clean");
     expect(result.code, result.stderr).toBe(0);
@@ -40,10 +55,15 @@ describe("preview runtime effective IAM admission", () => {
       expect(result.code).not.toBe(0);
       expect(result.stdout).not.toContain("admitted=true");
     });
+    test(`the isolated project fails closed for ${mode}`, async () => {
+      const result = await run(mode, "1362801465");
+      expect(result.code).not.toBe(0);
+      expect(result.stdout).not.toContain("admitted=true");
+    });
   }
 });
 
-async function run(mode: string) {
+async function run(mode: string, repositoryId = "1255553151") {
   const dir = await mkdtemp(join(tmpdir(), "preview-runtime-iam-"));
   temporary.push(dir);
   const bin = join(dir, "bin");
@@ -57,7 +77,7 @@ async function run(mode: string) {
   await writeFile(counts, "{}");
   const child = Bun.spawn(["/bin/bash", helper, "verify"], {
     cwd: root,
-    env: { ...process.env, ACCESS_TOKEN: "mock-token", MOCK_COUNTS: counts, MOCK_LOG: log, MOCK_MODE: mode, PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: dir },
+    env: { ...process.env, ACCESS_TOKEN: "mock-token", MOCK_COUNTS: counts, MOCK_LOG: log, MOCK_MODE: mode, PATH: `${bin}:${process.env.PATH}`, REPOSITORY_ID: repositoryId, RUNNER_TEMP: dir },
     stdout: "pipe", stderr: "pipe",
   });
   const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);

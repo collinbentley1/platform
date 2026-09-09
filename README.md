@@ -255,6 +255,14 @@ variable/override files, CLI config, and crash logs.
 
 ## Local Verification
 
+The scaffold renders registered applications from their reviewed Terraform
+contract, including data resources and role bounds. New repository
+`1362801465` (`virtual-care-mcp`) uses Firestore with visits TTL and memory-only
+previews. Its first bootstrap is the fixed-identity
+[`virtual-care-enrollment` root](terraform/deployments/virtual-care-enrollment/README.md),
+which keeps federation disabled until reviewed activation and leaves the
+existing recovery cohort unchanged.
+
 The canary cleanup fixtures require Bash 4 or newer and `jq`. Put the modern
 Bash installation's `bin` directory first in `PATH` before running `bun test`.
 On macOS, `/bin/bash` is version 3.2 and cannot run these fixtures. The tests

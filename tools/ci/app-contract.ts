@@ -1,6 +1,10 @@
 export const expectedVerifyScript =
   "bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci";
 
+export function reviewedPackageLimitForRepository(repositoryId: string): number {
+  return repositoryId === "1362801465" ? 135 : 128;
+}
+
 const dependencyGroups = [
   "dependencies",
   "devDependencies",

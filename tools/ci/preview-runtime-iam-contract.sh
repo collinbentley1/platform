@@ -24,7 +24,14 @@ command -v curl >/dev/null
 command -v jq >/dev/null
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 
-projects=(cdbentley runsetta medlock-1025243085 critical-history-16823277)
+case "${REPOSITORY_ID:-}" in
+  1362801465) projects=(virtual-care-mcp) ;;
+  ''|1255553151|711292980|1025243085|280932482)
+    projects=(cdbentley runsetta medlock-1025243085 critical-history-16823277)
+    ;;
+  *) echo "Unregistered preview IAM audit repository." >&2; exit 64 ;;
+esac
+readonly project_count="${#projects[@]}"
 umask 077
 token_file="$RUNNER_TEMP/preview-runtime-iam-token"
 header_file="$RUNNER_TEMP/preview-runtime-iam-header"
@@ -66,7 +73,7 @@ snapshot_projects() {
       {projectId,projectNumber,lifecycleState,parent:(.parent // null)}
     ' "$response" >> "$destination"
   done
-  test "$(wc -l < "$destination" | tr -d ' ')" -eq 4
+  test "$(wc -l < "$destination" | tr -d ' ')" -eq "$project_count"
 }
 
 snapshot_project_policies() {
@@ -84,7 +91,7 @@ snapshot_project_policies() {
         test("^(deleted:)?(group|domain):") or
         test("^project(Owner|Editor|Viewer):") or
         test("^principalSet://cloudresourcemanager\\.googleapis\\.com/(projects|folders|organizations)/[^/]+/type/ServiceAccount$") or
-        test("^(deleted:)?serviceAccount:cloud-run-preview@(cdbentley|runsetta|medlock-1025243085|critical-history-16823277)\\.iam\\.gserviceaccount\\.com$");
+        test("^(deleted:)?serviceAccount:cloud-run-preview@(cdbentley|runsetta|medlock-1025243085|critical-history-16823277|virtual-care-mcp)\\.iam\\.gserviceaccount\\.com$");
       select(
         (.etag | type == "string" and length > 0) and
         ((.version // 1) == 1 or (.version // 1) == 3) and
@@ -103,7 +110,7 @@ snapshot_project_policies() {
       }
     ' "$response" >> "$destination"
   done
-  test "$(wc -l < "$destination" | tr -d ' ')" -eq 4
+  test "$(wc -l < "$destination" | tr -d ' ')" -eq "$project_count"
 }
 
 analyze_identity_in_scope() {
@@ -151,4 +158,4 @@ cmp "$snapshot_before" "$snapshot_after" >/dev/null
 cmp "$projects_before" "$projects_after" >/dev/null
 
 echo "preview_runtime_iam_admitted=true"
-echo "preview_runtime_iam_analyses=16"
+echo "preview_runtime_iam_analyses=$((project_count * project_count))"

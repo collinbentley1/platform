@@ -241,16 +241,20 @@ describe("the protected apply identity gains only what TTL and config need", () 
 });
 
 describe("only the application that needs them declares them", () => {
-  test("Identity Platform, reCAPTCHA, and TTL are scoped to the Medlock deployment", async () => {
+  test("Identity Platform and reCAPTCHA remain Medlock-only; TTL is scoped to both reviewed stores", async () => {
     const source = await readFile(bootstrapDeployment, "utf8");
     expect(source.match(/identitytoolkit\.googleapis\.com/g)?.length).toBe(1);
     expect(source.match(/recaptchaenterprise\.googleapis\.com/g)?.length).toBe(1);
-    expect(source.match(/manage_firestore_field_ttl\s*=\s*true/g)?.length).toBe(1);
-    // And it is the Medlock entry that carries them.
-    const medlock = source.slice(source.indexOf('"1025243085" = {'));
+    expect(source.match(/manage_firestore_field_ttl\s*=\s*true/g)?.length).toBe(2);
+    const medlock = source.match(/    "1025243085" = \{[\s\S]*?\n    \}/)?.[0] ?? "";
     expect(medlock.indexOf("identitytoolkit.googleapis.com")).toBeGreaterThan(-1);
     expect(medlock.indexOf("recaptchaenterprise.googleapis.com")).toBeGreaterThan(-1);
     expect(medlock.indexOf("manage_firestore_field_ttl = true")).toBeGreaterThan(-1);
+    const virtualCare = source.match(/    "1362801465" = \{[\s\S]*?\n    \}/)?.[0] ?? "";
+    expect(virtualCare).toContain("firestore.googleapis.com");
+    expect(virtualCare).toContain("manage_firestore_field_ttl = true");
+    expect(virtualCare).not.toContain("identitytoolkit.googleapis.com");
+    expect(virtualCare).not.toContain("recaptchaenterprise.googleapis.com");
   });
 
   test("the flag defaults to off so a new application inherits nothing", async () => {

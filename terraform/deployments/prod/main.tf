@@ -5,6 +5,7 @@ variable "repository_id" {
   validation {
     condition = contains([
       "1255553151",
+      "1362801465",
       "711292980",
       "1025243085",
       "280932482",
@@ -40,6 +41,38 @@ locals {
       preview_commit_service_account           = "gha-preview-commit@cdbentley.iam.gserviceaccount.com"
       preview_operator_service_account         = "gha-preview-operator@cdbentley.iam.gserviceaccount.com"
       preview_publisher_service_account        = "gha-preview-publish@cdbentley.iam.gserviceaccount.com"
+    }
+    "1362801465" = {
+      app                             = "virtual-care-mcp"
+      project_id                      = "virtual-care-mcp"
+      region                          = "us-east4"
+      service_name                    = "virtual-care-mcp"
+      artifact_registry_repository_id = "site"
+      artifact_registry_description   = "Container images for Virtual Care MCP."
+      container_env = {
+        VISIT_STORE          = "firestore"
+        FIRESTORE_PROJECT_ID = "virtual-care-mcp"
+      }
+      runtime_secret_ids               = []
+      runtime_secret_accessor_ids      = []
+      runtime_secret_version_adder_ids = []
+      firestore_database = {
+        name                         = "(default)"
+        location_id                  = "us-east4"
+        runtime_collection_env_name  = "FIRESTORE_COLLECTION"
+        runtime_collection_env_value = "visits"
+      }
+      bootstrap_runtime_service_account        = "cloud-run-bootstrap@virtual-care-mcp.iam.gserviceaccount.com"
+      runtime_service_account                  = "cloud-run-runtime@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_runtime_service_account          = "cloud-run-preview@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_ingress                          = "INGRESS_TRAFFIC_ALL"
+      prod_deploy_service_account              = "gha-prod-deploy@virtual-care-mcp.iam.gserviceaccount.com"
+      prod_publisher_service_account           = "gha-prod-publish@virtual-care-mcp.iam.gserviceaccount.com"
+      deployment_parity_reader_service_account = "gha-deploy-parity@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_deploy_service_account           = "gha-preview-deploy@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_commit_service_account           = "gha-preview-commit@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_operator_service_account         = "gha-preview-operator@virtual-care-mcp.iam.gserviceaccount.com"
+      preview_publisher_service_account        = "gha-preview-publish@virtual-care-mcp.iam.gserviceaccount.com"
     }
     "711292980" = {
       app                             = "runsetta"
@@ -277,4 +310,18 @@ resource "google_recaptcha_enterprise_key" "waitlist" {
     allow_amp_traffic = false
     allowed_domains   = ["medlock.ai"]
   }
+}
+
+resource "google_firestore_field" "virtual_care_visit_ttl" {
+  count = var.repository_id == "1362801465" ? 1 : 0
+
+  project    = local.deployment.project_id
+  database   = "(default)"
+  collection = "visits"
+  field      = "expiresAt"
+
+  ttl_config {}
+  index_config {}
+
+  depends_on = [module.site]
 }

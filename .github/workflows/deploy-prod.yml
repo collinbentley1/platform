@@ -576,6 +576,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243" ;;
             711292980) project_id="runsetta"; project_number="601124730704" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513" ;;
@@ -731,6 +732,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243"; service_name="virtual-care-mcp"; repository="site" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site" ;;
@@ -1031,6 +1033,7 @@ jobs:
           set -euo pipefail
           case "$REPOSITORY_ID" in
             1255553151) project_id="cdbentley"; project_number="882468538648"; service_name="cdbentley"; repository="site" ;;
+            1362801465) project_id="virtual-care-mcp"; project_number="894875537243"; service_name="virtual-care-mcp"; repository="site" ;;
             711292980) project_id="runsetta"; project_number="601124730704"; service_name="runsetta"; repository="api" ;;
             1025243085) project_id="medlock-1025243085"; project_number="229383559510"; service_name="medlock"; repository="site" ;;
             280932482) project_id="critical-history-16823277"; project_number="422714632513"; service_name="critical-history"; repository="site" ;;
@@ -1467,6 +1470,15 @@ jobs:
           case "$REPOSITORY_ID" in
             1255553151)
               # cdbentley has no product-specific runtime configuration.
+              ;;
+            1362801465)
+              jq '. + {
+                VISIT_STORE: "firestore",
+                FIRESTORE_PROJECT_ID: "virtual-care-mcp",
+                FIRESTORE_DATABASE_ID: "(default)",
+                FIRESTORE_COLLECTION: "visits"
+              }' "$env_file" > "$env_file.next"
+              mv "$env_file.next" "$env_file"
               ;;
             711292980)
               # Runsetta remains deliberately offline. Do not add Secret Manager

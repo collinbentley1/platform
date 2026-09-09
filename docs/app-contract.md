@@ -51,7 +51,7 @@ shares GitHub Actions app id `15368`, so its context alone cannot authenticate
 the immutable platform workflow that produced it.
 
 The platform binds the application policy to the immutable numeric repository
-ID from the GitHub event. For the four managed apps it requires exact
+ID from the GitHub event. For registered apps it requires exact
 platform-reviewed `format:check`, `lint`, `typecheck`, `test`, and `build`
 commands and this developer-facing composition:
 
@@ -59,6 +59,22 @@ commands and this developer-facing composition:
 verify = bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org && bun --no-env-file run verify:ci
 verify:ci = bun run format:check && bun run lint && bun run typecheck && bun run test && bun run build
 ```
+
+The dependency graph limit is 128 lockfile packages. Repository `1362801465`
+(`virtual-care-mcp`) has a reviewed limit of 135 for its MCP Apps and LiveKit
+graph. Credentialless policy enforcement selects this limit from the immutable
+GitHub event ID and rejects a mismatched app configuration before installation.
+The canonical local scanner recognizes only the matching repository ID, app,
+project, and service in `.platform/config.json`; its default remains 128. Every
+package still passes the seven-day resolution age and public Socket scan. The
+Docker dependency stage receives only that non-secret configuration file.
+
+Initial enrollment for this new project uses the fixed-identity
+[`virtual-care-enrollment` root](../terraform/deployments/virtual-care-enrollment/README.md).
+It creates bootstrap resources with federation disabled, transfers the same
+resource addresses to the registered remote backend, and requires a no-change
+plan before production provisioning. Activation follows exact source review and
+GitHub environment setup. The existing four-project recovery group is unchanged.
 
 Implicit `pre*` and `post*` hooks for those commands are forbidden. A pull
 request cannot replace a required check with `true` while retaining the expected

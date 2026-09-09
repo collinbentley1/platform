@@ -277,6 +277,12 @@ validate_preview_routes() {
               "PLATFORM_DEPLOY_ENVIRONMENT","PLATFORM_DEPLOY_NONCE","PLATFORM_IMAGE_INDEX_DIGEST",
               "PLATFORM_IMAGE_RUNNABLE_DIGEST","PLATFORM_PREVIEW_NUMBER"
             ]
+          elif $repository_id == "1362801465" then
+            ([.spec.containers[0].env[] | .name] | sort) == [
+              "PLATFORM_DEPLOY_ENVIRONMENT","PLATFORM_DEPLOY_NONCE","PLATFORM_IMAGE_INDEX_DIGEST",
+              "PLATFORM_IMAGE_RUNNABLE_DIGEST","PLATFORM_PREVIEW_NUMBER","VISIT_STORE"
+            ] and
+            exact_value("VISIT_STORE") == "memory"
           elif $repository_id == "711292980" then
             ([.spec.containers[0].env[] | .name] | sort) == [
               "PLATFORM_DEPLOY_ENVIRONMENT","PLATFORM_DEPLOY_NONCE","PLATFORM_IMAGE_INDEX_DIGEST",

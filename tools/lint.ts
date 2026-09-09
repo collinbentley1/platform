@@ -1978,8 +1978,10 @@ for (const moduleName of ["cloud-run-service", "bootstrap"]) {
 }
 const bootstrapModuleTests = join(root, "terraform/modules/bootstrap/tests");
 const bootstrapTestFiles = (await readdir(bootstrapModuleTests)).sort();
-if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify(["workflow_authority.tftest.hcl"])) {
-  failures.push("terraform/modules/bootstrap/tests: only the reviewed workflow-authority test is allowed.");
+if (JSON.stringify(bootstrapTestFiles) !== JSON.stringify([
+  "virtual_care_enrollment.tftest.hcl", "workflow_authority.tftest.hcl",
+])) {
+  failures.push("terraform/modules/bootstrap/tests: only the reviewed enrollment and workflow-authority tests are allowed.");
 }
 const workflowAuthorityTest = await readFile(
   join(bootstrapModuleTests, "workflow_authority.tftest.hcl"),
@@ -2607,7 +2609,7 @@ const bootstrapMain = await read("terraform/modules/bootstrap/main.tf");
 const bootstrapVariables = await read("terraform/modules/bootstrap/variables.tf");
 if (
   createHash("sha256").update(bootstrapMain).digest("hex") !==
-  "e331aafd8a76c334a87c036f24d92d8779814bc643a2cfb317f266578432a926"
+  "cf2c8f27495898254b3aaabca0534e45420b2f16b674568c25262bc7086a1588"
 ) {
   failures.push(
     "terraform/modules/bootstrap/main.tf: Privileged bootstrap content changed; review it and both independent hash contracts together.",
