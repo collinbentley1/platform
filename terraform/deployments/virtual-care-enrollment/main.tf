@@ -8,6 +8,17 @@ variable "active_workflow_sha" {
   }
 }
 
+variable "independent_storage_access_verified" {
+  description = "Operator confirmation that the independent, scoped storage lease in the enrollment runbook was verified with the credentials used for this plan. Project Owner and legacy bucket convenience grants do not satisfy this prerequisite."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = var.independent_storage_access_verified
+    error_message = "Verify independent storage permissions as documented in README.md before planning initial enrollment."
+  }
+}
+
 provider "google" {
   project = "virtual-care-mcp"
   region  = "us-east4"

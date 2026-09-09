@@ -4,7 +4,8 @@ This owner-operated root creates the first bootstrap resources for repository
 `collinbentley1/virtual-care-mcp`, numeric ID `1362801465`, in the standalone
 Google Cloud project `virtual-care-mcp`, number `894875537243`. It has no project,
 repository, or service selector. The only input is the exact reviewed platform
-commit. It keeps federation disabled throughout initial enrollment.
+commit plus confirmation that the operator's independent storage access was
+verified. It keeps federation disabled throughout initial enrollment.
 
 This root uses local state because its apply creates the remote state buckets.
 It retains the same `module.bootstrap` resource addresses as the registered
@@ -26,6 +27,31 @@ Require the new repository's Actions to remain disabled and no running jobs.
 Before the first apply, verify no existing WIF pool, state bucket, deployment
 identity, or Cloud Run service collides with this new enrollment. Never import
 an unexplained existing resource or change an existing consumer.
+
+Project Owner alone is insufficient for this enrollment. Cloud Storage grants
+new bucket owners access through legacy bucket/object convenience bindings,
+which the bootstrap intentionally removes. The operator must hold independent
+storage access before those removals. Use a separately reviewed, temporary
+project-level custom role binding restricted by resource name to these four
+buckets and by a fixed expiry. It must grant only the bucket policy and state
+handoff permissions required for the operation. Do not restore legacy
+convenience bindings or grant an existing consumer any new access.
+
+Verify the exact operator principal, custom role permissions, conditional
+binding, resource names, and expiry using the same credentials as Terraform.
+For existing buckets, prove bucket metadata, IAM policy, and required state
+object reads independently. Set `independent_storage_access_verified = true`
+only after that check. This input records an operator preflight confirmation;
+Terraform does not independently prove the effective IAM grant. Its false
+default prevents an initial plan from silently relying on Project Owner.
+
+Run Terraform with `umask 077`. If an apply fails, preserve the local state and
+classify tainted instances before further actions. A failed bucket IAM resource
+may already have changed the remote policy before its readback failed; inspect
+the live policy after restoring independent access, then create and review a
+fresh residual plan. Never replay the original saved plan or migrate incomplete
+state. Retire the temporary storage lease only after all state transfer,
+no-change planning, and provisioning checks that require it have completed.
 
 The owner reviews the saved plan at the exact source commit. It may address
 only `virtual-care-mcp` and the fixed new-app bucket names. The WIF pool must be

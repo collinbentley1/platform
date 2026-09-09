@@ -728,6 +728,8 @@ resource "google_project_iam_member" "terraform_convergence_reader" {
 resource "google_project_iam_member" "preview_iam_auditors" {
   for_each = local.preview_iam_auditor_members
 
+  depends_on = [google_service_account.preview_operator]
+
   project = var.project_id
   role    = google_project_iam_custom_role.preview_iam_auditor.name
   member  = each.value
