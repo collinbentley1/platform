@@ -361,8 +361,8 @@ async function doctor(repoArgs: string[]): Promise<void> {
           patchedDependencies?: unknown;
           workspaces?: unknown;
         };
-        if (packageJson.packageManager !== "bun@1.4.0") {
-          messages.push("package.json packageManager must be bun@1.4.0");
+        if (packageJson.packageManager !== "bun@1.4.2") {
+          messages.push("package.json packageManager must be bun@1.4.2");
         }
         if (packageJson.devDependencies?.typescript !== "7.0.2") {
           messages.push("package.json must pin the reviewed TypeScript version");

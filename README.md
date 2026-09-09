@@ -79,8 +79,8 @@ the catalog license is pinned to commit
 The resulting runtime is deliberately described as a hybrid: the immutable DHI
 Community Bun image supplies the signed hardened Alpine rootfs and exact layer,
 history, and configuration prefix, while the Dockerfile overlays the separately
-digest-bound Oven Bun 1.4.0+34cbb binary. The final image advertises
-`BUN_VERSION=1.4.0` and immutable OCI base name/digest labels; the DHI signature
+digest-bound Oven Bun 1.4.2+744846f84 binary. The final image advertises
+`BUN_VERSION=1.4.2` and immutable OCI base name/digest labels; the DHI signature
 does not attest the overlaid Oven binary. Preview and production are required to
 use byte-identical base contexts and exporter/provenance settings, though their
 application source and final image digest naturally differ.

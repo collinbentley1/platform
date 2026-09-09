@@ -619,7 +619,7 @@ the recovery object and stop; never rerun from empty state.
    `140f79eaba13b83e280f6f554f80f9633fae987e`, SHA-256
    `58881e3f5171ed2e98db7a4dbd64c16b9b5dbb2f5cbd9a56e79608a2360ad5f3`.
    The DHI evidence attests the hardened Alpine rootfs/base lineage, not the
-   separately provenance-bound Oven Bun 1.4.0 binary overlaid by the canonical
+   separately provenance-bound Oven Bun 1.4.2 binary overlaid by the canonical
    Dockerfile; the final image scan covers the complete hybrid.
 
    Do not create `GRYPE_DB_MANIFEST_JSON` or `DB_MANIFEST_JSON` at any GitHub
