@@ -120,8 +120,8 @@ part of the contract.
 The final runtime is an explicit hybrid: the immutable DHI Community image
 supplies the signed hardened Alpine rootfs and exact compressed layers,
 uncompressed diff-id history, and base configuration; the canonical Dockerfile
-overlays the separately digest/provenance-bound Oven Bun 1.4.0+34cbb binary.
-`BUN_VERSION=1.4.0` and immutable OCI base name/digest labels must describe this
+overlays the separately digest/provenance-bound Oven Bun 1.4.2+744846f84 binary.
+`BUN_VERSION=1.4.2` and immutable OCI base name/digest labels must describe this
 truthfully. DHI's signature does not attest the overlaid Bun binary; the complete
 hybrid is covered by the final scan. The vendored DHI key is pinned to keyring
 commit `d6b11e0475ac7ddf74687268d16a4201a15e163f` and SHA-256

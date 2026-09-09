@@ -957,8 +957,8 @@ for (const workflow of ["application.yml", "socket-firewall.yml", "platform.yml"
   requireContains(
     path,
     text,
-    "2d03fb5fb83ac8b567aca0a281b2ce1a1a19d488f56c2968d88c3f25e92fe452",
-    "Bun 1.4.0 archive checksum must be pinned.",
+    "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913",
+    "Bun 1.4.2 archive checksum must be pinned.",
   );
 }
 
@@ -1834,7 +1834,7 @@ requireContains(
   "FROM platform.invalid/bun-release AS bun-release",
   "The Bun binary stage must use only the platform-supplied closed OCI context.",
 );
-if (dockerfile.split("34cbb9a40b4bd1bd767d134a7065e66c2432a676").length !== 3) {
+if (dockerfile.split("744846f844374847c902b5e7fd59b4342a51ef99").length !== 3) {
   failures.push(
     "templates/app/Dockerfile: both executable stages must verify the exact Bun revision.",
   );

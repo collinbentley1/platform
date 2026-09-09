@@ -1258,7 +1258,7 @@ describe("platform scaffold and doctor", () => {
       PROTECTED_BOOTSTRAP_DOCKER_BINARY: "/usr/bin/docker",
       PROTECTED_BOOTSTRAP_DOCKER_INTEGRATION: "1",
       TERRAFORM_SANDBOX_IMAGE:
-        "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b",
+        "docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023",
     });
     expect(gate?.run).toBeString();
     const run = gate?.run as string;

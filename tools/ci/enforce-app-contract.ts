@@ -184,8 +184,8 @@ const terraformMirrorFailures = validateTerraformMirrorContract(
 if (terraformMirrorFailures.length > 0) {
   throw new Error(terraformMirrorFailures.join("\n"));
 }
-if (packageJson.packageManager !== "bun@1.4.0") {
-  throw new Error("package.json packageManager must be bun@1.4.0.");
+if (packageJson.packageManager !== "bun@1.4.2") {
+  throw new Error("package.json packageManager must be bun@1.4.2.");
 }
 const registryDependencyFailures = validateRegistryOnlyDependencySpecs(packageJson);
 if (registryDependencyFailures.length > 0) {

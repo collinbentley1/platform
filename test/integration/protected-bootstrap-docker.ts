@@ -9,7 +9,7 @@ import {
 } from "../../tools/ci/protected-bootstrap-bridge.ts";
 
 const terraformSandboxImage =
-  "docker.io/oven/bun@sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b";
+  "docker.io/oven/bun@sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023";
 
 interface DockerCommandResult {
   readonly exitCode: number;

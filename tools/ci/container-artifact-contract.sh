@@ -7,8 +7,8 @@ readonly REGCTL_SHA256=c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d
 readonly COSIGN_VERSION=3.1.3
 readonly COSIGN_SHA256=4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71
 readonly SCANNER_SANDBOX_IMAGE=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
-readonly OVEN_TOP_DIGEST=sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb
-readonly OVEN_AMD64_DIGEST=sha256:8aac45197595035f697ea6b11cd73ce2401d82503fcb2540b5fac606973b242b
+readonly OVEN_TOP_DIGEST=sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+readonly OVEN_AMD64_DIGEST=sha256:d73746a3e6cd8de6d7abff1c4c678028b6fe25e0c39808f9a71214589fa8b023
 readonly DHI_DEV_TOP_DIGEST=sha256:d364f4eb6d20f8e906bdb9d12726995f8335878f46e0c1c69c910df9d92df5d8
 readonly DHI_RUNTIME_TOP_DIGEST=sha256:b169efde3cf30151d66f3d7988cad69b4d08833cc4cfaeca7da6bda2bd0a89b3
 readonly DHI_DEV_AMD64_DIGEST=sha256:58a392f5dec3be5cb20a2495baca84ac785f237a2d2904c5b9cad7ba11f3e475
@@ -421,7 +421,7 @@ validate_base_manifest() {
     [.images[].role] == ["oven", "dhi_dev", "dhi_runtime"] and
     [.images[].topDigest] == [$oven, $dev, $runtime] and
     .images[0].childDigest == $ovenChild and .images[1].childDigest == $devChild and .images[2].childDigest == $runtimeChild and
-    [.images[].source] == ["docker.io/oven/bun:1.4.0-alpine", "dhi.io/bun:1-alpine-dev", "dhi.io/bun:1-alpine"] and
+    [.images[].source] == ["docker.io/oven/bun:1.4.2-alpine", "dhi.io/bun:1-alpine-dev", "dhi.io/bun:1-alpine"] and
     [.images[].distributionLicense] == ["MIT", "Apache-2.0", "Apache-2.0"] and
     [.images[].embeddedLicenseEvidence] == ["upstream-image", "signed-dhi-attestations", "signed-dhi-attestations"] and
     all(.images[];
@@ -667,7 +667,7 @@ prefetch() {
       '{childDigest:$child,configDigest:$config,distributionLicense:$distributionLicense,embeddedLicenseEvidence:$embeddedLicenseEvidence,layers:$layers,role:$role,source:$source,topDigest:$top}' > "$RUNNER_TEMP/$role-record.json"
   }
 
-  fetch_one oven docker.io/oven/bun:1.4.0-alpine "$OVEN_TOP_DIGEST" "$OVEN_AMD64_DIGEST" MIT upstream-image
+  fetch_one oven docker.io/oven/bun:1.4.2-alpine "$OVEN_TOP_DIGEST" "$OVEN_AMD64_DIGEST" MIT upstream-image
   docker_auth="$(printf '%s:%s' "$DHI_USERNAME" "$DHI_PUBLIC_READ_TOKEN" | base64 --wrap=0)"
   jq -cn --arg auth "$docker_auth" '{auths:{"dhi.io":{auth:$auth}}}' > "$DOCKER_CONFIG/config.json"
   chmod 0600 "$DOCKER_CONFIG/config.json"
@@ -751,7 +751,7 @@ validate_runtime_config_lineage() {
     .os == "linux" and .architecture == "amd64" and
     ($base[0].config
       | .Env = (((.Env // [])
-          | map(if startswith("BUN_VERSION=") then "BUN_VERSION=1.4.0" else . end)
+          | map(if startswith("BUN_VERSION=") then "BUN_VERSION=1.4.2" else . end)
           | without_env(["NODE_ENV", "PORT", "PUBLIC_DIR"])) + [
             "NODE_ENV=production", "PORT=8080", "PUBLIC_DIR=/app/dist/public"
           ])
