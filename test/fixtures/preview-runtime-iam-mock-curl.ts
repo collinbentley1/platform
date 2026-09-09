@@ -72,6 +72,15 @@ const response: any = {
   fullyExplored: true,
 };
 if (mode === "binding" && ["runsetta", "virtual-care-mcp"].includes(project)) main.analysisResults.push({ iamBinding: { role: "roles/viewer" } });
+if (mode === "cross-group-child-binding" && (
+  (project === "virtual-care-mcp" && identity === "serviceAccount:cloud-run-preview@cdbentley.iam.gserviceaccount.com") ||
+  (project === "cdbentley" && identity === "serviceAccount:cloud-run-preview@virtual-care-mcp.iam.gserviceaccount.com")
+)) {
+  main.analysisResults.push({
+    attachedResourceFullName: `//artifactregistry.googleapis.com/projects/${project}/locations/us-east4/repositories/private`,
+    iamBinding: { members: [identity], role: "roles/artifactregistry.reader" },
+  });
+}
 if (mode === "group-binding" && ["runsetta", "virtual-care-mcp"].includes(project)) {
   main.analysisResults.push({
     iamBinding: { members: ["group:preview-runtime@example.com"], role: "roles/viewer" },

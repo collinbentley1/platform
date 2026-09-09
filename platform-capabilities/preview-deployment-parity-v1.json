@@ -23,6 +23,6 @@
     "tools/ci/cloud-run-prod-dhi-transition.sh": "sha256:342c80ca2dd5b671a348088a6ed8bf897765cacd9c26413ea921cbc0494e1590",
     "tools/ci/container-artifact-contract.sh": "sha256:2a3e25d4c1c9ca4353546f154ae93175cb1cd6f3a0d3cc236ab01ef3bcbc6c54",
     "tools/ci/deployment-parity-transition.sh": "sha256:a5b7f6d8b45b192e49cdec3435dc30887996b83699dc5a4153ff4b2c2b63b973",
-    "tools/ci/preview-runtime-iam-contract.sh": "sha256:4b12a6c124694981d520205939a8aa0a1251b6ae61566b01e18e344862976444"
+    "tools/ci/preview-runtime-iam-contract.sh": "sha256:b259a59a68265999a6f31885997fd0448bad0fbb36c0b6c02f13541edd04cbab"
   }
 }

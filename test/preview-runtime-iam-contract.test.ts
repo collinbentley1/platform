@@ -11,11 +11,11 @@ const temporary: string[] = [];
 afterEach(async () => Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true }))));
 
 describe("preview runtime effective IAM admission", () => {
-  test("checks the isolated new project without entering the legacy audit group", async () => {
+  test("checks all five preview identities using only the new project scope", async () => {
     const result = await run("clean", "1362801465");
     expect(result.code, result.stderr).toBe(0);
-    expect(result.stdout).toContain("preview_runtime_iam_analyses=1");
-    expect(result.log.match(/:analyzeIamPolicy/g)?.length).toBe(1);
+    expect(result.stdout).toContain("preview_runtime_iam_analyses=5");
+    expect(result.log.match(/:analyzeIamPolicy/g)?.length).toBe(5);
     expect(result.log).toContain("projects/virtual-care-mcp");
     expect(result.log).not.toMatch(/cdbentley|runsetta|medlock|critical-history/);
   });
@@ -26,11 +26,21 @@ describe("preview runtime effective IAM admission", () => {
     expect(result.log).toBe("");
   });
 
-  test("admits only after 16 complete empty cross-project analyses", async () => {
+  for (const repositoryId of ["1255553151", "1362801465"]) {
+    test(`rejects a child-resource grant to a preview identity from the other audit group for ${repositoryId}`, async () => {
+      const result = await run("cross-group-child-binding", repositoryId);
+      expect(result.code).not.toBe(0);
+      expect(result.stdout).not.toContain("admitted=true");
+    });
+  }
+
+  test("checks all five preview identities using only the four legacy project scopes", async () => {
     const result = await run("clean");
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("preview_runtime_iam_admitted=true");
-    expect(result.log.match(/:analyzeIamPolicy/g)?.length).toBe(16);
+    expect(result.stdout).toContain("preview_runtime_iam_analyses=20");
+    expect(result.log.match(/:analyzeIamPolicy/g)?.length).toBe(20);
+    expect(result.log).not.toContain("projects/virtual-care-mcp");
     expect(result.log.match(/:getIamPolicy/g)?.length).toBe(8);
     expect(result.log.match(/cloudresourcemanager\.googleapis\.com\/v1\/projects\/[^:]+$/gm)?.length).toBe(8);
     expect(result.log).not.toContain("expandGroups");
