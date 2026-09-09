@@ -33,8 +33,7 @@ prove_production() {
   require_json "$service"
   require_json "$revision"
 
-  jq -e --arg name "$service_name" --arg namespace "$project_number" --arg parity "$DHI_PARITY_ID" \
-    --arg repository_id "$repository_id" '
+  jq -e --arg name "$service_name" --arg namespace "$project_number" --arg parity "$DHI_PARITY_ID" '
     .apiVersion == "serving.knative.dev/v1" and .kind == "Service" and
     .metadata.name == $name and .metadata.namespace == $namespace and
     .metadata.generation == .status.observedGeneration and
@@ -52,10 +51,7 @@ prove_production() {
     (.status.traffic | length) == 1 and
     .status.traffic[0].latestRevision == true and .status.traffic[0].percent == 100 and
     .status.traffic[0].revisionName == .status.latestReadyRevisionName and
-    (.status.traffic[0] | has("tag") | not) and
-    (if $repository_id == "1362801465" then
-      .status.url == "https://virtual-care-mcp-894875537243.us-east4.run.app"
-    else true end)
+    (.status.traffic[0] | has("tag") | not)
   ' "$service" >/dev/null || die "Production is not exactly one healthy, untagged, 100%-served latest revision."
 
   local revision_name

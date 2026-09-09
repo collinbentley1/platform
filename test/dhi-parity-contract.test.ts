@@ -360,8 +360,8 @@ describe("durable preview/production DHI parity", () => {
     const missing = structuredClone(revision);
     missing.spec.containers[0].env = missing.spec.containers[0].env.filter((entry: any) => entry.name !== "PUBLIC_BASE_URL");
     expect((await runCloudContract("prove-production", { service, revisions: [missing] }, true)).exitCode).not.toBe(0);
-    service.status.url = "https://foreign-project.run.app";
-    expect((await runCloudContract("prove-production", { service, revisions: [revision] }, true)).exitCode).not.toBe(0);
+    service.status.url = "https://virtual-care-mcp-hash-uk.a.run.app";
+    expect((await runCloudContract("prove-production", { service, revisions: [revision] }, true)).exitCode).toBe(0);
   });
 
   test("Virtual Care preview binds its own PR origin and refuses production storage", async () => {

@@ -1472,15 +1472,24 @@ jobs:
               # cdbentley has no product-specific runtime configuration.
               ;;
             1362801465)
-              gcloud run services describe "$SERVICE_NAME" \
-                --project="$PROJECT_ID" --region="$REGION" --format=json > "$service_snapshot"
+              rest_token_file="$RUNNER_TEMP/virtual-care-origin-token"
+              rest_header_file="$RUNNER_TEMP/virtual-care-origin-header"
+              v2_service_snapshot="$RUNNER_TEMP/virtual-care-origin-service.json"
+              gcloud auth print-access-token > "$rest_token_file"
+              printf 'Authorization: Bearer %s\n' "$(<"$rest_token_file")" > "$rest_header_file"
+              curl --fail-with-body --silent --show-error --proto '=https' --tlsv1.2 \
+                --header "@$rest_header_file" --output "$v2_service_snapshot" \
+                "https://run.googleapis.com/v2/projects/virtual-care-mcp/locations/us-east4/services/virtual-care-mcp"
+              rm -f -- "$rest_token_file" "$rest_header_file"
               jq -e '
-                .metadata.name == "virtual-care-mcp" and .metadata.namespace == "894875537243" and
-                .status.url == "https://virtual-care-mcp-894875537243.us-east4.run.app"
-              ' "$service_snapshot" >/dev/null || {
+                .name == "projects/virtual-care-mcp/locations/us-east4/services/virtual-care-mcp" and
+                (.defaultUriDisabled // false) == false and
+                (.urls | type == "array" and index("https://virtual-care-mcp-894875537243.us-east4.run.app") != null)
+              ' "$v2_service_snapshot" >/dev/null || {
                 echo "Virtual Care MCP canonical origin is not advertised by its registered Cloud Run service." >&2
                 exit 1
               }
+              rm -f -- "$v2_service_snapshot"
               jq '. + {
                 VISIT_STORE: "firestore",
                 PUBLIC_BASE_URL: "https://virtual-care-mcp-894875537243.us-east4.run.app",
@@ -1745,6 +1754,13 @@ jobs:
             echo "Production v2 exposure or exact 100%-served revision readback drifted." >&2
             exit 1
           }
+          if [ "$REPOSITORY_ID" = "1362801465" ]; then
+            jq -e '.urls | index("https://virtual-care-mcp-894875537243.us-east4.run.app") != null' \
+              "$v2_service_snapshot" >/dev/null || {
+                echo "Virtual Care MCP canonical origin disappeared from the deployed service." >&2
+                exit 1
+              }
+          fi
           jq -e --arg name "projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE_NAME}/revisions/${deployed_revision}" \
             --arg image "${IMAGE_NAME}@${RUNNABLE_DIGEST}" --arg index "$IMAGE_DIGEST" --arg runnable "$RUNNABLE_DIGEST" '
             def exact_value($name):
