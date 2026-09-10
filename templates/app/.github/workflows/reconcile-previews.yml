@@ -1,6 +1,7 @@
 name: Reconcile previews
 run-name: ${{ inputs.delivery_nonce && format('recovery-dispatch-{0}', inputs.delivery_nonce) || github.workflow }}
 
+# checkov:skip=CKV_GHA_7:delivery_nonce labels only the run name for lost-response recovery and cannot reach jobs.
 on:
   push:
     branches:

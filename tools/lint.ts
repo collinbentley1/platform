@@ -11,6 +11,7 @@ import {
   semanticSecretContextReferences,
 } from "./ci/workflow-secret-contract";
 import { checkWorkflowAuthority } from "./ci/workflow-authority";
+import { callerPins } from "../protected-recovery/operator";
 
 const root = join(import.meta.dir, "..");
 const failures: string[] = [];
@@ -1497,7 +1498,7 @@ for (const boundary of [
   "infra/terraform >/dev/null; then",
   "grep -rahcE --include='*.tf'",
   "grep -rahcE 'collinbentley1/platform",
-  "' . >/dev/null; then",
+  'suppression_counts="$(grep -rahcE --exclude-dir=.git',
 ]) {
   requireContains(
     ".github/workflows/infrastructure.yml",
@@ -1512,6 +1513,23 @@ rejectContains(
   'printf \'%s\\n\' "$platform_refs"',
   "Infrastructure validation must never replay attacker-controlled grep output to the runner command channel.",
 );
+rejectContains(
+  ".github/workflows/infrastructure.yml",
+  infrastructure,
+  'printf \'%s\\n\' "$suppression_counts"',
+  "Infrastructure validation must never replay caller-controlled suppression counts to the runner command channel.",
+);
+for (const [path, workflow] of [
+  [".github/workflows/infrastructure.yml", infrastructure],
+  [".github/workflows/platform.yml", platformDependencyWorkflow],
+] as const) {
+  requireContains(
+    path,
+    workflow,
+    "(checkov|bridgecrew|cortex):skip=",
+    "Checkov suppression inventories must cover every marker alias the pinned scanner accepts.",
+  );
+}
 requireContains(
   ".github/workflows/infrastructure.yml",
   infrastructure,
@@ -1707,6 +1725,40 @@ for (const workflow of [...reusableWorkflows, "application.yml", "socket-firewal
   requireContains(path, text, "@__PLATFORM_SHA__", "Template workflows must use the scaffolded platform SHA.");
   rejectContains(path, text, "secrets: inherit", "Template workflows must pass only named secrets.");
   checkActionPins(path, text, true);
+}
+
+const reconcileCallerPath = "templates/app/.github/workflows/reconcile-previews.yml";
+const reconcileCaller = await read(reconcileCallerPath);
+const approvedCheckovSuppression =
+  "# checkov:skip=CKV_GHA_7:delivery_nonce labels only the run name for lost-response recovery and cannot reach jobs.";
+const approvedRecoveryRunName =
+  "run-name: ${{ inputs.delivery_nonce && format('recovery-dispatch-{0}', inputs.delivery_nonce) || github.workflow }}";
+let unexplainedDeliveryNonce = reconcileCaller;
+for (const approvedLine of [
+  approvedCheckovSuppression,
+  approvedRecoveryRunName,
+  "      delivery_nonce:",
+]) {
+  if (unexplainedDeliveryNonce.split(approvedLine).length !== 2) {
+    failures.push(`${reconcileCallerPath}: approved delivery nonce line must appear exactly once: ${approvedLine}`);
+  }
+  unexplainedDeliveryNonce = unexplainedDeliveryNonce.replace(approvedLine, "");
+}
+if (unexplainedDeliveryNonce.includes("delivery_nonce")) {
+  failures.push(`${reconcileCallerPath}: delivery_nonce may appear only in its declaration, run name, and exact Checkov rationale.`);
+}
+try {
+  const lintPin = "a".repeat(40);
+  callerPins(
+    reconcileCaller.replaceAll("__PLATFORM_SHA__", lintPin),
+    "reconcile-previews.yml",
+    "collinbentley1/platform",
+    [lintPin],
+  );
+} catch (error) {
+  failures.push(
+    `${reconcileCallerPath}: recovery caller structure is not exact: ${error instanceof Error ? error.message : "unknown error"}`,
+  );
 }
 
 for (const workflow of ["application.yml", "infrastructure.yml", "socket-firewall.yml"]) {

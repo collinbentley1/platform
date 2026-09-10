@@ -2004,11 +2004,13 @@ describe("platform scaffold and doctor", () => {
       "--user 65532:65532",
       "--workdir /tmp",
       '--mount "type=bind,src=${terraform_root},dst=/scan,readonly"',
+      '--mount "type=bind,src=${rendered_consumer_root},dst=/scan,readonly"',
       '--mount "type=bind,src=${policy_file},dst=/policy.yml,readonly"',
       "--directory /scan",
       "--config-file /policy.yml",
       "--skip-download",
       "--skip-path '(^|/)\\.terraform(/|$)'",
+      "--framework terraform github_actions",
     ]) {
       expect(workflow).toContain(boundary);
     }
@@ -2019,6 +2021,20 @@ describe("platform scaffold and doctor", () => {
       "soft-fail: false\n",
     );
     expect(workflow).toContain("The platform Checkov policy must contain only the fail-closed setting.");
+    expect(workflow).toContain(
+      "Platform Terraform and the consumer template must not contain symbolic links.",
+    );
+    expect(workflow).toContain(
+      'approved_path="$consumer_root/.github/workflows/reconcile-previews.yml"',
+    );
+    expect(workflow).toContain(
+      "Only the one approved consumer-template Checkov suppression is accepted.",
+    );
+    expect(workflow).toContain(
+      'suppression_counts="$(grep -rahcE',
+    );
+    expect(workflow).toContain("(checkov|bridgecrew|cortex):skip=");
+    expect(workflow).not.toContain('printf \'%s\\n\' "$suppression_counts"');
     expect(workflow).not.toContain('uses: docker://ghcr.io/bridgecrewio/checkov@');
 
     const infrastructure = await readFile(
@@ -2044,11 +2060,20 @@ describe("platform scaffold and doctor", () => {
     expect(infrastructure).toContain("Terraform module search failed closed for $root.");
     expect(infrastructure).toContain("Platform reference search failed closed.");
     expect(infrastructure).toContain("Checkov suppression search failed closed.");
+    expect(infrastructure).toContain(
+      'approved_path=".github/workflows/reconcile-previews.yml"',
+    );
+    expect(infrastructure).toContain(
+      "# checkov:skip=CKV_GHA_7:delivery_nonce labels only the run name for lost-response recovery and cannot reach jobs.",
+    );
+    expect(infrastructure).toContain(
+      "Only the one platform-owned reconcile suppression is accepted.",
+    );
     expect(infrastructure).not.toMatch(/grep -R/);
     expect(infrastructure).not.toMatch(/\bgrep\s+-[A-Za-z]*I/);
     expect(infrastructure).not.toContain("--binary-files=without-match");
-    expect(infrastructure.match(/grep -raE/g)).toHaveLength(2);
-    expect(infrastructure.match(/grep -rahcE/g)).toHaveLength(2);
+    expect(infrastructure.match(/grep -raE/g)).toHaveLength(1);
+    expect(infrastructure.match(/grep -rahcE/g)).toHaveLength(3);
     expect(infrastructure).not.toContain("(^|[^[:alnum:]_])(resource|data)[[:space:]]+");
     expect(infrastructure).toContain(
       'provisioner[[:space:]]+"(local-exec|remote-exec)"',
@@ -2058,8 +2083,21 @@ describe("platform scaffold and doctor", () => {
     );
     expect(infrastructure).toContain("(^|[^[:alnum:]_])module[[:space:]]+");
     expect(infrastructure).toContain("infra/terraform >/dev/null; then");
-    expect(infrastructure).toContain("' . >/dev/null; then");
+    expect(infrastructure).toContain(
+      'suppression_counts="$(grep -rahcE --exclude-dir=.git',
+    );
+    expect(infrastructure).toContain("(checkov|bridgecrew|cortex):skip=");
     expect(infrastructure).not.toContain('printf \'%s\\n\' "$platform_refs"');
+    expect(infrastructure).not.toContain('printf \'%s\\n\' "$suppression_counts"');
+
+    const reconcileCaller = await readFile(
+      join(repoRoot, "templates/app/.github/workflows/reconcile-previews.yml"),
+      "utf8",
+    );
+    expect(reconcileCaller).toContain(
+      "# checkov:skip=CKV_GHA_7:delivery_nonce labels only the run name for lost-response recovery and cannot reach jobs.\non:",
+    );
+    expect(reconcileCaller.match(/delivery_nonce/g)).toHaveLength(4);
   });
 
   test("security searches reject NUL-bearing and comment-prefixed HCL policy text", async () => {
@@ -2084,7 +2122,7 @@ describe("platform scaffold and doctor", () => {
     await writeFile(
       join(root, "safe\n::warning title=Injected::untrusted filename\ntail.yaml"),
       Buffer.from(
-        '# binary-classification probe \0 remains inside this comment\n# checkov:skip=CKV_TEST:caller suppression must be rejected\n',
+        '# binary-classification probe \0 remains inside this comment\n# rationale checkov:skip=CKV_TEST:first alias must be rejected\n# bridgecrew:skip=CKV_TEST:second alias must be rejected\n# cortex:skip=CKV_TEST:third alias must be rejected\n',
       ),
     );
 
@@ -2117,11 +2155,11 @@ describe("platform scaffold and doctor", () => {
     const suppressions = await grep([
       "-rahcE",
       "--exclude-dir=.git",
-      "#[[:space:]]*checkov:skip",
+      "(checkov|bridgecrew|cortex):skip=",
       root,
     ]);
     expect(suppressions.exitCode).toBe(0);
-    expect(sumGrepCounts(suppressions.stdout)).toBe(1);
+    expect(sumGrepCounts(suppressions.stdout)).toBe(3);
     expect(suppressions.stdout).not.toContain("::warning");
   });
 

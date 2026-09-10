@@ -318,15 +318,37 @@ jobs:
             echo "Caller-controlled Checkov configuration is forbidden." >&2
             exit 1
           fi
-          if grep -raE --exclude-dir=.git '#[[:space:]]*checkov:skip' . >/dev/null; then
-            echo "Inline Checkov suppressions are not accepted in any scanned caller file." >&2
+          approved_path=".github/workflows/reconcile-previews.yml"
+          approved_suppression="# checkov:skip=CKV_GHA_7:delivery_nonce labels only the run name for lost-response recovery and cannot reach jobs."
+          if [ ! -f "$approved_path" ] || [ -L "$approved_path" ] || [ "$(realpath -e -- "$approved_path")" != "$GITHUB_WORKSPACE/$approved_path" ]; then
+            echo "The approved Checkov suppression path must be a regular file." >&2
             exit 1
-          else
-            search_status="$?"
-            if [ "$search_status" -ne 1 ]; then
-              echo "Checkov suppression search failed closed." >&2
-              exit 1
-            fi
+          fi
+          if [ "$(grep -Fxc -- "$approved_suppression" "$approved_path")" != "1" ]; then
+            echo "The approved Checkov suppression must appear exactly once in the reconcile caller." >&2
+            exit 1
+          fi
+          suppression_status=0
+          suppression_counts="$(grep -rahcE --exclude-dir=.git '(checkov|bridgecrew|cortex):skip=' .)" || suppression_status="$?"
+          if [ "$suppression_status" -ne 0 ]; then
+            echo "Checkov suppression search failed closed." >&2
+            exit 1
+          fi
+          suppression_total=0
+          while IFS= read -r count; do
+            case "$count" in
+              ''|*[!0-9]*)
+                echo "Checkov suppression count was not numeric." >&2
+                exit 1
+                ;;
+            esac
+            suppression_total=$((suppression_total + count))
+          done <<EOF
+          $suppression_counts
+          EOF
+          if [ "$suppression_total" -ne 1 ]; then
+            echo "Only the one platform-owned reconcile suppression is accepted." >&2
+            exit 1
           fi
           policy_file="$RUNNER_TEMP/platform-checkov.yml"
           rm -f -- "$policy_file"
