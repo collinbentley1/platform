@@ -1189,8 +1189,23 @@ describe("platform scaffold and doctor", () => {
       expect(text).toContain("Socket Security Scanner free mode");
     }
 
-    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+    for (const workflow of [
+      "deploy-preview.yml",
+      "deploy-prod.yml",
+      "cleanup-preview.yml",
+      "reconcile-previews.yml",
+    ]) {
       const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
+      const parsed = Bun.YAML.parse(text) as {
+        on?: {
+          workflow_call?: {
+            secrets?: Record<string, { required?: boolean }>;
+          };
+        };
+      };
+      expect(parsed.on?.workflow_call?.secrets).toEqual({
+        DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3: { required: false },
+      });
       expect(semanticSecretContextReferences(text)).toEqual([
         {
           job: "prefetch-bases",
@@ -1198,12 +1213,15 @@ describe("platform scaffold and doctor", () => {
           value: "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
         },
       ]);
+    }
+
+    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+      const text = await readFile(join(repoRoot, ".github/workflows", workflow), "utf8");
       expect(text).toContain("environment: dhi-base-prefetch-20260822-098dca9280b3");
       expect(text).toContain("DHI_USERNAME: ${{ vars.DHI_USERNAME }}");
       expect(text).not.toContain("GRYPE_DB_MANIFEST_JSON");
       expect(text).not.toContain("DB_MANIFEST_JSON:");
       expect(text).toContain("MAPBOX_PUBLIC_TOKEN: ${{ vars.MAPBOX_PUBLIC_TOKEN }}");
-      expect(text).not.toContain("on:\n  workflow_call:\n    secrets:");
       expect(text).not.toContain("secrets.SOCKET_API_TOKEN");
       expect(text).not.toContain("secrets.WAITLIST_IDENTITY_KEYSET");
       const build = text.slice(text.indexOf("  build:\n"), text.indexOf("\n  verify-image:\n"));
