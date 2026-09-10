@@ -2,6 +2,9 @@ name: Deploy production
 
 on:
   workflow_call:
+    secrets:
+      DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3:
+        required: false
 
 permissions: {}
 

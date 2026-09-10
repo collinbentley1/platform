@@ -269,10 +269,21 @@ const previewTrafficTransaction = await read("tools/ci/cloud-run-preview-traffic
 for (const [path, workflow] of [
   [".github/workflows/deploy-preview.yml", deployPreview],
   [".github/workflows/deploy-prod.yml", deployProd],
+  [".github/workflows/cleanup-preview.yml", await read(".github/workflows/cleanup-preview.yml")],
+  [
+    ".github/workflows/reconcile-previews.yml",
+    await read(".github/workflows/reconcile-previews.yml"),
+  ],
 ] as const) {
   const workflowCall = sectionBetween(workflow, "  workflow_call:\n", "\npermissions:");
-  if (workflowCall.trim() !== "workflow_call:") {
-    failures.push(`${path}: reusable deploy workflows must not declare caller-provided secrets or inputs.`);
+  const expectedWorkflowCall = `workflow_call:
+    secrets:
+      DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3:
+        required: false`;
+  if (workflowCall.trim() !== expectedWorkflowCall) {
+    failures.push(
+      `${path}: reusable DHI workflows must declare only the optional environment-resolved DHI secret.`,
+    );
   }
 }
 
@@ -497,10 +508,10 @@ try {
     !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
     typeof manifest.url !== "string" ||
     manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-08T00:33:13Z_1788849010.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "3564b57fd65da3cba50174d9fdab8b4e8dab6f7f7b798ebd3cec3085ea10c7e6" ||
+      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-10T00:31:01Z_1789021824.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
+    manifest.sha256 !== "ce7ae6d4f7fb81029fc3bd1891b6b441f96bac4e278519743e4768eebd805e69" ||
     manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-09-08T06:30:10Z"
+    manifest.built !== "2026-09-10T06:30:24Z"
   ) {
     failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
   }
@@ -597,7 +608,7 @@ for (const [path, workflow] of [
 }
 const artifactContract = await read("tools/ci/container-artifact-contract.sh");
 for (const boundary of [
-  "GRYPE_DB_MANIFEST_SHA256=8f57ede4357c121883016b4ca50b0a110abfdc455a58ab073575d1b0189c9446",
+  "GRYPE_DB_MANIFEST_SHA256=455a7082e350b00c216ab2dd00d72d76573b09d9b4b04e5191c1e6e6c7fd2463",
   'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
   'test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST"',
   'verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"',

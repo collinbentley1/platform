@@ -86,10 +86,14 @@ are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
 commit SHA. Deploy callers forward no secrets and must never use
-`secrets: inherit`. The preview caller uses the trusted default-branch
-`pull_request_target` definition, restricts `branches` to `main`, and passes no
-caller-controlled inputs. The reusable workflow verifies the immutable numeric
-repository ID, exact base/head identities, same-repository numeric head repo ID,
+`secrets: inherit`. Each DHI reusable workflow declares the one environment
+secret as optional so it is available in the workflow's `secrets` context. The
+job's protected environment supplies the value and takes precedence over any
+same-named caller value; approved callers pass none. The preview caller uses the
+trusted default-branch `pull_request_target` definition, restricts `branches` to
+`main`, and passes no caller-controlled inputs. The reusable workflow verifies
+the immutable numeric repository ID, exact base/head identities,
+same-repository numeric head repo ID,
 base branch, event, and run attempt before any operation.
 
 Only `prefetch-bases` enters

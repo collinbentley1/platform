@@ -40,7 +40,9 @@ function visit(
   }
 
   for (const [key, item] of Object.entries(value)) {
-    if (/^secrets$/i.test(key) || containsSecretContextReference(key)) {
+    const workflowCallSecretDeclaration =
+      path.length === 2 && path[0] === "on" && path[1] === "workflow_call" && key === "secrets";
+    if (!workflowCallSecretDeclaration && (/^secrets$/i.test(key) || containsSecretContextReference(key))) {
       references.push({ job: jobFor(path), path: [...path, `<key:${key}>`].join("."), value: key });
     }
     visit(item, [...path, key], nestedAncestors, references);

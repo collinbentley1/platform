@@ -574,7 +574,9 @@ the recovery object and stop; never rerun from empty state.
    REST API, including zero unwanted reviewers, secrets, variables, tag rules,
    and bypass actors. The DHI environment is intentionally shared by preview
    and production so exact base parity is structural rather than two separately
-   managed credential copies.
+   managed credential copies. Each reusable workflow declares that environment
+   secret as optional, while every caller continues to forward no secrets; the
+   protected job environment supplies the value at job start.
 
    Repository Actions must also use the exact general selected-actions policy
    and frozen-SHA allowlist defined by the activation protocol. A bare enable,
