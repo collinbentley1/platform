@@ -1232,13 +1232,32 @@ describe("platform scaffold and doctor", () => {
       expect(build).toContain("DOCKER_BUILD_CHECKS_ANNOTATIONS: \"false\"");
     }
 
-    for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+    const expectedCallerSecretJobs: Readonly<Record<string, readonly string[]>> = {
+      "deploy-prod.yml": ["deploy"],
+      "deploy-preview.yml": ["invalidate", "deploy"],
+      "cleanup-preview.yml": ["cleanup"],
+      "reconcile-previews.yml": ["reconcile"],
+    };
+    const expectedCallerSecretMapping = {
+      DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3:
+        "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
+    };
+    for (const workflow of Object.keys(expectedCallerSecretJobs)) {
       const caller = await readFile(
         join(repoRoot, "templates/app/.github/workflows", workflow),
         "utf8",
       );
-      expect(caller).not.toContain("secrets:");
       expect(caller).not.toContain("secrets: inherit");
+      const parsed = Bun.YAML.parse(caller) as {
+        jobs: Record<string, { secrets?: unknown }>;
+      };
+      for (const [jobName, job] of Object.entries(parsed.jobs)) {
+        expect(job.secrets).toEqual(
+          expectedCallerSecretJobs[workflow]!.includes(jobName)
+            ? expectedCallerSecretMapping
+            : undefined,
+        );
+      }
     }
 
     const dockerfile = await readFile(join(repoRoot, "templates/app/Dockerfile"), "utf8");
@@ -1901,13 +1920,15 @@ describe("platform scaffold and doctor", () => {
     expect(rollout).toContain("Medlock/Health has no GitHub waitlist key");
     expect(rollout).toContain("least-scope, non-default public `pk.*` value");
     expect(rollout).toContain("default public token\n   is forbidden");
-    expect(rollout).toContain("no secret forwarding, no `secrets: inherit`");
+    expect(rollout).toContain("only the exact named epoch DHI mapping on the five lifecycle calls");
+    expect(rollout).toContain("no\n   `secrets: inherit`");
     expect(rollout).toContain("The historical `161ac5c` tree predates this pipeline");
   });
 
   test("the app contract documents the credentialless artifact boundary and exact environment matrix", async () => {
     const contract = await readFile(join(repoRoot, "docs/app-contract.md"), "utf8");
-    expect(contract).toContain("Deploy callers forward no secrets");
+    expect(contract).toContain("The five lifecycle calls forward only the exact named");
+    expect(contract).toContain("the explicit named map is required");
     expect(contract).toContain("`pull_request_target` definition");
     expect(contract).toContain("`dhi-base-prefetch-20260822-098dca9280b3`");
     expect(contract).toContain("`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3`");

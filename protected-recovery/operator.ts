@@ -126,6 +126,22 @@ export const callerUses: Readonly<Record<string, readonly string[]>> = {
   "cleanup-preview.yml": ["cleanup-preview.yml"],
   "reconcile-previews.yml": ["reconcile-previews.yml"],
 };
+const callerDhiSecretJobs: Readonly<Record<string, readonly string[]>> = {
+  "deploy-prod.yml": ["deploy"],
+  "deploy-preview.yml": ["invalidate", "deploy"],
+  "cleanup-preview.yml": ["cleanup"],
+  "reconcile-previews.yml": ["reconcile"],
+};
+const callerJobUses: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "deploy-prod.yml": { infrastructure: "infrastructure.yml", deploy: "deploy-prod.yml" },
+  "deploy-preview.yml": { invalidate: "cleanup-preview.yml", deploy: "deploy-preview.yml" },
+  "cleanup-preview.yml": { cleanup: "cleanup-preview.yml" },
+  "reconcile-previews.yml": { reconcile: "reconcile-previews.yml" },
+};
+const callerDhiSecretMapping: Readonly<Record<string, string>> = {
+  DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3:
+    "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
+};
 export function callerPins(content: string, file: string, platform: string, pins: readonly string[]): Record<string, string> {
   const document = object(Bun.YAML.parse(content));
   const jobs = object(document.jobs);
@@ -142,6 +158,27 @@ export function callerPins(content: string, file: string, platform: string, pins
     found[workflow] = sha;
   }
   exact(Object.keys(found).sort(), [...(callerUses[file] ?? [])].sort(), `mandatory calls in ${file}`);
+  const expectedJobUses = callerJobUses[file] ?? {};
+  exact(Object.keys(jobs).sort(), Object.keys(expectedJobUses).sort(), `mandatory jobs in ${file}`);
+  for (const [jobName, workflow] of Object.entries(expectedJobUses)) {
+    exact(
+      object(jobs[jobName]).uses,
+      `${platform}/.github/workflows/${workflow}@${found[workflow]}`,
+      `${file} ${jobName} reusable call`,
+    );
+  }
+  const secretJobs = callerDhiSecretJobs[file] ?? [];
+  for (const [jobName, value] of Object.entries(jobs)) {
+    const job = object(value);
+    if (secretJobs.includes(jobName)) {
+      if (!("secrets" in job)) {
+        throw new Error(`${file} ${jobName} DHI secret mapping is missing`);
+      }
+      exact(job.secrets, callerDhiSecretMapping, `${file} ${jobName} DHI secret mapping`);
+    } else if ("secrets" in job) {
+      throw new Error(`${file} ${jobName} must not forward secrets`);
+    }
+  }
   const events = object(document.on);
   if (file === "deploy-prod.yml" || file === "reconcile-previews.yml") {
     exact(events.push, { branches: ["main"] }, `${file} push trigger`);
@@ -152,7 +189,7 @@ export function callerPins(content: string, file: string, platform: string, pins
     exact(document.permissions, {}, "reconcile workflow permissions");
     exact(Object.keys(jobs), ["reconcile"], "reconcile job set");
     const reconcile = object(jobs.reconcile);
-    exact(Object.keys(reconcile).sort(), ["permissions", "uses"], "reconcile job shape");
+    exact(Object.keys(reconcile).sort(), ["permissions", "secrets", "uses"], "reconcile job shape");
     exact(reconcile.permissions, { actions: "read", "id-token": "write", "pull-requests": "read" }, "reconcile job permissions");
     exact(document["run-name"], "${{ inputs.delivery_nonce && format('recovery-dispatch-{0}', inputs.delivery_nonce) || github.workflow }}", "reconcile run-name");
     exact(Object.keys(events).sort(), ["push", "schedule", "workflow_dispatch"], "reconcile event set");

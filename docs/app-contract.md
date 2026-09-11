@@ -85,13 +85,14 @@ the pinned TypeScript entrypoint by its exact installed path. The package script
 are developer-facing parity, not the privileged verification boundary.
 
 All reusable workflows and Terraform modules must use the same full platform
-commit SHA. Deploy callers forward no secrets and must never use
-`secrets: inherit`. Each DHI reusable workflow declares the one environment
-secret as optional so it is available in the workflow's `secrets` context. The
-job's protected environment supplies the value and takes precedence over any
-same-named caller value; approved callers pass none. The preview caller uses the
-trusted default-branch `pull_request_target` definition, restricts `branches` to
-`main`, and passes no caller-controlled inputs. The reusable workflow verifies
+commit SHA. The five lifecycle calls forward only the exact named
+`DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3` expression and must never use
+`secrets: inherit`. Each DHI reusable workflow declares that one secret as
+optional. The protected prefetch job's environment supplies the value and takes
+precedence over the same-named caller slot; the explicit named map is required
+for GitHub to resolve that value across the reusable-workflow boundary. The
+preview caller uses the trusted default-branch `pull_request_target` definition,
+restricts `branches` to `main`, and passes no caller-controlled inputs. The reusable workflow verifies
 the immutable numeric repository ID, exact base/head identities,
 same-repository numeric head repo ID,
 base branch, event, and run attempt before any operation.

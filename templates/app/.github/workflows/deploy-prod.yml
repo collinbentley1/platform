@@ -26,4 +26,6 @@ jobs:
       contents: read
       id-token: write # Exchange only through exact production publish and deploy paths.
       pull-requests: read # The reusable deploy proves every live preview tag maps to an active PR head.
+    secrets:
+      DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3: ${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}
     uses: collinbentley1/platform/.github/workflows/deploy-prod.yml@__PLATFORM_SHA__

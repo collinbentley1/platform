@@ -575,8 +575,9 @@ the recovery object and stop; never rerun from empty state.
    and bypass actors. The DHI environment is intentionally shared by preview
    and production so exact base parity is structural rather than two separately
    managed credential copies. Each reusable workflow declares that environment
-   secret as optional, while every caller continues to forward no secrets; the
-   protected job environment supplies the value at job start.
+   secret as optional, and the five lifecycle calls use only its exact named
+   expression. The protected job environment supplies the value at job start;
+   `secrets: inherit`, an omitted mapping, and an empty literal are forbidden.
 
    Repository Actions must also use the exact general selected-actions policy
    and frozen-SHA allowlist defined by the activation protocol. A bare enable,
@@ -660,8 +661,9 @@ the recovery object and stop; never rerun from empty state.
    may access only this secret.
 
    Before re-enabling Actions, semantically prove every workflow and caller has
-   no secret forwarding, no `secrets: inherit`, no Socket or Health GitHub secret
-   reference, and only the epoch DHI prefetch reference. Delete the old
+   only the exact named epoch DHI mapping on the five lifecycle calls, no
+   `secrets: inherit`, no Socket or Health GitHub secret reference, and only the
+   epoch DHI prefetch reference inside reusable jobs. Delete the old
    `preview-build`, `production-build`, and `dependency-scan` environments only
    after their values have been removed and the old DHI/Socket provider tokens
    are revoked. Re-read environment, repository, and organization secret
@@ -673,8 +675,9 @@ the recovery object and stop; never rerun from empty state.
    all pass; populating a secret alone is never sufficient.
 2. Prepare, but do not merge, consumer PRs that pin every caller and Terraform
    mirror to the reviewed full platform SHA, remove caller-controlled commands
-   and cloud inputs, remove production `workflow_dispatch`, remove
-   `secrets: inherit`, and adopt the canonical Docker/Bun contract.
+   and cloud inputs, remove production `workflow_dispatch`, replace
+   `secrets: inherit` with the exact named epoch DHI mapping, and adopt the
+   canonical Docker/Bun contract.
    Squash/merge this precursor workflow hardening only after review and call its
    immutable commit `S`. A follow-on protected controller commit `C` must
    hardcode and audit `S`; bootstrap exact WIF trust for `S`, then repin all
