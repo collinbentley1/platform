@@ -87,6 +87,66 @@ describe("durable delivery operator", () => {
       }
     }
   });
+  test("caller preflight requires only the exact named DHI mapping on lifecycle jobs", async () => {
+    const file = "deploy-prod.yml";
+    const content = (await readFile(
+      join(import.meta.dir, "../../templates/app/.github/workflows", file),
+      "utf8",
+    )).replaceAll("__PLATFORM_SHA__", sha);
+    const mapping = [
+      "    secrets:",
+      "      DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3: ${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
+    ].join("\n");
+    const check = (candidate: string) =>
+      callerPins(candidate, file, "collinbentley1/platform", [sha]);
+
+    expect(() => check(content.replace(`${mapping}\n`, ""))).toThrow("DHI secret mapping");
+    expect(() =>
+      check(
+        content
+          .replace("  deploy:\n", "  renamed:\n")
+          .replace(`${mapping}\n`, ""),
+      )
+    ).toThrow("mandatory jobs");
+    const infrastructureCall =
+      `collinbentley1/platform/.github/workflows/infrastructure.yml@${sha}`;
+    const deployCall = `collinbentley1/platform/.github/workflows/deploy-prod.yml@${sha}`;
+    expect(() =>
+      check(
+        content
+          .replace(infrastructureCall, "SWAPPED_CALL")
+          .replace(deployCall, infrastructureCall)
+          .replace("SWAPPED_CALL", deployCall),
+      )
+    ).toThrow("reusable call");
+    expect(() =>
+      check(
+        content.replace(
+          "${{ secrets.DHI_PUBLIC_READ_TOKEN_20260822_098DCA9280B3 }}",
+          "${{ secrets.WRONG }}",
+        ),
+      )
+    ).toThrow("DHI secret mapping");
+    expect(() =>
+      check(
+        content.replace(
+          mapping,
+          `${mapping}\n      UNAPPROVED: \${{ secrets.UNAPPROVED }}`,
+        ),
+      )
+    ).toThrow("DHI secret mapping");
+    expect(() => check(content.replace(mapping, "    secrets: inherit"))).toThrow(
+      "DHI secret mapping",
+    );
+    expect(() =>
+      check(
+        content.replace(
+          "    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@",
+          `${mapping}\n    uses: collinbentley1/platform/.github/workflows/infrastructure.yml@`,
+        ),
+      )
+    ).toThrow("must not forward secrets");
+  });
   test("member bindings distinguish opened and synchronize cleanup callers and exact pins", () => {
     const pins = { "deploy-preview.yml": { "deploy-preview.yml": sha, "cleanup-preview.yml": sha } };
     const member = (workflow: string, pin = sha) => `principalSet://iam.googleapis.com/pool/attribute.authority/owner/consumer/.github/workflows/deploy-preview.yml@refs/heads/main:collinbentley1/platform/.github/workflows/${workflow}@${pin}:${pin}:preview-cloud:pull_request_target`;

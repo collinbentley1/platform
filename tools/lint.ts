@@ -1758,20 +1758,6 @@ for (const approvedLine of [
 if (unexplainedDeliveryNonce.includes("delivery_nonce")) {
   failures.push(`${reconcileCallerPath}: delivery_nonce may appear only in its declaration, run name, and exact Checkov rationale.`);
 }
-try {
-  const lintPin = "a".repeat(40);
-  callerPins(
-    reconcileCaller.replaceAll("__PLATFORM_SHA__", lintPin),
-    "reconcile-previews.yml",
-    "collinbentley1/platform",
-    [lintPin],
-  );
-} catch (error) {
-  failures.push(
-    `${reconcileCallerPath}: recovery caller structure is not exact: ${error instanceof Error ? error.message : "unknown error"}`,
-  );
-}
-
 for (const workflow of ["application.yml", "infrastructure.yml", "socket-firewall.yml"]) {
   const path = `templates/app/.github/workflows/${workflow}`;
   const text = await read(path);
@@ -1791,10 +1777,27 @@ for (const workflow of ["application.yml", "infrastructure.yml", "socket-firewal
   }
 }
 
-for (const workflow of ["deploy-preview.yml", "deploy-prod.yml"]) {
+for (const workflow of [
+  "deploy-prod.yml",
+  "deploy-preview.yml",
+  "cleanup-preview.yml",
+  "reconcile-previews.yml",
+]) {
   const path = `templates/app/.github/workflows/${workflow}`;
   const text = await read(path);
-  rejectContains(path, text, "    secrets:", "Deploy callers must not forward any secret map to a reusable workflow.");
+  try {
+    const lintPin = "a".repeat(40);
+    callerPins(
+      text.replaceAll("__PLATFORM_SHA__", lintPin),
+      workflow,
+      "collinbentley1/platform",
+      [lintPin],
+    );
+  } catch (error) {
+    failures.push(
+      `${path}: lifecycle caller structure is not exact: ${error instanceof Error ? error.message : "unknown error"}`,
+    );
+  }
 }
 requireContains(
   "templates/app/.github/workflows/deploy-preview.yml",
