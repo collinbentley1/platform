@@ -24,6 +24,7 @@ const reusableWorkflows = [
   "deploy-preview.yml",
   "cleanup-preview.yml",
   "reconcile-previews.yml",
+  "rescan-vulnerabilities.yml",
 ];
 const platformWorkflows = [
   ...reusableWorkflows,
@@ -481,8 +482,8 @@ rejectContains(
 );
 
 const grypeConfig = await read("tools/ci/grype.yaml");
-requireContains("tools/ci/grype.yaml", grypeConfig, "auto-update: false", "Grype must not trust a mutable database listing.");
-requireContains("tools/ci/grype.yaml", grypeConfig, "max-allowed-built-age: 48h", "The reviewed vulnerability DB must expire closed.");
+requireContains("tools/ci/grype.yaml", grypeConfig, "auto-update: false", "The isolated scanner must import a verified snapshot without network updates.");
+requireContains("tools/ci/grype.yaml", grypeConfig, "max-allowed-built-age: 48h", "Database freshness must remain a release gate.");
 const grypeBlockingPolicy = await read("tools/ci/grype-blocking.jq");
 requireContains(
   "$CONTRACT_ROOT/grype-blocking.jq",
@@ -497,31 +498,22 @@ rejectContains(
   "Vulnerability blocking must not depend on upstream fix availability.",
 );
 try {
-  const manifest = JSON.parse(await read("tools/ci/grype-db.json")) as {
-    built?: unknown;
-    schemaVersion?: unknown;
-    sha256?: unknown;
-    url?: unknown;
+  const policy = JSON.parse(await read("tools/ci/grype-db-policy.json")) as unknown;
+  const expected = {
+    schemaVersion: 1,
+    listingUrl: "https://grype.anchore.io/databases/v6/latest.json",
+    downloadBaseUrl: "https://grype.anchore.io/databases/v6/",
+    databaseSchemaVersion: "v6.1.9",
+    maxBuiltAgeSeconds: 172800,
+    maxFutureSkewSeconds: 3600,
+    maxArchiveBytes: 536870912,
+    maxListingBytes: 4096,
   };
-  if (
-    typeof manifest.sha256 !== "string" ||
-    !/^[0-9a-f]{64}$/.test(manifest.sha256) ||
-    typeof manifest.url !== "string" ||
-    manifest.url !==
-      `https://grype.anchore.io/databases/v6/vulnerability-db_v6.1.9_2026-09-10T00:31:01Z_1789021824.tar.zst?checksum=sha256%3A${manifest.sha256}` ||
-    manifest.sha256 !== "ce7ae6d4f7fb81029fc3bd1891b6b441f96bac4e278519743e4768eebd805e69" ||
-    manifest.schemaVersion !== "v6.1.9" ||
-    manifest.built !== "2026-09-10T06:30:24Z"
-  ) {
-    failures.push("tools/ci/grype-db.json: vulnerability DB identity must match the reviewed checksum-qualified snapshot.");
-  }
-  const builtAt = typeof manifest.built === "string" ? Date.parse(manifest.built) : Number.NaN;
-  const databaseAgeMs = Date.now() - builtAt;
-  if (!Number.isFinite(builtAt) || databaseAgeMs < -60 * 60 * 1000 || databaseAgeMs > 48 * 60 * 60 * 1000) {
-    failures.push("tools/ci/grype-db.json: reviewed vulnerability DB must be between zero and 48 hours old.");
+  if (JSON.stringify(policy) !== JSON.stringify(expected)) {
+    failures.push("tools/ci/grype-db-policy.json: acquisition policy must use the approved upstream, schema, and bounds.");
   }
 } catch {
-  failures.push("tools/ci/grype-db.json: vulnerability DB manifest must be valid JSON.");
+  failures.push("tools/ci/grype-db-policy.json: acquisition policy must be valid JSON.");
 }
 
 for (const [path, workflow] of [
@@ -532,7 +524,7 @@ for (const [path, workflow] of [
     path,
     workflow,
     "GRYPE_DB_MANIFEST_JSON",
-    "The credentialless promoter must load the vulnerability DB manifest only from immutable platform policy.",
+    "Database manifests must be produced by the trusted acquisition action, never caller JSON.",
   );
   rejectContains(
     path,
@@ -608,10 +600,7 @@ for (const [path, workflow] of [
 }
 const artifactContract = await read("tools/ci/container-artifact-contract.sh");
 for (const boundary of [
-  "GRYPE_DB_MANIFEST_SHA256=455a7082e350b00c216ab2dd00d72d76573b09d9b4b04e5191c1e6e6c7fd2463",
-  'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
-  'test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST"',
-  'verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"',
+  "GRYPE_DB_POLICY_SHA256=b21d50070ace6d9f7e2aa8455eeea94501050d07335da64192d5484980da8442",
   'db import /database/grype-db.tar.zst',
   '"$scanner_policy/grype-blocking.jq"',
   "jq -e 'length == 0'",
@@ -635,6 +624,16 @@ rejectContains(
   "db update",
   "The credentialless promoter must not trust mutable vulnerability metadata.",
 );
+const databaseAction = await read(".github/actions/grype-database/action.yml");
+checkActionPins(".github/actions/grype-database/action.yml", databaseAction, false);
+const databaseImplementation = await read("tools/ci/grype-database.sh");
+for (const boundary of [
+  'test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}"',
+  'verify_sha256 "$GRYPE_DB_POLICY_SHA256" "$GRYPE_DB_POLICY"',
+  'Grype upstream attempted a database rollback or same-build substitution.',
+]) {
+  requireContains("tools/ci/grype-database.sh", databaseImplementation, boundary, `Grype acquisition is missing ${boundary}.`);
+}
 const syftConfig = await read("tools/ci/syft.yaml");
 if (syftConfig.trim() !== "{}") {
   failures.push("tools/ci/syft.yaml: trusted Syft policy must retain complete default cataloging without caller exclusions.");
@@ -3447,7 +3446,12 @@ function checkActionPins(path: string, text: string, allowPlatformPlaceholder: b
   )) {
     const spec = match[1] ?? match[2] ?? match[3]!;
     if (spec.startsWith("./")) {
-      failures.push(`${path}: local action ${spec} is not allowed in platform workflows.`);
+      const allowedLocal =
+        ([".github/workflows/platform.yml", ".github/workflows/refresh-grype-db.yml"].includes(path) &&
+          spec === "./.github/actions/grype-database") ||
+        ([".github/workflows/deploy-prod.yml", ".github/workflows/deploy-preview.yml", ".github/workflows/rescan-vulnerabilities.yml"].includes(path) &&
+          spec === "./platform-policy/.github/actions/grype-database");
+      if (!allowedLocal) failures.push(`${path}: local action ${spec} is not allowed in platform workflows.`);
       continue;
     }
     if (spec.startsWith("docker://")) {

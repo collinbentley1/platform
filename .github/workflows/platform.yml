@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       checks: read
+      actions: read # Restore only the protected platform database cache.
       contents: read
 
     steps:
@@ -381,35 +382,23 @@ jobs:
           "$tools/grype" version -o json | jq -e \
             '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"'
 
-      - name: Validate the reviewed vulnerability database snapshot
+      - name: Acquire the database with the platform-owned action
+        id: database
+        uses: ./.github/actions/grype-database
+
+      - name: Validate the verified vulnerability database snapshot
+        env:
+          SNAPSHOT: ${{ steps.database.outputs.directory }}
         run: |
           set -euo pipefail
-          manifest="$GITHUB_WORKSPACE/tools/ci/grype-db.json"
           grype="$RUNNER_TEMP/platform-tools/grype"
           export GRYPE_DB_CACHE_DIR="$RUNNER_TEMP/platform-grype-db"
           mkdir -p "$GRYPE_DB_CACHE_DIR"
-          db_url="$(jq -er '
-            select((keys | sort) == ["built", "schemaVersion", "sha256", "url"])
-            |
-            .url as $url
-            | .sha256 as $sha
-            | select($sha | test("^[0-9a-f]{64}$"))
-            | select($url | test(("^https://grype\\.anchore\\.io/databases/v6/vulnerability-db_v6\\.[0-9]+\\.[0-9]+_[0-9TZ:-]+_[0-9]+\\.tar\\.zst\\?checksum=sha256%3A" + $sha + "$")))
-            | $url
-          ' "$manifest")"
-          expected_schema="$(jq -er '.schemaVersion | select(test("^v6\\.[0-9]+\\.[0-9]+$"))' "$manifest")"
-          expected_built="$(jq -er '.built | fromdateiso8601 | todateiso8601' "$manifest")"
-          "$grype" --config tools/ci/grype.yaml db import "$db_url"
+          "$grype" --config tools/ci/grype.yaml db import "$SNAPSHOT/grype-db.tar.zst"
           "$grype" --config tools/ci/grype.yaml db status -o json | jq -e \
-            --arg from "$db_url" \
-            --arg schema "$expected_schema" \
-            --arg built "$expected_built" '
-              .valid == true and
-              .schemaVersion == $schema and
-              .built == $built and
-              .from == $from and
-              ((now - (.built | fromdateiso8601)) >= -3600) and
-              ((now - (.built | fromdateiso8601)) <= 172800)
+            --arg schema "$(jq -er .schemaVersion "$SNAPSHOT/manifest.json")" \
+            --arg built "$(jq -er .built "$SNAPSHOT/manifest.json")" '
+              .valid == true and .schemaVersion == $schema and .built == $built
             '
 
   terraform-validation:

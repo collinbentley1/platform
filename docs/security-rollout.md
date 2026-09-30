@@ -626,11 +626,15 @@ the recovery object and stop; never rerun from empty state.
    Dockerfile; the final image scan covers the complete hybrid.
 
    Do not create `GRYPE_DB_MANIFEST_JSON` or `DB_MANIFEST_JSON` at any GitHub
-   variable scope. The verifier loads only the byte-pinned
-   `tools/ci/grype-db.json` from the exact platform policy archive. Refresh it by
-   reviewed PR before its 48-hour expiry, then authorize and repin the resulting
-   platform SHA across every consumer. Treat inability to complete that cadence
-   as a release stop condition; it is not the intended long-term update path.
+   variable scope. The exact platform policy fixes the Anchore origin, supported
+   schema, checksum format, byte bounds, and 48-hour maximum database age. The
+   platform-owned action fetches current data before scanning and permits only a
+   verified protected-main cache within that age during transient outages.
+   Publication and concrete Cloud Run deployment recheck freshness. Database
+   refreshes do not mint new platform SHAs or require WIF changes.
+   Adopt the canonical `rescan-vulnerabilities.yml` caller with the reviewed
+   platform SHA, then deploy once to retain production SBOMs. Scheduled rescans
+   require no cloud credentials. See [vulnerability scanning](vulnerability-scanning.md).
    Socket uses no GitHub secret or paid
    scanner token. Every local scan runs the public policy, and branch protection
    requires the exact successful Socket GitHub App id `156372` checks. Delete

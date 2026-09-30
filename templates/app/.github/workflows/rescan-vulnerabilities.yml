@@ -1,0 +1,15 @@
+name: Rescan production vulnerabilities
+
+on:
+  schedule:
+    - cron: '40 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rescan:
+    permissions:
+      actions: read # Read and renew bound production SBOM artifacts.
+      contents: read
+    uses: collinbentley1/platform/.github/workflows/rescan-vulnerabilities.yml@__PLATFORM_SHA__

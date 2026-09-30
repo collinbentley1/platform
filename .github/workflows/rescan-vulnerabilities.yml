@@ -1,0 +1,160 @@
+name: Rescan retained production SBOMs
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  inventory:
+    name: Select published production inventories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      matrix: ${{ steps.inventory.outputs.matrix }}
+    steps:
+      - name: Require the protected default branch and original run attempt
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Fetch the exact reusable-workflow policy source
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$GITHUB_WORKSPACE/platform-policy"
+          repository="$RUNNER_TEMP/platform-rescan-repository"
+          git_home="$RUNNER_TEMP/platform-rescan-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci .github/actions/grype-database | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Bind inventories to protected production and renewal runs
+        id: inventory
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" discover-production-sbom
+
+  scan:
+    name: Rescan production run ${{ matrix.deploymentRunId }}
+    needs: inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.inventory.outputs.matrix) }}
+    steps:
+      - name: Require the protected default branch and original run attempt
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Fetch the exact reusable-workflow policy source
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$GITHUB_WORKSPACE/platform-policy"
+          repository="$RUNNER_TEMP/platform-rescan-repository"
+          git_home="$RUNNER_TEMP/platform-rescan-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci .github/actions/grype-database | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire the database with the platform-owned action
+        id: database
+        uses: ./platform-policy/.github/actions/grype-database
+
+      - name: Download the exact retained inventory artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          repository: ${{ github.repository }}
+          run-id: ${{ matrix.artifactRunId }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ matrix.artifactId }}
+          path: ${{ runner.temp }}/platform-sbom-download
+          digest-mismatch: error
+          skip-decompress: true
+
+      - name: Scan the bound SBOM without network or credentials
+        id: scan
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          RESCAN_ARTIFACT_SHA256: ${{ matrix.contentSha256 }}
+          RESCAN_DEPLOYMENT_RUN_ID: ${{ matrix.deploymentRunId }}
+          RESCAN_HEAD_SHA: ${{ matrix.headSha }}
+          GRYPE_DATABASE_DIR: ${{ steps.database.outputs.directory }}
+          GRYPE_DATABASE_MANIFEST_SHA256: ${{ steps.database.outputs.manifest-sha256 }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" rescan-sbom
+
+      # Renew even when the completed scan finds new blocking vulnerabilities.
+      # Scanner failures never renew an inventory or produce a passing gate.
+      - name: Renew the original production evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.scan.outputs.inventory_artifact }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Save the current scan results and database evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-rescan-${{ matrix.deploymentRunId }}
+          path: ${{ steps.scan.outputs.report_directory }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail on newly discovered High or Critical vulnerabilities
+        env:
+          BLOCKING_COUNT: ${{ steps.scan.outputs.blocking_count }}
+        run: |
+          set -euo pipefail
+          [[ "$BLOCKING_COUNT" =~ ^[0-9]+$ ]]
+          if [ "$BLOCKING_COUNT" != 0 ]; then
+            echo "Found $BLOCKING_COUNT blocking vulnerabilities; inspect the production-rescan artifact." >&2
+            exit 1
+          fi

@@ -179,6 +179,10 @@ const capabilityFiles = [
   "tools/ci/cloud-run-preview-controller.sh",
   "tools/ci/cloud-run-preview-traffic.sh",
   "tools/ci/container-artifact-contract.sh",
+  ".github/actions/grype-database/action.yml",
+  "tools/ci/grype-database.sh",
+  "tools/ci/grype-db-policy.json",
+  "tools/ci/grype-rescan.sh",
   "tools/ci/deployment-parity-transition.sh",
   "tools/ci/preview-runtime-iam-contract.sh",
 ] as const;
@@ -1826,6 +1830,7 @@ describe("protected owner Terraform bridge", () => {
       "deploy-prod.yml",
       "infrastructure.yml",
       "reconcile-previews.yml",
+      "rescan-vulnerabilities.yml",
       "socket-firewall.yml",
     ];
     const workflowDirectory = join(directory, ".github", "workflows");
@@ -1864,6 +1869,7 @@ describe("protected owner Terraform bridge", () => {
       "deploy-prod.yml",
       "infrastructure.yml",
       "reconcile-previews.yml",
+      "rescan-vulnerabilities.yml",
       "socket-firewall.yml",
     ];
     try {

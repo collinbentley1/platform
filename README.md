@@ -8,8 +8,8 @@ This repository is the source of truth for the operational pattern shared by the
 - Pure Bun application verification, Bun 1.4 native (stable pins, no canary fallbacks).
 - Socket Firewall dependency checks.
 - Seven-day minimum package-release age for new resolutions.
-- Final-image SBOM generation and a fail-closed Grype gate using a reviewed,
-  checksum-qualified database snapshot.
+- Final-image SBOM generation and a fail-closed Grype gate using a verified,
+  checksum-qualified current database snapshot and scheduled production SBOM rescans.
 - Checkov and Terraform validation.
 - GitHub Actions Workload Identity Federation into Google Cloud.
 - Docker Hardened Images and immutable Artifact Registry tags.
@@ -275,16 +275,19 @@ Ubuntu with Bash 5.
 Release `0.5.13` only after required checks and adversarial review. Create a
 protected GitHub release tag for discovery, then copy the release commit SHA into
 consumer workflow and Terraform references. Never move an existing release tag.
-Refresh and review `tools/ci/grype-db.json` immediately before the release. After
-platform CI imports and validates it, the credentialless verifier loads only
-that byte-pinned file from the immutable platform policy archive; every
-`GRYPE_DB_MANIFEST_JSON` or `DB_MANIFEST_JSON` override is forbidden. The
-snapshot expires after 48 hours, so builds fail closed against stale data. A
-refresh changes the platform commit and therefore requires a new reviewed
-platform SHA, WIF authorization, and consumer repin. That sub-48-hour rollout
-cadence is a release stop condition, not an acceptable steady-state update
-mechanism; do not release once the snapshot is stale or if the complete repin
-cannot finish inside its validity window.
+The platform-owned database action acquires current, checksum-verified Anchore
+snapshots under the immutable `tools/ci/grype-db-policy.json` policy. A protected
+scheduled workflow supplies a verified cache for transient upstream outages;
+every snapshot must remain under 48 hours old through publication and deployment.
+Database updates do not change the platform SHA or require consumer repins.
+Ordinary source lint validates policy without imposing a date on source code.
+
+Adoption requires one reviewed platform SHA update and the canonical
+`rescan-vulnerabilities.yml` consumer workflow. After the first production deploy,
+daily read-only rescans use retained SBOMs and report newly discovered High or
+Critical vulnerabilities through a failing workflow. See
+[database acquisition and rescans](docs/vulnerability-scanning.md) for trust,
+retention, outage behavior, and rollout requirements.
 
 ```sh
 gh release create v0.5.13 --target <reviewed-commit-sha> --generate-notes

@@ -17,6 +17,17 @@ afterEach(async () => {
 });
 
 describe("production Secret Manager deploy boundary", () => {
+  test("an expired or future-dated database stops before any cloud read or mutation", async () => {
+    const script = await productionDeployScript();
+    for (const hours of [49, -2]) {
+      const built = new Date(Date.now() - hours * 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+      const result = await runDeployScript(script, serviceWithWaitlistEntries([], []), [], undefined, undefined, undefined, undefined, built);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("database expired before publication or deployment");
+      expect(result.calls).toBe("");
+    }
+  });
+
   test("stage one deploys only the still-unprovisioned Medlock shape", async () => {
     const deployScript = await productionDeployScript();
     const staged = await runDeployScript(
@@ -381,6 +392,7 @@ async function runDeployScript(
   keySnapshot: unknown = exactRecaptchaKey(),
   keyInventorySnapshot: unknown[] = [exactRecaptchaKey()],
   medlockOwnershipRequired: "false" | "true" = "true",
+  databaseBuilt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
 ): Promise<{
   calls: string;
   capturedEnvironment: string;
@@ -536,6 +548,7 @@ async function runDeployScript(
       GCLOUD_VERSION_STATE: versionState,
       GCLOUD_V2_REVISION_FIXTURE: v2RevisionFixture,
       GCLOUD_V2_SERVICE_FIXTURE: v2ServiceFixture,
+      GRYPE_DATABASE_BUILT: databaseBuilt,
       GITHUB_OUTPUT: join(root, "github-output.txt"),
       GITHUB_RUN_ATTEMPT: "1",
       GITHUB_RUN_ID: "987654321",

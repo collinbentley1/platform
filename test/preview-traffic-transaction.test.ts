@@ -50,6 +50,16 @@ afterEach(async () => {
 });
 
 describe("etag-bound preview traffic transaction", () => {
+  test("an expired or future-dated database stops before preview mutations", async () => {
+    for (const hours of [49, -2]) {
+      const built = new Date(Date.now() - hours * 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+      const result = await runDeployPreflightFailure(built);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("database expired before publication or deployment");
+      expect(result.mutations).toBe("");
+    }
+  });
+
   test("a deploy preflight failure before exposure classification performs no Cloud Run mutation", async () => {
     const result = await runDeployPreflightFailure();
     expect(result.exitCode).not.toBe(0);
@@ -217,7 +227,9 @@ type RunOptions = {
   serviceBuildConfig?: boolean;
 };
 
-async function runDeployPreflightFailure(): Promise<{
+async function runDeployPreflightFailure(
+  databaseBuilt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+): Promise<{
   exitCode: number;
   mutations: string;
   stderr: string;
@@ -248,7 +260,7 @@ async function runDeployPreflightFailure(): Promise<{
   ) as { jobs: { deploy: { steps: Array<{ name?: string; run?: string }> } } };
   const run = workflow.jobs.deploy.steps.find((step) => step.name === "Deploy preview to Cloud Run")?.run;
   expect(run).toBeDefined();
-  const child = Bun.spawn(["/bin/bash", "--noprofile", "--norc", "-c", run!], {
+  const child = Bun.spawn(["/bin/bash", "--noprofile", "--norc", "-c", run!.replaceAll("${{ steps.parity-policy.outputs.root }}", repoRoot)], {
     cwd: repoRoot,
     env: {
       ...process.env,
@@ -258,6 +270,7 @@ async function runDeployPreflightFailure(): Promise<{
         "us-east4-docker.pkg.dev/critical-history-16823277/site-preview/critical-history",
       EXPECTED_PRODUCTION_IMAGE_NAME:
         "us-east4-docker.pkg.dev/critical-history-16823277/site/critical-history",
+      GRYPE_DATABASE_BUILT: databaseBuilt,
       FAKE_MUTATIONS: mutations,
       GITHUB_OUTPUT: output,
       GITHUB_RUN_ATTEMPT: "1",

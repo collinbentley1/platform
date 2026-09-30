@@ -68,6 +68,7 @@ const workflowFiles = [
   "deploy-preview.yml",
   "cleanup-preview.yml",
   "reconcile-previews.yml",
+  "rescan-vulnerabilities.yml",
 ];
 const expectedReusableCalls: Readonly<Record<string, readonly string[]>> = {
   "application.yml": ["application.yml"],
@@ -78,6 +79,7 @@ const expectedReusableCalls: Readonly<Record<string, readonly string[]>> = {
   "deploy-preview.yml": ["deploy-preview.yml"],
   "cleanup-preview.yml": ["cleanup-preview.yml"],
   "reconcile-previews.yml": ["reconcile-previews.yml"],
+  "rescan-vulnerabilities.yml": ["rescan-vulnerabilities.yml"],
 };
 const canonicalAppFiles = [
   "Dockerfile",

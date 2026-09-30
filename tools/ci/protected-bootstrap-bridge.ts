@@ -258,6 +258,10 @@ const CAPABILITY_REQUIRED_FILES = [
   "tools/ci/cloud-run-preview-controller.sh",
   "tools/ci/cloud-run-preview-traffic.sh",
   "tools/ci/container-artifact-contract.sh",
+  ".github/actions/grype-database/action.yml",
+  "tools/ci/grype-database.sh",
+  "tools/ci/grype-db-policy.json",
+  "tools/ci/grype-rescan.sh",
   "tools/ci/deployment-parity-transition.sh",
   "tools/ci/preview-runtime-iam-contract.sh",
 ] as const;
@@ -268,6 +272,7 @@ const CONSUMER_WORKFLOW_CALLS: Readonly<Record<string, readonly string[]>> = {
   "deploy-prod.yml": ["infrastructure.yml", "deploy-prod.yml"],
   "infrastructure.yml": ["infrastructure.yml"],
   "reconcile-previews.yml": ["reconcile-previews.yml"],
+  "rescan-vulnerabilities.yml": ["rescan-vulnerabilities.yml"],
   "socket-firewall.yml": ["socket-firewall.yml"],
 };
 const FORBIDDEN_PRE_MIGRATION_WORKFLOW_SHAS = new Set([

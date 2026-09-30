@@ -36,11 +36,11 @@ readonly DHI_ATTESTATION_POLICY_IMPLEMENTED=true
 readonly BUILDKIT_PROVENANCE_URI_POLICY_IMPLEMENTED=true
 readonly DHI_PUBLIC_KEY_SHA256=1d02bbccf149283ae6288d96264dcad3fb23ee1911d90324a48eab28e4cb8a5f
 readonly DHI_CATALOG_LICENSE_SHA256=58881e3f5171ed2e98db7a4dbd64c16b9b5dbb2f5cbd9a56e79608a2360ad5f3
-readonly GRYPE_DB_MANIFEST_SHA256=455a7082e350b00c216ab2dd00d72d76573b09d9b4b04e5191c1e6e6c7fd2463
+readonly GRYPE_DB_POLICY_SHA256=b21d50070ace6d9f7e2aa8455eeea94501050d07335da64192d5484980da8442
 readonly CONTRACT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly DHI_PUBLIC_KEY="$CONTRACT_ROOT/trust/docker-dhi-community-20260822.pub"
 readonly DHI_CATALOG_LICENSE="$CONTRACT_ROOT/trust/docker-dhi-catalog-license-140f79e.txt"
-readonly GRYPE_DB_MANIFEST="$CONTRACT_ROOT/grype-db.json"
+readonly GRYPE_DB_POLICY="$CONTRACT_ROOT/grype-db-policy.json"
 
 die() {
   echo "$*" >&2
@@ -99,24 +99,6 @@ require_json_file() {
     END { exit (bad || string || depth != 0) ? 1 : 0 }
   ' "$path" || die "JSON nesting or quoting exceeds the reviewed parser envelope."
   jq -e . "$path" >/dev/null || die "JSON file is invalid."
-}
-
-load_reviewed_grype_db_manifest() {
-  test -z "${DB_MANIFEST_JSON:-}" && test -z "${GRYPE_DB_MANIFEST_JSON:-}" ||
-    die "Refusing an injected Grype database manifest."
-  test -f "$GRYPE_DB_MANIFEST" && test ! -L "$GRYPE_DB_MANIFEST" ||
-    die "The reviewed Grype database manifest is not a regular policy file."
-  verify_sha256 "$GRYPE_DB_MANIFEST_SHA256" "$GRYPE_DB_MANIFEST"
-  require_json_file "$GRYPE_DB_MANIFEST" 4096
-  jq -cer '
-    select((keys | sort) == ["built", "schemaVersion", "sha256", "url"]) |
-    .sha256 as $sha |
-    .built as $built |
-    select($sha | test("^[0-9a-f]{64}$")) |
-    select(.schemaVersion | test("^v6\\.[0-9]+\\.[0-9]+$")) |
-    select($built | fromdateiso8601 | todateiso8601 == $built) |
-    select(.url | test(("^https://grype\\.anchore\\.io/databases/v6/vulnerability-db_v6\\.[0-9]+\\.[0-9]+_[0-9TZ:-]+_[0-9]+\\.tar\\.zst\\?checksum=sha256%3A" + $sha + "$")))
-  ' "$GRYPE_DB_MANIFEST" || die "The reviewed Grype database manifest schema drifted."
 }
 
 single_regular_file() {
@@ -1033,14 +1015,15 @@ promote_image() {
   verify_sha256 38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26 "$RUNNER_TEMP/grype.tgz"
   tar -xzf "$RUNNER_TEMP/grype.tgz" -C "$tools" grype
   "$tools/grype" version -o json | jq -e '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"' >/dev/null
-  local db_manifest_json db_url db_sha expected_schema expected_built db_archive
-  db_manifest_json="$(load_reviewed_grype_db_manifest)"
-  db_url="$(jq -er '.url' <<< "$db_manifest_json")"
+  local db_manifest_json db_sha expected_schema expected_built db_archive
+  test "${GRYPE_DATABASE_DIR:?}" = "$RUNNER_TEMP/platform-grype-database" || die "Grype database path differs from the trusted action output."
+  grype_verify_directory "$GRYPE_DATABASE_DIR" "${GRYPE_DATABASE_MANIFEST_SHA256:?}"
+  db_manifest_json="$(cat "$GRYPE_DATABASE_DIR/manifest.json")"
   db_sha="$(jq -er '.sha256' <<< "$db_manifest_json")"
   expected_schema="$(jq -er '.schemaVersion' <<< "$db_manifest_json")"
   expected_built="$(jq -er '.built' <<< "$db_manifest_json")"
   db_archive="$scanner_database/grype-db.tar.zst"
-  curl --fail --show-error --silent --location --output "$db_archive" "$db_url"
+  install -m 0444 "$GRYPE_DATABASE_DIR/grype-db.tar.zst" "$db_archive"
   verify_sha256 "$db_sha" "$db_archive"
   chmod -R a-w,go+rX "$tools" "$scanner_policy" "$scanner_database"
   docker pull "$SCANNER_SANDBOX_IMAGE" >/dev/null
@@ -1127,6 +1110,14 @@ promote_image() {
   ) > "$scanner_after"
   cmp "$scanner_before" "$scanner_after" || die "The unprivileged scanners changed the read-only OCI graph."
 
+  jq -cnS --arg imageDigest "$published_index_digest" --arg sbomSha256 "$(sha256_file "$verified/sbom.spdx.json")" \
+    --arg resultSha256 "$(sha256_file "$verified/grype.json")" --arg policySha256 "$GRYPE_DB_POLICY_SHA256" \
+    --argjson database "$db_manifest_json" \
+    '{schemaVersion:1,imageDigest:$imageDigest,sbomSha256:$sbomSha256,resultSha256:$resultSha256,
+      policySha256:$policySha256,database:$database,grypeVersion:"0.117.0",blockingCount:0,scannedAt:(now | todateiso8601)}' \
+    > "$verified/scan-evidence.json"
+  grype_check_freshness "$expected_built"
+
   local bundle="$RUNNER_TEMP/platform-promoted-bundle"
   local artifact="$RUNNER_TEMP/platform-${kind}-promoted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar"
   local canonical="$RUNNER_TEMP/platform-canonical-image.oci.tar"
@@ -1148,6 +1139,7 @@ promote_image() {
   install -d -m 0700 "$bundle"
   install -m 0600 "$canonical" "$bundle/image.oci.tar"
   install -m 0600 "$verified/sbom.spdx.json" "$bundle/sbom.spdx.json"
+  install -m 0600 "$verified/scan-evidence.json" "$bundle/scan-evidence.json"
   install -m 0600 "$runtime_manifest" "$bundle/dhi-runtime.manifest.json"
   local image_sha sbom_sha
   image_sha="$(sha256_file "$bundle/image.oci.tar")"
@@ -1158,14 +1150,16 @@ promote_image() {
     dhiDev:(.images[] | select(.role == "dhi_dev") | {childDigest,topDigest}),
     dhiRuntime:(.images[] | select(.role == "dhi_runtime") | {childDigest,topDigest})
   }' "$base_root/manifest.json")"
-  jq -cnS --argjson baseImages "$base_images" --arg event "${EXPECTED_EVENT_NAME:?}" --arg head "$EXPECTED_HEAD_SHA" --arg imageSha256 "$image_sha" --arg publishedIndexDigest "$published_index_digest" --arg repositoryId "$EXPECTED_REPOSITORY_ID" --arg runnableManifestDigest "$runnable_manifest_digest" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg runId "$GITHUB_RUN_ID" --arg runtimeManifestSha256 "${DHI_RUNTIME_AMD64_DIGEST#sha256:}" --arg sbomSha256 "$sbom_sha" --arg workflowSha "$WORKFLOW_SHA" \
-    '{artifactType:"platform-promoted-image",baseImages:$baseImages,eventName:$event,headSha:$head,imageSha256:$imageSha256,publishedIndexDigest:$publishedIndexDigest,repositoryId:$repositoryId,runnableManifestDigest:$runnableManifestDigest,runAttempt:$runAttempt,runId:$runId,runtimeManifestSha256:$runtimeManifestSha256,sbomSha256:$sbomSha256,schemaVersion:1,workflowSha:$workflowSha}' > "$bundle/manifest.json"
+  jq -cnS --argjson baseImages "$base_images" --arg event "${EXPECTED_EVENT_NAME:?}" --arg head "$EXPECTED_HEAD_SHA" --arg imageSha256 "$image_sha" --arg publishedIndexDigest "$published_index_digest" --arg repositoryId "$EXPECTED_REPOSITORY_ID" --arg runnableManifestDigest "$runnable_manifest_digest" --arg runAttempt "$GITHUB_RUN_ATTEMPT" --arg runId "$GITHUB_RUN_ID" --arg runtimeManifestSha256 "${DHI_RUNTIME_AMD64_DIGEST#sha256:}" --arg sbomSha256 "$sbom_sha" --arg scanEvidenceSha256 "$(sha256_file "$bundle/scan-evidence.json")" --arg workflowSha "$WORKFLOW_SHA" \
+    '{artifactType:"platform-promoted-image",baseImages:$baseImages,eventName:$event,headSha:$head,imageSha256:$imageSha256,publishedIndexDigest:$publishedIndexDigest,repositoryId:$repositoryId,runnableManifestDigest:$runnableManifestDigest,runAttempt:$runAttempt,runId:$runId,runtimeManifestSha256:$runtimeManifestSha256,sbomSha256:$sbomSha256,scanEvidenceSha256:$scanEvidenceSha256,schemaVersion:2,workflowSha:$workflowSha}' > "$bundle/manifest.json"
   write_deterministic_tar "$bundle" "$artifact" "$MAX_IMAGE_BYTES"
   echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
   echo "content_sha256=$(sha256_file "$artifact")" >> "$GITHUB_OUTPUT"
   echo "published_index_digest=$published_index_digest" >> "$GITHUB_OUTPUT"
   echo "runnable_manifest_digest=$runnable_manifest_digest" >> "$GITHUB_OUTPUT"
   echo "sbom_sha256=$sbom_sha" >> "$GITHUB_OUTPUT"
+  echo "scan_evidence_sha256=$(sha256_file "$bundle/scan-evidence.json")" >> "$GITHUB_OUTPUT"
+  echo "database_built=$expected_built" >> "$GITHUB_OUTPUT"
 }
 
 validate_promoted() {
@@ -1186,7 +1180,7 @@ validate_promoted() {
   validate_base_bundle "$trusted_base_root"
   local root="$RUNNER_TEMP/platform-promoted-$RANDOM"
   safe_extract_tar "$artifact" "$root" "$((MAX_IMAGE_BYTES + 1048576))"
-  test "$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "dhi-runtime.manifest.json image.oci.tar manifest.json sbom.spdx.json " || die "Promoted artifact has an unexpected file set."
+  test "$(find "$root" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | tr '\n' ' ')" = "dhi-runtime.manifest.json image.oci.tar manifest.json sbom.spdx.json scan-evidence.json " || die "Promoted artifact has an unexpected file set."
   find "$root" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q . &&
     die "Promoted artifact contains a non-regular inventory entry."
   require_json_file "$root/manifest.json" "$MAX_MANIFEST_JSON_BYTES"
@@ -1194,11 +1188,11 @@ validate_promoted() {
     --arg ovenTop "$OVEN_TOP_DIGEST" --arg devTop "$DHI_DEV_TOP_DIGEST" --arg devChild "$DHI_DEV_AMD64_DIGEST" \
     --arg runtimeTop "$DHI_RUNTIME_TOP_DIGEST" --arg runtimeChild "$DHI_RUNTIME_AMD64_DIGEST" \
     --arg repo "${EXPECTED_REPOSITORY_ID:?}" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg run "$GITHUB_RUN_ID" --arg workflow "${WORKFLOW_SHA:?}" '
-    (keys | sort) == ["artifactType", "baseImages", "eventName", "headSha", "imageSha256", "publishedIndexDigest", "repositoryId", "runAttempt", "runId", "runnableManifestDigest", "runtimeManifestSha256", "sbomSha256", "schemaVersion", "workflowSha"] and
+    (keys | sort) == ["artifactType", "baseImages", "eventName", "headSha", "imageSha256", "publishedIndexDigest", "repositoryId", "runAttempt", "runId", "runnableManifestDigest", "runtimeManifestSha256", "sbomSha256", "scanEvidenceSha256", "schemaVersion", "workflowSha"] and
     .artifactType == "platform-promoted-image" and .eventName == $event and .headSha == $head and
     .publishedIndexDigest == $published and .runnableManifestDigest == $runnable and
     .repositoryId == $repo and .runAttempt == $attempt and .runId == $run and
-    .schemaVersion == 1 and .workflowSha == $workflow and
+    .schemaVersion == 2 and .workflowSha == $workflow and
     .baseImages == {
       dhiDev:{childDigest:$devChild,topDigest:$devTop},
       dhiRuntime:{childDigest:$runtimeChild,topDigest:$runtimeTop},
@@ -1206,7 +1200,8 @@ validate_promoted() {
     } and
     (.baseImages.oven.childDigest | test("^sha256:[0-9a-f]{64}$")) and
     .runtimeManifestSha256 == ($runtimeChild | sub("^sha256:"; "")) and
-    (.imageSha256 | test("^[0-9a-f]{64}$")) and (.sbomSha256 | test("^[0-9a-f]{64}$"))
+    (.imageSha256 | test("^[0-9a-f]{64}$")) and (.sbomSha256 | test("^[0-9a-f]{64}$")) and
+    (.scanEvidenceSha256 | test("^[0-9a-f]{64}$"))
   ' "$root/manifest.json" >/dev/null
   local expected_base_images
   expected_base_images="$(jq -c '{
@@ -1217,6 +1212,9 @@ validate_promoted() {
   jq -e --argjson expected "$expected_base_images" '.baseImages == $expected' "$root/manifest.json" >/dev/null
   verify_sha256 "$(jq -er .imageSha256 "$root/manifest.json")" "$root/image.oci.tar"
   verify_sha256 "$(jq -er .sbomSha256 "$root/manifest.json")" "$root/sbom.spdx.json"
+  verify_sha256 "$(jq -er .scanEvidenceSha256 "$root/manifest.json")" "$root/scan-evidence.json"
+  grype_validate_scan_evidence "$root/scan-evidence.json" "$EXPECTED_PUBLISHED_INDEX_DIGEST" "$(jq -er .sbomSha256 "$root/manifest.json")"
+  echo "database_built=$(jq -er .database.built "$root/scan-evidence.json")" >> "$GITHUB_OUTPUT"
   local image_root="$RUNNER_TEMP/platform-publisher-image-$RANDOM"
   safe_extract_tar "$root/image.oci.tar" "$image_root" "$MAX_IMAGE_BYTES"
   local published runnable kind
@@ -1482,6 +1480,7 @@ publish_image() {
   trap 'rm -rf -- "$auth"; unset AR_ACCESS_TOKEN DOCKER_CONFIG REGCTL_CONFIG' EXIT
   printf '%s' "$AR_ACCESS_TOKEN" | "$regctl" registry login us-east4-docker.pkg.dev --user oauth2accesstoken --pass-stdin
   unset AR_ACCESS_TOKEN
+  grype_check_freshness "${GRYPE_DATABASE_BUILT:?}"
   "$regctl" image import "$REMOTE_IMAGE" "$IMAGE_ARCHIVE"
   local remote_digest
   remote_digest="$("$regctl" image digest "$REMOTE_IMAGE")"
@@ -1498,6 +1497,26 @@ prepare_publisher() {
 }
 
 case "${1:-}" in
+  acquire-grype-db|discover-grype-cache|pack-grype-db|check-grype-freshness|promote|validate-promoted|rescan-sbom|discover-production-sbom|retain-production-sbom|publish|test-grype-db-policy)
+    test -f "$CONTRACT_ROOT/grype-database.sh" && test ! -L "$CONTRACT_ROOT/grype-database.sh" || die "Grype implementation must be a regular platform file."
+    source "$CONTRACT_ROOT/grype-database.sh"
+    case "${1:-}" in
+      rescan-sbom|discover-production-sbom|retain-production-sbom)
+        test -f "$CONTRACT_ROOT/grype-rescan.sh" && test ! -L "$CONTRACT_ROOT/grype-rescan.sh" || die "Rescan implementation must be a regular platform file."
+        source "$CONTRACT_ROOT/grype-rescan.sh"
+        ;;
+    esac
+    ;;
+esac
+
+case "${1:-}" in
+  rescan-sbom) grype_rescan_sbom ;;
+  discover-production-sbom) grype_discover_production_sboms ;;
+  retain-production-sbom) grype_retain_production_sbom ;;
+  acquire-grype-db) grype_acquire_database ;;
+  discover-grype-cache) grype_discover_cache ;;
+  pack-grype-db) grype_pack_database ;;
+  check-grype-freshness) grype_check_freshness "${2:?}" ;;
   prefetch) prefetch ;;
   verify-base) verify_base ;;
   promote) promote_image ;;
@@ -1533,9 +1552,9 @@ case "${1:-}" in
     verify_dhi_attestations() { printf '%s\t%s\n' "$3" "$4"; }
     verify_expected_child unused-regctl unused-cosign "${TEST_CHILD_ROLE:?}" "${TEST_CHILD_DIGEST:?}" "${TEST_EXPECTED_CHILD_DIGEST:?}"
     ;;
-  test-grype-db-manifest)
+  test-grype-db-policy)
     test "${CONTRACT_TEST_ONLY:-}" = platform-buildkit-v0.32.2-fixture || die "The Grype manifest test entry point is disabled."
-    load_reviewed_grype_db_manifest >/dev/null
+    grype_load_policy >/dev/null
     ;;
   *) echo "usage: container-artifact-contract.sh {prefetch|verify-base|promote|validate-promoted|verify-live-production|verify-live-images|prepare-publisher|publish}" >&2; exit 64 ;;
 esac
