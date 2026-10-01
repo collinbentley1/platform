@@ -405,6 +405,8 @@ describe("networkless rescan orchestration", () => {
       for (const file of ["container-artifact-contract.sh", "grype-database.sh", "grype-db-policy.json", "grype-blocking.jq", "grype.yaml"]) {
         await writeFile(join(policy, file), await readFile(join(repo, "tools/ci", file)));
       }
+      await chmod(policy, 0o700);
+      await chmod(join(policy, "grype.yaml"), 0o600);
       const tools = join(root, "fixture-tools");
       await mkdir(tools);
       await executable(join(tools, "grype"), `#!/bin/bash\necho '{"version":"0.117.0","gitCommit":"b5fa92bbcbef655497e3be840a2f718380e2cdd3"}'\n`);
@@ -433,14 +435,20 @@ if args[:2]==['image','inspect']:
  print(json.dumps([${JSON.stringify(sandboxImage)}]) if '.RepoDigests' in args[3] else 'sha256:'+('f'*64))
  sys.exit(0)
 assert args[0]=='run'
-for pair in [['--network','none'],['--user','65534:65534'],['--cap-drop','ALL'],['--security-opt','no-new-privileges'],['--pids-limit','256'],['--memory','1073741824'],['--pull','never']]:
+for pair in [['--network','none'],['--user','65534:65534'],['--cap-drop','ALL'],['--security-opt','no-new-privileges'],['--pids-limit','256'],['--pull','never']]:
  assert any(args[i:i+2]==pair for i in range(len(args)-1)),pair
 assert '--read-only' in args and '--privileged' not in args
+assert args[args.index('--memory')+1]==('4294967296' if 'import' in args else '1073741824')
 for value in args:
  assert 'docker.sock' not in value and 'GH_TOKEN' not in value and 'AR_ACCESS_TOKEN' not in value
 mounts=[args[i+1] for i,v in enumerate(args) if v=='--mount']
 for target in ['/input','/tools','/policy','/database']:
  assert any('dst='+target+',readonly' in m for m in mounts)
+policy=root/'platform-rescan-policy'
+assert policy.stat().st_mode & 0o005 == 0o005
+assert (policy/'grype.yaml').stat().st_mode & 0o004 == 0o004
+assert [p.name for p in policy.iterdir()]==['grype.yaml']
+assert (policy/'grype.yaml').read_bytes()==(root/'test-policy/grype.yaml').read_bytes()
 if 'import' in args: sys.exit(0)
 if 'status' in args:
  expected=json.loads((root/'platform-grype-database/manifest.json').read_text())

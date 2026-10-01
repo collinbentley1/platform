@@ -169,15 +169,21 @@ grype_rescan_sbom() {
   grype_validate_sbom_record "$source" "${RESCAN_DEPLOYMENT_RUN_ID:?}" "${RESCAN_HEAD_SHA:?}"
 
   local tools="$RUNNER_TEMP/platform-rescan-tools" state="$RUNNER_TEMP/platform-rescan-state" report="$RUNNER_TEMP/platform-rescan-report"
-  install -d -m 0755 "$tools" "$report"
+  local policy="$RUNNER_TEMP/platform-rescan-policy"
+  install -d -m 0755 "$tools" "$report" "$policy"
   install -d -m 0777 "$state"
+  # A restored checkout may have private permissions. Export only the scanner
+  # configuration with explicit read access for its unprivileged container UID.
+  test -f "$CONTRACT_ROOT/grype.yaml" && test ! -L "$CONTRACT_ROOT/grype.yaml" ||
+    die "The rescan configuration must be a regular platform policy file."
+  install -m 0444 "$CONTRACT_ROOT/grype.yaml" "$policy/grype.yaml"
   curl --fail --show-error --silent --location --output "$RUNNER_TEMP/rescan-grype.tgz" \
     https://github.com/anchore/grype/releases/download/v0.117.0/grype_0.117.0_linux_amd64.tar.gz
   verify_sha256 38525dab1e06f162ebaa02f94d82d1f807076b011a44180cf2777edf1a7b9c26 "$RUNNER_TEMP/rescan-grype.tgz"
   tar -xzf "$RUNNER_TEMP/rescan-grype.tgz" -C "$tools" grype
   "$tools/grype" version -o json | jq -e \
     '.version == "0.117.0" and .gitCommit == "b5fa92bbcbef655497e3be840a2f718380e2cdd3"' >/dev/null
-  chmod -R a-w,go+rX "$tools" "$source" "$GRYPE_DATABASE_DIR"
+  chmod -R a-w,go+rX "$tools" "$source" "$GRYPE_DATABASE_DIR" "$policy"
   docker pull "$SCANNER_SANDBOX_IMAGE" >/dev/null
   local image_id
   image_id="$(docker image inspect --format '{{.Id}}' "$SCANNER_SANDBOX_IMAGE")"
@@ -186,26 +192,26 @@ grype_rescan_sbom() {
     jq -e --arg image "$SCANNER_SANDBOX_IMAGE" 'index($image) != null' >/dev/null
   local -a sandbox=(
     run --rm --pull never --network none --read-only --cap-drop ALL
-    --security-opt no-new-privileges --user 65534:65534 --pids-limit 256 --memory 1073741824 --cpus 2
+    --security-opt no-new-privileges --user 65534:65534 --pids-limit 256 --cpus 2
     --mount "type=bind,src=$source,dst=/input,readonly"
     --mount "type=bind,src=$tools,dst=/tools,readonly"
-    --mount "type=bind,src=$CONTRACT_ROOT,dst=/policy,readonly"
+    --mount "type=bind,src=$policy,dst=/policy,readonly"
     --mount "type=bind,src=$GRYPE_DATABASE_DIR,dst=/database,readonly"
     --mount "type=bind,src=$state,dst=/state"
     --tmpfs /tmp:rw,noexec,nosuid,nodev,size=268435456
     --env GRYPE_DB_CACHE_DIR=/state/db --env GRYPE_CHECK_FOR_APP_UPDATE=false
-    --env XDG_CACHE_HOME=/state/cache --entrypoint /tools/grype "$image_id"
+    --env XDG_CACHE_HOME=/state/cache
   )
-  /usr/bin/timeout --signal=TERM --kill-after=10s 2m docker "${sandbox[@]}" \
+  /usr/bin/timeout --signal=TERM --kill-after=10s 2m docker "${sandbox[@]}" --memory 4294967296 --entrypoint /tools/grype "$image_id" \
     --config /policy/grype.yaml db import /database/grype-db.tar.zst > "$report/import.log" 2>&1 ||
     die "The networkless rescan database import failed."
-  /usr/bin/timeout --signal=TERM --kill-after=10s 1m docker "${sandbox[@]}" \
+  /usr/bin/timeout --signal=TERM --kill-after=10s 1m docker "${sandbox[@]}" --memory 1073741824 --entrypoint /tools/grype "$image_id" \
     --config /policy/grype.yaml db status -o json > "$report/database-status.json" 2> "$report/status.log" ||
     die "The rescan database status check failed."
   jq -e --slurpfile expected "$GRYPE_DATABASE_DIR/manifest.json" \
     '.valid == true and .built == $expected[0].built and .schemaVersion == $expected[0].schemaVersion' \
     "$report/database-status.json" >/dev/null || die "Rescan database metadata differs from the verified snapshot."
-  /usr/bin/timeout --signal=TERM --kill-after=10s 10m docker "${sandbox[@]}" \
+  /usr/bin/timeout --signal=TERM --kill-after=10s 10m docker "${sandbox[@]}" --memory 1073741824 --entrypoint /tools/grype "$image_id" \
     --config /policy/grype.yaml sbom:/input/sbom.spdx.json --output json > "$report/grype.json" 2> "$report/scan.log" ||
     die "The networkless SBOM rescan failed."
   grype_require_json "$report/grype.json" "$MAX_SCAN_JSON_BYTES"

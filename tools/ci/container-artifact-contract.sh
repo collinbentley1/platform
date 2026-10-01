@@ -1058,7 +1058,7 @@ promote_image() {
   local -a sandbox=(
     run --rm --pull never --network none --read-only --cap-drop ALL
     --security-opt no-new-privileges --user 65534:65534
-    --pids-limit 256 --memory 1073741824 --cpus 2
+    --pids-limit 256 --cpus 2
     --mount "type=bind,src=$scanner_image,dst=/input,readonly"
     --mount "type=bind,src=$tools,dst=/tools,readonly"
     --mount "type=bind,src=$scanner_policy,dst=/policy,readonly"
@@ -1071,13 +1071,14 @@ promote_image() {
     --env "HOST_ONLY_MARKER=$host_only_marker"
   )
   scanner_container() {
-    local duration="$1" state_root="$2" entrypoint="$3"
-    shift 3
+    local duration="$1" state_root="$2" entrypoint="$3" memory="$4"
+    shift 4
+    case "$memory" in 1073741824|4294967296) ;; *) die "Unsupported scanner memory limit." ;; esac
     /usr/bin/timeout --signal=TERM --kill-after=10s "$duration" \
-      docker "${sandbox[@]}" --mount "type=bind,src=$state_root,dst=/state" \
+      docker "${sandbox[@]}" --memory "$memory" --mount "type=bind,src=$state_root,dst=/state" \
       --entrypoint "$entrypoint" "$scanner_sandbox_image_id" "$@"
   }
-  scanner_container 2m "$scanner_state/probe" /bin/sh -eu -c '
+  scanner_container 2m "$scanner_state/probe" /bin/sh 1073741824 -eu -c '
     test ! -e "$HOST_ONLY_MARKER"
     test "$(ls /sys/class/net | tr "\n" " ")" = "lo "
     ! touch /input/parser-rce-write
@@ -1085,20 +1086,21 @@ promote_image() {
     printf confined > /state/confinement-probe
   ' > /dev/null 2> "$verified/confinement.stderr" || die "The scanner sandbox confinement probe failed."
   test "$(cat "$scanner_state/probe/confinement-probe")" = confined || die "The scanner sandbox could not write only its bounded state mount."
-  scanner_container 15m "$scanner_state/syft" /tools/syft \
+  scanner_container 15m "$scanner_state/syft" /tools/syft 1073741824 \
     --config /policy/syft.yaml oci-dir:/input --output spdx-json > "$verified/sbom.spdx.json" 2> "$verified/syft.stderr" ||
     die "The isolated Syft scan failed."
-  scanner_container 15m "$scanner_state/grype" /tools/grype \
+  # Import needs room for the expanded verified database; image scans stay at 1 GiB.
+  scanner_container 15m "$scanner_state/grype" /tools/grype 4294967296 \
     --config /policy/grype.yaml db import /database/grype-db.tar.zst > /dev/null 2> "$verified/grype-db-import.stderr" ||
     die "The isolated Grype database import failed."
-  scanner_container 5m "$scanner_state/grype" /tools/grype \
+  scanner_container 5m "$scanner_state/grype" /tools/grype 1073741824 \
     --config /policy/grype.yaml db status -o json > "$verified/grype-db-status.json" 2> "$verified/grype-db-status.stderr" ||
     die "The isolated Grype database status check failed."
   jq -e --arg schema "$expected_schema" --arg built "$expected_built" '
     .valid == true and .schemaVersion == $schema and .built == $built and
     ((now - (.built | fromdateiso8601)) >= -3600) and ((now - (.built | fromdateiso8601)) <= 172800)
   ' "$verified/grype-db-status.json" >/dev/null
-  scanner_container 15m "$scanner_state/grype" /tools/grype \
+  scanner_container 15m "$scanner_state/grype" /tools/grype 1073741824 \
     --config /policy/grype.yaml oci-dir:/input --scope squashed --output json > "$verified/grype.json" 2> "$verified/grype.stderr" ||
     die "The isolated Grype image scan failed."
   require_json_file "$verified/grype.json" "$MAX_SCAN_JSON_BYTES"
