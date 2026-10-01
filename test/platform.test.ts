@@ -1339,7 +1339,10 @@ describe("platform scaffold and doctor", () => {
       expect(gate?.run).toBeString();
       return {
         env: gate?.env,
-        permissions: job?.permissions ?? workflow.permissions,
+        permissions: {
+          checks: (job?.permissions ?? workflow.permissions)?.checks,
+          contents: (job?.permissions ?? workflow.permissions)?.contents,
+        },
         run: gate?.run as string,
         shell: gate?.shell ?? null,
         timeoutMinutes: job?.["timeout-minutes"],
@@ -2274,13 +2277,15 @@ describe("platform scaffold and doctor", () => {
           .map((step) => ({ jobName, step })),
       );
 
-      expect(uploads).toHaveLength(3);
+      expect(uploads).toHaveLength(kind === "production" ? 4 : 3);
       expect(uploads.map(({ jobName }) => jobName).sort()).toEqual([
+        ...(kind === "production" ? ["attest"] : []),
         "build",
         "prefetch-bases",
         "verify-image",
       ]);
       const expectedPaths: Record<string, string> = {
+        attest: "${{ steps.inventory.outputs.artifact }}",
         build: "${{ runner.temp }}/platform-image.oci.tar",
         "prefetch-bases": "${{ steps.bundle.outputs.artifact }}",
         "verify-image": "${{ steps.promote.outputs.artifact }}",

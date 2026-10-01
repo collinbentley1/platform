@@ -63,7 +63,9 @@ test "$(git_safe -C "$destination" status --porcelain=v1 --untracked-files=all)"
 for path in \
   tools/ci/container-artifact-contract.sh \
   tools/ci/grype-blocking.jq \
-  tools/ci/grype-db.json \
+  tools/ci/grype-db-policy.json \
+  tools/ci/grype-database.sh \
+  tools/ci/grype-rescan.sh \
   tools/ci/grype.yaml \
   tools/ci/syft.yaml \
   tools/ci/trust/docker-dhi-community-20260822.pub; do

@@ -1,0 +1,45 @@
+name: Verified Grype database
+description: Acquire a current Anchore snapshot under platform policy, with a verified bounded-age cache fallback.
+outputs:
+  directory:
+    description: Read-only snapshot directory.
+    value: ${{ steps.snapshot.outputs.directory }}
+  manifest-sha256:
+    description: Exact local database manifest digest.
+    value: ${{ steps.snapshot.outputs.manifest_sha256 }}
+  database-built:
+    description: Upstream database build timestamp.
+    value: ${{ steps.snapshot.outputs.database_built }}
+  database-sha256:
+    description: Exact upstream database archive digest.
+    value: ${{ steps.snapshot.outputs.database_sha256 }}
+runs:
+  using: composite
+  steps:
+    - name: Find the protected platform cache producer
+      id: cache
+      shell: /bin/bash --noprofile --norc -euo pipefail {0}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        export PATH=/usr/bin:/bin
+        /bin/bash "$GITHUB_ACTION_PATH/../../../tools/ci/container-artifact-contract.sh" discover-grype-cache
+    - name: Download only the verified producer's exact cache artifact
+      if: steps.cache.outputs.artifact_id != ''
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        repository: collinbentley1/platform
+        run-id: ${{ steps.cache.outputs.run_id }}
+        github-token: ${{ github.token }}
+        artifact-ids: ${{ steps.cache.outputs.artifact_id }}
+        path: ${{ runner.temp }}/platform-grype-cache-download
+        digest-mismatch: error
+        skip-decompress: true
+    - name: Verify and acquire the snapshot before any untrusted scanner input
+      id: snapshot
+      shell: /bin/bash --noprofile --norc -euo pipefail {0}
+      env:
+        GRYPE_CACHE_CONTENT_SHA256: ${{ steps.cache.outputs.content_sha256 }}
+      run: |
+        export PATH=/usr/bin:/bin
+        /bin/bash "$GITHUB_ACTION_PATH/../../../tools/ci/container-artifact-contract.sh" acquire-grype-db

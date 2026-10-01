@@ -20,6 +20,10 @@ const requiredPaths = [
   "tools/ci/cloud-run-preview-traffic.sh",
   "tools/ci/cloud-run-prod-dhi-transition.sh",
   "tools/ci/container-artifact-contract.sh",
+  ".github/actions/grype-database/action.yml",
+  "tools/ci/grype-database.sh",
+  "tools/ci/grype-db-policy.json",
+  "tools/ci/grype-rescan.sh",
   "tools/ci/deployment-parity-transition.sh",
   "tools/ci/preview-runtime-iam-contract.sh",
 ].sort();

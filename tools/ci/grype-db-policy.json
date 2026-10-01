@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "listingUrl": "https://grype.anchore.io/databases/v6/latest.json",
+  "downloadBaseUrl": "https://grype.anchore.io/databases/v6/",
+  "databaseSchemaVersion": "v6.1.9",
+  "maxBuiltAgeSeconds": 172800,
+  "maxFutureSkewSeconds": 3600,
+  "maxArchiveBytes": 536870912,
+  "maxListingBytes": 4096
+}

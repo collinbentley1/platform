@@ -412,15 +412,15 @@ describe("protected container and preview lifecycle contracts", () => {
     expect(mismatch.stderr).toContain("Pinned linux/amd64 child digest mismatch for oven");
   });
 
-  test("the Grype database manifest can only come from immutable platform policy bytes", async () => {
-    const baseline = await executeGrypeManifestCheck(helper);
+  test("the Grype database acquisition policy can only come from immutable platform policy bytes", async () => {
+    const baseline = await executeGrypePolicyCheck(helper);
     expect(baseline.exitCode, baseline.stderr).toBe(0);
 
     for (const injected of [
       { DB_MANIFEST_JSON: "{}" },
       { GRYPE_DB_MANIFEST_JSON: "{}" },
     ]) {
-      const result = await executeGrypeManifestCheck(helper, injected);
+      const result = await executeGrypePolicyCheck(helper, injected);
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain("Refusing an injected Grype database manifest");
     }
@@ -429,8 +429,9 @@ describe("protected container and preview lifecycle contracts", () => {
     temporaryRoots.push(symlinkRoot);
     const symlinkHelper = join(symlinkRoot, "container-artifact-contract.sh");
     await cp(helper, symlinkHelper);
-    await symlink(join(repoRoot, "tools/ci/grype-db.json"), join(symlinkRoot, "grype-db.json"));
-    const linked = await executeGrypeManifestCheck(symlinkHelper);
+    await cp(join(repoRoot, "tools/ci/grype-database.sh"), join(symlinkRoot, "grype-database.sh"));
+    await symlink(join(repoRoot, "tools/ci/grype-db-policy.json"), join(symlinkRoot, "grype-db-policy.json"));
+    const linked = await executeGrypePolicyCheck(symlinkHelper);
     expect(linked.exitCode).not.toBe(0);
     expect(linked.stderr).toContain("not a regular policy file");
 
@@ -438,8 +439,9 @@ describe("protected container and preview lifecycle contracts", () => {
     temporaryRoots.push(modifiedRoot);
     const modifiedHelper = join(modifiedRoot, "container-artifact-contract.sh");
     await cp(helper, modifiedHelper);
-    await writeFile(join(modifiedRoot, "grype-db.json"), "{}\n");
-    const modified = await executeGrypeManifestCheck(modifiedHelper);
+    await cp(join(repoRoot, "tools/ci/grype-database.sh"), join(modifiedRoot, "grype-database.sh"));
+    await writeFile(join(modifiedRoot, "grype-db-policy.json"), "{}\n");
+    const modified = await executeGrypePolicyCheck(modifiedHelper);
     expect(modified.exitCode).not.toBe(0);
     expect(modified.stderr).toContain("SHA-256 verification failed");
   });
@@ -1176,11 +1178,11 @@ async function executeChildVerificationDispatch(
   return { exitCode, stderr, stdout };
 }
 
-async function executeGrypeManifestCheck(
+async function executeGrypePolicyCheck(
   helperPath: string,
   overrides: Record<string, string> = {},
 ): Promise<{ exitCode: number; stderr: string }> {
-  const child = Bun.spawn(["/bin/bash", helperPath, "test-grype-db-manifest"], {
+  const child = Bun.spawn(["/bin/bash", helperPath, "test-grype-db-policy"], {
     cwd: repoRoot,
     env: {
       ...process.env,

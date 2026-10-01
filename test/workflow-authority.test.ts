@@ -139,6 +139,7 @@ describe("workflow authority manifest", () => {
       "protected-recovery-invoke.yml",
       "reconcile-previews.yml",
       "refresh-grype-db.yml",
+      "rescan-vulnerabilities.yml",
       "socket-firewall.yml",
     ]);
     for (const attestation of result.entries.filter((candidate) => candidate.purpose === "attestation")) {
@@ -156,7 +157,7 @@ describe("workflow authority manifest", () => {
   test("an id-token job the manifest does not declare fails closed", async () => {
     const root = await fixtureRoot();
     await editFile(root, ".github/workflows/refresh-grype-db.yml", (text) =>
-      text.replace("      contents: write\n", "      contents: write\n      id-token: write\n"),
+      text.replace("      contents: read\n", "      contents: read\n      id-token: write\n"),
     );
     expect(await failuresOf(root)).toEqual([
       `.github/workflows/refresh-grype-db.yml: job refresh requests id-token: write but ${manifestPath} declares no authority for it.`,

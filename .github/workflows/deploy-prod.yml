@@ -412,6 +412,8 @@ jobs:
       image-digest: ${{ steps.promote.outputs.published_index_digest }}
       runnable-digest: ${{ steps.promote.outputs.runnable_manifest_digest }}
       sbom-content-digest: ${{ steps.promote.outputs.sbom_sha256 }}
+      scan-evidence-content-digest: ${{ steps.promote.outputs.scan_evidence_sha256 }}
+      database-built: ${{ steps.promote.outputs.database_built }}
 
     steps:
       - name: Reject workflow reruns before any privileged action
@@ -430,7 +432,7 @@ jobs:
           set -euo pipefail
           test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
           [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
-          destination="$RUNNER_TEMP/platform-promoter-policy"
+          destination="$GITHUB_WORKSPACE/platform-policy"
           repository="$RUNNER_TEMP/platform-promoter-repository"
           git_home="$RUNNER_TEMP/platform-promoter-git-home"
           test ! -e "$destination" && test ! -L "$destination"
@@ -441,10 +443,14 @@ jobs:
           git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
           git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
           test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
-          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci | tar -x -C "$destination"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci .github/actions/grype-database | tar -x -C "$destination"
           test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
           rm -rf -- "$repository" "$git_home"
           echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire the database with the platform-owned action
+        id: database
+        uses: ./platform-policy/.github/actions/grype-database
 
       - name: Bind both exact source artifacts to this run
         env:
@@ -491,6 +497,8 @@ jobs:
       - name: Validate, scan, and promote in a fresh credentialless job
         id: promote
         env:
+          GRYPE_DATABASE_DIR: ${{ steps.database.outputs.directory }}
+          GRYPE_DATABASE_MANIFEST_SHA256: ${{ steps.database.outputs.manifest-sha256 }}
           ARTIFACT_KIND: production
           BASE_CONTENT_SHA256: ${{ needs.prefetch-bases.outputs.content-sha256 }}
           BASE_DOWNLOAD_DIR: ${{ runner.temp }}/platform-promoter-bases
@@ -623,6 +631,7 @@ jobs:
       image-digest: ${{ steps.copy.outputs.digest }}
       image-name: ${{ steps.app.outputs.image_name }}
       runnable-digest: ${{ needs.verify-image.outputs.runnable-digest }}
+      database-built: ${{ steps.artifact.outputs.database_built }}
 
     steps:
       - name: Reject workflow reruns before any privileged action
@@ -844,6 +853,7 @@ jobs:
         id: copy
         env:
           AR_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GRYPE_DATABASE_BUILT: ${{ steps.artifact.outputs.database_built }}
           EXPECTED_PUBLISHED_INDEX_DIGEST: ${{ needs.verify-image.outputs.image-digest }}
           IMAGE_ARCHIVE: ${{ steps.artifact.outputs.image_archive }}
           REMOTE_IMAGE: ${{ steps.app.outputs.remote_image }}
@@ -891,17 +901,22 @@ jobs:
         env:
           EXPECTED_CONTENT_SHA256: ${{ needs.verify-image.outputs.content-sha256 }}
           EXPECTED_SBOM_DIGEST: ${{ needs.verify-image.outputs.sbom-content-digest }}
+          EXPECTED_SCAN_EVIDENCE_DIGEST: ${{ needs.verify-image.outputs.scan-evidence-content-digest }}
         run: |
           set -euo pipefail
           [[ "$EXPECTED_CONTENT_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_SBOM_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SCAN_EVIDENCE_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           mapfile -t files < <(find "$RUNNER_TEMP/platform-attest-download" -mindepth 1 -maxdepth 1 -type f -print)
           test "${#files[@]}" -eq 1
           printf '%s  %s\n' "$EXPECTED_CONTENT_SHA256" "${files[0]}" | sha256sum --check --strict
-          test "$(sort -u < <(tar -tf "${files[0]}") | tr '\n' ' ')" = "./ ./dhi-runtime.manifest.json ./image.oci.tar ./manifest.json ./sbom.spdx.json "
+          test "$(sort -u < <(tar -tf "${files[0]}") | tr '\n' ' ')" = "./ ./dhi-runtime.manifest.json ./image.oci.tar ./manifest.json ./sbom.spdx.json ./scan-evidence.json "
           mkdir -p platform-build
           tar -xOf "${files[0]}" ./sbom.spdx.json > platform-build/sbom.spdx.json
           printf '%s  %s\n' "$EXPECTED_SBOM_DIGEST" platform-build/sbom.spdx.json | sha256sum --check --strict
+          tar -xOf "${files[0]}" ./scan-evidence.json > platform-build/scan-evidence.json
+          tar -xOf "${files[0]}" ./manifest.json > platform-build/manifest.json
+          printf '%s  %s\n' "$EXPECTED_SCAN_EVIDENCE_DIGEST" platform-build/scan-evidence.json | sha256sum --check --strict
 
       - name: Require a valid JSON SBOM
         run: jq -e '(.spdxVersion | startswith("SPDX-")) and (.packages | type == "array")' platform-build/sbom.spdx.json >/dev/null
@@ -918,6 +933,59 @@ jobs:
           subject-name: ${{ needs.publish.outputs.image-name }}
           subject-digest: ${{ needs.publish.outputs.image-digest }}
           sbom-path: platform-build/sbom.spdx.json
+
+      - name: Attest the exact vulnerability database and scan evidence
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-name: ${{ needs.publish.outputs.image-name }}
+          subject-digest: ${{ needs.publish.outputs.image-digest }}
+          predicate-type: https://github.com/collinbentley1/platform/attestations/vulnerability-scan/v1
+          predicate-path: platform-build/scan-evidence.json
+
+      - name: Fetch the exact reusable-workflow policy source
+        id: policy
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$WORKFLOW_REPOSITORY" = "collinbentley1/platform"
+          [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          destination="$GITHUB_WORKSPACE/platform-policy"
+          repository="$RUNNER_TEMP/platform-rescan-repository"
+          git_home="$RUNNER_TEMP/platform-rescan-git-home"
+          test ! -e "$destination" && test ! -L "$destination"
+          install -d -m 0700 "$destination" "$repository" "$git_home"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null XDG_CONFIG_HOME="$git_home" PATH=/usr/bin:/bin
+          git_safe() { /usr/bin/git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c credential.helper= -c diff.external= -c filter.lfs.process= -c filter.lfs.required=false -c protocol.ext.allow=never -c protocol.file.allow=never -c submodule.recurse=false "$@"; }
+          git_safe -C "$repository" init --quiet
+          git_safe -C "$repository" remote add origin "https://github.com/${WORKFLOW_REPOSITORY}.git"
+          git_safe -C "$repository" fetch --quiet --depth=1 --no-tags origin "$WORKFLOW_SHA"
+          test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
+          git_safe -C "$repository" archive "$WORKFLOW_SHA" tools/ci .github/actions/grype-database | tar -x -C "$destination"
+          test -f "$destination/tools/ci/container-artifact-contract.sh" && test ! -L "$destination/tools/ci/container-artifact-contract.sh"
+          rm -rf -- "$repository" "$git_home"
+          echo "root=$destination" >> "$GITHUB_OUTPUT"
+
+      - name: Retain the exact published production SBOM for recurring scans
+        id: inventory
+        env:
+          REPOSITORY_ID: ${{ github.event.repository.id }}
+          PUBLISHED_IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
+          PUBLISHED_IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
+        run: |
+          set -euo pipefail
+          /bin/bash "${{ steps.policy.outputs.root }}/tools/ci/container-artifact-contract.sh" retain-production-sbom
+
+      - name: Save the production inventory without deployment credentials
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.inventory.outputs.artifact }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 90
 
   deploy:
     name: Deploy production
@@ -1082,6 +1150,8 @@ jobs:
           test "$(git_safe -C "$repository" rev-parse FETCH_HEAD^{commit})" = "$WORKFLOW_SHA"
           git_safe -C "$repository" archive "$WORKFLOW_SHA" \
             tools/ci/container-artifact-contract.sh \
+            tools/ci/grype-database.sh \
+            tools/ci/grype-db-policy.json \
             tools/ci/cloud-run-dhi-parity.sh \
             tools/ci/cloud-run-prod-dhi-transition.sh \
             tools/ci/deployment-parity-transition.sh | tar -x -C "$destination"
@@ -1420,6 +1490,7 @@ jobs:
       - name: Deploy production to Cloud Run
         id: production-deploy
         env:
+          GRYPE_DATABASE_BUILT: ${{ needs.publish.outputs.database-built }}
           DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.image-digest }}
           IMAGE_NAME: ${{ needs.publish.outputs.image-name }}
@@ -1437,6 +1508,7 @@ jobs:
           SERVICE_NAME: ${{ steps.app.outputs.service_name }}
         run: |
           set -euo pipefail
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/container-artifact-contract.sh" check-grype-freshness "$GRYPE_DATABASE_BUILT"
           if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
              [[ ! "$RUNNABLE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
              [ "$IMAGE_DIGEST" = "$RUNNABLE_DIGEST" ] ||
@@ -1701,6 +1773,7 @@ jobs:
               ;;
           esac
 
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/container-artifact-contract.sh" check-grype-freshness "$GRYPE_DATABASE_BUILT"
           gcloud run deploy "$SERVICE_NAME" \
             --project="$PROJECT_ID" \
             --region="$REGION" \
@@ -1842,6 +1915,7 @@ jobs:
         if: steps.epoch-prepare.outputs.epoch-required == 'true'
         shell: /bin/bash --noprofile --norc -euo pipefail {0}
         env:
+          GRYPE_DATABASE_BUILT: ${{ needs.publish.outputs.database-built }}
           DHI_PARITY_ID: ${{ steps.parity-policy.outputs.dhi-parity-id }}
           LIVE_PRODUCTION_HEAD_SHA: ${{ steps.production-deploy.outputs.head-sha }}
           LIVE_PRODUCTION_INDEX_IMAGE: ${{ steps.production-deploy.outputs.index-image }}
@@ -1873,6 +1947,7 @@ jobs:
               PLATFORM_IMAGE_INDEX_DIGEST:$index,
               PLATFORM_IMAGE_RUNNABLE_DIGEST:$runnable
             }' > "$env_file"
+          /bin/bash "${{ steps.parity-policy.outputs.root }}/tools/ci/container-artifact-contract.sh" check-grype-freshness "$GRYPE_DATABASE_BUILT"
           gcloud run deploy "$PREVIEW_SERVICE" \
             --project="$PROJECT_ID" \
             --region="$REGION" \

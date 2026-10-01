@@ -10,6 +10,7 @@ the repeated delivery mechanics.
 - `.github/workflows/socket-firewall.yml`
 - `.github/workflows/infrastructure.yml`
 - `.github/workflows/deploy-prod.yml`
+- `.github/workflows/rescan-vulnerabilities.yml`
 - `.github/workflows/deploy-preview.yml`
 - `.github/workflows/cleanup-preview.yml`
 - `.github/workflows/reconcile-previews.yml`
@@ -36,9 +37,11 @@ required and these required checks:
   published package versions for seven days before they may be resolved
 
 The protected deployment controller performs the final-image Syft/Grype gate
-with the checksum-qualified `tools/ci/grype-db.json` embedded in the immutable
-platform policy archive; mutable repository, organization, and environment
-manifest variables are forbidden. The database expires closed after 48 hours. The
+with a current checksum-verified snapshot acquired by the platform-owned action
+under the immutable `tools/ci/grype-db-policy.json` policy. Repository,
+organization, and environment manifest overrides are forbidden. A verified
+protected-main cache may bridge transient outages within the 48-hour limit;
+publication and deployment both recheck freshness. The
 `pull_request_target` controller is attached to the trusted base SHA and must not
 be configured as a required head-SHA pull-request check.
 
@@ -112,10 +115,10 @@ registry token, or host execution of app code. It consumes only literal local
 OCI contexts and emits a raw OCI artifact. A fresh credentialless verifier
 revalidates and canonicalizes the complete graph, proves the exact DHI runtime
 layer/config/history lineage, and runs Syft/Grype in a networkless read-only
-container sandbox using only the byte-pinned `tools/ci/grype-db.json` from the
-exact platform SHA. Refreshing the 48-hour snapshot requires a new reviewed
-platform SHA, WIF authorization, and consumer repin; that cadence is a release
-stop condition rather than an acceptable steady-state updater. A separate
+container sandbox using a snapshot verified before any application input reaches
+the scanners. The promoted bundle binds scan evidence to the image digest and
+SBOM; GitHub attests that evidence alongside provenance and the SBOM. Snapshot
+updates do not require platform SHA, WIF, or consumer updates. A separate
 publisher downloads by exact artifact id/digest, revalidates the
 canonical one-descriptor outer wrapper, published inner-index digest, runnable
 digest, source, provenance, and base lineage without extracting layers, then
@@ -295,3 +298,9 @@ consumer Terraform code.
 Terraform working directories, state, saved plans, variable files, CLI config,
 crash logs, and override files are forbidden in app commits and covered by the
 required `.gitignore`. Provider lockfiles remain committed and reviewed.
+
+The canonical daily `rescan-vulnerabilities.yml` caller uses only GitHub Actions
+and contents read permissions. It covers the latest successful production release
+and newer published candidates from partial deployments, retains original
+release evidence, and renews inventory retention after completed scans even when
+new vulnerabilities block the final gate. See [vulnerability scanning](vulnerability-scanning.md).
