@@ -232,6 +232,7 @@ resource "google_identity_platform_config" "identity" {
   count   = local.identity_enabled ? 1 : 0
   project = var.project_id
   sign_in {
+    phone_number { enabled = false }
     email {
       enabled           = true
       password_required = true
@@ -288,6 +289,7 @@ resource "google_identity_platform_config" "waitlist" {
   count   = contains(keys(local.apps), "healthmcp") ? 1 : 0
   project = var.project_id
   sign_in {
+    phone_number { enabled = false }
     allow_duplicate_emails = false
     email {
       enabled           = true
