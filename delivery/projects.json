@@ -108,6 +108,23 @@
         "PUBLIC_ORIGIN": "https://platform-reference-882468538648.us-east4.run.app"
       },
       "secrets": {}
+    },
+    {
+      "name": "platform-smoke",
+      "repositoryId": "1436085618",
+      "project": "platform-smoke-20261027",
+      "number": "304420999540",
+      "region": "us-east4",
+      "registry": "site",
+      "service": "platform-smoke",
+      "data": true,
+      "identity": true,
+      "env": {
+        "PUBLIC_ORIGIN": "https://platform-smoke-304420999540.us-east4.run.app",
+        "IDENTITY_PROJECT_ID": "platform-smoke-20261027",
+        "FIRESTORE_PROJECT_ID": "platform-smoke-20261027"
+      },
+      "secrets": {}
     }
   ],
   "defaults": {
