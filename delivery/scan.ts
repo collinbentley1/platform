@@ -11,7 +11,8 @@ export function scanDecision(rows: readonly Occurrence[], resource: string): { r
   const discovery = rows.filter(row => row.kind === "DISCOVERY");
   if (discovery.some(row => ["FINISHED_FAILED", "FINISHED_UNSUPPORTED"].includes(row.discovery?.analysisStatus ?? ""))) throw new Error("Managed scanning failed or does not support this image.");
   const ready = discovery.length > 0 && discovery.every(row => ["FINISHED_SUCCESS", "COMPLETE"].includes(row.discovery?.analysisStatus ?? "") && row.discovery?.continuousAnalysis === "ACTIVE" && !(row.discovery.analysisError?.length) && !row.discovery.analysisStatusError?.code);
-  const blocking = rows.filter(row => row.kind === "VULNERABILITY").filter(row => {
+  const blocking = rows.filter(row => row.kind === "SECRET" || row.kind === "VULNERABILITY").filter(row => {
+    if (row.kind === "SECRET") return true;
     const severity = row.vulnerability?.effectiveSeverity ?? row.vulnerability?.severity;
     return !["MINIMAL", "LOW", "MEDIUM"].includes(severity ?? "");
   }).map(row => row.noteName.split("/").at(-1) ?? "unknown-advisory");

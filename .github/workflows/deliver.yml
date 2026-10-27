@@ -1,0 +1,198 @@
+name: Deliver applications
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      application:
+        description: Registered application, or all applications
+        type: string
+        default: ''
+      pull_request:
+        description: Same-repository preview number
+        type: string
+        default: ''
+permissions: {}
+concurrency:
+  group: delivery-${{ inputs.application || 'all' }}-${{ inputs.pull_request || 'production' }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      ready: ${{ steps.plan.outputs.ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM_APP: ${{ inputs.application }}
+          PLATFORM_PR: ${{ inputs.pull_request }}
+        run: bun delivery/prepare.ts plan
+  build:
+    needs: plan
+    if: needs.plan.outputs.ready == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.release }}
+          path: release
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - name: Prepare the exact application and release
+        env:
+          PLATFORM_APP: ${{ matrix.app }}
+          SOURCE_SHA: ${{ matrix.sha }}
+          RELEASE_SHA: ${{ matrix.release }}
+        run: bun delivery/prepare.ts source
+      - name: Build and test without cloud credentials
+        env:
+          SOURCE_SHA: ${{ matrix.sha }}
+          RELEASE_SHA: ${{ matrix.release }}
+        run: |
+          docker buildx create --name platform --driver docker-container --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 --use
+          docker buildx build --platform linux/amd64 --provenance=false --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "io.collinbentley.platform.revision=$RELEASE_SHA" --output "type=oci,dest=$RUNNER_TEMP/image.oci.tar" application
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: image-${{ matrix.app }}
+          path: ${{ runner.temp }}/image.oci.tar
+          retention-days: 1
+          if-no-files-found: error
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.ready == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: publish-${{ matrix.app }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: image-${{ matrix.app }}
+          path: ${{ runner.temp }}/image
+      - name: Install verified registry client
+        run: |
+          curl -fsSL https://github.com/regclient/regclient/releases/download/v0.11.5/regctl-linux-amd64 -o "$RUNNER_TEMP/regctl"
+          echo "c93aa7638749f5aaac1a8e01787321889c78f0101809bb2880343478d0ba0467  $RUNNER_TEMP/regctl" | sha256sum --check --strict
+          chmod 700 "$RUNNER_TEMP/regctl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        id: google
+        with:
+          workload_identity_provider: projects/${{ matrix.number }}/locations/global/workloadIdentityPools/platform-delivery/providers/github
+          service_account: platform-publish@${{ matrix.project }}.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Validate and publish opaque image bytes
+        id: publish
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          PLATFORM_APP: ${{ matrix.app }}
+          SOURCE_SHA: ${{ matrix.sha }}
+          RELEASE_SHA: ${{ matrix.release }}
+        run: bun delivery/publish.ts "$RUNNER_TEMP/image/image.oci.tar"
+      - name: Save bound deployment evidence
+        env:
+          EVIDENCE: ${{ steps.publish.outputs.evidence }}
+        run: printenv EVIDENCE > "$RUNNER_TEMP/evidence.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: evidence-${{ matrix.app }}
+          path: ${{ runner.temp }}/evidence.json
+          retention-days: 1
+  deploy:
+    needs: [plan, publish]
+    if: needs.plan.outputs.ready == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: deploy-${{ matrix.app }}
+    concurrency:
+      group: service-${{ matrix.app }}-${{ matrix.pr || 'production' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+      checks: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: evidence-${{ matrix.app }}
+          path: ${{ runner.temp }}/evidence
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        id: google
+        with:
+          workload_identity_provider: projects/${{ matrix.number }}/locations/global/workloadIdentityPools/platform-delivery/providers/github
+          service_account: platform-deploy@${{ matrix.project }}.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+      - name: Resolve private preview audience
+        if: matrix.pr != ''
+        id: preview
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          PLATFORM_APP: ${{ matrix.app }}
+        run: bun delivery/run.ts audience
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        if: matrix.pr != ''
+        id: preview-token
+        with:
+          workload_identity_provider: projects/${{ matrix.number }}/locations/global/workloadIdentityPools/platform-delivery/providers/github
+          service_account: platform-deploy@${{ matrix.project }}.iam.gserviceaccount.com
+          token_format: id_token
+          id_token_audience: ${{ steps.preview.outputs.audience }}
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Scan, stage, probe, and route the verified revision
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          PLATFORM_PREVIEW_TOKEN: ${{ steps.preview-token.outputs.id_token }}
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM_APP: ${{ matrix.app }}
+          PLATFORM_PR: ${{ matrix.pr }}
+          PLATFORM_AUTHORITY_SHA: ${{ github.sha }}
+          RELEASE_SHA: ${{ matrix.release }}
+          SOURCE_SHA: ${{ matrix.sha }}
+          IDENTITY_API_KEY: ${{ vars.IDENTITY_API_KEY }}
+        run: bun delivery/run.ts deploy "$RUNNER_TEMP/evidence/evidence.json"

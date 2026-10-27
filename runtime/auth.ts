@@ -1,5 +1,5 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
-import { boundedFetch, HttpError } from "./http.ts";
+import { boundedFetch, readText, HttpError } from "./http.ts";
 
 export type Identity = { readonly id: string; readonly email?: string };
 const keyUrl = new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com");
@@ -43,7 +43,7 @@ export async function passwordSignIn(apiKey: string, email: string, password: st
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password, returnSecureToken: true }),
   });
   if (!result.ok) throw new HttpError(401, "Unable to sign in.");
-  const body = await result.json() as { idToken?: unknown };
+  const body = JSON.parse(await readText(result, 65_536)) as { idToken?: unknown };
   if (typeof body.idToken !== "string") throw new HttpError(503, "Sign in is unavailable.");
   return body.idToken;
 }

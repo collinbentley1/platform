@@ -1,0 +1,30 @@
+name: Review admission
+on:
+  workflow_call:
+    inputs:
+      platform_sha:
+        type: string
+        required: true
+permissions: {}
+jobs:
+  review:
+    name: Review admission
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.id == github.event.pull_request.base.repo.id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: collinbentley1/platform
+          ref: ${{ inputs.platform_sha }}
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - name: Wait for current-head review and resolved feedback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: bun delivery/review.ts "$PR_NUMBER"

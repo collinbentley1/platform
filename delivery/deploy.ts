@@ -19,7 +19,7 @@ export async function service(app: Project, preview = false): Promise<Service> {
 export async function requireCurrentSource(app: Project, evidence: ImageEvidence, pr?: string): Promise<void> {
   if (Bun.env.GITHUB_ACTIONS !== "true") return; // Owner CLI supports testing an exact unmerged checkout.
   const platform = await api<{ sha: string }>("/repos/collinbentley1/platform/commits/main");
-  if (platform.sha !== evidence.platformSha) throw new Error("Platform authority changed while this deployment was running.");
+  if (platform.sha !== Bun.env.PLATFORM_AUTHORITY_SHA) throw new Error("Platform authority changed while this deployment was running.");
   const repo = app.repository ?? app.name;
   const identity = await api<{ id: number }>(`/repos/collinbentley1/${repo}`);
   if (String(identity.id) !== app.repositoryId) throw new Error("Repository identity changed.");

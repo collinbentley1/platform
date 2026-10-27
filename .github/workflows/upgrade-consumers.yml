@@ -1,0 +1,55 @@
+name: Upgrade consumers
+on:
+  schedule:
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: platform-consumer-upgrades
+  cancel-in-progress: false
+jobs:
+  upgrade:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: platform-upgrades
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: [cdbentley, critical-history, healthmcp, runsetta, virtual-care-mcp]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - name: Resolve the protected release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun delivery/release.ts resolve
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.release.outputs.sha }}
+          path: release
+          persist-credentials: false
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: app
+        with:
+          app-id: ${{ vars.PLATFORM_APP_ID }}
+          private-key: ${{ secrets.PLATFORM_APP_PRIVATE_KEY }}
+          owner: collinbentley1
+          repositories: ${{ matrix.repository }}
+          permission-contents: write
+          permission-workflows: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-checks: read
+          permission-administration: read
+      - name: Propose the complete upgrade and admit verified automatic merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PLATFORM_TARGET_REPOSITORY: collinbentley1/${{ matrix.repository }}
+        run: bun delivery/upgrade.ts release --adopt

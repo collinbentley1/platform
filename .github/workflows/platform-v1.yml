@@ -1,10 +1,45 @@
-name: Platform v1 integration
+name: Platform
 on:
   push:
-    branches: [codex/production-platform]
+    branches: [main, codex/production-platform]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 permissions: {}
 jobs:
+  verify:
+    name: Platform verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - run: bun ci --ignore-scripts --no-env-file
+      - run: bun run verify
+  terraform:
+    name: Terraform modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install verified Terraform
+        run: |
+          curl -fsSL https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip -o "$RUNNER_TEMP/terraform.zip"
+          echo "ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280  $RUNNER_TEMP/terraform.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/terraform.zip" -d "$RUNNER_TEMP/terraform-bin"
+          echo "$RUNNER_TEMP/terraform-bin" >> "$GITHUB_PATH"
+      - run: |
+          terraform -chdir=delivery/terraform fmt -check
+          terraform -chdir=delivery/terraform init -backend=false -lockfile=readonly
+          terraform -chdir=delivery/terraform validate
   reference:
     name: Complete starter and container
     runs-on: ubuntu-24.04
@@ -36,10 +71,27 @@ jobs:
       - name: Build the actual Cloud Run architecture
         run: |
           docker buildx create --name platform --driver docker-container --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 --use
-          docker buildx build --platform linux/amd64 --label org.opencontainers.image.revision="$GITHUB_SHA" --label dev.platform.revision="$GITHUB_SHA" --provenance=false --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
+          docker buildx build --platform linux/amd64 --label org.opencontainers.image.revision="$GITHUB_SHA" --label io.collinbentley.platform.revision="$GITHUB_SHA" --provenance=false --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: reference-image
           path: ${{ runner.temp }}/reference.oci.tar
           retention-days: 1
           if-no-files-found: error
+  release:
+    name: Publish verified release
+    needs: [verify, terraform, reference]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun delivery/release.ts publish

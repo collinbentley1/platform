@@ -22,10 +22,14 @@ locals {
   authority_workflows = ["deliver.yml", "reconcile-v1.yml"]
 }
 
-provider "google" { project = var.project_id }
+provider "google" {
+  project               = var.project_id
+  billing_project       = var.project_id
+  user_project_override = true
+}
 
 resource "google_project_service" "services" {
-  for_each           = toset(concat(["run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : []))
+  for_each           = toset(concat(["run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : [], contains(keys(local.apps), "healthmcp") ? ["identitytoolkit.googleapis.com", "recaptchaenterprise.googleapis.com", "secretmanager.googleapis.com"] : []))
   project            = var.project_id
   service            = each.key
   disable_on_destroy = false
@@ -93,6 +97,14 @@ resource "google_artifact_registry_repository_iam_member" "deploy" {
   repository = each.key
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${google_service_account.deploy.email}"
+}
+
+resource "google_artifact_registry_repository_iam_member" "audit" {
+  for_each   = local.registries
+  location   = "us-east4"
+  repository = each.key
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.audit.email}"
 }
 
 resource "google_project_iam_custom_role" "deploy" {

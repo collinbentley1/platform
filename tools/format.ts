@@ -3,17 +3,15 @@ import { join, relative } from "node:path";
 
 const mode = Bun.argv.includes("--write") ? "write" : "check";
 const root = join(import.meta.dir, "..");
-const formattedRoots = new Set([".github", "docs", "protected-recovery", "templates", "terraform", "tools"]);
+const formattedRoots = new Set([".github", "delivery", "runtime", "templates", "test", "tools"]);
 const formattedFiles = new Set([
   ".gitignore",
   "bunfig.toml",
   "package.json",
-  "README.md",
   "tsconfig.json",
 ]);
 const includeExtensions = new Set([
   ".json",
-  ".md",
   ".tf",
   ".toml",
   ".ts",

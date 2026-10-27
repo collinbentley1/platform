@@ -66,6 +66,8 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
         ? json({ error: error.message, requestId: id }, error.status)
         : json({ error: "Internal server error.", requestId: id }, 500);
     }
+    let method = "UNKNOWN"; let https = false;
+    try { method = request.method; https = new URL(request.url).protocol === "https:"; } catch {}
     let headers = response.headers;
     const defaults = {
       "Content-Security-Policy": options.csp ?? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -76,13 +78,13 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
     };
     const apply = () => {
       for (const [key, value] of Object.entries(defaults)) if (!headers.has(key)) headers.set(key, value);
-      if (new URL(request.url).protocol === "https:") headers.set("Strict-Transport-Security", "max-age=31536000");
+      if (https && !headers.has("Strict-Transport-Security")) headers.set("Strict-Transport-Security", "max-age=31536000");
       headers.set("X-Request-ID", id);
     };
     try { apply(); } catch { response = new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) }); headers = response.headers; apply(); }
-    options.log?.({ requestId: id, method: request.method, status: response.status, durationMs: Math.round(performance.now() - start) });
+    options.log?.({ requestId: id, method, status: response.status, durationMs: Math.round(performance.now() - start) });
     // Preserve Bun.file bodies so their framing and sendfile behavior survive middleware.
-    return request.method === "HEAD" && response.body !== null ? new Response(null, { status: response.status, statusText: response.statusText, headers }) : response;
+    return method === "HEAD" && response.body !== null ? new Response(null, { status: response.status, statusText: response.statusText, headers }) : response;
   };
 }
 

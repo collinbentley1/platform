@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
-import { mkdir } from "node:fs/promises";
+import { mkdir, chmod } from "node:fs/promises";
 import { dirname } from "node:path";
-import { boundedFetch, HttpError } from "./http.ts";
+import { boundedFetch, readText, HttpError } from "./http.ts";
 
 export type RecordValue = { readonly id: string; readonly title: string; readonly createdAt: string };
 export interface RecordStore {
@@ -26,12 +26,13 @@ export function memoryStore(): RecordStore {
     async ready() {}, close() { records.clear(); },
   };
 }
-function recordId(id: string): void { if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/.test(id)) throw new HttpError(400, "Invalid record ID."); }
+function recordId(id: string): void { if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) throw new HttpError(400, "Invalid record ID."); }
 function ownerId(owner: string): void { if (!owner || owner.length > 128) throw new HttpError(401, "Sign in required."); }
 
 export async function sqliteStore(path: string): Promise<RecordStore> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const db = new Database(path, { create: true, strict: true });
+  await chmod(path, 0o600);
   db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (owner TEXT NOT NULL, id TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(owner,id))");
   return {
     async list(owner) { ownerId(owner); return db.query("SELECT id,title,created_at AS createdAt FROM records WHERE owner=? ORDER BY created_at DESC,id LIMIT 100").all(owner) as RecordValue[]; },
@@ -54,7 +55,7 @@ export function metadataTokenProvider(fetcher: typeof boundedFetch = boundedFetc
     if (cached && cached.expires > Date.now()) return cached.token;
     const response = await fetcher("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", { headers: { "Metadata-Flavor": "Google" } });
     if (!response.ok || response.headers.get("Metadata-Flavor") !== "Google") throw new Error("Runtime identity unavailable.");
-    const value = await response.json() as { access_token?: unknown; expires_in?: unknown };
+    const value = JSON.parse(await readText(response, 262_144)) as { access_token?: unknown; expires_in?: unknown };
     if (typeof value.access_token !== "string" || typeof value.expires_in !== "number" || value.expires_in <= 60) throw new Error("Runtime identity unavailable.");
     cached = { token: value.access_token, expires: Date.now() + Math.min(value.expires_in - 60, 300) * 1000 };
     return cached.token;
@@ -76,7 +77,7 @@ export function firestoreStore(project: string, collection = "platform_records",
     async list(owner) {
       const response = await call(`${base}/${ownerPath(owner)}?pageSize=100&orderBy=createdAt%20desc`);
       if (!response.ok) throw new Error("Data unavailable.");
-      const data = await response.json() as { documents?: Parameters<typeof decode>[0][] };
+      const data = JSON.parse(await readText(response, 262_144)) as { documents?: Parameters<typeof decode>[0][] };
       return (data.documents ?? []).map(decode);
     },
     async put(owner, record) {
@@ -84,11 +85,11 @@ export function firestoreStore(project: string, collection = "platform_records",
       const response = await call(`${url}?currentDocument.exists=false`, { method: "PATCH", body: JSON.stringify({ fields: { title: { stringValue: record.title }, createdAt: { stringValue: record.createdAt } } }) });
       if (response.status === 409 || response.status === 412) {
         const existing = await call(url); if (!existing.ok) throw new Error("Data unavailable.");
-        const saved = decode(await existing.json() as Parameters<typeof decode>[0]);
+        const saved = decode(JSON.parse(await readText(existing, 4096)) as Parameters<typeof decode>[0]);
         if (saved.title !== record.title) throw new HttpError(409, "Operation ID already used.");
         return saved;
       }
-      if (!response.ok) throw new Error("Data unavailable."); return decode(await response.json() as Parameters<typeof decode>[0]);
+      if (!response.ok) throw new Error("Data unavailable."); return decode(JSON.parse(await readText(response, 262_144)) as Parameters<typeof decode>[0]);
     },
     async remove(owner, id) { recordId(id); const result = await call(`${base}/${ownerPath(owner)}/${id}`, { method: "DELETE" }); if (!result.ok && result.status !== 404) throw new Error("Data unavailable."); },
     async ready() { const response = await call(`${base}/${collection}/_health`); if (!response.ok && response.status !== 404) throw new Error("Data unavailable."); }, close() {},

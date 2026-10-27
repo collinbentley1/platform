@@ -1,4 +1,4 @@
-FROM oven/bun:1.4.2@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS dependencies
+FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS dependencies
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
 RUN bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
@@ -10,7 +10,7 @@ RUN bun --no-env-file run verify:ci
 FROM dependencies AS production-dependencies
 RUN rm -rf node_modules && bun ci --production --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
 
-FROM oven/bun:1.4.2@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f
+FROM oven/bun:1.4.2-distroless@sha256:1a0c31c7c5f9d193aedf60fe1cebdeb76ac8f6e29f24be8dd8cbd6df72df26ec
 WORKDIR /app
 ENV NODE_ENV=production PORT=8080
 COPY --from=production-dependencies --chown=1000:1000 /app/node_modules ./node_modules
@@ -18,4 +18,5 @@ COPY --from=production-dependencies --chown=1000:1000 /app/package.json /app/bun
 COPY --from=build --chown=1000:1000 /app/dist ./
 USER 1000:1000
 EXPOSE 8080
-CMD ["bun", "--no-env-file", "server.js"]
+ENTRYPOINT ["/usr/local/bin/bun"]
+CMD ["--no-env-file", "server.js"]

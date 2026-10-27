@@ -43,9 +43,10 @@ export async function proposeUpgrade(source: string, release: { sha: string; tag
     await command([...git, "checkout", "--detach", "FETCH_HEAD"], { cwd: directory, env });
     const changed = await upgrade(directory, source, release.sha, { adopt });
     if (!changed.length) return undefined;
-    const additions = await Promise.all(changed.map(async path => ({ path, contents: Buffer.from(await readFile(join(directory, path))).toString("base64") })));
+    const additions: Array<{path:string;contents:string}> = []; const deletions: Array<{path:string}> = [];
+    for (const path of changed) { const content = await readFile(join(directory, path)).catch(error => { if(error.code === "ENOENT") return undefined; throw error; }); if(content) additions.push({path,contents:content.toString("base64")}); else deletions.push({path}); }
     await api(`/repos/${repo}/git/refs`, "POST", { ref: `refs/heads/${branch}`, sha: base.sha });
-    await graphql(`mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}`, { input: { branch: { repositoryNameWithOwner: repo, branchName: branch }, expectedHeadOid: base.sha, message: { headline: `Update platform to ${release.tag}` }, fileChanges: { additions } } });
+    await graphql(`mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}`, { input: { branch: { repositoryNameWithOwner: repo, branchName: branch }, expectedHeadOid: base.sha, message: { headline: `Update platform to ${release.tag}` }, fileChanges: { additions, deletions } } });
     return await api<PullRequest>(`/repos/${repo}/pulls`, "POST", { title: `Update platform to ${release.tag}`, head: branch, base: "main", body: `Updates the managed platform contract to ${release.tag}.` });
   } finally { await rm(directory, { recursive: true, force: true }); }
 }

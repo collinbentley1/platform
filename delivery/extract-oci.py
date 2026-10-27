@@ -9,9 +9,13 @@ archive, destination = map(Path, sys.argv[1:])
 if destination.exists() or destination.is_symlink():
     raise SystemExit("OCI destination already exists")
 with tarfile.open(archive, "r:") as source:
-    members = source.getmembers()
-    if len(members) > 520 or sum(member.size for member in members) > 1610612736:
-        raise SystemExit("OCI archive exceeds bounds")
+    members = []
+    total = 0
+    for member in source:
+        members.append(member)
+        total += member.size
+        if len(members) > 520 or total > 1610612736:
+            raise SystemExit("OCI archive exceeds bounds")
     paths = set()
     for member in members:
         name = member.name.removeprefix("./").rstrip("/")

@@ -1,0 +1,40 @@
+name: Application verification
+on:
+  workflow_call:
+    inputs:
+      platform_sha:
+        type: string
+        required: true
+      pull_request:
+        type: string
+        default: ''
+permissions: {}
+jobs:
+  verify:
+    name: Bun verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          path: application
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: collinbentley1/platform
+          ref: ${{ inputs.platform_sha }}
+          path: platform
+          persist-credentials: false
+      - run: bash platform/delivery/install-bun.sh
+      - name: Verify the complete managed contract
+        env:
+          RELEASE_SHA: ${{ inputs.platform_sha }}
+        run: bun platform/tools/platform-v1.ts doctor application --sha "$RELEASE_SHA"
+      - name: Install and verify application
+        working-directory: application
+        run: |
+          bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
+          bun ../platform/tools/platform-v1.ts verify .
