@@ -16,3 +16,5 @@ test("failed reviews can be retried on the upgrade schedule without spamming a r
  const comments=[{body:`@codex review\n<!-- platform-review-head:${head} -->`,created_at,user:{id:1}},{body:'<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | ✅ **Completed** | `bbbbbbb` |',created_at,user:{id:199175422}}];
  expect(reviewRequestDue(comments,head,Date.parse("2030-01-01T05:00:00Z"))).toBe(true);
  });
+
+test("an automatic review needs no duplicate manual request marker",()=>{const head="a".repeat(40);const comments=[{body:`<!-- codex-pull-request-review-summary --> {"commit_sha":"${head}","status":"running"}`,created_at:"2030-01-01T00:00:00Z",user:{id:199175422}}];expect(reviewRequestDue(comments,head)).toBe(false);});

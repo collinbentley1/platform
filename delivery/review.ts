@@ -32,18 +32,25 @@ export async function automatedReview(number: string, expectedHead: string): Pro
 export function reviewRequestDue(comments: readonly {body:string;created_at:string;user:{id:number}}[],head:string,now=Date.now()): boolean {
   const marker=`<!-- platform-review-head:${head} -->`;
   const previous=comments.filter(comment=>comment.body.includes(marker)).at(-1);
-  if(!previous) return true;
   const summary=comments.filter(comment=>comment.user.id===codexId && comment.body.includes("<!-- codex-pull-request-review-summary -->")).at(-1);
   const completed=summary?reviewedCommit(summary.body):undefined;
   if(completed && head.startsWith(completed)) return false;
   if(summary?.body.includes(head) && /\"status\":\"running\"/.test(summary.body)) return false;
-  return now-Date.parse(previous.created_at)>=4*60*60_000;
+  return !previous || now-Date.parse(previous.created_at)>=4*60*60_000;
 }
 
 export async function requestReview(number: string, head: string): Promise<void> {
   const comments = await pages<{ body: string; created_at: string; user: {id:number} }>(`/repos/${repository()}/issues/${number}/comments`);
   const marker = `<!-- platform-review-head:${head} -->`;
-  if (reviewRequestDue(comments,head)) await api(`/repos/${repository()}/issues/${number}/comments`, "POST", { body: `@codex review\n\n${marker}` });
+  if (!reviewRequestDue(comments,head)) return;
+  const pr=await pullRequest(number);
+  if(pr.head.sha!==head || pr.draft) throw new Error("Review refresh requires the unchanged ready upgrade PR.");
+  await api(`/repos/${repository()}/issues/${number}/comments`, "POST", { body: `Refresh automatic review.\n\n${marker}` });
+  // Repository-wide automatic reviews use the configured owner's review allowance.
+  // A bot-authored @mention can resolve a different billing identity.
+  await graphql(`mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
+  if((await pullRequest(number)).head.sha!==head) throw new Error("Upgrade head changed during review refresh.");
+  await graphql(`mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
 }
 
 export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promise<void> {

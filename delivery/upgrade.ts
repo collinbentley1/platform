@@ -53,6 +53,8 @@ export async function proposeUpgrade(source: string, release: { sha: string; tag
 
 export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_000): Promise<void> {
   const pr = await pullRequest(prNumber); let head = pr.head.sha;
+  // Allow the PR-open automatic review webhook to establish its current-head summary.
+  await Bun.sleep(30_000);
   await requestReview(prNumber, head);
   const rules = await api<{ required_status_checks?: { checks: Array<{ context: string; app_id: number | null }> } }>(`/repos/${repository()}/branches/main/protection`);
   const required = rules.required_status_checks?.checks ?? [];
