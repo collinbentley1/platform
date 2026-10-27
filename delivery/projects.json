@@ -125,7 +125,7 @@
         "FIRESTORE_PROJECT_ID": "platform-smoke-20261027"
       },
       "secrets": {
-        "PLATFORM_SMOKE_SECRET": "platform-smoke-proof:1"
+        "PLATFORM_SMOKE_SECRET": "platform-smoke-proof:2"
       }
     }
   ],
