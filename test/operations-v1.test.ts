@@ -19,7 +19,9 @@ test("a new project gets a monthly native Cloud Run cap and rerunning creates no
       writes.push(body); budgets.push(cap());
       return structuredClone(budgets[0]) as T;
     }
-    expect(path).toBe(`${account}/budgets?pageSize=1000`);
+    const query = new URL(`https://billing.test/${path}`).searchParams;
+    expect(query.get("scope")).toBe(`projects/${app.number}`);
+    expect(query.get("pageSize")).toBe("100");
     return structuredClone({ budgets }) as T;
   };
   await ensureCloudRunCap(app, account, request);
@@ -52,12 +54,24 @@ test("a lifted or excessive existing cap needs owner attention rather than a dup
   }
 });
 
-test("incomplete or ambiguous inventory cannot create another cap", async () => {
-  for (const inventory of [{ budgets: [], nextPageToken: "next" }, { budgets: [cap(), cap()] }]) {
-    const request = async <T>(_path: string, body?: unknown): Promise<T> => {
-      expect(body).toBeUndefined();
-      return structuredClone(inventory) as T;
-    };
-    await expect(ensureCloudRunCap(app, account, request)).rejects.toThrow();
-  }
+test("a cap on a later page is reused instead of duplicated", async () => {
+  const pages: string[] = [];
+  const request = async <T>(path: string, body?: unknown): Promise<T> => {
+    expect(body).toBeUndefined();
+    const query = new URL(`https://billing.test/${path}`).searchParams;
+    expect(query.get("scope")).toBe(`projects/${app.number}`);
+    const token = query.get("pageToken") ?? ""; pages.push(token);
+    return structuredClone(token === "" ? { budgets: [], nextPageToken: "next/+?" } : { budgets: [cap()] }) as T;
+  };
+  expect(await ensureCloudRunCap(app, account, request)).toEqual(cap());
+  expect(pages).toEqual(["", "next/+?"]);
+});
+
+test("duplicate caps across pages cannot create another cap", async () => {
+  const request = async <T>(path: string, body?: unknown): Promise<T> => {
+    expect(body).toBeUndefined();
+    const token = new URL(`https://billing.test/${path}`).searchParams.get("pageToken");
+    return structuredClone({ budgets: [cap()], ...(!token ? { nextPageToken: "next" } : {}) }) as T;
+  };
+  await expect(ensureCloudRunCap(app, account, request)).rejects.toThrow("ambiguous");
 });

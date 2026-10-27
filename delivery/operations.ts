@@ -11,9 +11,15 @@ type BudgetRequest = <T>(path: string, body?: unknown) => Promise<T>;
 const cloudRunService = "services/152E-C115-5142";
 
 export async function ensureCloudRunCap(app: Pick<Project, "project" | "number">, account: string, request: BudgetRequest): Promise<NativeBudget> {
-  const inventory = await request<{ budgets?: NativeBudget[]; nextPageToken?: string }>(`${account}/budgets?pageSize=1000`);
-  if (inventory.nextPageToken) throw new Error("Budget inventory is incomplete; no cap was created.");
-  const matches = (inventory.budgets ?? []).filter(budget => budget.spendCap && budget.budgetFilter?.projects?.includes(`projects/${app.number}`) && budget.budgetFilter?.services?.includes(cloudRunService));
+  const budgets: NativeBudget[] = [];
+  let pageToken = "";
+  do {
+    const query = new URLSearchParams({ scope: `projects/${app.number}`, pageSize: "100", ...(pageToken ? { pageToken } : {}) });
+    const page = await request<{ budgets?: NativeBudget[]; nextPageToken?: string }>(`${account}/budgets?${query}`);
+    budgets.push(...page.budgets ?? []);
+    pageToken = page.nextPageToken ?? "";
+  } while (pageToken);
+  const matches = budgets.filter(budget => budget.spendCap && budget.budgetFilter?.projects?.includes(`projects/${app.number}`) && budget.budgetFilter?.services?.includes(cloudRunService));
   if (matches.length > 1) throw new Error(`Cloud Run cap is ambiguous for ${app.project}.`);
   const cap = matches[0] ?? await request<NativeBudget>(`${account}/budgets`, {
     displayName: `Platform Cloud Run cap - ${app.project}`,
