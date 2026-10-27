@@ -1,14 +1,17 @@
 import catalogSource from "./projects.json";
 
 export type Project = { name: string; repositoryId: string; project: string; number: string; region: string; registry: string; service: string; data: boolean; env: Record<string, string>; secrets: Record<string, string>; repository?: string; sourceDirectory?: string; identity?: boolean };
-const catalog = catalogSource as unknown as { schemaVersion: number; owner: string; platformRepositoryId: string; projects: Project[] };
+type Catalog = { schemaVersion: number; owner: string; platformRepositoryId: string; projects: Project[]; defaults: { productionMaxInstances: number; previewMaxInstances: number; monthlyBudgetUSD: number } };
+const catalog = catalogSource as unknown as Catalog;
 export const defaults = catalogSource.defaults;
 export const owner = "collinbentley1";
 export const platformRepositoryId = "1255856466";
 export const projects: readonly Project[] = catalog.projects;
 
-export function validateCatalog(value: { schemaVersion: number; owner: string; platformRepositoryId: string; projects: Project[] }): void {
+export function validateCatalog(value: Catalog): void {
   if (value.schemaVersion !== 1 || value.owner !== owner || value.platformRepositoryId !== platformRepositoryId) throw new Error("Invalid catalog authority.");
+  const limits=value.defaults;
+  if(!limits || !Number.isFinite(limits.monthlyBudgetUSD) || limits.monthlyBudgetUSD<=0 || limits.monthlyBudgetUSD>30 || !Number.isInteger(limits.productionMaxInstances) || limits.productionMaxInstances<1 || limits.productionMaxInstances>2 || limits.previewMaxInstances!==1)throw new Error("Catalog defaults exceed the 30 USD budget or capacity limits.");
   const names = new Set<string>(); const ids = new Set<string>();
   for (const app of value.projects) {
     if (!/^[a-z][a-z0-9-]{0,39}$/.test(app.name) || !/^[1-9][0-9]*$/.test(app.repositoryId) || !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(app.project) || !/^[1-9][0-9]*$/.test(app.number) || app.region !== "us-east4" || !/^[a-z][a-z0-9-]{0,39}$/.test(app.service) || !/^[a-z][a-z0-9-]{0,39}$/.test(app.registry)) throw new Error("Invalid project identity.");
