@@ -56,6 +56,7 @@ export async function create(name: string, args: string[]): Promise<void> {
   if (repo.private || repo.owner.login !== owner) throw new Error("Repository authority or visibility differs.");
   if (!await command(["git", "remote"], { cwd: directory })) await command(["git", "remote", "add", "origin", `git@github.com:${owner}/${name}.git`], { cwd: directory });
   if ((await command(["git", "remote", "get-url", "origin"], { cwd: directory })) !== `git@github.com:${owner}/${name}.git`) throw new Error("Unexpected onboarding remote.");
+  if(await command(["git","ls-remote","--heads","origin","refs/heads/main"],{cwd:directory}))await command(["git","pull","--ff-only","origin","main"],{cwd:directory});
   if (await command(["git", "status", "--porcelain"], { cwd: directory })) {
     await command([process.execPath, "install", "--ignore-scripts", "--no-env-file"], { cwd: directory });
     await command(["git", "add", "--all"], { cwd: directory });
