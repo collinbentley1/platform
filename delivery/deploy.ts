@@ -80,10 +80,13 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const revisionName = `${app.service}${preview ? "-preview-v1" : ""}-${suffix}`;
   const tag = `c${nonce.replaceAll("-", "").slice(0, 16)}`;
   const previewTag = previewPr ? `pr-${previewPr}` : undefined;
+  const mapbox=app.name==="critical-history"?Bun.env.MAPBOX_PUBLIC_TOKEN?.trim():undefined;
+  if(app.name==="critical-history" && !/^pk\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(mapbox??""))throw new Error("Critical History requires its protected public Mapbox configuration.");
   const directory = await mkdtemp(join(tmpdir(), "platform-deploy-"));
   const environment: Record<string, string> = {
     ...(preview ? previewEnvironment(app) : app.env), NODE_ENV: "production", PLATFORM_DEPLOY_NONCE: nonce, PLATFORM_SOURCE_SHA: evidence.sourceSha, PLATFORM_RELEASE_SHA: evidence.platformSha,
   };
+  if(mapbox)environment.MAPBOX_PUBLIC_TOKEN=mapbox;
   const previewOrigin = new URL(before.uri); previewOrigin.hostname = `${previewTag ?? tag}---${previewOrigin.hostname}`;
   if (preview && app.name === "virtual-care-mcp") environment.PUBLIC_BASE_URL = previewOrigin.origin;
   if (preview && app.name === "healthmcp") Object.assign(environment,{ALLOWED_HOSTS:previewOrigin.hostname,ALLOWED_ORIGINS:previewOrigin.origin,CANONICAL_HOST:previewOrigin.hostname,LEGACY_HOSTS:""});

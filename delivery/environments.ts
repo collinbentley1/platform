@@ -24,6 +24,11 @@ export async function environments(apps: readonly Project[] = projects): Promise
       if (!siteKey || !/^[A-Za-z0-9_-]{20,100}$/.test(siteKey)) throw new Error("Managed reCAPTCHA configuration is missing or ambiguous.");
       await command(["gh","variable","set","RECAPTCHA_SITE_KEY","--repo","collinbentley1/platform","--env",`deploy-${app.name}`],{stdin:siteKey,quiet:true});
     }
+    if(app.name==="critical-history") {
+      const token=Bun.env.MAPBOX_PUBLIC_TOKEN ?? await command(["gh","variable","get","MAPBOX_PUBLIC_TOKEN","--repo","collinbentley1/platform","--env",`deploy-${app.name}`],{quiet:true});
+      if(!/^pk\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token.trim()))throw new Error("Critical History requires its protected public Mapbox configuration.");
+      if(Bun.env.MAPBOX_PUBLIC_TOKEN)await command(["gh","variable","set","MAPBOX_PUBLIC_TOKEN","--repo","collinbentley1/platform","--env",`deploy-${app.name}`],{stdin:token.trim(),quiet:true});
+    }
     console.log(JSON.stringify({event:"github-environments-enrolled",app:app.name,branches:["main"]}));
   }
 }

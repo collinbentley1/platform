@@ -13,5 +13,7 @@ test("manual verification uses the requested PR head instead of silently verifyi
  const {productionOrigin}=await import("../delivery/deploy.ts"); const {project}=await import("../delivery/catalog.ts");
  expect(productionOrigin(project("virtual-care-mcp"),"https://internal-alias.run.app")).toBe("https://virtual-care-mcp-894875537243.us-east4.run.app");
  expect(productionOrigin(project("healthmcp"),"https://internal-alias.run.app")).toBe("https://medlock.ai");
- expect(productionOrigin(project("cdbentley"),"https://internal-alias.run.app")).toBe("https://internal-alias.run.app");
+ expect(productionOrigin(project("runsetta"),"https://internal-alias.run.app")).toBe("https://runsetta.com");
+ expect(productionOrigin(project("critical-history"),"https://internal-alias.run.app")).toBe("https://ycriticalhistory.org");
+ expect(productionOrigin(project("cdbentley"),"https://internal-alias.run.app")).toBe("https://cdbentley.com");
  });

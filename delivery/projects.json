@@ -12,7 +12,9 @@
       "registry": "site",
       "service": "cdbentley",
       "data": false,
-      "env": {},
+      "env": {
+        "PUBLIC_ORIGIN": "https://cdbentley.com"
+      },
       "secrets": {}
     },
     {
@@ -24,7 +26,9 @@
       "registry": "site",
       "service": "critical-history",
       "data": false,
-      "env": {},
+      "env": {
+        "PUBLIC_ORIGIN": "https://ycriticalhistory.org"
+      },
       "secrets": {}
     },
     {
@@ -65,7 +69,8 @@
       "env": {
         "RUNSETTA_OFFLINE": "1",
         "RUNSETTA_TTS_MODEL": "gpt-4o-mini-tts",
-        "RUNSETTA_TTS_VOICE": "marin"
+        "RUNSETTA_TTS_VOICE": "marin",
+        "PUBLIC_ORIGIN": "https://runsetta.com"
       },
       "secrets": {}
     },
