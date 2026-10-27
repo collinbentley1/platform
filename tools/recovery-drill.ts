@@ -1,6 +1,6 @@
 import { command } from "../delivery/process.ts";
 import { project } from "../delivery/catalog.ts";
-import { google, GoogleError } from "../delivery/google.ts";
+import { google, GoogleError, operation } from "../delivery/google.ts";
 if (Bun.env.GITHUB_ACTIONS || !Bun.argv.includes("--apply")) throw new Error("Owner recovery drill: bun tools/recovery-drill.ts <registered-app> --apply (temporary Firestore clone).");
 const app = project(Bun.argv[2] ?? ""); if (!app.data) throw new Error("Application has no managed datastore.");
 Bun.env.GOOGLE_OAUTH_ACCESS_TOKEN = await command(["gcloud", "auth", "print-access-token"], { quiet: true });
@@ -18,8 +18,8 @@ try {
   while (Date.now() < Date.parse(snapshot) + 5000) await Bun.sleep(Math.min(5000, Date.parse(snapshot) + 5000 - Date.now()));
   await google(`${base}/${source}/documents/${doc}`, "DELETE");
   cloneRequested = true;
-  // Let Google's CLI handle the long-running clone and delete operations.
-  await command(["gcloud", "firestore", "databases", "clone", `--source-database=${source}`, `--destination-database=${id}`, `--snapshot-time=${snapshot}`, `--project=${app.project}`, "--quiet"]);
+  const cloning = await google<{name:string}>(`${base}/projects/${app.project}/databases:clone`,"POST",{databaseId:id,pitrSnapshot:{database:source,snapshotTime:snapshot}});
+  await operation(cloning.name,30*60_000);
   const restored = await google<typeof fixture>(`${base}/projects/${app.project}/databases/${id}/documents/${doc}`);
   if (JSON.stringify(restored.fields) !== JSON.stringify(fixture.fields)) throw new Error("Restored fixture content differs.");
   console.log(JSON.stringify({ event: "recovery-drill-passed", app: app.name }));
@@ -31,8 +31,9 @@ try {
       let exists = true;
       try { await google(`${base}/${name}`); } catch (error) { if (!missing(error)) throw error; exists = false; }
       if (exists) {
-        await google(`${base}/${name}?updateMask=deleteProtectionState`, "PATCH", { name, deleteProtectionState: "DELETE_PROTECTION_DISABLED" });
-        await command(["gcloud", "firestore", "databases", "delete", `--database=${id}`, `--project=${app.project}`, "--quiet"]);
+        const unlock = await google<{name:string}>(`${base}/${name}?updateMask=delete_protection_state`,"PATCH",{name,deleteProtectionState:"DELETE_PROTECTION_DISABLED"});
+        if(unlock.name.includes("/operations/")) await operation(unlock.name);
+        const removal = await google<{name:string}>(`${base}/${name}`,"DELETE"); await operation(removal.name);
       }
       console.log(JSON.stringify({ event: "recovery-clone-removed", database: id }));
     }

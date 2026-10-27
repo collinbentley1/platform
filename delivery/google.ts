@@ -14,14 +14,15 @@ export async function google<T>(address: string, method = "GET", body?: unknown,
   const value = await readText(response, 8_388_608);
   return value ? JSON.parse(value) as T : undefined as T;
 }
-export async function operation(name: string): Promise<void> {
-  if (!/^projects\/[a-z0-9-]+\/locations\/[a-z0-9-]+\/operations\/[a-zA-Z0-9-]+$/.test(name)) throw new Error("Invalid Cloud Run operation.");
-  const deadline = Date.now() + 10 * 60_000;
+export async function operation(name: string, timeoutMs = 10 * 60_000): Promise<void> {
+  if (!/^projects\/[a-z0-9-]+\/(?:locations\/[a-z0-9-]+|databases\/(?:\(default\)|[a-z0-9-]+))\/operations\/[a-zA-Z0-9_-]+$/.test(name)) throw new Error("Invalid Google operation.");
+  const firestore = name.includes("/databases/");
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = await google<{ done?: boolean; error?: unknown }>(`https://run.googleapis.com/v2/${name}`);
-    if (value.error) throw new Error("Cloud Run operation failed.");
+    const value = await google<{ done?: boolean; error?: unknown }>(`https://${firestore ? "firestore.googleapis.com/v1" : "run.googleapis.com/v2"}/${name}`);
+    if (value.error) throw new Error("Google operation failed.");
     if (value.done) return;
     await Bun.sleep(3000);
   }
-  throw new Error("Cloud Run operation did not settle before its deadline.");
+  throw new Error("Google operation did not settle before its deadline.");
 }
