@@ -1,6 +1,7 @@
 import { readdir, readFile, writeFile, mkdir, lstat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import { command } from "./process.ts";
 
 export const releaseSchema = 1;
 export type ReleaseLock = { schemaVersion: number; sha: string; managed: Record<string, string> };
@@ -27,7 +28,7 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   requireSha(sha);
   const files = await runtimeFiles(root);
   files["Dockerfile"] = await readFile(join(root, "delivery/Dockerfile"), "utf8");
-  files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.npmrc\nnpmrc\n.local\n.data\nnode_modules\ndist\ncoverage\n**/gha-creds-*.json\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n**/*.pem\n**/*.key\n";
+  files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.npmrc\nnpmrc\n.local\n.data\nnode_modules\ndist\ncoverage\n**/gha-creds-*.json\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n**/*.pem\n**/*.key\n**/*.p12\n**/*.pfx\n";
   files["bunfig.toml"] = 'env = false\ntelemetry = false\n\n[install]\nexact = true\nminimumReleaseAge = 604800\nregistry = "https://registry.npmjs.org"\n';
   files[".github/workflows/application.yml"] = caller("application-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      pull_request:\n        required: false\n        type: string\n", "Bun verify", "      contents: read\n      pull-requests: read\n      checks: write").replace(/      platform_sha:/, "      pull_request: ${{ inputs.pull_request || '' }}\n      platform_sha:");
   /* Central installation-token upgrader owns release proposals. */
@@ -35,6 +36,16 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   files[".github/dependabot.yml"] = 'version: 2\nupdates:\n  - package-ecosystem: bun\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n    groups:\n      dependencies:\n        patterns: ["*"]\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "collinbentley1/platform/*"\n';
   files["tools/verify-socket-config.ts"] = 'const config = Bun.TOML.parse(await Bun.file("bunfig.toml").text()) as { install?: { registry?: string; minimumReleaseAge?: number; security?: unknown } };\nif (config.install?.registry !== "https://registry.npmjs.org" || config.install.minimumReleaseAge !== 604800 || config.install.security) throw new Error("Dependency policy differs from the managed platform contract.");\nexport {};\n';
   return files;
+}
+
+
+export function runtimeManifest(text: string, runtime: string, packageManager: string): string {
+  const value=JSON.parse(text) as {dependencies?:Record<string,string>;packageManager?:string};
+  const dependencies=(JSON.parse(runtime) as {dependencies:Record<string,string>}).dependencies;
+  if(!value || typeof value!=="object" || Array.isArray(value) || !dependencies || Object.values(dependencies).some(version=>!/^\d+\.\d+\.\d+$/.test(version))) throw new Error("Invalid runtime dependency manifest.");
+  if(value.packageManager===packageManager && Object.entries(dependencies).every(([name,version])=>value.dependencies?.[name]===version)) return text;
+  value.dependencies={...value.dependencies,...dependencies}; value.packageManager=packageManager;
+  return JSON.stringify(value,null,2)+"\n";
 }
 
 const retiredWorkflows = ["application.yml", "platform-upgrade.yml", "bun-dependency-update.yml", "cleanup-preview.yml", "deploy-preview.yml", "deploy-prod.yml", "infrastructure.yml", "reconcile-previews.yml", "socket-firewall.yml"];
@@ -74,6 +85,10 @@ export async function upgrade(root: string, source: string, sha: string, options
   }
   const next: ReleaseLock = { schemaVersion: releaseSchema, sha: requireSha(sha), managed: Object.fromEntries(Object.entries(desired).map(([path, content]) => [path, digest(content)])) };
   desired[".platform/release.json"] = JSON.stringify(next, null, 2) + "\n";
+  const manifestText=await regularText(root,"package.json");
+  const packageManager=(JSON.parse(await readFile(join(source,"package.json"),"utf8")) as {packageManager:string}).packageManager;
+  const manifest=manifestText===undefined?undefined:runtimeManifest(manifestText,desired[".platform/runtime/package.json"]!,packageManager);
+  const updateManifest=manifest!==undefined && manifest!==manifestText;
   const changed: string[] = [];
   for (const [path, content] of Object.entries(desired)) {
     if (await regularText(root, path) !== content) changed.push(path);
@@ -84,9 +99,15 @@ export async function upgrade(root: string, source: string, sha: string, options
     if (!Object.hasOwn(desired, path) && await regularText(root, path) !== undefined) { changed.push(path); removed.add(path); }
   }
   for (const path of Object.keys(previous?.managed ?? {})) if (!Object.hasOwn(desired, path) && !removed.has(path)) { changed.push(path); removed.add(path); }
+  if(updateManifest) changed.push("package.json","bun.lock");
   if (!options.check) {
     for (const path of removed) await unlink(join(root, path));
-    for (const path of changed.filter(path => !removed.has(path))) { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), desired[path]!); }
+    for (const path of changed.filter(path => !removed.has(path) && path!=="package.json" && path!=="bun.lock")) { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), desired[path]!); }
+    if(updateManifest) {
+      await writeFile(join(root,"package.json"),manifest!);
+      // Resolve dependency metadata without consumer code or installation credentials.
+      await command([process.execPath,"install","--lockfile-only","--ignore-scripts","--no-env-file","--minimum-release-age=604800","--registry=https://registry.npmjs.org"],{cwd:root,env:{PATH:"/usr/bin:/bin",GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_NOSYSTEM:"1"}});
+    }
   }
   return changed;
 }
@@ -96,6 +117,11 @@ export async function doctor(root: string, source: string, sha: string): Promise
   const server = await regularText(root, "src/server.ts");
   if (!server || !/import\s*\{[^}]*\bsecureHandler\b[^}]*\}\s*from\s*["'][^"']*\.platform\/runtime\/http\.ts["']/.test(server) || !/\bsecureHandler\s*\(/.test(server)) failures.push("the application entry point must consume the shared HTTP runtime");
   for (const [path, content] of Object.entries(expected)) if (await regularText(root, path) !== content) failures.push(`managed file differs: ${path}`);
+  const manifest=await regularText(root,"package.json");
+  if(manifest) {
+    const packageManager=(JSON.parse(await readFile(join(source,"package.json"),"utf8")) as {packageManager:string}).packageManager;
+    if(runtimeManifest(manifest,expected[".platform/runtime/package.json"]!,packageManager)!==manifest) failures.push("runtime dependencies or package manager differ from the selected release");
+  }
   const lockText = await regularText(root, ".platform/release.json");
   if (!lockText) failures.push("missing release lock");
   else {

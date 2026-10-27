@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { doctor, upgrade } from "../delivery/consumer.ts";
+import { doctor, upgrade, runtimeManifest } from "../delivery/consumer.ts";
 
 const source = resolve(import.meta.dir, "..");
 const first = "a".repeat(40); const second = "b".repeat(40);
@@ -32,3 +32,5 @@ describe("managed platform upgrades", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
+
+test("runtime dependency upgrades preserve product dependencies and scripts",()=>{ const current=JSON.stringify({dependencies:{product:"9.0.0"},scripts:{start:"custom"},packageManager:"bun@1.4.0"}); const next=runtimeManifest(current,JSON.stringify({dependencies:{jose:"6.1.3"}}),"bun@1.4.2"); expect(JSON.parse(next)).toEqual({dependencies:{product:"9.0.0",jose:"6.1.3"},scripts:{start:"custom"},packageManager:"bun@1.4.2"});expect(runtimeManifest(next,JSON.stringify({dependencies:{jose:"6.1.3"}}),"bun@1.4.2")).toBe(next);});

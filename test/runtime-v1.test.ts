@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpError, readJson, secureHandler, serveStatic, requireOrigin } from "../runtime/http.ts";
 import { identityVerifier, sessionCookie, sessionToken } from "../runtime/auth.ts";
-import { sqliteStore, firestoreStore } from "../runtime/data.ts";
+import { sqliteStore, firestoreStore, memoryStore } from "../runtime/data.ts";
 
 describe("shared application boundaries", () => {
   test("bounds streamed input without trusting content length and rejects malformed UTF-8", async () => {
@@ -94,3 +94,5 @@ test("Firestore readiness requires a successful database operation, including on
  globalThis.fetch=(async(_input:unknown)=>Response.json({name:`projects/demo/databases/(default)/documents/records/${id}`,fields:{title:{stringValue:""},createdAt:{stringValue:""}}})) as typeof fetch;
  try { const store=firestoreStore("demo-project","platform_records",async()=>"synthetic"); await expect(store.put("alice",{id,title:"",createdAt:""})).resolves.toEqual({id,title:"",createdAt:""}); } finally {globalThis.fetch=original;}
  });
+
+test("memory previews sort by creation time before selecting the newest 100",async()=>{const store=memoryStore();const newer={id:crypto.randomUUID(),title:"new",createdAt:"2030-01-01"};await store.put("alice",newer);for(let i=0;i<100;i++)await store.put("alice",{id:crypto.randomUUID(),title:"older",createdAt:"2020-01-01"});const listed=await store.list("alice");expect(listed).toHaveLength(100);expect(listed[0]).toEqual(newer);});
