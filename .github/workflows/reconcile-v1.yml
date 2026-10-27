@@ -1,0 +1,53 @@
+name: Audit serving applications
+on:
+  schedule:
+    - cron: '43 8 * * *'
+    - cron: '13 9 * * 0'
+  workflow_dispatch:
+    inputs:
+      refresh_images:
+        description: Refresh registry pull age without executing images
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  audit:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: audit-${{ matrix.application }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {application: cdbentley, project: cdbentley, number: '882468538648'}
+          - {application: critical-history, project: critical-history-16823277, number: '422714632513'}
+          - {application: healthmcp, project: medlock-1025243085, number: '229383559510'}
+          - {application: runsetta, project: runsetta, number: '601124730704'}
+          - {application: virtual-care-mcp, project: virtual-care-mcp, number: '894875537243'}
+          - {application: platform-reference, project: cdbentley, number: '882468538648'}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - name: Install verified registry client for the weekly pull
+        if: github.event.schedule == '13 9 * * 0' || inputs.refresh_images
+        run: bash delivery/install-regctl.sh
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        id: google
+        with:
+          workload_identity_provider: projects/${{ matrix.number }}/locations/global/workloadIdentityPools/platform-delivery/providers/github
+          service_account: platform-audit@${{ matrix.project }}.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Verify actual serving digests, active vulnerability scans, identity, and private previews
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          PLATFORM_APP: ${{ matrix.application }}
+          PLATFORM_REFRESH_IMAGES: ${{ github.event.schedule == '13 9 * * 0' || inputs.refresh_images }}
+        run: bun delivery/reconcile.ts

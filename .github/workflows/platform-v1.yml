@@ -1,0 +1,112 @@
+name: Platform
+on:
+  push:
+    branches: [main, codex/production-platform]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  verify:
+    name: Platform verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - run: bun ci --ignore-scripts --no-env-file
+      - run: bun run verify
+  terraform:
+    name: Terraform modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install verified Terraform
+        run: |
+          curl -fsSL https://releases.hashicorp.com/terraform/1.14.5/terraform_1.14.5_linux_amd64.zip -o "$RUNNER_TEMP/terraform.zip"
+          echo "ac21c2b9dcd115711f540cbd27ead0596bb4288a917cb56dfa9b25edb3eb6280  $RUNNER_TEMP/terraform.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/terraform.zip" -d "$RUNNER_TEMP/terraform-bin"
+          echo "$RUNNER_TEMP/terraform-bin" >> "$GITHUB_PATH"
+      - run: |
+          terraform -chdir=delivery/terraform fmt -check
+          terraform -chdir=delivery/terraform init -backend=false -lockfile=readonly
+          terraform -chdir=delivery/terraform validate
+  reference:
+    name: Complete starter and container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  $RUNNER_TEMP/bun.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun-bin"
+          echo "$RUNNER_TEMP/bun-bin/bun-linux-x64" >> "$GITHUB_PATH"
+      - name: Verify shared runtime and upgrades
+        run: |
+          bun ci --ignore-scripts --no-env-file
+          bun test test/runtime-v1.test.ts test/upgrades-v1.test.ts test/review-v1.test.ts test/scanning-v1.test.ts test/merge-v1.test.ts
+      - name: Create and verify a real application
+        run: |
+          bun tools/platform-v1.ts init platform-reference "$RUNNER_TEMP/reference" --sha "$GITHUB_SHA"
+          cd "$RUNNER_TEMP/reference"
+          bun ci --ignore-scripts --no-env-file
+          bun run verify:ci
+      - name: Build the actual Cloud Run architecture
+        run: |
+          docker buildx create --name platform --driver docker-container --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 --use
+          docker buildx build --platform linux/amd64 --label org.opencontainers.image.revision="$GITHUB_SHA" --label io.collinbentley.platform.revision="$GITHUB_SHA" --provenance=false --load --tag platform-reference-smoke --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
+      - name: Exercise the actual non-root production container
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker logs platform-reference-smoke; docker rm -f platform-reference-smoke' EXIT
+          docker run -d --name platform-reference-smoke -p 127.0.0.1:8080:8080 -e PLATFORM_PREVIEW=1 -e PUBLIC_ORIGIN=https://reference.test -e PLATFORM_DEPLOY_NONCE=container-smoke platform-reference-smoke
+          for attempt in {1..30}; do
+            if curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/livez | jq -e '.deployment == "container-smoke"'; then break; fi
+            if [ "$attempt" -eq 30 ]; then exit 1; fi
+            sleep 1
+          done
+          curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/ | grep -q 'Your notes'
+          curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/readyz | jq -e '.ok == true'
+          curl -fsS -H 'Host: reference.test' -H 'Origin: https://reference.test' -H 'Content-Type: application/json' --data '{"id":"12345678-1234-1234-1234-123456789012","title":"Container verification"}' http://127.0.0.1:8080/api/notes | jq -e '.title == "Container verification"'
+          curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/api/notes | jq -e '.notes | length == 1'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: reference-image
+          path: ${{ runner.temp }}/reference.oci.tar
+          retention-days: 1
+          if-no-files-found: error
+  release:
+    name: Publish verified release
+    needs: [verify, terraform, reference]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun delivery/release.ts publish

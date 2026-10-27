@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>__APP_NAME__</title><link rel="stylesheet" href="/app.css"><script type="module" src="/client.js"></script></head>
+<body><main>
+<header><h1>__APP_NAME__</h1><p>A private workspace for your notes.</p></header>
+<p id="status" role="status" aria-live="polite"></p>
+<section id="sign-in"><h2>Sign in</h2><form id="login-form">
+<label>Email<input id="email" name="email" type="email" autocomplete="username" required maxlength="254"></label>
+<label>Password<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+<button>Sign in</button></form></section>
+<section id="workspace" hidden><div class="bar"><h2>Your notes</h2><button id="sign-out" type="button">Sign out</button></div>
+<form id="note-form"><label>New note<input id="title" name="title" required maxlength="200"></label><button>Add note</button></form>
+<p id="empty" hidden>No notes yet. Add your first one above.</p><ul id="notes"></ul></section>
+</main></body></html>

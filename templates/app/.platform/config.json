@@ -1,8 +1,0 @@
-{
-  "name": "__APP_NAME__",
-  "projectId": "__PROJECT_ID__",
-  "githubRepositoryId": "__GITHUB_REPOSITORY_ID__",
-  "region": "us-east4",
-  "serviceName": "__APP_NAME__",
-  "artifactRegistryRepository": "site"
-}
