@@ -26,4 +26,7 @@ test("preview promotion and rollback preserve other previews and the base route"
   expect(JSON.parse(JSON.stringify(promoted.map(({revision,tag,percent})=>({revision,tag,percent}))))).toEqual([{revision:"base",percent:100},{revision:"other",tag:"pr-4"},{revision:"new",tag:"pr-3"}]);
   expect(previewTraffic(promoted,"pr-3","candidate-test","healthy").at(-1)).toMatchObject({revision:"healthy",tag:"pr-3"});
   expect(before[1]?.revision).toBe("healthy");
+  const coalesced=previewTraffic([{revision:"base",percent:100,tag:"pr-3"}],"pr-3","candidate-test","new");
+  expect(coalesced[0]).toMatchObject({revision:"base",percent:100});expect(coalesced[0]?.tag).toBeUndefined();
+  expect(coalesced.at(-1)).toMatchObject({revision:"new",tag:"pr-3"});
 });

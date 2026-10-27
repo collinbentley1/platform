@@ -76,7 +76,12 @@ export function productionTraffic(traffic:readonly Traffic[],revision:string,can
   return [{type:"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",revision,percent:100},...normalizedTraffic(traffic.filter(item=>item.tag && item.tag!==candidateTag)).map(item=>({type:item.type!,revision:item.revision!,tag:item.tag!}))];
 }
 export function previewTraffic(traffic: readonly Traffic[], tag: string, candidateTag: string, revision: string): Traffic[] {
-  return [...normalizedTraffic(traffic.filter(item=>item.tag!==tag && item.tag!==candidateTag)), { type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision, tag }];
+  const retained=traffic.flatMap(item=>{
+    if(item.tag!==tag && item.tag!==candidateTag)return[item];
+    if((item.percent??0)>0){const {tag:_tag,...route}=item;return[route];}
+    return[];
+  });
+  return [...normalizedTraffic(retained), { type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision, tag }];
 }
 
 export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: string): Promise<{ url: string; revision: string }> {
