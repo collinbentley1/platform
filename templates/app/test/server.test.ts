@@ -6,7 +6,7 @@ import type { IdentityProvider } from "../.platform/runtime/identity.ts";
 import { createHandler } from "../src/server.ts";
 import { sqliteStore, memoryStore } from "../.platform/runtime/data.ts";
 
-const identity = (id?: string): IdentityProvider => ({ verify: async token => ({ id: token, emailVerified: true, authenticatedAt: Math.floor(Date.now()/1000) }), signIn: async () => id ?? "alice", signUp: async () => "new-user", sendVerification: async () => {}, sendReset: async () => {}, confirm: async () => {}, revoke: async () => {}, remove: async () => {} });
+const identity = (id?: string): IdentityProvider => ({ verify: async token => ({ id: token, emailVerified: true, authenticatedAt: Math.floor(Date.now()/1000) }), signIn: async () => id ?? "alice", signUp: async () => "new-user", sendVerification: async () => {}, sendReset: async () => {}, revoke: async () => {}, remove: async () => {} });
 
 test("a signed-in user can save, retry, and delete a durable note without exposing another user's records", async () => {
   const root = await mkdtemp(join(tmpdir(), "application-test-")); const store = await sqliteStore(join(root, "notes.sqlite"));

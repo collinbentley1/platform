@@ -19,7 +19,12 @@ export async function operation(name: string, timeoutMs = 10 * 60_000): Promise<
   const firestore = name.includes("/databases/");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = await google<{ done?: boolean; error?: unknown }>(`https://${firestore ? "firestore.googleapis.com/v1" : "run.googleapis.com/v2"}/${name}`);
+    let value: { done?: boolean; error?: unknown };
+    try { value = await google(`https://${firestore ? "firestore.googleapis.com/v1" : "run.googleapis.com/v2"}/${name}`); }
+    catch (error) {
+      if (!(error instanceof GoogleError ? error.status === 429 || error.status >= 500 : error instanceof TypeError || error instanceof DOMException && error.name === "TimeoutError")) throw error;
+      await Bun.sleep(3000); continue;
+    }
     if (value.error) throw new Error("Google operation failed.");
     if (value.done) return;
     await Bun.sleep(3000);

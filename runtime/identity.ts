@@ -10,7 +10,6 @@ export interface IdentityProvider {
   signUp(email: string, password: string): Promise<string>;
   sendVerification(token: string): Promise<void>;
   sendReset(email: string): Promise<void>;
-  confirm(code: string, password?: string): Promise<void>;
   revoke(id: string): Promise<void>;
   remove(id: string): Promise<void>;
 }
@@ -57,7 +56,6 @@ export function managedIdentity(projectId: string, apiKey: string, continueUrl?:
     signUp: (email, password) => credentials("signUp", email, password),
     async sendVerification(token) { await call("sendOobCode", { requestType: "VERIFY_EMAIL", idToken: token, ...(continueUrl ? { continueUrl } : {}) }); },
     async sendReset(email) { try { await call("sendOobCode", { requestType: "PASSWORD_RESET", email, ...(continueUrl ? { continueUrl } : {}) }); } catch (error) { if (!(error instanceof ProviderError && error.code === "EMAIL_NOT_FOUND")) throw error; } },
-    async confirm(code, password) { await call(password === undefined ? "update" : "resetPassword", password === undefined ? { oobCode: code } : { oobCode: code, newPassword: password }); },
     async revoke(id) { await auth.revokeRefreshTokens(id); },
     async remove(id) { await auth.deleteUser(id); },
   };

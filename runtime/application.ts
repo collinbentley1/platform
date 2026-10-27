@@ -51,12 +51,6 @@ export function application(config: ApplicationConfig, dependencies: Application
       if (!dependencies.identity) throw new HttpError(503, "Account recovery is unavailable.");
       await dependencies.identity.sendReset(body.email); return json({ ok: true });
     }
-    if (url.pathname === "/api/account/confirm" && request.method === "POST") {
-      await consume("account-actions"); const body = await readJson(request, 4096);
-      if (!object(body) || typeof body.code !== "string" || body.code.length > 2048 || (body.password !== undefined && (typeof body.password !== "string" || body.password.length < 12 || body.password.length > 1024))) throw new HttpError(400, "Invalid account action.");
-      if (!dependencies.identity) throw new HttpError(503, "Account recovery is unavailable.");
-      await dependencies.identity.confirm(body.code, body.password as string | undefined); return json({ ok: true });
-    }
     if (url.pathname === "/api/account/verify" && request.method === "POST") {
       const user = await identify(); await consume(`verification:${user.id}`);
       if (!dependencies.identity || !token) throw new HttpError(503, "Verification is unavailable.");
@@ -76,6 +70,6 @@ export function application(config: ApplicationConfig, dependencies: Application
     if (response) return response;
     if (url.pathname.startsWith("/api/")) throw new HttpError(404, "Not found.");
     if (!["GET", "HEAD"].includes(request.method)) throw new HttpError(405, "Method not allowed.");
-    return serveStatic(config.publicDirectory, url.pathname === "/account" ? "/" : url.pathname);
+    return serveStatic(config.publicDirectory, url.pathname);
   }, { origin, log: entry => console.info(JSON.stringify(entry)) });
 }

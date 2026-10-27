@@ -60,16 +60,4 @@ for (const [id, path, method] of [["sign-out-all", "/api/session/revoke", "POST"
     void action(event.currentTarget as HTMLButtonElement, async () => { await api(path, { method }); signedIn(false); announce(id === "delete-account" ? "Account and notes deleted." : "Signed out on all devices."); });
   });
 }
-const link = new URL(location.href); const code = link.searchParams.get("oobCode"); const mode = link.searchParams.get("mode");
-if (code && ["verifyEmail", "resetPassword"].includes(mode ?? "")) {
-  history.replaceState(null, "", location.pathname);
-  element("sign-in").hidden = true; element("account-action").hidden = false;
-  element("new-password-label").hidden = mode !== "resetPassword";
-  element<HTMLInputElement>("new-password").required = mode === "resetPassword";
-  element<HTMLFormElement>("account-form").addEventListener("submit", event => { event.preventDefault(); void action((event.currentTarget as HTMLFormElement).querySelector("button")!, async () => {
-    await api("/api/account/confirm", { method: "POST", body: JSON.stringify({ code, ...(mode === "resetPassword" ? { password: element<HTMLInputElement>("new-password").value } : {}) }) });
-    await api("/api/session", { method: "DELETE" }); element("account-action").hidden = true; signedIn(false); announce("Account updated. Sign in to continue.");
-  }); });
-} else {
-  try { await loadSession(); } catch { signedIn(false); announce(location.hostname === "127.0.0.1" || location.hostname === "localhost" ? "Local development: use any email and password." : "Sign in to continue."); }
-}
+try { await loadSession(); } catch { signedIn(false); announce(location.hostname === "127.0.0.1" || location.hostname === "localhost" ? "Local development: use any email and password." : "Sign in to continue."); }

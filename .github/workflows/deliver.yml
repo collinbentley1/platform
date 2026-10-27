@@ -112,7 +112,7 @@ jobs:
           ref: ${{ matrix.release }}
           path: release
           persist-credentials: false
-      - run: bash delivery/install-bun.sh
+      - run: bash release/delivery/install-bun.sh
       - name: Prepare the exact application and release
         env:
           PLATFORM_APP: ${{ matrix.app }}
