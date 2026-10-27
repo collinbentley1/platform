@@ -118,10 +118,15 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     const current = await service(app);
     if (routed(current.trafficStatuses ?? []) !== routed([{ revision: revisionName, percent: 100 }])) throw new Error("Production route did not converge to the verified revision.");
     try {
-      await probe(productionOrigin(app, current.uri), nonce);
-      if (app.identity) await ready(productionOrigin(app, current.uri));
-      const root = await fetch(new URL("/", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
-      if (!root.ok || !root.headers.get("X-Request-ID")) throw new Error("Application entry route failed after promotion.");
+      for(let attempt=0;;attempt++) {
+        try {
+          await probe(productionOrigin(app, current.uri), nonce);
+          if (app.identity) await ready(productionOrigin(app, current.uri));
+          const root = await fetch(new URL("/", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
+          if (!root.ok || !root.headers.get("X-Request-ID") || root.headers.get("X-Platform-Source")!==evidence.sourceSha || root.headers.get("X-Platform-Release")!==evidence.platformSha) throw new Error("Application entry route failed after promotion.");
+          await root.body?.cancel(); break;
+        } catch(error) { if(attempt===2) throw error; await Bun.sleep(2000); }
+      }
     } catch (error) {
       const failed = await service(app);
       // Roll back only our own route, with a fresh etag. Never overwrite another operator.

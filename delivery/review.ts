@@ -34,7 +34,9 @@ export function reviewRequestDue(comments: readonly {body:string;created_at:stri
   const previous=comments.filter(comment=>comment.body.includes(marker)).at(-1);
   if(!previous) return true;
   const summary=comments.filter(comment=>comment.user.id===codexId && comment.body.includes("<!-- codex-pull-request-review-summary -->")).at(-1);
-  if(summary && (reviewedCommit(summary.body) || /\"status\":\"running\"/.test(summary.body))) return false;
+  const completed=summary?reviewedCommit(summary.body):undefined;
+  if(completed && head.startsWith(completed)) return false;
+  if(summary?.body.includes(head) && /\"status\":\"running\"/.test(summary.body)) return false;
   return now-Date.parse(previous.created_at)>=4*60*60_000;
 }
 
