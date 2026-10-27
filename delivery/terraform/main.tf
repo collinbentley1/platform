@@ -314,3 +314,13 @@ resource "google_recaptcha_enterprise_key" "waitlist" {
 output "waitlist_site_key" {
   value = try(google_recaptcha_enterprise_key.waitlist[0].name, null)
 }
+
+resource "google_firestore_field" "visits_expiry" {
+  count      = contains(keys(local.apps), "virtual-care-mcp") ? 1 : 0
+  project    = var.project_id
+  database   = google_firestore_database.application[0].name
+  collection = "visits"
+  field      = "expiresAt"
+  ttl_config {}
+  index_config {}
+}

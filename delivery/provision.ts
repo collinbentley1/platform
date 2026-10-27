@@ -40,7 +40,7 @@ export async function provision(projectId: string, apply = false): Promise<void>
   }
   const variables = join(artifacts, "enrollment.tfvars.json");
   await writeFile(variables, JSON.stringify({ project_id: projectId, initial_images: images }), { mode: 0o600 });
-  const env = { ...process.env, GOOGLE_OAUTH_ACCESS_TOKEN: await command(["gcloud", "auth", "print-access-token"], { quiet: true }) };
+  const env = { ...process.env, TF_DATA_DIR:join(artifacts,"terraform-data"), GOOGLE_OAUTH_ACCESS_TOKEN: await command(["gcloud", "auth", "print-access-token"], { quiet: true }) };
   const terraform = (args: string[]) => command(["terraform", `-chdir=${directory}`, ...args], { env });
   await terraform(["init", "-input=false", "-reconfigure", `-backend-config=bucket=${bucket}`, "-backend-config=prefix=delivery/v1"]);
   const state = await terraform(["state", "list"]);
@@ -54,6 +54,31 @@ export async function provision(projectId: string, apply = false): Promise<void>
       await terraform(["import", "-input=false", `-var-file=${variables}`, "google_firestore_database.application[0]", `projects/${projectId}/databases/(default)`]);
     } catch (error) { if (!(error instanceof GoogleError && error.status === 404)) throw error; }
   }
+  const importPresent=async(address:string,id:string,url:string):Promise<void>=>{
+    if(state.split("\n").includes(address)) return;
+    try { await google(url,"GET",undefined,projectId); await terraform(["import","-input=false",`-var-file=${variables}`,address,id]); }
+    catch(error) {if(!(error instanceof GoogleError && error.status===404)) throw error;}
+  };
+  if(apps.some(app=>app.identity)) {
+    await importPresent("google_identity_platform_config.identity[0]",`projects/${projectId}/config`,`https://identitytoolkit.googleapis.com/v2/projects/${projectId}/config`);
+    if(!state.split("\n").includes("google_apikeys_key.identity[0]")) {
+      const keys=await google<{keys?:Array<{name:string;displayName:string}>;nextPageToken?:string}>(`https://apikeys.googleapis.com/v2/projects/${projectId}/locations/global/keys?pageSize=100`,"GET",undefined,projectId);
+      const selected=keys.keys?.filter(key=>key.displayName==="Public Identity Platform client")??[];
+      if(keys.nextPageToken || selected.length>1) throw new Error("Existing identity key inventory is ambiguous.");
+      if(selected[0]) await terraform(["import","-input=false",`-var-file=${variables}`,"google_apikeys_key.identity[0]",selected[0].name]);
+    }
+  }
+  if(apps.some(app=>app.name==="healthmcp")) {
+    await importPresent("google_identity_platform_config.waitlist[0]",`projects/${projectId}/config`,`https://identitytoolkit.googleapis.com/v2/projects/${projectId}/config`);
+    for(const collection of ["waitlist","waitlist_quota"]) {const id=`projects/${projectId}/databases/(default)/collectionGroups/${collection}/fields/expiresAt`;await importPresent(`google_firestore_field.waitlist_expiry["${collection}"]`,id,`https://firestore.googleapis.com/v1/${id}`);}
+    if(!state.split("\n").includes("google_recaptcha_enterprise_key.waitlist[0]")) {
+      const keys=await google<{keys?:Array<{name:string;displayName:string}>;nextPageToken?:string}>(`https://recaptchaenterprise.googleapis.com/v1/projects/${projectId}/keys?pageSize=100`,"GET",undefined,projectId);
+      const selected=keys.keys?.filter(key=>key.displayName==="Medlock waitlist ownership")??[];
+      if(keys.nextPageToken || selected.length>1) throw new Error("Existing reCAPTCHA key inventory is ambiguous.");
+      if(selected[0]) await terraform(["import","-input=false",`-var-file=${variables}`,"google_recaptcha_enterprise_key.waitlist[0]",selected[0].name]);
+    }
+  }
+  if(apps.some(app=>app.name==="virtual-care-mcp")) {const id=`projects/${projectId}/databases/(default)/collectionGroups/visits/fields/expiresAt`;await importPresent("google_firestore_field.visits_expiry[0]",id,`https://firestore.googleapis.com/v1/${id}`);}
   const planFile = join(artifacts, "enrollment.tfplan");
   await terraform(["plan", "-input=false", `-var-file=${variables}`, `-out=${planFile}`]);
   const plan = JSON.parse(await terraform(["show", "-json", planFile])) as { resource_changes?: Array<{ address: string; change: { actions: string[] } }> };

@@ -185,7 +185,7 @@ jobs:
     timeout-minutes: 30
     environment: deploy-${{ matrix.app }}
     concurrency:
-      group: service-${{ matrix.app }}-${{ matrix.pr || 'production' }}
+      group: service-${{ matrix.app }}-${{ matrix.pr && 'preview' || 'production' }}
       cancel-in-progress: false
     permissions:
       contents: read
