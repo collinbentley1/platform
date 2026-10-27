@@ -34,4 +34,5 @@ const response = await fetch(new URL("/livez", preview.uri), {redirect:"error",s
 if (![401,403].includes(response.status)) throw new Error("Preview accepts anonymous requests.");
 const health = await fetch(new URL("/livez", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
 if (!health.ok || !(await health.json() as {ok?:boolean}).ok) throw new Error("Production health failed.");
+if(app.data) {const readiness=await fetch(new URL("/readyz",productionOrigin(app,current.uri)),{redirect:"error",signal:AbortSignal.timeout(20_000)});if(!readiness.ok || !(await readiness.json() as {ok?:boolean}).ok) throw new Error("Production datastore readiness failed.");}
 console.log(JSON.stringify({event:"serving-application-verified",app:app.name,revisions:[...revisions]}));

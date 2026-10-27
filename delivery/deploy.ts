@@ -104,7 +104,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     const token = preview ? Bun.env.PLATFORM_PREVIEW_TOKEN ?? await command(["gcloud", "auth", "print-identity-token"], { quiet: true }) : undefined;
     if (!target?.uri) throw new Error("The exact staged revision has no health route.");
     await probe(target.uri, nonce, token);
-    if (app.identity) await ready(target.uri, token);
+    if (app.data) await ready(target.uri, token);
     if (preview) {
       const anonymous = await fetch(new URL("/livez", target.uri), { redirect: "error", signal: AbortSignal.timeout(15_000) });
       if (![401, 403].includes(anonymous.status)) throw new Error("Private preview accepts anonymous requests.");
@@ -121,7 +121,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
       for(let attempt=0;;attempt++) {
         try {
           await probe(productionOrigin(app, current.uri), nonce);
-          if (app.identity) await ready(productionOrigin(app, current.uri));
+          if (app.data) await ready(productionOrigin(app, current.uri));
           const root = await fetch(new URL("/", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
           if (!root.ok || !root.headers.get("X-Request-ID") || root.headers.get("X-Platform-Source")!==evidence.sourceSha || root.headers.get("X-Platform-Release")!==evidence.platformSha) throw new Error("Application entry route failed after promotion.");
           await root.body?.cancel(); break;
