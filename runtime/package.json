@@ -5,7 +5,9 @@
   "exports": {
     "./http": "./http.ts",
     "./auth": "./auth.ts",
-    "./data": "./data.ts"
+    "./data": "./data.ts",
+    "./application": "./application.ts",
+    "./identity": "./identity.ts"
   },
   "dependencies": {
     "jose": "6.2.12",

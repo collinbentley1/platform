@@ -1,3 +1,4 @@
+import {latestRelease} from "./upgrade.ts";
 import {tmpdir} from "node:os";
 import { resolve, join } from "node:path";
 import { readFile, writeFile, mkdtemp } from "node:fs/promises";
@@ -36,9 +37,9 @@ export async function create(name: string, args: string[]): Promise<void> {
   const prior = await readFile(marker, "utf8").catch(() => undefined);
   if (prior && JSON.parse(prior).project !== projectId) throw new Error("The local project belongs to another onboarding request.");
   if (!prior) {
-    const release=await github<{tag_name:string}>(`repos/${owner}/platform/releases/latest`);
-    const revision=await github<{sha:string}>(`repos/${owner}/platform/commits/${release.tag_name}`);
-    await command(["git","fetch","origin",`refs/tags/${release.tag_name}:refs/tags/${release.tag_name}`],{cwd:root});
+    const release=await latestRelease(<T>(path:string)=>github<T>(path.replace(/^\//,"")));
+    const revision={sha:release.sha};
+    await command(["git","fetch","origin",`refs/tags/${release.tag}:refs/tags/${release.tag}`],{cwd:root});
     const temporary=await mkdtemp(join(tmpdir(),"platform-create-source-"));const source=join(temporary,"release");
     await command(["git","worktree","add","--detach",source,revision.sha],{cwd:root});
     try{await command([process.execPath, "tools/platform.ts", "init", name, directory,"--sha",revision.sha], { cwd: source });}
@@ -66,6 +67,7 @@ export async function create(name: string, args: string[]): Promise<void> {
   });
   await command(["git", "pull", "--ff-only"], { cwd: root });
   // New process reads the newly reviewed catalog, not this process's old import.
+  await command([process.execPath,"tools/platform.ts","budget"],{cwd:root});
   await command([process.execPath, "tools/platform.ts", "repository-settings", name], { cwd: root });
   await command([process.execPath, "tools/platform.ts", "enroll", projectId, "--apply"], { cwd: root });
   await command(["gh", "workflow", "run", "upgrade-consumers.yml", "--repo", `${owner}/platform`, "--ref", "main"]);
