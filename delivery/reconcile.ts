@@ -1,5 +1,5 @@
 import { projects, imageName } from "./catalog.ts";
-import { service, runtimeIdentity } from "./deploy.ts";
+import { service, runtimeIdentity, productionOrigin } from "./deploy.ts";
 import { google, accessToken } from "./google.ts";
 import { scanImage } from "./scan.ts";
 import { command } from "./process.ts";
@@ -32,6 +32,6 @@ const preview = await service(app, true);
 if (preview.template.serviceAccount !== runtimeIdentity(app, true)) throw new Error("Preview runtime identity drifted.");
 const response = await fetch(new URL("/livez", preview.uri), {redirect:"error",signal:AbortSignal.timeout(15_000)});
 if (![401,403].includes(response.status)) throw new Error("Preview accepts anonymous requests.");
-const health = await fetch(new URL("/livez", app.env.PUBLIC_ORIGIN ?? current.uri), {redirect:"error",signal:AbortSignal.timeout(20_000)});
+const health = await fetch(new URL("/livez", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
 if (!health.ok || !(await health.json() as {ok?:boolean}).ok) throw new Error("Production health failed.");
 console.log(JSON.stringify({event:"serving-application-verified",app:app.name,revisions:[...revisions]}));

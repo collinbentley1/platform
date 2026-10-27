@@ -8,3 +8,9 @@ test("manual verification uses the requested PR head instead of silently verifyi
   expect(await resolveSource("",main,read)).toEqual({sha:main,pr:"",reviewable:"false"});
   await expect(resolveSource("42;echo injected",main,read)).rejects.toThrow("Invalid requested");
 });
+
+ test("production probes use the application's configured public host",async()=>{
+ const {productionOrigin}=await import("../delivery/deploy.ts"); const {project}=await import("../delivery/catalog.ts");
+ expect(productionOrigin(project("virtual-care-mcp"),"https://internal-alias.run.app")).toBe("https://virtual-care-mcp-894875537243.us-east4.run.app");
+ expect(productionOrigin(project("cdbentley"),"https://internal-alias.run.app")).toBe("https://internal-alias.run.app");
+ });

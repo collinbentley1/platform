@@ -13,6 +13,8 @@ type Traffic = { revision?: string; percent?: number; tag?: string; type?: strin
 type Service = { name: string; etag: string; uri: string; traffic?: Traffic[]; trafficStatuses?: Traffic[]; template: { serviceAccount: string }; latestReadyRevision?: string };
 type Revision = { name: string; serviceAccount: string; containers: Array<{ image: string }>; conditions: Array<{ type: string; state: string }>; labels?: Record<string, string> };
 
+export function productionOrigin(app: Project, serviceUri: string): string { return app.env.PUBLIC_ORIGIN ?? app.env.PUBLIC_BASE_URL ?? serviceUri; }
+
 export function runtimeIdentity(app: Project, preview = false): string { return `${preview ? "preview" : "runtime"}-${app.service.slice(0, 20)}@${app.project}.iam.gserviceaccount.com`; }
 export function servicePath(app: Project, preview = false): string { return `projects/${app.project}/locations/${app.region}/services/${app.service}${preview ? "-preview-v1" : ""}`; }
 export async function service(app: Project, preview = false): Promise<Service> { return google<Service>(`https://run.googleapis.com/v2/${servicePath(app, preview)}`); }
@@ -116,9 +118,9 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     const current = await service(app);
     if (routed(current.trafficStatuses ?? []) !== routed([{ revision: revisionName, percent: 100 }])) throw new Error("Production route did not converge to the verified revision.");
     try {
-      await probe(app.env.PUBLIC_ORIGIN ?? current.uri, nonce);
-      if (app.identity) await ready(app.env.PUBLIC_ORIGIN ?? current.uri);
-      const root = await fetch(new URL("/", app.env.PUBLIC_ORIGIN ?? current.uri), {redirect:"error",signal:AbortSignal.timeout(20_000)});
+      await probe(productionOrigin(app, current.uri), nonce);
+      if (app.identity) await ready(productionOrigin(app, current.uri));
+      const root = await fetch(new URL("/", productionOrigin(app, current.uri)), {redirect:"error",signal:AbortSignal.timeout(20_000)});
       if (!root.ok || !root.headers.get("X-Request-ID")) throw new Error("Application entry route failed after promotion.");
     } catch (error) {
       const failed = await service(app);
@@ -135,7 +137,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
       throw error;
     }
     console.info(JSON.stringify({ event: "deployment-verified", app: app.name, revision: revisionName, source: evidence.sourceSha, platform: evidence.platformSha }));
-    return { url: app.env.PUBLIC_ORIGIN ?? current.uri, revision: revisionName };
+    return { url: productionOrigin(app, current.uri), revision: revisionName };
   } catch (error) {
     try {
       const current = await service(app, preview);
