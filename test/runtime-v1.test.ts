@@ -130,7 +130,7 @@ test("account data deletion removes only its owner's records", async () => {
 test("account recovery hides missing accounts but surfaces provider outages", async () => {
   const {managedIdentity}=await import("../runtime/identity.ts");
   const fetcher=globalThis.fetch;let status=400;let code="EMAIL_NOT_FOUND";
-  globalThis.fetch=(async()=>Response.json({error:{message:code}},{status})) as typeof fetch;
+  globalThis.fetch=(async(_input:unknown)=>Response.json({error:{message:code}},{status})) as typeof fetch;
   try {
     const provider=managedIdentity("demo-recovery-test","synthetic-key");
     await expect(provider.sendReset("synthetic@example.invalid")).resolves.toBeUndefined();

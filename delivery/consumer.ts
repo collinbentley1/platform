@@ -35,7 +35,10 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   /* Central installation-token upgrader owns release proposals. */
   files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n  issue_comment:\n    types: [created, edited]\n  pull_request_review:\n    types: [submitted]\n  pull_request_review_comment:\n    types: [created, edited, deleted]\n  schedule:\n    - cron: '7,22,37,52 * * * *'\n  workflow_dispatch:\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write");
   const runtimeDependencies=Object.keys((JSON.parse(files[".platform/runtime/package.json"]!) as {dependencies:Record<string,string>}).dependencies).sort();
-  files[".github/dependabot.yml"] = 'version: 2\nupdates:\n  - package-ecosystem: bun\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n    groups:\n      dependencies:\n        patterns: ["*"]\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "collinbentley1/platform/*"\n';
+  files[".github/dependabot.yml"] = Bun.YAML.stringify({version:2,updates:[
+    {"package-ecosystem":"bun",directory:"/",schedule:{interval:"weekly"},cooldown:{"default-days":7},groups:{dependencies:{patterns:["*"]}},ignore:runtimeDependencies.map(name=>({"dependency-name":name}))},
+    {"package-ecosystem":"github-actions",directory:"/",schedule:{interval:"weekly"},ignore:[{"dependency-name":"collinbentley1/platform/*"}]}
+  ]}).trimEnd()+"\n";
   files["tools/verify-socket-config.ts"] = 'const config = Bun.TOML.parse(await Bun.file("bunfig.toml").text()) as { install?: { registry?: string; minimumReleaseAge?: number; security?: unknown } };\nif (config.install?.registry !== "https://registry.npmjs.org" || config.install.minimumReleaseAge !== 604800 || config.install.security) throw new Error("Dependency policy differs from the managed platform contract.");\nexport {};\n';
   return files;
 }
