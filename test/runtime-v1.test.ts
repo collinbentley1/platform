@@ -127,6 +127,24 @@ test("account data deletion removes only its owner's records", async () => {
   } finally {store.close();await rm(root,{recursive:true,force:true});}
 });
 
+test("Firestore cleanup recognizes a completed final batch and keeps larger deletions retryable",async()=>{
+  const original=globalThis.fetch;
+  try{
+    for(const total of [9901,10000,10001]){
+      let remaining=total;
+      globalThis.fetch=(async(_input:unknown,init?:RequestInit)=>{
+        if(init?.method==="PATCH")return Response.json({});
+        if(init?.method==="POST"){remaining-=JSON.parse(String(init.body)).writes.length;return Response.json({});}
+        const documents=Array.from({length:Math.min(100,remaining)},(_,i)=>({name:`projects/demo-cleanup/databases/(default)/documents/records/alice/items/${i}`}));
+        return Response.json({documents,...(remaining>100?{nextPageToken:"more"}:{})});
+      }) as typeof fetch;
+      const store=firestoreStore("demo-cleanup","records",async()=>"synthetic-token");
+      if(total>10000){await expect(store.removeAll("alice")).rejects.toThrow("incomplete");expect(remaining).toBe(1);}
+      await store.removeAll("alice");expect(remaining).toBe(0);
+    }
+  }finally{globalThis.fetch=original;}
+});
+
 test("account recovery hides missing accounts but surfaces provider outages", async () => {
   const {managedIdentity}=await import("../runtime/identity.ts");
   const fetcher=globalThis.fetch;let status=400;let code="EMAIL_NOT_FOUND";
