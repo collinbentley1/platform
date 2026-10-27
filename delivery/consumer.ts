@@ -12,7 +12,7 @@ export function requireSha(sha: string): string { if (!shaPattern.test(sha)) thr
 export async function runtimeFiles(root: string): Promise<Record<string, string>> {
   const entries = await readdir(join(root, "runtime"), { withFileTypes: true });
   const files: Record<string, string> = {};
-  for (const entry of entries) {
+  for (const entry of entries.toSorted((a,b)=>a.name<b.name?-1:a.name>b.name?1:0)) {
     if (!entry.isFile() || !/^[a-z-]+\.(ts|json)$/.test(entry.name)) throw new Error("Invalid runtime package file.");
     files[`.platform/runtime/${entry.name}`] = await readFile(join(root, "runtime", entry.name), "utf8");
   }
