@@ -104,6 +104,7 @@ export async function upgrade(root: string, source: string, sha: string, options
     for (const path of removed) await unlink(join(root, path));
     for (const path of changed.filter(path => !removed.has(path) && path!=="package.json" && path!=="bun.lock")) { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), desired[path]!); }
     if(updateManifest) {
+      await regularText(root,"bun.lock"); // Refuse a credential-bearing job writing through a repository symlink.
       await writeFile(join(root,"package.json"),manifest!);
       // Resolve dependency metadata without consumer code or installation credentials.
       await command([process.execPath,"install","--lockfile-only","--ignore-scripts","--no-env-file","--minimum-release-age=604800","--registry=https://registry.npmjs.org"],{cwd:root,env:{PATH:"/usr/bin:/bin",GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_NOSYSTEM:"1"}});

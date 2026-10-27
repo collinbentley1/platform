@@ -29,10 +29,19 @@ export async function automatedReview(number: string, expectedHead: string): Pro
   return ![...latest.values()].includes("CHANGES_REQUESTED");
 }
 
+export function reviewRequestDue(comments: readonly {body:string;created_at:string;user:{id:number}}[],head:string,now=Date.now()): boolean {
+  const marker=`<!-- platform-review-head:${head} -->`;
+  const previous=comments.filter(comment=>comment.body.includes(marker)).at(-1);
+  if(!previous) return true;
+  const summary=comments.filter(comment=>comment.user.id===codexId && comment.body.includes("<!-- codex-pull-request-review-summary -->")).at(-1);
+  if(summary && (reviewedCommit(summary.body) || /\"status\":\"running\"/.test(summary.body))) return false;
+  return now-Date.parse(previous.created_at)>=4*60*60_000;
+}
+
 export async function requestReview(number: string, head: string): Promise<void> {
-  const comments = await pages<{ body: string }>(`/repos/${repository()}/issues/${number}/comments`);
+  const comments = await pages<{ body: string; created_at: string; user: {id:number} }>(`/repos/${repository()}/issues/${number}/comments`);
   const marker = `<!-- platform-review-head:${head} -->`;
-  if (!comments.some(comment => comment.body.includes(marker))) await api(`/repos/${repository()}/issues/${number}/comments`, "POST", { body: `@codex review\n\n${marker}` });
+  if (reviewRequestDue(comments,head)) await api(`/repos/${repository()}/issues/${number}/comments`, "POST", { body: `@codex review\n\n${marker}` });
 }
 
 export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promise<void> {
