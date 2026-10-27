@@ -7,7 +7,7 @@ import { validateCatalog } from "./catalog.ts";
 
 const root = resolve(import.meta.dir, "..");
 const owner = "collinbentley1";
-const installationUrls = ["https://github.com/settings/installations/175658023", "https://chatgpt.com/settings/code-review"];
+const installationUrls = ["https://github.com/settings/installations/175658023", "https://github.com/settings/installations/67956186", "https://github.com/settings/installations/137315361", "https://chatgpt.com/codex/cloud/settings/code-review"];
 export async function create(name: string, args: string[]): Promise<void> {
   const option = (key: string) => { const at = args.indexOf(key); return at < 0 ? undefined : args[at + 1]; };
   const projectId = option("--project");
