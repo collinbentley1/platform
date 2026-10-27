@@ -12,5 +12,6 @@ test("manual verification uses the requested PR head instead of silently verifyi
  test("production probes use the application's configured public host",async()=>{
  const {productionOrigin}=await import("../delivery/deploy.ts"); const {project}=await import("../delivery/catalog.ts");
  expect(productionOrigin(project("virtual-care-mcp"),"https://internal-alias.run.app")).toBe("https://virtual-care-mcp-894875537243.us-east4.run.app");
+ expect(productionOrigin(project("healthmcp"),"https://internal-alias.run.app")).toBe("https://medlock.ai");
  expect(productionOrigin(project("cdbentley"),"https://internal-alias.run.app")).toBe("https://internal-alias.run.app");
  });

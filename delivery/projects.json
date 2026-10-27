@@ -46,7 +46,8 @@
         "FIRESTORE_PROJECT_ID": "medlock-1025243085",
         "FIRESTORE_COLLECTION": "waitlist",
         "PLATFORM_DEPLOY_ENVIRONMENT": "production",
-        "WAITLIST_ACTIVATION_ENABLED": "false"
+        "WAITLIST_ACTIVATION_ENABLED": "false",
+        "PUBLIC_ORIGIN": "https://medlock.ai"
       },
       "secrets": {
         "WAITLIST_IDENTITY_KEYSET": "waitlist-identity-keyset:1"

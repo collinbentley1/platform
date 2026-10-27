@@ -32,6 +32,22 @@ export async function proposeUpgrade(source: string, release: { sha: string; tag
   if (existing.length === 1) return existing[0];
   if (existing.length > 1) throw new Error("Ambiguous upgrade proposal.");
   const base = await api<{ sha: string }>(`/repos/${repo}/commits/main`);
+  const references=await api<Array<{ref:string;object:{sha:string}}>>(`/repos/${repo}/git/matching-refs/heads/${branch}`);
+  const reference=references.find(value=>value.ref===`refs/heads/${branch}`);
+  let baseline=base.sha; let completedTree:string|undefined;
+  if(reference) {
+    const declined=await api<Array<{merged_at:string|null}>>(`/repos/${repo}/pulls?state=closed&head=collinbentley1:${branch}`);
+    if(declined.some(pr=>!pr.merged_at)) return undefined;
+    const ancestry=await api<{status:string}>(`/repos/${repo}/compare/${requireSha(reference.object.sha)}...${base.sha}`);
+    if(["ahead","identical"].includes(ancestry.status)) baseline=reference.object.sha;
+    else {
+      const commit=await api<{parents:Array<{sha:string}>;tree:{sha:string}}>(`/repos/${repo}/git/commits/${reference.object.sha}`);
+      if(commit.parents.length!==1) throw new Error("An interrupted upgrade branch has unexpected history.");
+      baseline=requireSha(commit.parents[0]!.sha); completedTree=commit.tree.sha;
+      const parent=await api<{status:string}>(`/repos/${repo}/compare/${baseline}...${base.sha}`);
+      if(!["ahead","identical"].includes(parent.status)) throw new Error("Interrupted upgrade is not based on protected main history.");
+    }
+  }
   const directory = await mkdtemp(join(tmpdir(), "platform-upgrade-"));
   try {
     const token = Bun.env.GH_TOKEN; if (!token) throw new Error("Upgrade installation token is missing.");
@@ -39,14 +55,20 @@ export async function proposeUpgrade(source: string, release: { sha: string; tag
     const git = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.required=false", "-c", "submodule.recurse=false", "-c", "protocol.file.allow=never"];
     await command([...git, "init", directory], { env });
     await command([...git, "remote", "add", "origin", `https://github.com/${repo}.git`], { cwd: directory, env });
-    await command([...git, "fetch", "--depth=1", "origin", requireSha(base.sha)], { cwd: directory, env });
+    await command([...git, "fetch", "--depth=1", "origin", requireSha(baseline)], { cwd: directory, env });
     await command([...git, "checkout", "--detach", "FETCH_HEAD"], { cwd: directory, env });
     const changed = await upgrade(directory, source, release.sha, { adopt });
     if (!changed.length) return undefined;
     const additions: Array<{path:string;contents:string}> = []; const deletions: Array<{path:string}> = [];
     for (const path of changed) { const content = await readFile(join(directory, path)).catch(error => { if(error.code === "ENOENT") return undefined; throw error; }); if(content) additions.push({path,contents:content.toString("base64")}); else deletions.push({path}); }
-    await api(`/repos/${repo}/git/refs`, "POST", { ref: `refs/heads/${branch}`, sha: base.sha });
-    await graphql(`mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}`, { input: { branch: { repositoryNameWithOwner: repo, branchName: branch }, expectedHeadOid: base.sha, message: { headline: `Update platform to ${release.tag}` }, fileChanges: { additions, deletions } } });
+    if(completedTree) {
+      await command([...git,"add","--all","--",...changed],{cwd:directory,env});
+      const expectedTree=await command([...git,"write-tree"],{cwd:directory,env});
+      if(expectedTree!==completedTree) throw new Error("Interrupted upgrade branch differs from the exact managed upgrade.");
+    } else {
+      if(!reference) await api(`/repos/${repo}/git/refs`, "POST", { ref: `refs/heads/${branch}`, sha: baseline });
+      await graphql(`mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid}}}`, { input: { branch: { repositoryNameWithOwner: repo, branchName: branch }, expectedHeadOid: baseline, message: { headline: `Update platform to ${release.tag}` }, fileChanges: { additions, deletions } } });
+    }
     return await api<PullRequest>(`/repos/${repo}/pulls`, "POST", { title: `Update platform to ${release.tag}`, head: branch, base: "main", body: `Updates the managed platform contract to ${release.tag}.` });
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
