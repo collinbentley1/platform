@@ -114,7 +114,7 @@ export async function catalogChange(change:string,title:string,mutate:(catalog:P
 }
 
 export async function deliver(name:string):Promise<void>{
-  await workflow("deliver.yml",`${owner}/platform`,["-f",`application=${name}`,"-f","force=true"]);
+  await workflow("deliver.yml",`${owner}/platform`,["-f",`application=${name}`]);
 }
 async function workflow(file:string,repository:string,fields:string[]=[]):Promise<void>{
   const result=await command(["gh","workflow","run",file,"--repo",repository,"--ref","main",...fields]);
