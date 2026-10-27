@@ -45,7 +45,13 @@ finally {
         if (cloning) { try { await operation(cloning,30*60_000); } catch(error) { console.error("Clone operation failed; attempting reserved-database cleanup:",error); } }
         const unlock = await ready(() => google<{name:string}>(`${base}/${name}?updateMask=deleteProtectionState`,"PATCH",{name,deleteProtectionState:"DELETE_PROTECTION_DISABLED"}));
         await operation(unlock);
-        const removal = await google<{name:string}>(`${base}/${name}`,"DELETE"); await operation(removal);
+        await google(`${base}/${name}`,"DELETE");
+        const deadline = Date.now() + 10 * 60_000;
+        for (;;) {
+          try { await google(`${base}/${name}`); } catch(error) { if (missing(error)) break; throw error; }
+          if (Date.now() >= deadline) throw new Error("Recovery clone deletion has not settled.");
+          await Bun.sleep(3000);
+        }
       }
       console.log(JSON.stringify({ event: "recovery-clone-removed", database: id }));
     }
