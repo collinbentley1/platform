@@ -10,8 +10,33 @@ on:
         default: ''
 permissions: {}
 jobs:
+  resolve:
+    name: Resolve application source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      pr: ${{ steps.source.outputs.pr }}
+      reviewable: ${{ steps.source.outputs.reviewable }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: collinbentley1/platform
+          ref: ${{ inputs.platform_sha }}
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_PR: ${{ inputs.pull_request || github.event.pull_request.number || '' }}
+          DEFAULT_SHA: ${{ github.sha }}
+        run: bun delivery/resolve-source.ts
   verify:
     name: Bun verify
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -19,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
           path: application
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -38,3 +63,25 @@ jobs:
         run: |
           bun ci --no-env-file --ignore-scripts --registry=https://registry.npmjs.org
           bun ../platform/tools/platform-v1.ts verify .
+  review:
+    name: Review admission
+    needs: resolve
+    if: needs.resolve.outputs.reviewable == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: collinbentley1/platform
+          ref: ${{ inputs.platform_sha }}
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - name: Establish head-bound review admission during first adoption
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+        run: bun delivery/review.ts "$PR_NUMBER"

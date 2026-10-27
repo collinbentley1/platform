@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler } from "../src/server.ts";
-import { sqliteStore } from "../.platform/runtime/data.ts";
+import { sqliteStore, memoryStore } from "../.platform/runtime/data.ts";
 
 test("a signed-in user can save, retry, and delete a durable note without exposing another user's records", async () => {
   const root = await mkdtemp(join(tmpdir(), "application-test-")); const store = await sqliteStore(join(root, "notes.sqlite"));
@@ -32,4 +32,20 @@ test("a signed-in user can save, retry, and delete a durable note without exposi
 
 test("development authentication cannot be exposed on a public origin", () => {
   expect(() => createHandler({ origin: "https://application.example", publicDirectory: "./public", development: true }, {} as never)).toThrow("loopback");
+});
+
+test("TLS termination retains secure host-only sessions and rejects forged hosts and cross-site origins", async () => {
+  const origin = "https://application.example";
+  const handler = createHandler({origin,publicDirectory:"./public",development:false}, {
+    store:memoryStore(),verify:async token=>({id:token}),signIn:async()=>"verified-identity",
+  });
+  const login = await handler(new Request("http://application.example/api/session",{method:"POST",headers:{Origin:origin,"Content-Type":"application/json"},body:JSON.stringify({email:"test@example.invalid",password:"synthetic"})}));
+  expect(login.status).toBe(200);
+  expect(login.headers.get("Set-Cookie")).toContain("__Host-platform-session=verified-identity");
+  expect(login.headers.get("Set-Cookie")).toContain("Secure");
+  expect(login.headers.get("Strict-Transport-Security")).toBeTruthy();
+  const session = await handler(new Request("http://application.example/api/session",{headers:{Cookie:"__Host-platform-session=verified-identity"}}));
+  expect(session.status).toBe(200);
+  expect((await handler(new Request("http://forged.example/api/session"))).status).toBe(403);
+  expect((await handler(new Request("http://application.example/api/session",{method:"DELETE",headers:{Origin:"https://sibling.example"}}))).status).toBe(403);
 });

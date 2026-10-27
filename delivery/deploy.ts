@@ -7,6 +7,7 @@ import { google, operation } from "./google.ts";
 import { scanImage } from "./scan.ts";
 import { api } from "./github.ts";
 import type { ImageEvidence } from "./oci.ts";
+import { latestRelease } from "./upgrade.ts";
 
 type Traffic = { revision?: string; percent?: number; tag?: string; type?: string };
 type Service = { name: string; etag: string; uri: string; traffic?: Traffic[]; trafficStatuses?: Traffic[]; template: { serviceAccount: string }; latestReadyRevision?: string };
@@ -28,6 +29,11 @@ export async function requireCurrentSource(app: Project, evidence: ImageEvidence
     const value = await api<{ state: string; draft: boolean; head: { sha: string; repo: { id: number } }; base: { ref: string } }>(`/repos/collinbentley1/${repo}/pulls/${pr}`);
     if (value.state !== "open" || value.draft || value.base.ref !== "main" || String(value.head.repo.id) !== app.repositoryId || value.head.sha !== evidence.sourceSha) throw new Error("Preview head is stale or no longer eligible.");
   } else {
+    if (app.sourceDirectory) {
+      const release = await latestRelease();
+      if (evidence.sourceSha !== release.sha || evidence.platformSha !== release.sha) throw new Error("Reference application source differs from the published release.");
+      return;
+    }
     const head = await api<{ sha: string }>(`/repos/collinbentley1/${repo}/commits/main`);
     if (head.sha !== evidence.sourceSha) throw new Error("Application head changed while this deployment was running.");
   }

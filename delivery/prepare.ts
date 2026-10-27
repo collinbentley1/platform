@@ -29,12 +29,12 @@ async function plan(): Promise<void> {
       const pull = await api<{ state: string; draft: boolean; head: { sha: string; repo: { id: number } }; base: { ref: string } }>(`/repos/collinbentley1/${repo}/pulls/${pr}`);
       if (pull.state !== "open" || pull.draft || pull.base.ref !== "main" || String(pull.head.repo.id) !== app.repositoryId) throw new Error("Preview is not an eligible same-repository pull request.");
       sha = requireSha(pull.head.sha);
-    } else sha = requireSha((await api<{ sha: string }>(`/repos/collinbentley1/${repo}/commits/main`)).sha);
+    } else sha = app.sourceDirectory ? release.sha : requireSha((await api<{ sha: string }>(`/repos/collinbentley1/${repo}/commits/main`)).sha);
     if (!pr && Bun.env.PLATFORM_FORCE !== "true") {
       try { const response = await fetch(`https://${app.service}-${app.number}.${app.region}.run.app/livez`, {redirect:"error",signal:AbortSignal.timeout(10_000)}); if(response.ok && response.headers.get("X-Platform-Source") === sha && response.headers.get("X-Platform-Release") === release.sha) continue; } catch {}
     }
     if (!await eligible(app, sha)) { if (selected) throw new Error("Application checks have not passed."); continue; }
-    items.push({ app: app.name, sha, release: release.sha, project: app.project, number: app.number, pr });
+    items.push({ app: app.name, sha, release: app.sourceDirectory ? sha : release.sha, project: app.project, number: app.number, pr });
   }
   await output({ matrix: JSON.stringify({ include: items }), ready: String(items.length > 0) });
 }
@@ -43,6 +43,7 @@ async function source(): Promise<void> {
   const sha = requireSha(Bun.env.SOURCE_SHA ?? ""); const release = requireSha(Bun.env.RELEASE_SHA ?? "");
   const directory = resolve(Bun.env.APPLICATION_DIRECTORY ?? "application");
   if (app.sourceDirectory) {
+    if (sha !== release) throw new Error("Reference application and generated runtime must use the same exact source.");
     await command(["bun", "tools/platform-v1.ts", "init", "platform-reference", directory, "--sha", release], { cwd: resolve("release") });
   } else {
     await mkdir(directory, { recursive: false });

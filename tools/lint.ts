@@ -14,7 +14,7 @@ for(const file of await readdir(join(root,".github/workflows"))) {
 const docker=await readFile(join(root,"delivery/Dockerfile"),"utf8");
 const stages = new Set<string>();
 for(const line of docker.split("\n").filter(line=>line.startsWith("FROM "))) {
-  const match = /^FROM ([^\s]+)(?: AS ([a-z-]+))?$/.exec(line);
+  const match = /^FROM (?:--platform=\$BUILDPLATFORM )?([^\s]+)(?: AS ([a-z-]+))?$/.exec(line);
   if(!match || (!stages.has(match[1]!) && !/@sha256:[a-f0-9]{64}$/.test(match[1]!))) throw new Error("Container bases must be digest-pinned.");
   if(match[2]) stages.add(match[2]);
 }
