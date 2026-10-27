@@ -125,7 +125,7 @@ jobs:
         run: |
           docker buildx create --name platform --driver docker-container --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 --use
           docker buildx build --platform linux/amd64 --provenance=false --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "io.collinbentley.platform.revision=$RELEASE_SHA" --output "type=oci,dest=$RUNNER_TEMP/image.oci.tar" application
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: image-${{ matrix.app }}
           path: ${{ runner.temp }}/image.oci.tar
@@ -179,7 +179,7 @@ jobs:
         env:
           EVIDENCE: ${{ steps.publish.outputs.evidence }}
         run: printenv EVIDENCE > "$RUNNER_TEMP/evidence.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: evidence-${{ matrix.app }}
           path: ${{ runner.temp }}/evidence.json
