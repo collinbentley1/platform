@@ -214,7 +214,7 @@ resource "google_cloud_run_v2_service" "app" {
       resources { limits = { cpu = "1", memory = "512Mi" } }
     }
   }
-  lifecycle { ignore_changes = [ingress, template[0].service_account, template[0].containers[0].image, template[0].containers[0].env, template[0].labels, traffic, labels, client, client_version] }
+  lifecycle { ignore_changes = [ingress, template[0].revision, template[0].service_account, template[0].containers[0].image, template[0].containers[0].env, template[0].labels, traffic, labels, client, client_version] }
 }
 resource "google_cloud_run_v2_service" "preview" {
   for_each             = local.apps
@@ -238,7 +238,7 @@ resource "google_cloud_run_v2_service" "preview" {
       resources { limits = { cpu = "1", memory = "512Mi" } }
     }
   }
-  lifecycle { ignore_changes = [template[0].containers[0].image, template[0].containers[0].env, template[0].labels, traffic, labels, client, client_version] }
+  lifecycle { ignore_changes = [template[0].revision, template[0].containers[0].image, template[0].containers[0].env, template[0].labels, traffic, labels, client, client_version] }
 }
 resource "google_cloud_run_v2_service_iam_member" "deploy" {
   for_each = local.apps
