@@ -1,5 +1,8 @@
 import { test, expect } from "bun:test";
 import { ensureCloudRunCap } from "../delivery/operations.ts";
+import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 const app = { project: "test-project", number: "123456789" };
 const account = "billingAccounts/000000-111111-222222";
@@ -74,4 +77,26 @@ test("duplicate caps across pages cannot create another cap", async () => {
     return structuredClone({ budgets: [cap()], ...(!token ? { nextPageToken: "next" } : {}) }) as T;
   };
   await expect(ensureCloudRunCap(app, account, request)).rejects.toThrow("ambiguous");
+});
+
+test("onboarding uses normal delivery while credential changes can explicitly force it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "platform-delivery-arguments-"));
+  const calls = join(directory, "calls.jsonl");
+  try {
+    await writeFile(join(directory, "gh"), '#!/usr/bin/env bun\nimport {appendFileSync} from "node:fs";\nappendFileSync(Bun.env.PLATFORM_TEST_GH_CALLS,JSON.stringify(Bun.argv.slice(2))+"\\n");\nif(Bun.argv[2]==="workflow")console.log("https://github.com/collinbentley1/platform/actions/runs/123");\n', { mode: 0o700 });
+    for (const force of [false, true]) {
+      await writeFile(calls, "");
+      const script = `import {deliver} from ${JSON.stringify(resolve(import.meta.dir, "../delivery/create.ts"))}; await deliver("test-app"${force ? ",{force:true}" : ""});`;
+      const child = Bun.spawn([process.execPath, "-e", script], { env: { ...process.env, PATH: `${directory}:${process.env.PATH}`, PLATFORM_TEST_GH_CALLS: calls }, stdout: "pipe", stderr: "pipe" });
+      const [status, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect({ status, error }).toEqual({ status: 0, error: "" });
+      expect(output).toContain("workflow-started");
+      const recorded = (await readFile(calls, "utf8")).trim().split("\n").map(line => JSON.parse(line) as string[]);
+      expect(recorded).toHaveLength(2);
+      expect(recorded[0]!.slice(0, 3)).toEqual(["workflow", "run", "deliver.yml"]);
+      expect(recorded[0]).toContain("application=test-app");
+      expect(recorded[0]!.includes("force=true")).toBe(force);
+      expect(recorded[1]!.slice(0, 3)).toEqual(["run", "watch", "123"]);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });

@@ -22,6 +22,6 @@ export async function rotate(name: string, key: string): Promise<void> {
     if(!target || target.project!==app.project || target.secrets[key]!==current)throw new Error("Secret configuration changed; review before retrying.");
     target.secrets[key]=`${id}:${number}`;return true;
   });
-  await deliver(name);
+  await deliver(name,{force:true});
   console.log(JSON.stringify({event:"secret-rotation-deployed",app:name,key,version:number,previousVersion:current.split(":")[1],note:"The prior version remains available for rollback. Disable it with gcloud after any application-specific overlap window."}));
 }
