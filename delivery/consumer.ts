@@ -45,11 +45,17 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
 
 
 export function runtimeManifest(text: string, runtime: string, packageManager: string): string {
-  const value=JSON.parse(text) as {dependencies?:Record<string,string>;packageManager?:string};
+  const value=JSON.parse(text) as {dependencies?:Record<string,string>;devDependencies?:Record<string,string>;packageManager?:string};
   const dependencies=(JSON.parse(runtime) as {dependencies:Record<string,string>}).dependencies;
   if(!value || typeof value!=="object" || Array.isArray(value) || !dependencies || Object.values(dependencies).some(version=>!/^\d+\.\d+\.\d+$/.test(version))) throw new Error("Invalid runtime dependency manifest.");
-  if(value.packageManager===packageManager && Object.entries(dependencies).every(([name,version])=>value.dependencies?.[name]===version)) return text;
-  value.dependencies={...value.dependencies,...dependencies}; value.packageManager=packageManager;
+  if(value.packageManager===packageManager && Object.entries(dependencies).every(([name,version])=>(value.dependencies?.[name] ?? value.devDependencies?.[name])===version)) return text;
+  // Product manifests declare which runtime capabilities ship in production.
+  // Keep every managed module available for typechecking without shipping unused SDKs.
+  for(const [name,version] of Object.entries(dependencies)) {
+    if(Object.hasOwn(value.dependencies ?? {},name)) value.dependencies![name]=version;
+    else (value.devDependencies ??= {})[name]=version;
+  }
+  value.packageManager=packageManager;
   return JSON.stringify(value,null,2)+"\n";
 }
 
