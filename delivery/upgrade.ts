@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { api, graphql, pages, GitHubError, repository, pullRequest, type PullRequest } from "./github.ts";
 import { upgrade, requireSha } from "./consumer.ts";
 import { command } from "./process.ts";
-import { automatedReview, requestReview } from "./review.ts";
+import { automatedReview, requestReview, consumerReviewCheck } from "./review.ts";
 
 type Check = { name: string; status: string; conclusion: string | null; app: { id: number }; id: number };
 export function checksPassed(checks: readonly Check[], required: readonly { context: string; app_id: number | null }[]): boolean {
@@ -80,7 +80,7 @@ export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_
   await requestReview(prNumber, head);
   const rules = await api<{ required_status_checks?: { checks: Array<{ context: string; app_id: number | null }> } }>(`/repos/${repository()}/branches/main/protection`);
   const required = rules.required_status_checks?.checks ?? [];
-  if (!required.some(rule => rule.context === "Automated review" && rule.app_id === 15368)) throw new Error("Automatic upgrades require the trusted automated-review check.");
+  if (!required.some(rule => [consumerReviewCheck,"Automated review"].includes(rule.context) && rule.app_id === 15368)) throw new Error("Automatic upgrades require the trusted automated-review check.");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const current = await pullRequest(prNumber); if (current.head.sha !== head) throw new Error("Upgrade head changed.");

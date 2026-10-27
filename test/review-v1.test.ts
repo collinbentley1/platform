@@ -29,9 +29,20 @@ test("interrupted review refreshes remain recoverable without taking over a huma
   expect(recoverableReviewDraft([{...pending,body:`<!-- platform-review-head:${head} -->`}],head,123)).toBeUndefined();
 });
 
+test("a pending review fails the native job without publishing a separate check",async()=>{
+  const {reviewGate}=await import("../delivery/review.ts"),original=globalThis.fetch,token=Bun.env.GH_TOKEN,target=Bun.env.PLATFORM_TARGET_REPOSITORY;
+  Bun.env.GH_TOKEN="synthetic-test-token";Bun.env.PLATFORM_TARGET_REPOSITORY="collinbentley1/cdbentley";
+  globalThis.fetch=(async(_input:unknown,options?:RequestInit)=>{
+    if(options?.method!=="GET")throw new Error("Review admission must remain read-only");
+    return Response.json({state:"open",draft:false,head:{sha:"a".repeat(40),repo:{id:1}},base:{ref:"main",repo:{id:1}}});
+  }) as typeof fetch;
+  try{await expect(reviewGate("1",0)).rejects.toThrow("still pending");}
+  finally{globalThis.fetch=original;if(token===undefined)delete Bun.env.GH_TOKEN;else Bun.env.GH_TOKEN=token;if(target===undefined)delete Bun.env.PLATFORM_TARGET_REPOSITORY;else Bun.env.PLATFORM_TARGET_REPOSITORY=target;}
+});
+
 test("scheduled admission reruns an eligible workflow after bare resolution or reopening",async()=>{
   const {reviewSweep}=await import("../delivery/review.ts");const original=globalThis.fetch,token=Bun.env.GH_TOKEN,target=Bun.env.PLATFORM_TARGET_REPOSITORY;
-  const head="a".repeat(40);let resolved=true,writes=0;let previous={id:1,name:"Automated review",app:{id:15368},status:"completed",conclusion:"failure"};
+  const head="a".repeat(40);let resolved=true,writes=0;let previous={id:1,name:"Automated review / Review admission",app:{id:15368},status:"completed",conclusion:"failure"};
   const pr={number:1,state:"open",draft:false,head:{sha:head,ref:"fixture",repo:{id:1}},base:{ref:"main",repo:{id:1}}};
   Bun.env.GH_TOKEN="synthetic-test-token";Bun.env.PLATFORM_TARGET_REPOSITORY="collinbentley1/cdbentley";
   globalThis.fetch=(async(input:unknown,options?:RequestInit)=>{

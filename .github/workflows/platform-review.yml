@@ -4,6 +4,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   pull_request_review:
     types: [submitted, edited, dismissed]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
@@ -13,13 +17,14 @@ concurrency:
   cancel-in-progress: true
 jobs:
   review:
+    name: ${{ (github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review') && 'review' || 'Refresh review admission' }}
     if: vars.PLATFORM_REVIEW_GATE_READY == 'true' && (github.event.pull_request || github.event.issue.pull_request || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     permissions:
       contents: read
       pull-requests: read
-      checks: write
+      checks: read
       actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

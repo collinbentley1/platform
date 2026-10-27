@@ -1,5 +1,6 @@
 import { command, github } from "./process.ts";
 import { projects, platformRepositoryId } from "./catalog.ts";
+import {consumerReviewCheck,platformReviewCheck} from "./review.ts";
 
 const actions = [
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -30,7 +31,7 @@ export async function settings(name: string): Promise<void> {
   await write(`${path}/automated-security-fixes`);
   if (name === "platform") {
     const current=await github<{required_status_checks:{checks:Array<{context:string;app_id:number|null}>}}>(`${path}/branches/main/protection`);
-    const checks=[...current.required_status_checks.checks.filter(check=>!["Browser application","CodeQL"].includes(check.context)),{context:"Browser application",app_id:15368},{context:"CodeQL",app_id:57789}];
+    const checks=[...current.required_status_checks.checks.filter(check=>!["Automated review",platformReviewCheck,"Browser application","CodeQL"].includes(check.context)),{context:platformReviewCheck,app_id:15368},{context:"Browser application",app_id:15368},{context:"CodeQL",app_id:57789}];
     await write(`${path}/branches/main/protection/required_status_checks`,{strict:true,checks},"PATCH");
   }
   if (name !== "platform") {
@@ -41,8 +42,8 @@ export async function settings(name: string): Promise<void> {
       await write(`${path}/branches/main/protection`,{required_status_checks:{strict:true,checks:[]},enforce_admins:true,required_pull_request_reviews:null,restrictions:null,allow_force_pushes:false,allow_deletions:false});
       existing = await github(`${path}/branches/main/protection`);
     }
-    const replaced = new Set(["CodeQL","Bun verify / Bun verify","Automated review","infrastructure / Terraform validate","infrastructure / Checkov","Socket Firewall / Socket Firewall","Socket Security: Project Report","Socket Security: Pull Request Alerts"]);
-    const checks = [...existing.required_status_checks.checks.filter(check=>!replaced.has(check.context)),{context:"CodeQL",app_id:57789},{context:"Bun verify / Bun verify",app_id:15368},{context:"Automated review",app_id:15368},{context:"Socket Security: Project Report",app_id:156372},{context:"Socket Security: Pull Request Alerts",app_id:156372}];
+    const replaced = new Set(["CodeQL","Bun verify / Bun verify","Automated review",consumerReviewCheck,"infrastructure / Terraform validate","infrastructure / Checkov","Socket Firewall / Socket Firewall","Socket Security: Project Report","Socket Security: Pull Request Alerts"]);
+    const checks = [...existing.required_status_checks.checks.filter(check=>!replaced.has(check.context)),{context:"CodeQL",app_id:57789},{context:"Bun verify / Bun verify",app_id:15368},{context:consumerReviewCheck,app_id:15368},{context:"Socket Security: Project Report",app_id:156372},{context:"Socket Security: Pull Request Alerts",app_id:156372}];
     await write(`${path}/branches/main/protection/required_status_checks`,{strict:true,checks},"PATCH");
     const rulesets=await github<Array<{id:number;name:string}>>(`${path}/rulesets`);
     for(const entry of rulesets.filter(entry=>entry.name==="Require trusted review for non-owner pull requests")) {
