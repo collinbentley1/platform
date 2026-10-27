@@ -273,3 +273,44 @@ resource "google_firestore_backup_schedule" "daily" {
   retention = "604800s"
   daily_recurrence {}
 }
+
+resource "google_firestore_field" "waitlist_expiry" {
+  for_each   = contains(keys(local.apps), "healthmcp") ? toset(["waitlist", "waitlist_quota"]) : toset([])
+  project    = var.project_id
+  database   = google_firestore_database.application[0].name
+  collection = each.value
+  field      = "expiresAt"
+  ttl_config {}
+  index_config {}
+}
+
+resource "google_identity_platform_config" "waitlist" {
+  count   = contains(keys(local.apps), "healthmcp") ? 1 : 0
+  project = var.project_id
+  sign_in {
+    allow_duplicate_emails = false
+    email {
+      enabled           = true
+      password_required = false
+    }
+  }
+  authorized_domains = ["medlock.ai", "www.medlock.ai"]
+  depends_on         = [google_project_service.services]
+}
+
+resource "google_recaptcha_enterprise_key" "waitlist" {
+  count           = contains(keys(local.apps), "healthmcp") ? 1 : 0
+  project         = var.project_id
+  display_name    = "Medlock waitlist ownership"
+  deletion_policy = "PREVENT"
+  web_settings {
+    integration_type  = "SCORE"
+    allow_all_domains = false
+    allow_amp_traffic = false
+    allowed_domains   = ["medlock.ai"]
+  }
+  depends_on = [google_project_service.services]
+}
+output "waitlist_site_key" {
+  value = try(google_recaptcha_enterprise_key.waitlist[0].name, null)
+}

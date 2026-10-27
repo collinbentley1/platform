@@ -92,6 +92,6 @@ export function firestoreStore(project: string, collection = "platform_records",
       if (!response.ok) throw new Error("Data unavailable."); return decode(JSON.parse(await readText(response, 262_144)) as Parameters<typeof decode>[0]);
     },
     async remove(owner, id) { recordId(id); const result = await call(`${base}/${ownerPath(owner)}/${id}`, { method: "DELETE" }); if (!result.ok && result.status !== 404) throw new Error("Data unavailable."); },
-    async ready() { const response = await call(`${base}/${collection}/_health`); if (!response.ok && response.status !== 404) throw new Error("Data unavailable."); }, close() {},
+    async ready() { const response = await call(`${base}/${collection}?pageSize=1&mask.fieldPaths=createdAt`); if (!response.ok) throw new Error("Data unavailable."); await response.body?.cancel(); }, close() {},
   };
 }

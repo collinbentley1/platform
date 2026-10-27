@@ -31,8 +31,10 @@ export async function provision(projectId: string, apply = false): Promise<void>
       const current = await google<{ latestReadyRevision?: string }>(`https://run.googleapis.com/v2/projects/${app.project}/locations/${app.region}/services/${app.service}`);
       const revision = current.latestReadyRevision;
       if (!revision) throw new Error("The existing service has no ready revision.");
-      const value = await gcloud<{ status: { imageDigest: string } }>(["run", "revisions", "describe", revision.split("/").at(-1)!, `--project=${app.project}`, `--region=${app.region}`]);
-      images[app.name] = value.status.imageDigest;
+      const value = await google<{containers:Array<{image:string}>}>(`https://run.googleapis.com/v2/${revision}`);
+      const image = value.containers[0]?.image;
+      if (!image || !/@sha256:[a-f0-9]{64}$/.test(image)) throw new Error("Existing revision does not resolve to an immutable image.");
+      images[app.name] = image;
       existing.add(app.name);
     } catch (error) { if (error instanceof GoogleError && error.status === 404) images[app.name] = bootstrap; else throw error; }
   }
@@ -60,6 +62,8 @@ export async function provision(projectId: string, apply = false): Promise<void>
   console.log(JSON.stringify({ project: projectId, changes: changes.map(change => ({ address: change.address, actions: change.change.actions })), artifacts }));
   if (apply) {
     await terraform(["apply", "-input=false", "-auto-approve", planFile]);
+    const { environments } = await import("./environments.ts");
+    await environments(apps);
     console.log(JSON.stringify({ event: "enrollment-applied", project: projectId }));
   }
   // Keep private plans for owner inspection; never place state or plans in the repository.

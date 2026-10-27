@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpError, readJson, secureHandler, serveStatic, requireOrigin } from "../runtime/http.ts";
 import { identityVerifier, sessionCookie, sessionToken } from "../runtime/auth.ts";
-import { sqliteStore } from "../runtime/data.ts";
+import { sqliteStore, firestoreStore } from "../runtime/data.ts";
 
 describe("shared application boundaries", () => {
   test("bounds streamed input without trusting content length and rejects malformed UTF-8", async () => {
@@ -62,4 +62,29 @@ test("durable records isolate users and make repeated creates idempotent", async
     expect(await store.list("bob")).toEqual([]); await store.remove("bob", id); expect((await store.list("alice")).length).toBe(1);
     store.close(); store = await sqliteStore(path); expect(await store.list("alice")).toEqual([record]);
   } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("Cloud Run TLS termination keeps HSTS without trusting forwarded request headers",async()=>{
+  const previous=Bun.env.K_SERVICE;
+  try{
+    Bun.env.K_SERVICE="synthetic-cloud-run";
+    const response=await secureHandler(()=>new Response("ok"))(new Request("http://app.example/"));
+    expect(response.headers.get("Strict-Transport-Security")).toBe("max-age=31536000");
+  }finally{if(previous===undefined)delete Bun.env.K_SERVICE;else Bun.env.K_SERVICE=previous;}
+});
+
+test("Firestore readiness requires a successful database operation, including on an empty store",async()=>{
+  const original=globalThis.fetch;let status=404;
+  globalThis.fetch=(async(input:unknown)=>{
+    const url=new URL(String(input));
+    expect(url.pathname).toBe("/v1/projects/demo-project/databases/(default)/documents/platform_records");
+    expect(url.searchParams.get("pageSize")).toBe("1");
+    return Response.json(status===200?{documents:[]}:{error:{status:"NOT_FOUND"}},{status});
+  }) as typeof fetch;
+  try{
+    const store=firestoreStore("demo-project","platform_records",async()=>"synthetic-test-identity");
+    await expect(store.ready()).rejects.toThrow("Data unavailable");
+    status=403;await expect(store.ready()).rejects.toThrow("Data unavailable");
+    status=200;await expect(store.ready()).resolves.toBeUndefined();
+  }finally{globalThis.fetch=original;}
 });

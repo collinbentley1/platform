@@ -129,5 +129,15 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     }
     console.info(JSON.stringify({ event: "deployment-verified", app: app.name, revision: revisionName, source: evidence.sourceSha, platform: evidence.platformSha }));
     return { url: app.env.PUBLIC_ORIGIN ?? current.uri, revision: revisionName };
+  } catch (error) {
+    try {
+      const current = await service(app, preview);
+      if (current.trafficStatuses?.some(item=>item.tag===tag&&item.revision?.split("/").at(-1)===revisionName&&(item.percent??0)===0)) {
+        const traffic=current.trafficStatuses.filter(item=>!(item.tag===tag&&item.revision?.split("/").at(-1)===revisionName)).map(item=>({type:"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",revision:item.revision?.split("/").at(-1),...(item.percent===undefined?{}:{percent:item.percent}),...(item.tag?{tag:item.tag}:{})}));
+        const cleanup=await google<{name:string}>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`,"PATCH",{name,etag:current.etag,traffic});
+        await operation(cleanup.name);
+      }
+    } catch { console.error(JSON.stringify({event:"failed-candidate-cleanup-needs-attention",app:app.name,revision:revisionName})); }
+    throw error;
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
