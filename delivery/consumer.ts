@@ -104,6 +104,7 @@ export async function upgrade(root: string, source: string, sha: string, options
     const path = `.github/workflows/${file}`;
     if (!Object.hasOwn(desired, path) && await regularText(root, path) !== undefined) { changed.push(path); removed.add(path); }
   }
+  for (const path of ["tools/socket-security-scanner.ts", "tools/platform-verify.ts"]) if (await regularText(root,path)!==undefined) { changed.push(path); removed.add(path); }
   for (const path of Object.keys(previous?.managed ?? {})) if (!Object.hasOwn(desired, path) && !removed.has(path)) { changed.push(path); removed.add(path); }
   if(updateManifest) changed.push("package.json","bun.lock");
   if(nextAgents!==agents) changed.push("AGENTS.md");
