@@ -29,7 +29,7 @@ provider "google" {
 }
 
 resource "google_project_service" "services" {
-  for_each           = toset(concat(["run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : [], length(local.secrets) > 0 ? ["secretmanager.googleapis.com"] : [], contains(keys(local.apps), "healthmcp") ? ["identitytoolkit.googleapis.com", "recaptchaenterprise.googleapis.com", "secretmanager.googleapis.com"] : []))
+  for_each           = toset(concat(["cloudresourcemanager.googleapis.com", "run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : [], length(local.secrets) > 0 ? ["secretmanager.googleapis.com"] : [], contains(keys(local.apps), "healthmcp") ? ["identitytoolkit.googleapis.com", "recaptchaenterprise.googleapis.com", "secretmanager.googleapis.com"] : []))
   project            = var.project_id
   service            = each.key
   disable_on_destroy = false
@@ -54,16 +54,27 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   oidc { issuer_uri = "https://token.actions.githubusercontent.com" }
 }
 
-resource "google_service_account" "publish" { account_id = "platform-publish" }
-resource "google_service_account" "deploy" { account_id = "platform-deploy" }
-resource "google_service_account" "audit" { account_id = "platform-audit" }
+resource "google_service_account" "publish" {
+  account_id = "platform-publish"
+  depends_on = [google_project_service.services]
+}
+resource "google_service_account" "deploy" {
+  account_id = "platform-deploy"
+  depends_on = [google_project_service.services]
+}
+resource "google_service_account" "audit" {
+  account_id = "platform-audit"
+  depends_on = [google_project_service.services]
+}
 resource "google_service_account" "runtime" {
   for_each   = local.apps
   account_id = "runtime-${substr(each.value.service, 0, 20)}"
+  depends_on = [google_project_service.services]
 }
 resource "google_service_account" "preview" {
   for_each   = local.apps
   account_id = "preview-${substr(each.value.service, 0, 20)}"
+  depends_on = [google_project_service.services]
 }
 
 resource "google_service_account_iam_member" "publish_wif" {
@@ -124,11 +135,13 @@ resource "google_project_iam_custom_role" "deploy" {
   role_id     = "platformServiceUpdate"
   title       = "Update the reviewed application service"
   permissions = ["run.services.get", "run.services.update"]
+  depends_on  = [google_project_service.services]
 }
 resource "google_project_iam_custom_role" "read" {
   role_id     = "platformDeliveryRead"
   title       = "Read deployment and vulnerability status"
   permissions = ["run.services.get", "run.revisions.get", "run.operations.get", "containeranalysis.occurrences.get", "containeranalysis.occurrences.list"]
+  depends_on  = [google_project_service.services]
 }
 resource "google_project_iam_member" "read" {
   for_each = { deploy = google_service_account.deploy.email, audit = google_service_account.audit.email }
@@ -185,6 +198,10 @@ resource "google_cloud_run_v2_service" "app" {
   location             = each.value.region
   deletion_protection  = true
   invoker_iam_disabled = false
+  scaling {
+    min_instance_count = 0
+    max_instance_count = local.catalog.defaults.productionMaxInstances
+  }
   template {
     service_account = google_service_account.runtime[each.key].email
     scaling {
@@ -205,6 +222,10 @@ resource "google_cloud_run_v2_service" "preview" {
   location             = each.value.region
   deletion_protection  = false
   invoker_iam_disabled = false
+  scaling {
+    min_instance_count = 0
+    max_instance_count = local.catalog.defaults.previewMaxInstances
+  }
   template {
     service_account = google_service_account.preview[each.key].email
     scaling {
@@ -260,6 +281,7 @@ resource "google_project_iam_custom_role" "identity_runtime" {
   role_id     = "platformAccountLifecycle"
   title       = "Managed application account lifecycle"
   permissions = ["firebaseauth.users.get", "firebaseauth.users.update", "firebaseauth.users.delete", "serviceusage.services.use"]
+  depends_on  = [google_project_service.services]
 }
 resource "google_project_iam_member" "identity_runtime" {
   for_each = { for name, app in local.apps : name => app if try(app.identity, false) }
