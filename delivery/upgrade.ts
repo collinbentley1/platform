@@ -77,8 +77,9 @@ export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_
     }
     if (checksPassed(checks, required) && await automatedReview(prNumber, head)) {
       const latest = await pullRequest(prNumber); if (latest.head.sha !== head) throw new Error("Upgrade head changed before merge admission.");
-      await graphql(`mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){pullRequest{number}}}`, { id: latest.node_id });
-      console.log(JSON.stringify({ event: "upgrade-auto-merge-enabled", repository: repository(), pullRequest: prNumber, head })); return;
+      const merged=await api<{merged:boolean}>(`/repos/${repository()}/pulls/${prNumber}/merge`,"PUT",{sha:head,merge_method:"squash"});
+      if(!merged.merged) throw new Error("Verified automatic merge did not complete.");
+      console.log(JSON.stringify({ event: "upgrade-auto-merged", repository: repository(), pullRequest: prNumber, head })); return;
     }
     await Bun.sleep(20_000);
   }

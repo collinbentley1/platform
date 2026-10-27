@@ -29,6 +29,14 @@ export async function settings(name: string): Promise<void> {
     const replaced = new Set(["Bun verify / Bun verify","Automated review","infrastructure / Terraform validate","infrastructure / Checkov","Socket Firewall / Socket Firewall","Socket Security: Project Report","Socket Security: Pull Request Alerts"]);
     const checks = [...existing.required_status_checks.checks.filter(check=>!replaced.has(check.context)),{context:"Bun verify / Bun verify",app_id:15368},{context:"Automated review",app_id:15368},{context:"Socket Security: Project Report",app_id:156372},{context:"Socket Security: Pull Request Alerts",app_id:156372}];
     await write(`${path}/branches/main/protection/required_status_checks`,{strict:true,checks},"PATCH");
+    const rulesets=await github<Array<{id:number;name:string}>>(`${path}/rulesets`);
+    for(const entry of rulesets.filter(entry=>entry.name==="Require trusted review for non-owner pull requests")) {
+      const ruleset=await github<{name:string;target:string;enforcement:string;conditions:unknown;rules:unknown[];bypass_actors:Array<{actor_id:number;actor_type:string;bypass_mode:string}>}>(`${path}/rulesets/${entry.id}`);
+      if(!ruleset.bypass_actors.some(actor=>actor.actor_type==="Integration" && actor.actor_id===5488696)) {
+        const {name,target,enforcement,conditions,rules,bypass_actors}=ruleset;
+        await write(`${path}/rulesets/${entry.id}`,{name,target,enforcement,conditions,rules,bypass_actors:[...bypass_actors,{actor_id:5488696,actor_type:"Integration",bypass_mode:"pull_request"}]});
+      }
+    }
   }
   console.log(JSON.stringify({repository:name,actions:"sha-only",nativeSecurity:true,autoMerge:true}));
 }
