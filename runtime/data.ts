@@ -11,6 +11,21 @@ export interface RecordStore {
   ready(): Promise<void>;
   close(): void;
 }
+export function memoryStore(): RecordStore {
+  const records = new Map<string, RecordValue>();
+  const key = (owner: string, id: string) => JSON.stringify([owner, id]);
+  return {
+    async list(owner) { ownerId(owner); return [...records.entries()].filter(([id]) => JSON.parse(id)[0] === owner).map(([, record]) => ({ ...record })).slice(-100).reverse(); },
+    async put(owner, record) {
+      ownerId(owner); recordId(record.id); const id = key(owner, record.id); const previous = records.get(id);
+      if (previous && previous.title !== record.title) throw new HttpError(409, "Operation ID already used.");
+      if (!previous && records.size >= 1000) throw new HttpError(429, "Preview capacity reached.");
+      records.set(id, previous ?? { ...record }); return { ...(previous ?? record) };
+    },
+    async remove(owner, id) { ownerId(owner); recordId(id); records.delete(key(owner, id)); },
+    async ready() {}, close() { records.clear(); },
+  };
+}
 function recordId(id: string): void { if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/.test(id)) throw new HttpError(400, "Invalid record ID."); }
 function ownerId(owner: string): void { if (!owner || owner.length > 128) throw new HttpError(401, "Sign in required."); }
 

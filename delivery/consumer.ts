@@ -27,7 +27,7 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   requireSha(sha);
   const files = await runtimeFiles(root);
   files["Dockerfile"] = await readFile(join(root, "delivery/Dockerfile"), "utf8");
-  files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.local\nnode_modules\ndist\ncoverage\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n";
+  files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.npmrc\nnpmrc\n.local\n.data\nnode_modules\ndist\ncoverage\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n**/*.pem\n**/*.key\n";
   files["bunfig.toml"] = 'env = false\ntelemetry = false\n\n[install]\nexact = true\nminimumReleaseAge = 604800\nregistry = "https://registry.npmjs.org"\n';
   files[".github/workflows/application.yml"] = caller("application-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      pull_request:\n        required: false\n        type: string\n", "Bun verify", "      contents: read\n      pull-requests: read\n      checks: write").replace(/    uses:/, "    with:\n      pull_request: ${{ inputs.pull_request || '' }}\n    uses:");
   files[".github/workflows/platform-upgrade.yml"] = caller("platform-upgrade-v1.yml", sha, '  schedule:\n    - cron: "17 7 * * *"\n  workflow_dispatch:\n', "Platform upgrade", "      contents: write\n      pull-requests: write\n      actions: write");

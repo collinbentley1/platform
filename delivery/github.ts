@@ -1,7 +1,7 @@
 import { appendFile } from "node:fs/promises";
 
 export function repository(): string {
-  const name = Bun.env.GITHUB_REPOSITORY ?? "";
+  const name = Bun.env.PLATFORM_TARGET_REPOSITORY ?? Bun.env.GITHUB_REPOSITORY ?? "";
   if (!/^collinbentley1\/[a-zA-Z0-9._-]+$/.test(name)) throw new Error("Unexpected GitHub repository.");
   return name;
 }

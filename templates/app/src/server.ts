@@ -1,9 +1,9 @@
 import { resolve } from "node:path";
 import { HttpError, json, readJson, requireOrigin, secureHandler, serveStatic } from "../.platform/runtime/http.ts";
 import { identityVerifier, passwordSignIn, sessionCookie, sessionToken, type Identity } from "../.platform/runtime/auth.ts";
-import { firestoreStore, sqliteStore, type RecordStore } from "../.platform/runtime/data.ts";
+import { firestoreStore, memoryStore, sqliteStore, type RecordStore } from "../.platform/runtime/data.ts";
 
-type Config = { origin: string; publicDirectory: string; development: boolean; nonce?: string };
+type Config = { origin: string; publicDirectory: string; development: boolean; preview?: boolean; nonce?: string };
 type Dependencies = { store: RecordStore; verify: (token: string) => Promise<Identity>; signIn: (email: string, password: string) => Promise<string> };
 
 export function createHandler(config: Config, dependencies: Dependencies) {
@@ -11,6 +11,7 @@ export function createHandler(config: Config, dependencies: Dependencies) {
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(new URL(origin).hostname);
   if (config.development && !loopback) throw new Error("Development authentication requires a loopback origin.");
   const identify = async (request: Request): Promise<Identity> => {
+    if (config.preview) return { id: "synthetic-preview" };
     const token = sessionToken(request);
     if (!token) throw new HttpError(401, "Sign in required.");
     if (config.development && token === "development") return { id: "local-developer", email: "developer@example.invalid" };
@@ -25,7 +26,7 @@ export function createHandler(config: Config, dependencies: Dependencies) {
     if (url.origin !== origin) throw new HttpError(403, "Host is not allowed.");
     if (!["GET", "HEAD"].includes(request.method)) requireOrigin(request, origin);
     if (url.pathname === "/api/session") {
-      if (request.method === "GET") return json({ user: await identify(request), development: config.development });
+      if (request.method === "GET") return json({ user: await identify(request), development: config.development, preview: Boolean(config.preview) });
       if (request.method === "DELETE") return json({ ok: true }, 200, { "Set-Cookie": sessionCookie(origin, "", 0) });
       if (request.method === "POST") {
         const body = await readJson(request, 4096);
@@ -56,13 +57,17 @@ function isObject(value: unknown): value is Record<string, unknown> { return val
 
 if (import.meta.main) {
   const production = Bun.env.NODE_ENV === "production" || Boolean(Bun.env.K_SERVICE);
+  const preview = Bun.env.PLATFORM_PREVIEW === "1";
+  if (Bun.env.PLATFORM_PREVIEW && !preview) throw new Error("Invalid preview mode.");
   const project = Bun.env.IDENTITY_PROJECT_ID;
   const apiKey = Bun.env.IDENTITY_API_KEY;
   const origin = Bun.env.PUBLIC_ORIGIN ?? (production ? "" : "http://127.0.0.1:8080");
-  if (production && (!project || !apiKey || !Bun.env.FIRESTORE_PROJECT_ID || !origin.startsWith("https://"))) throw new Error("Production identity, data, and HTTPS origin configuration is required.");
-  const store = production ? firestoreStore(Bun.env.FIRESTORE_PROJECT_ID!) : await sqliteStore(Bun.env.DATABASE_PATH ?? "./.local/application.sqlite");
+  if (production && !origin.startsWith("https://")) throw new Error("Production requires an HTTPS origin.");
+  if (production && !preview && (!project || !apiKey || !Bun.env.FIRESTORE_PROJECT_ID)) throw new Error("Production identity and data configuration is required.");
+  if (preview && (project || apiKey || Bun.env.FIRESTORE_PROJECT_ID)) throw new Error("Previews may not receive production identity or data configuration.");
+  const store = preview ? memoryStore() : production ? firestoreStore(Bun.env.FIRESTORE_PROJECT_ID!) : await sqliteStore(Bun.env.DATABASE_PATH ?? "./.local/application.sqlite");
   const verify = project ? identityVerifier(project) : async (): Promise<Identity> => { throw new HttpError(401, "Sign in required."); };
-  const handler = createHandler({ origin, development: !production, publicDirectory: resolve(import.meta.dir, "public"), ...(Bun.env.PLATFORM_DEPLOY_NONCE ? { nonce: Bun.env.PLATFORM_DEPLOY_NONCE } : {}) }, {
+  const handler = createHandler({ origin, development: !production, preview, publicDirectory: resolve(import.meta.dir, "public"), ...(Bun.env.PLATFORM_DEPLOY_NONCE ? { nonce: Bun.env.PLATFORM_DEPLOY_NONCE } : {}) }, {
     store, verify, signIn: (email, password) => passwordSignIn(apiKey ?? "", email, password),
   });
   const server = Bun.serve({ hostname: production ? "0.0.0.0" : "127.0.0.1", port: Number(Bun.env.PORT ?? 8080), maxRequestBodySize: 65_536, idleTimeout: 30, fetch: handler });

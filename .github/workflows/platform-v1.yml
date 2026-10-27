@@ -26,7 +26,7 @@ jobs:
       - name: Verify shared runtime and upgrades
         run: |
           bun ci --ignore-scripts --no-env-file
-          bun test test/runtime-v1.test.ts test/upgrades-v1.test.ts
+          bun test test/runtime-v1.test.ts test/upgrades-v1.test.ts test/review-v1.test.ts test/scanning-v1.test.ts test/merge-v1.test.ts
       - name: Create and verify a real application
         run: |
           bun tools/platform-v1.ts init platform-reference "$RUNNER_TEMP/reference" --sha "$GITHUB_SHA"
@@ -34,7 +34,9 @@ jobs:
           bun ci --ignore-scripts --no-env-file
           bun run verify:ci
       - name: Build the actual Cloud Run architecture
-        run: docker buildx build --platform linux/amd64 --provenance=false --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
+        run: |
+          docker buildx create --name platform --driver docker-container --driver-opt image=moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8 --use
+          docker buildx build --platform linux/amd64 --label org.opencontainers.image.revision="$GITHUB_SHA" --label dev.platform.revision="$GITHUB_SHA" --provenance=false --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: reference-image

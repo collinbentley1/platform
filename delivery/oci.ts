@@ -35,7 +35,7 @@ export async function verifyImage(directory: string, sourceSha: string, platform
   const names = await readdir(algorithm); if (names.length > 512) throw new Error("OCI graph exceeds its blob bound.");
   const closure = new Set<string>(); let total = 0;
   const readBlob = async (descriptor: Descriptor, metadata = false): Promise<Buffer> => {
-    if (!descriptor || !/^sha256:[a-f0-9]{64}$/.test(descriptor.digest) || !Number.isSafeInteger(descriptor.size) || descriptor.size < 1 || descriptor.size > 536_870_912) throw new Error("Invalid OCI descriptor.");
+    if (!descriptor || Object.hasOwn(descriptor, "urls") || !/^sha256:[a-f0-9]{64}$/.test(descriptor.digest) || !Number.isSafeInteger(descriptor.size) || descriptor.size < 1 || descriptor.size > 536_870_912) throw new Error("Invalid OCI descriptor.");
     const bytes = await regular(join(algorithm, descriptor.digest.slice(7)), metadata ? 4_194_304 : 536_870_912);
     if (bytes.length !== descriptor.size || hash(bytes) !== descriptor.digest) throw new Error("OCI content digest differs.");
     if (!closure.has(descriptor.digest)) { total += bytes.length; closure.add(descriptor.digest); }

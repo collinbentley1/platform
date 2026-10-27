@@ -140,6 +140,20 @@ resource "google_secret_manager_secret_iam_member" "runtime" {
   member    = "serviceAccount:${google_service_account.runtime[each.value.app].email}"
 }
 
+resource "google_project_iam_custom_role" "waitlist" {
+  count       = contains(keys(local.apps), "healthmcp") ? 1 : 0
+  project     = var.project_id
+  role_id     = "platformWaitlistSender"
+  title       = "Waitlist ownership runtime"
+  permissions = ["firebaseauth.users.sendEmail", "serviceusage.services.use", "recaptchaenterprise.assessments.create"]
+}
+resource "google_project_iam_member" "waitlist" {
+  count   = contains(keys(local.apps), "healthmcp") ? 1 : 0
+  project = var.project_id
+  role    = google_project_iam_custom_role.waitlist[0].name
+  member  = "serviceAccount:${google_service_account.runtime["healthmcp"].email}"
+}
+
 resource "google_cloud_run_v2_service" "app" {
   for_each             = local.apps
   name                 = each.value.service

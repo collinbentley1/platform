@@ -13,7 +13,7 @@ export async function readJson(request: Request, maximumBytes = 65_536): Promise
   try { return JSON.parse(text); } catch { throw new HttpError(400, "Invalid JSON."); }
 }
 
-export async function readText(request: Request, maximumBytes: number): Promise<string> {
+export async function readText(request: Pick<Request, "headers" | "body">, maximumBytes: number): Promise<string> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) throw new Error("Invalid body bound.");
   const length = request.headers.get("content-length");
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > maximumBytes)) {
@@ -66,7 +66,7 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
         ? json({ error: error.message, requestId: id }, error.status)
         : json({ error: "Internal server error.", requestId: id }, 500);
     }
-    const headers = new Headers(response.headers);
+    let headers = response.headers;
     const defaults = {
       "Content-Security-Policy": options.csp ?? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'",
       "Permissions-Policy": options.permissionsPolicy ?? "camera=(), microphone=(), geolocation=(), payment=()",
@@ -74,11 +74,15 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
       "X-Frame-Options": "DENY",
       "Referrer-Policy": "no-referrer",
     };
-    for (const [key, value] of Object.entries(defaults)) if (!headers.has(key)) headers.set(key, value);
-    if (new URL(request.url).protocol === "https:") headers.set("Strict-Transport-Security", "max-age=31536000");
-    headers.set("X-Request-ID", id);
+    const apply = () => {
+      for (const [key, value] of Object.entries(defaults)) if (!headers.has(key)) headers.set(key, value);
+      if (new URL(request.url).protocol === "https:") headers.set("Strict-Transport-Security", "max-age=31536000");
+      headers.set("X-Request-ID", id);
+    };
+    try { apply(); } catch { response = new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) }); headers = response.headers; apply(); }
     options.log?.({ requestId: id, method: request.method, status: response.status, durationMs: Math.round(performance.now() - start) });
-    return new Response(request.method === "HEAD" ? null : response.body, { status: response.status, statusText: response.statusText, headers });
+    // Preserve Bun.file bodies so their framing and sendfile behavior survive middleware.
+    return request.method === "HEAD" && response.body !== null ? new Response(null, { status: response.status, statusText: response.statusText, headers }) : response;
   };
 }
 
