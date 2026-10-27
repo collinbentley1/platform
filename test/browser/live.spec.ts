@@ -14,6 +14,6 @@ test("production sign-in and durable owner-scoped CRUD", async ({ page, context 
     id = notes.find(note => note.title === title)?.id; expect(id).toBeTruthy();
     await page.reload(); await expect(page.getByText(title, { exact: true })).toBeVisible();
     await page.getByRole("button", { name: `Delete ${title}`, exact: true }).click(); await expect(page.getByText(title, { exact: true })).toHaveCount(0);
-    await page.getByRole("button", { name: "Sign out", exact: true }).click(); expect((await context.request.get("/api/notes")).status()).toBe(401);
+    await page.getByRole("button", { name: "Sign out", exact: true }).click(); await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible(); expect((await context.request.get("/api/notes")).status()).toBe(401);
   } finally { if (id) await context.request.delete(`/api/notes/${id}`, { headers: { Origin: process.env.PLATFORM_TEST_ORIGIN! } }); }
 });
