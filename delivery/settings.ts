@@ -6,7 +6,7 @@ const actions = [
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
   "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
   "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
-  "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
+  "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
   "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
   "google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db",
   "github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370",
