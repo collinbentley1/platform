@@ -98,7 +98,7 @@ jobs:
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - run: bun ci --ignore-scripts --no-env-file
-      - run: bunx playwright install --with-deps chromium
+      - run: bun x playwright install --with-deps chromium
       - run: bun run test:browser
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: failure()

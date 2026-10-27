@@ -18,10 +18,10 @@ jobs:
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - run: bun ci --ignore-scripts --no-env-file
-      - run: bunx playwright install --with-deps chromium
+      - run: bun x playwright install --with-deps chromium
       - name: Exercise only the synthetic account
         env:
           PLATFORM_TEST_ORIGIN: https://platform-reference-882468538648.us-east4.run.app
           PLATFORM_TEST_EMAIL: ${{ secrets.PLATFORM_TEST_EMAIL }}
           PLATFORM_TEST_PASSWORD: ${{ secrets.PLATFORM_TEST_PASSWORD }}
-        run: bunx playwright test
+        run: bun x playwright test
