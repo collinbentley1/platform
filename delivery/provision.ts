@@ -13,7 +13,7 @@ export async function provision(projectId: string, apply = false): Promise<void>
   if (!apps.length) throw new Error("Project is not registered.");
   const metadata = await gcloud<{ projectNumber: string }>(["projects", "describe", projectId]);
   if (apps.some(app => app.number !== metadata.projectNumber)) throw new Error("Project numeric identity differs from the reviewed catalog.");
-  const inspectionApis=[...(apps.some(app=>app.data)?["firestore.googleapis.com"]:[]),...(apps.some(app=>app.identity || app.name==="healthmcp")?["identitytoolkit.googleapis.com","apikeys.googleapis.com"]:[]),...(apps.some(app=>app.name==="healthmcp")?["recaptchaenterprise.googleapis.com"]:[])];
+  const inspectionApis=["run.googleapis.com","artifactregistry.googleapis.com","storage.googleapis.com",...(apps.some(app=>app.data)?["firestore.googleapis.com"]:[]),...(apps.some(app=>app.identity || app.name==="healthmcp")?["identitytoolkit.googleapis.com","apikeys.googleapis.com"]:[]),...(apps.some(app=>app.name==="healthmcp")?["recaptchaenterprise.googleapis.com"]:[])];
   if(inspectionApis.length) await command(["gcloud","services","enable",...inspectionApis,`--project=${projectId}`,"--quiet"]);
   const directory = resolve(import.meta.dir, "terraform");
   const artifacts = await mkdtemp(join(tmpdir(), "platform-enrollment-"));
