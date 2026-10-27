@@ -1,5 +1,9 @@
 name: Deliver applications
 on:
+  workflow_run:
+    workflows: [Upgrade consumers]
+    types: [completed]
+    branches: [main]
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
@@ -22,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   catalog:
-    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -70,6 +74,7 @@ jobs:
           PLATFORM_APP: ${{ matrix.application }}
         run: bun delivery/cleanup.ts
   plan:
+    needs: catalog
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
