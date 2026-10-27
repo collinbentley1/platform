@@ -7,7 +7,6 @@ on:
       - delivery/terraform/**
       - delivery/settings.ts
       - .github/workflows/upgrade-consumers.yml
-      - .github/workflows/deliver.yml
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
