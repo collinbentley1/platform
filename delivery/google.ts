@@ -2,14 +2,18 @@ import { command } from "./process.ts";
 import { readText } from "../runtime/http.ts";
 
 const hosts = new Set(["containeranalysis.googleapis.com", "run.googleapis.com", "storage.googleapis.com", "identitytoolkit.googleapis.com", "apikeys.googleapis.com", "firestore.googleapis.com", "monitoring.googleapis.com", "recaptchaenterprise.googleapis.com"]);
-export class GoogleError extends Error { constructor(readonly status: number) { super(`Google API request failed (${status}).`); } }
+export class GoogleError extends Error { constructor(readonly status: number, readonly code?: string) { super(`Google API request failed (${status}).`); } }
 export async function accessToken(): Promise<string> { return Bun.env.GOOGLE_OAUTH_ACCESS_TOKEN ?? await command(["gcloud", "auth", "print-access-token"], { quiet: true }); }
 export async function google<T>(address: string, method = "GET", body?: unknown, quotaProject?: string): Promise<T> {
   const url = new URL(address);
   if(quotaProject && !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(quotaProject)) throw new Error("Invalid quota project.");
   if (url.protocol !== "https:" || !hosts.has(url.hostname) || url.username || url.password) throw new Error("Invalid Google API destination.");
   const response = await fetch(url, { method, headers: { Authorization: `Bearer ${await accessToken()}`, "Content-Type": "application/json", ...(quotaProject?{"X-Goog-User-Project":quotaProject}:{}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), redirect: "error", signal: AbortSignal.timeout(30_000) });
-  if (!response.ok) throw new GoogleError(response.status);
+  if (!response.ok) {
+    let code: string | undefined;
+    try { const value = JSON.parse(await readText(response, 4096)) as { error?: { status?: string } }; if (/^[A-Z_]+$/.test(value.error?.status ?? "")) code = value.error!.status; } catch {}
+    throw new GoogleError(response.status, code);
+  }
   if (response.status === 204) return undefined as T;
   const value = await readText(response, 8_388_608);
   return value ? JSON.parse(value) as T : undefined as T;
