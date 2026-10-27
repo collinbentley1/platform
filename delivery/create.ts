@@ -98,12 +98,15 @@ export async function catalogChange(change:string,title:string,mutate:(catalog:P
       const created = await github<{ number: number }>(`repos/${owner}/platform/pulls`, ["--method", "POST", "-f", `head=${branch}`, "-f", "base=main", "-f", `title=${title}`, "-f", `body=${title}.`]); number = created.number;
     }
     console.log(JSON.stringify({ event: "catalog-review", pullRequest: `https://github.com/${owner}/platform/pull/${number}`, installationUrls }));
+    const refresh = () => command(["gh", "pr", "update-branch", String(number), "--repo", `${owner}/platform`]);
+    await refresh();
     await command(["gh", "pr", "merge", String(number), "--repo", `${owner}/platform`, "--auto", "--squash"]);
     const deadline = Date.now() + 30 * 60_000;
     for (;;) {
-      const pull = await github<{ merged: boolean; state: string }>(`repos/${owner}/platform/pulls/${number}`);
+      const pull = await github<{ merged: boolean; state: string; mergeable_state?: string }>(`repos/${owner}/platform/pulls/${number}`);
       if (pull.merged) break;
       if (pull.state === "closed" || Date.now() > deadline) throw new Error("Registration is awaiting review. Resolve its checks and rerun this command.");
+      if (pull.mergeable_state === "behind") await refresh();
       await Bun.sleep(15_000);
     }
 
