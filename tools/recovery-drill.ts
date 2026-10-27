@@ -44,8 +44,8 @@ finally {
       if (exists) {
         if (cloning) { try { await operation(cloning,30*60_000); } catch(error) { console.error("Clone operation failed; attempting reserved-database cleanup:",error); } }
         const unlock = await ready(() => google<{name:string}>(`${base}/${name}?updateMask=deleteProtectionState`,"PATCH",{name,deleteProtectionState:"DELETE_PROTECTION_DISABLED"}));
-        await operation(unlock.name);
-        const removal = await google<{name:string}>(`${base}/${name}`,"DELETE"); await operation(removal.name);
+        await operation(unlock);
+        const removal = await google<{name:string}>(`${base}/${name}`,"DELETE"); await operation(removal);
       }
       console.log(JSON.stringify({ event: "recovery-clone-removed", database: id }));
     }

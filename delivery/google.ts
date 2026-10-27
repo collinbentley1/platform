@@ -18,8 +18,10 @@ export async function google<T>(address: string, method = "GET", body?: unknown,
   const value = await readText(response, 8_388_608);
   return value ? JSON.parse(value) as T : undefined as T;
 }
-export async function operation(name: string, timeoutMs = 10 * 60_000): Promise<void> {
+export async function operation(value: string | {name: string; done?: boolean; error?: unknown}, timeoutMs = 10 * 60_000): Promise<void> {
+  const name = typeof value === "string" ? value : value.name;
   if (!/^projects\/[a-z0-9-]+\/(?:locations\/[a-z0-9-]+|databases\/(?:\(default\)|[a-z0-9-]+))\/operations\/[a-zA-Z0-9_-]+$/.test(name)) throw new Error("Invalid Google operation.");
+  if (typeof value !== "string") { if (value.error) throw new Error("Google operation failed."); if (value.done) return; }
   const firestore = name.includes("/databases/");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
