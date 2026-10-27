@@ -4,6 +4,10 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
+      force:
+        description: Redeploy even if the serving source is current
+        type: boolean
+        default: false
       application:
         description: Registered application, or all applications
         type: string
@@ -38,6 +42,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLATFORM_APP: ${{ inputs.application }}
           PLATFORM_PR: ${{ inputs.pull_request }}
+          PLATFORM_FORCE: ${{ inputs.force }}
         run: bun delivery/prepare.ts plan
   build:
     needs: plan

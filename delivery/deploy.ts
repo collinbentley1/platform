@@ -63,11 +63,11 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const tag = previewPr ? `pr-${previewPr}` : "candidate";
   const directory = await mkdtemp(join(tmpdir(), "platform-deploy-"));
   const environment: Record<string, string> = {
-    ...(preview ? previewEnvironment(app) : app.env), NODE_ENV: "production", PLATFORM_DEPLOY_NONCE: nonce,
+    ...(preview ? previewEnvironment(app) : app.env), NODE_ENV: "production", PLATFORM_DEPLOY_NONCE: nonce, PLATFORM_SOURCE_SHA: evidence.sourceSha, PLATFORM_RELEASE_SHA: evidence.platformSha,
   };
   if (app.identity) {
-    if (preview) environment.PUBLIC_ORIGIN = before.uri;
-    else { const key = Bun.env.IDENTITY_API_KEY; if (!key) throw new Error("Identity client configuration is missing."); environment.IDENTITY_API_KEY = key; }
+    if (preview) { const origin = new URL(before.uri); origin.hostname = `${tag}---${origin.hostname}`; environment.PUBLIC_ORIGIN = origin.origin; }
+    else { const key = Bun.env.IDENTITY_API_KEY; if (!key) { await rm(directory, { recursive: true, force: true }); throw new Error("Identity client configuration is missing."); } environment.IDENTITY_API_KEY = key; }
   }
   const secrets = preview ? [] : Object.entries(app.secrets).map(([key, value]) => `${key}=${value}`);
   await writeFile(join(directory, "environment.json"), JSON.stringify(environment), { mode: 0o600 });
@@ -93,7 +93,24 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     await operation(result.name);
     const current = await service(app);
     if (routed(current.trafficStatuses ?? []) !== routed([{ revision: revisionName, percent: 100 }])) throw new Error("Production route did not converge to the verified revision.");
-    await probe(app.env.PUBLIC_ORIGIN ?? current.uri, nonce);
+    try {
+      await probe(app.env.PUBLIC_ORIGIN ?? current.uri, nonce);
+      const root = await fetch(new URL("/", app.env.PUBLIC_ORIGIN ?? current.uri), {redirect:"error",signal:AbortSignal.timeout(20_000)});
+      if (!root.ok || !root.headers.get("X-Request-ID")) throw new Error("Application entry route failed after promotion.");
+    } catch (error) {
+      const failed = await service(app);
+      // Roll back only our own route, with a fresh etag. Never overwrite another operator.
+      if (routed(failed.trafficStatuses ?? []) === routed([{ revision: revisionName, percent: 100 }])) {
+        const rollbackTraffic = previousTraffic.filter(item => (item.percent ?? 0) > 0).map(item => ({ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision: item.revision?.split("/").at(-1), percent: item.percent }));
+        if (!rollbackTraffic.length || rollbackTraffic.some(item => !item.revision)) throw new Error("Cannot resolve the previous production route for rollback.");
+        const rollback = await google<{ name: string }>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`, "PATCH", { name, etag: failed.etag, traffic: rollbackTraffic });
+        await operation(rollback.name);
+        const restored = await service(app);
+        if (routed(restored.trafficStatuses ?? []) !== routed(previousTraffic)) throw new Error("Production rollback did not converge.");
+        console.error(JSON.stringify({ event: "deployment-rolled-back", app: app.name, failedRevision: revisionName }));
+      }
+      throw error;
+    }
     console.info(JSON.stringify({ event: "deployment-verified", app: app.name, revision: revisionName, source: evidence.sourceSha, platform: evidence.platformSha }));
     return { url: app.env.PUBLIC_ORIGIN ?? current.uri, revision: revisionName };
   } finally { await rm(directory, { recursive: true, force: true }); }

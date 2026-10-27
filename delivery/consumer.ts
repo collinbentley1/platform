@@ -31,7 +31,7 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   files["bunfig.toml"] = 'env = false\ntelemetry = false\n\n[install]\nexact = true\nminimumReleaseAge = 604800\nregistry = "https://registry.npmjs.org"\n';
   files[".github/workflows/application.yml"] = caller("application-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      pull_request:\n        required: false\n        type: string\n", "Bun verify", "      contents: read\n      pull-requests: read\n      checks: write").replace(/      platform_sha:/, "      pull_request: ${{ inputs.pull_request || '' }}\n      platform_sha:");
   /* Central installation-token upgrader owns release proposals. */
-  files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write");
+  files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n  issue_comment:\n    types: [created, edited]\n  pull_request_review:\n    types: [submitted]\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write");
   files[".github/dependabot.yml"] = 'version: 2\nupdates:\n  - package-ecosystem: bun\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n    groups:\n      dependencies:\n        patterns: ["*"]\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "collinbentley1/platform"\n';
   files["tools/verify-socket-config.ts"] = 'const config = Bun.TOML.parse(await Bun.file("bunfig.toml").text()) as { install?: { registry?: string; minimumReleaseAge?: number; security?: unknown } };\nif (config.install?.registry !== "https://registry.npmjs.org" || config.install.minimumReleaseAge !== 604800 || config.install.security) throw new Error("Dependency policy differs from the managed platform contract.");\nexport {};\n';
   return files;
@@ -93,6 +93,8 @@ export async function upgrade(root: string, source: string, sha: string, options
 
 export async function doctor(root: string, source: string, sha: string): Promise<string[]> {
   const expected = await managedFiles(source, sha); const failures: string[] = [];
+  const server = await regularText(root, "src/server.ts");
+  if (!server || !/import\s*\{[^}]*\bsecureHandler\b[^}]*\}\s*from\s*["'][^"']*\.platform\/runtime\/http\.ts["']/.test(server) || !/\bsecureHandler\s*\(/.test(server)) failures.push("the application entry point must consume the shared HTTP runtime");
   for (const [path, content] of Object.entries(expected)) if (await regularText(root, path) !== content) failures.push(`managed file differs: ${path}`);
   const lockText = await regularText(root, ".platform/release.json");
   if (!lockText) failures.push("missing release lock");

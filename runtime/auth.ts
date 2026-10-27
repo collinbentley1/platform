@@ -20,9 +20,9 @@ export function identityVerifier(projectId: string, keys: JWTVerifyGetKey = goog
   };
 }
 
-export function sessionToken(request: Request): string | undefined {
+export function sessionToken(request: Request, origin?: string): string | undefined {
   const cookie = request.headers.get("cookie") ?? "";
-  const name = new URL(request.url).protocol === "https:" ? "__Host-platform-session" : "platform-session";
+  const name = new URL(origin ?? request.url).protocol === "https:" ? "__Host-platform-session" : "platform-session";
   const values = cookie.split(";").map(part => part.trim()).filter(part => part.startsWith(name + "="));
   if (values.length !== 1) return undefined;
   const value = values[0]!.slice(name.length + 1);

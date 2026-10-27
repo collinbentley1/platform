@@ -11,7 +11,7 @@ export async function verifyApplication(directory: string): Promise<void> {
   const environment = { ...process.env };
   for (const key of Object.keys(environment)) if (/(?:TOKEN|SECRET|CREDENTIAL|PASSWORD|PRIVATE_KEY)/i.test(key) || key.startsWith("ACTIONS_ID_TOKEN_")) delete environment[key];
   const steps = [
-    [compiler, "--noEmit"], [join(root, "tools/format.ts"), "--check"],
+    ["audit", "--audit-level=high"], [compiler, "--noEmit"], [join(root, "tools/format.ts"), "--check"],
     [join(root, "tools/lint.ts")], ["test"], [join(root, "tools/build.ts")],
   ];
   for (const step of steps) {

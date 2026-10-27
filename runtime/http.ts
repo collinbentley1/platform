@@ -44,12 +44,13 @@ export function json(value: unknown, status = 200, headers: HeadersInit = {}): R
 }
 
 export function requireOrigin(request: Request, origin: string): void {
-  if (new URL(request.url).origin !== origin || request.headers.get("origin") !== origin) {
+  if (new URL(request.url).host !== new URL(origin).host || request.headers.get("origin") !== origin) {
     throw new HttpError(403, "Request origin is not allowed.");
   }
 }
 
 export type HttpOptions = {
+  readonly origin?: string;
   readonly csp?: string;
   readonly permissionsPolicy?: string;
   readonly log?: (entry: Readonly<Record<string, string | number>>) => void;
@@ -67,7 +68,7 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
         : json({ error: "Internal server error.", requestId: id }, 500);
     }
     let method = "UNKNOWN"; let https = false;
-    try { method = request.method; https = new URL(request.url).protocol === "https:"; } catch {}
+    try { method = request.method; https = new URL(options.origin ?? request.url).protocol === "https:"; } catch {}
     let headers = response.headers;
     const defaults = {
       "Content-Security-Policy": options.csp ?? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'",
@@ -80,6 +81,7 @@ export function secureHandler(handler: (request: Request) => Response | Promise<
       for (const [key, value] of Object.entries(defaults)) if (!headers.has(key)) headers.set(key, value);
       if (https && !headers.has("Strict-Transport-Security")) headers.set("Strict-Transport-Security", "max-age=31536000");
       headers.set("X-Request-ID", id);
+      if (/^[a-f0-9]{40}$/.test(Bun.env.PLATFORM_SOURCE_SHA ?? "") && /^[a-f0-9]{40}$/.test(Bun.env.PLATFORM_RELEASE_SHA ?? "")) { headers.set("X-Platform-Source", Bun.env.PLATFORM_SOURCE_SHA!); headers.set("X-Platform-Release", Bun.env.PLATFORM_RELEASE_SHA!); }
     };
     try { apply(); } catch { response = new Response(response.body, { status: response.status, statusText: response.statusText, headers: new Headers(response.headers) }); headers = response.headers; apply(); }
     options.log?.({ requestId: id, method, status: response.status, durationMs: Math.round(performance.now() - start) });

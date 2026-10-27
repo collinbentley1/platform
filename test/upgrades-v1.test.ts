@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { doctor, upgrade } from "../delivery/consumer.ts";
@@ -11,6 +11,8 @@ describe("managed platform upgrades", () => {
     const root = await mkdtemp(join(tmpdir(), "platform-upgrade-"));
     try {
       await writeFile(join(root, "product.ts"), "custom frontend and product code");
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, "src/server.ts"), 'import {secureHandler} from "../.platform/runtime/http.ts";\nexport const handler = secureHandler(() => new Response("custom"));\n');
       await upgrade(root, source, first, { adopt: true }); expect(await doctor(root, source, first)).toEqual([]);
       const planned = await upgrade(root, source, second, { check: true }); expect(planned).toContain(".platform/release.json");
       expect(JSON.parse(await readFile(join(root, ".platform/release.json"), "utf8")).sha).toBe(first);

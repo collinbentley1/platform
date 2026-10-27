@@ -36,7 +36,7 @@ export async function requestReview(number: string, head: string): Promise<void>
 }
 
 export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promise<void> {
-  const pr = await pullRequest(number); const head = pr.head.sha;
+  const pr = await pullRequest(number); if (pr.draft) return; const head = pr.head.sha;
   const check = await api<{ id: number }>(`/repos/${repository()}/check-runs`, "POST", { name: "Automated review", head_sha: head, status: "in_progress" });
   const deadline = Date.now() + timeoutMs;
   let success = false;

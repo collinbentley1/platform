@@ -30,7 +30,18 @@ switch (command) {
     console.log("Platform contract verified."); break;
   }
   case "verify": await verifyApplication(target); break;
-  default: throw new Error("Commands: init, upgrade [--check], doctor");
+  case "enroll": {
+    const { provision } = await import("../delivery/provision.ts");
+    await provision(args[0] ?? "", args.includes("--apply")); break;
+  }
+  case "repository-settings": {
+    const { settings } = await import("../delivery/settings.ts");
+    await settings(args[0] ?? ""); break;
+  }
+  case "help":
+  case undefined:
+    console.log("platform init <name> [directory] --sha <release>\nplatform verify [directory]\nplatform doctor [directory] --sha <release>\nplatform upgrade [directory] --sha <release> [--check] [--adopt]\nplatform enroll <registered-google-project> [--apply]\nplatform repository-settings <registered-repository>\n\nThe complete starter includes local SQLite and production Identity Platform + Firestore.\nPublished platform releases propose managed consumer PRs; all checks and current-head automated review must pass before automatic merge.\nCloud publishing and deployment run only in the protected platform repository. Each application owns its frontend and product code."); break;
+  default: throw new Error("Unknown command; run platform help.");
 }
 
 async function* walk(directory: string): AsyncGenerator<string> {

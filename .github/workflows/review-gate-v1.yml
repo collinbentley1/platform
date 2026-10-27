@@ -6,10 +6,13 @@ on:
         type: string
         required: true
 permissions: {}
+concurrency:
+  group: review-${{ github.repository_id }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
 jobs:
   review:
     name: Review admission
-    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.id == github.event.pull_request.base.repo.id
+    if: github.event.pull_request || github.event.issue.pull_request
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     permissions:
@@ -26,5 +29,5 @@ jobs:
       - name: Wait for current-head review and resolved feedback
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: bun delivery/review.ts "$PR_NUMBER"

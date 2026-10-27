@@ -12,7 +12,7 @@ export function createHandler(config: Config, dependencies: Dependencies) {
   if (config.development && !loopback) throw new Error("Development authentication requires a loopback origin.");
   const identify = async (request: Request): Promise<Identity> => {
     if (config.preview) return { id: "synthetic-preview" };
-    const token = sessionToken(request);
+    const token = sessionToken(request, origin);
     if (!token) throw new HttpError(401, "Sign in required.");
     if (config.development && token === "development") return { id: "local-developer", email: "developer@example.invalid" };
     return dependencies.verify(token);
@@ -23,7 +23,7 @@ export function createHandler(config: Config, dependencies: Dependencies) {
     if (url.pathname === "/readyz") {
       try { await dependencies.store.ready(); return json({ ok: true }); } catch { return json({ ok: false }, 503); }
     }
-    if (url.origin !== origin) throw new HttpError(403, "Host is not allowed.");
+    if (url.host !== new URL(origin).host) throw new HttpError(403, "Host is not allowed.");
     if (!["GET", "HEAD"].includes(request.method)) requireOrigin(request, origin);
     if (url.pathname === "/api/session") {
       if (request.method === "GET") return json({ user: await identify(request), development: config.development, preview: Boolean(config.preview) });
@@ -50,7 +50,7 @@ export function createHandler(config: Config, dependencies: Dependencies) {
     if (url.pathname.startsWith("/api/")) throw new HttpError(404, "Not found.");
     if (request.method !== "GET" && request.method !== "HEAD") throw new HttpError(405, "Method not allowed.");
     return serveStatic(config.publicDirectory, url.pathname);
-  }, { log: entry => console.info(JSON.stringify(entry)) });
+  }, { origin, log: entry => console.info(JSON.stringify(entry)) });
 }
 
 function isObject(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === "object" && !Array.isArray(value); }

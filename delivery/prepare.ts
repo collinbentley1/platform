@@ -30,6 +30,9 @@ async function plan(): Promise<void> {
       if (pull.state !== "open" || pull.draft || pull.base.ref !== "main" || String(pull.head.repo.id) !== app.repositoryId) throw new Error("Preview is not an eligible same-repository pull request.");
       sha = requireSha(pull.head.sha);
     } else sha = requireSha((await api<{ sha: string }>(`/repos/collinbentley1/${repo}/commits/main`)).sha);
+    if (!pr && Bun.env.PLATFORM_FORCE !== "true") {
+      try { const response = await fetch(`https://${app.service}-${app.number}.${app.region}.run.app/livez`, {redirect:"error",signal:AbortSignal.timeout(10_000)}); if(response.ok && response.headers.get("X-Platform-Source") === sha && response.headers.get("X-Platform-Release") === release.sha) continue; } catch {}
+    }
     if (!await eligible(app, sha)) { if (selected) throw new Error("Application checks have not passed."); continue; }
     items.push({ app: app.name, sha, release: release.sha, project: app.project, number: app.number, pr });
   }
