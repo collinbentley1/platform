@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   review:
-    if: github.event.pull_request || github.event.issue.pull_request
+    if: vars.PLATFORM_REVIEW_GATE_READY == 'true' && (github.event.pull_request || github.event.issue.pull_request)
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     permissions:

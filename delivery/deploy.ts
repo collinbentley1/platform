@@ -71,8 +71,11 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const environment: Record<string, string> = {
     ...(preview ? previewEnvironment(app) : app.env), NODE_ENV: "production", PLATFORM_DEPLOY_NONCE: nonce, PLATFORM_SOURCE_SHA: evidence.sourceSha, PLATFORM_RELEASE_SHA: evidence.platformSha,
   };
+  const previewOrigin = new URL(before.uri); previewOrigin.hostname = `${tag}---${previewOrigin.hostname}`;
+  if (preview && app.name === "virtual-care-mcp") environment.PUBLIC_BASE_URL = previewOrigin.origin;
+  if (preview && app.name === "healthmcp") Object.assign(environment,{ALLOWED_HOSTS:previewOrigin.hostname,ALLOWED_ORIGINS:previewOrigin.origin,CANONICAL_HOST:previewOrigin.hostname,LEGACY_HOSTS:""});
   if (app.identity) {
-    if (preview) { const origin = new URL(before.uri); origin.hostname = `${tag}---${origin.hostname}`; environment.PUBLIC_ORIGIN = origin.origin; }
+    if (preview) environment.PUBLIC_ORIGIN = previewOrigin.origin;
     else { const key = Bun.env.IDENTITY_API_KEY; if (!key) { await rm(directory, { recursive: true, force: true }); throw new Error("Identity client configuration is missing."); } environment.IDENTITY_API_KEY = key; }
   }
   const secrets = preview ? [] : Object.entries(app.secrets).map(([key, value]) => `${key}=${value}`);
