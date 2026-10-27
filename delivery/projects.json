@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "owner": "collinbentley1",
+  "platformRepositoryId": "1255856466",
+  "projects": [
+    { "name": "cdbentley", "repositoryId": "1255553151", "project": "cdbentley", "number": "882468538648", "region": "us-east4", "registry": "site", "service": "cdbentley", "data": false, "env": {}, "secrets": {} },
+    { "name": "critical-history", "repositoryId": "280932482", "project": "critical-history-16823277", "number": "422714632513", "region": "us-east4", "registry": "site", "service": "critical-history", "data": false, "env": {}, "secrets": {} },
+    { "name": "healthmcp", "repositoryId": "1025243085", "project": "medlock-1025243085", "number": "229383559510", "region": "us-east4", "registry": "site", "service": "medlock", "data": true, "env": { "ALLOWED_HOSTS": "medlock.ai,www.medlock.ai,mcp.medlock.ai,healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app,*.run.app", "ALLOWED_ORIGINS": "https://medlock.ai,https://www.medlock.ai,https://mcp.medlock.ai,https://chat.openai.com,https://claude.ai,https://*.run.app", "CANONICAL_HOST": "medlock.ai", "LEGACY_HOSTS": "healthmcp.ai,www.healthmcp.ai,healthmcp.app,www.healthmcp.app", "MEDLOCK_VERSION": "0.2.0", "WAITLIST_BACKEND": "firestore", "FIRESTORE_PROJECT_ID": "medlock-1025243085", "FIRESTORE_COLLECTION": "waitlist" }, "secrets": {} },
+    { "name": "runsetta", "repositoryId": "711292980", "project": "runsetta", "number": "601124730704", "region": "us-east4", "registry": "api", "service": "runsetta", "data": false, "env": { "RUNSETTA_OFFLINE": "1", "RUNSETTA_TTS_MODEL": "gpt-4o-mini-tts", "RUNSETTA_TTS_VOICE": "marin" }, "secrets": {} },
+    { "name": "virtual-care-mcp", "repositoryId": "1362801465", "project": "virtual-care-mcp", "number": "894875537243", "region": "us-east4", "registry": "site", "service": "virtual-care-mcp", "data": true, "env": { "VISIT_STORE": "firestore", "FIRESTORE_PROJECT_ID": "virtual-care-mcp", "PUBLIC_BASE_URL": "https://virtual-care-mcp-894875537243.us-east4.run.app" }, "secrets": {} },
+    { "name": "platform-reference", "repository": "platform", "sourceDirectory": "templates/app", "repositoryId": "1255856466", "project": "cdbentley", "number": "882468538648", "region": "us-east4", "registry": "site", "service": "platform-reference", "data": true, "identity": true, "env": { "IDENTITY_PROJECT_ID": "cdbentley", "FIRESTORE_PROJECT_ID": "cdbentley", "PUBLIC_ORIGIN": "https://platform-reference-882468538648.us-east4.run.app" }, "secrets": {} }
+  ]
+}

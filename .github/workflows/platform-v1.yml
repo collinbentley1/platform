@@ -1,0 +1,43 @@
+name: Platform v1 integration
+on:
+  push:
+    branches: [codex/production-platform]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  reference:
+    name: Complete starter and container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  $RUNNER_TEMP/bun.zip" | sha256sum --check --strict
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun-bin"
+          echo "$RUNNER_TEMP/bun-bin/bun-linux-x64" >> "$GITHUB_PATH"
+      - name: Verify shared runtime and upgrades
+        run: |
+          bun ci --ignore-scripts --no-env-file
+          bun test test/runtime-v1.test.ts test/upgrades-v1.test.ts
+      - name: Create and verify a real application
+        run: |
+          bun tools/platform-v1.ts init platform-reference "$RUNNER_TEMP/reference" --sha "$GITHUB_SHA"
+          cd "$RUNNER_TEMP/reference"
+          bun ci --ignore-scripts --no-env-file
+          bun run verify:ci
+      - name: Build the actual Cloud Run architecture
+        run: docker buildx build --platform linux/amd64 --provenance=false --output "type=oci,dest=$RUNNER_TEMP/reference.oci.tar" "$RUNNER_TEMP/reference"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: reference-image
+          path: ${{ runner.temp }}/reference.oci.tar
+          retention-days: 1
+          if-no-files-found: error
