@@ -22,13 +22,13 @@ try { await google(`${base}/projects/${app.project}/databases/${id}`); throw new
 const created = await google<{updateTime:string}>(`${base}/${source}/documents/${doc}`, "PATCH", fixture);
 const snapshot = new Date((Math.floor(Date.parse(created.updateTime) / 60000) + 1) * 60000).toISOString();
 let cloneRequested = false;
-let cloning: string | undefined;
+let cloning: Parameters<typeof operation>[0] | undefined;
 console.log(JSON.stringify({ event: "recovery-drill-started", app: app.name, database: id, snapshot }));
 try {
   while (Date.now() < Date.parse(snapshot) + 5000) await Bun.sleep(Math.min(5000, Date.parse(snapshot) + 5000 - Date.now()));
   await google(`${base}/${source}/documents/${doc}`, "DELETE");
   cloneRequested = true;
-  cloning = (await google<{name:string}>(`${base}/projects/${app.project}/databases:clone`,"POST",{databaseId:id,pitrSnapshot:{database:source,snapshotTime:snapshot}})).name;
+  cloning = await google<{name:string}>(`${base}/projects/${app.project}/databases:clone`,"POST",{databaseId:id,pitrSnapshot:{database:source,snapshotTime:snapshot}});
   await operation(cloning,30*60_000);
   const restored = await ready(() => google<typeof fixture>(`${base}/projects/${app.project}/databases/${id}/documents/${doc}`));
   if (JSON.stringify(restored.fields) !== JSON.stringify(fixture.fields)) throw new Error("Restored fixture content differs.");
