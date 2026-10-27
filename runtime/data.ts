@@ -143,11 +143,12 @@ export function firestoreStore(project: string, collection = "platform_records",
       for (let batch = 0; batch < 100; batch++) {
         const response = await call(`${base}/${ownerPath(owner)}?pageSize=100&mask.fieldPaths=createdAt`);
         if (!response.ok) throw new Error("Account data cleanup unavailable.");
-        const value = JSON.parse(await readText(response, 262_144)) as { documents?: Array<{ name: string }> };
+        const value = JSON.parse(await readText(response, 262_144)) as { documents?: Array<{ name: string }>; nextPageToken?: string };
         if (!value.documents?.length) return;
         const result = await call(`${base}:commit`, { method: "POST", body: JSON.stringify({ writes: value.documents.map(document => ({ delete: document.name })) }) });
         if (!result.ok) throw new Error("Account data cleanup unavailable.");
         await result.body?.cancel();
+        if (!value.nextPageToken) return;
       }
       throw new Error("Account cleanup is incomplete. Retry to continue.");
     },

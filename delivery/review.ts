@@ -1,6 +1,8 @@
 import { api, graphql, pages, pullRequest, repository } from "./github.ts";
 
 const codexId = 199175422;
+export const platformReviewCheck = "review";
+export const consumerReviewCheck = "Automated review / Review admission";
 export function reviewedCommit(body: string): string | undefined {
   if (!body.includes("<!-- codex-pull-request-review-summary -->")) return undefined;
   return /\|[^|\n]*Code Review[^|\n]*\|[^|\n]*Completed[^|\n]*\|\s*`([a-f0-9]{7,40})`/.exec(body)?.[1];
@@ -72,20 +74,13 @@ export async function requestReview(number: string, head: string): Promise<void>
 
 export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promise<void> {
   const pr = await pullRequest(number); if (pr.draft) return; const head = pr.head.sha;
-  const check = await api<{ id: number }>(`/repos/${repository()}/check-runs`, "POST", { name: "Automated review", head_sha: head, status: "in_progress" });
   const deadline = Date.now() + timeoutMs;
-  let success = false;
-  try {
-    // The platform upgrade producer requests a review; the generic read-only gate does not post comments.
-    while (Date.now() < deadline) {
-      const current = await pullRequest(number); if (current.head.sha !== head) throw new Error("Review head changed.");
-      if (await automatedReview(number, head)) { success = true; return; }
-      await Bun.sleep(20_000);
-    }
-    // The published check remains unsuccessful. A later review event can refresh it
-    // without leaving a failed polling-worker job on the same commit forever.
-    console.info(JSON.stringify({event:"automated-review-pending",repository:repository(),pullRequest:number,head}));
-  } finally { await api(`/repos/${repository()}/check-runs/${check.id}`, "PATCH", { status: "completed", conclusion: success ? "success" : "failure", completed_at: new Date().toISOString() }); }
+  while (Date.now() < deadline) {
+    const current = await pullRequest(number); if (current.head.sha !== head) throw new Error("Review head changed.");
+    if (await automatedReview(number, head)) return;
+    await Bun.sleep(20_000);
+  }
+  throw new Error("Current-head review or feedback resolution is still pending. A later receipt or sweep reruns this job.");
 }
 
 export async function reviewSweep():Promise<void> {
@@ -93,9 +88,10 @@ export async function reviewSweep():Promise<void> {
   for(const pr of pulls.filter(pr=>!pr.draft && pr.base.ref==="main" && pr.head.repo?.id===pr.base.repo.id)) {
     const head=pr.head.sha;
     const admitted=await automatedReview(String(pr.number),head);
-    const result=await api<{check_runs:Array<{id:number;name:string;app:{id:number};status:string;conclusion:string|null}>}>(`/repos/${repository()}/commits/${head}/check-runs?check_name=Automated%20review&filter=latest&per_page=100`);
+    const name=repository()==="collinbentley1/platform"?platformReviewCheck:consumerReviewCheck;
+    const result=await api<{check_runs:Array<{id:number;name:string;app:{id:number};status:string;conclusion:string|null}>}>(`/repos/${repository()}/commits/${head}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`);
     if(result.check_runs.length>=100)throw new Error("Review check inventory exceeds its bound.");
-    const previous=result.check_runs.filter(check=>check.name==="Automated review" && check.app.id===15368).sort((a,b)=>b.id-a.id)[0];
+    const previous=result.check_runs.filter(check=>check.name===name && check.app.id===15368).sort((a,b)=>b.id-a.id)[0];
     if(admitted ? previous?.status==="completed" && previous.conclusion==="success" : previous?.conclusion!=="success")continue;
     const current=await pullRequest(String(pr.number));if(current.head.sha!==head || current.draft)continue;
     // Checks published by scheduled/manual runs do not satisfy GitHub's PR
@@ -110,6 +106,6 @@ export async function reviewSweep():Promise<void> {
 }
 
 if (import.meta.main) {
-  if(Bun.argv[2]==="sweep")await reviewSweep();
+  if(Bun.argv[2]==="sweep" || ["issue_comment","pull_request_review_comment"].includes(Bun.env.GITHUB_EVENT_NAME??""))await reviewSweep();
   else await reviewGate(Bun.argv[2] ?? "");
 }
