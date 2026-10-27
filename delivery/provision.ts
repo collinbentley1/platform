@@ -13,7 +13,7 @@ export async function provision(projectId: string, apply = false): Promise<void>
   if (!apps.length) throw new Error("Project is not registered.");
   const metadata = await gcloud<{ projectNumber: string }>(["projects", "describe", projectId]);
   if (apps.some(app => app.number !== metadata.projectNumber)) throw new Error("Project numeric identity differs from the reviewed catalog.");
-  const inspectionApis=[...(apps.some(app=>app.data)?["firestore.googleapis.com"]:[]),...(apps.some(app=>app.identity || app.name==="healthmcp")?["identitytoolkit.googleapis.com","apikeys.googleapis.com"]:[]),...(apps.some(app=>app.name==="healthmcp")?["recaptchaenterprise.googleapis.com"]:[])];
+  const inspectionApis=["cloudresourcemanager.googleapis.com","iam.googleapis.com","run.googleapis.com","artifactregistry.googleapis.com","storage.googleapis.com",...(apps.some(app=>app.data)?["firestore.googleapis.com"]:[]),...(apps.some(app=>app.identity || app.name==="healthmcp")?["identitytoolkit.googleapis.com","apikeys.googleapis.com"]:[]),...(apps.some(app=>app.name==="healthmcp")?["recaptchaenterprise.googleapis.com"]:[])];
   if(inspectionApis.length) await command(["gcloud","services","enable",...inspectionApis,`--project=${projectId}`,"--quiet"]);
   const directory = resolve(import.meta.dir, "terraform");
   const artifacts = await mkdtemp(join(tmpdir(), "platform-enrollment-"));
@@ -45,6 +45,14 @@ export async function provision(projectId: string, apply = false): Promise<void>
   const terraform = (args: string[]) => command(["terraform", `-chdir=${directory}`, ...args], { env });
   await terraform(["init", "-input=false", "-reconfigure", `-backend-config=bucket=${bucket}`, "-backend-config=prefix=delivery/v1"]);
   const state = await terraform(["state", "list"]);
+  for (const registry of new Set(apps.map(app=>app.registry))) {
+    const address = `google_artifact_registry_repository.images[${JSON.stringify(registry)}]`;
+    if (!state.split("\n").includes(address)) {
+      const id = `projects/${projectId}/locations/us-east4/repositories/${registry}`;
+      try { await google(`https://artifactregistry.googleapis.com/v1/${id}`); await terraform(["import","-input=false",`-var-file=${variables}`,address,id]); }
+      catch(error) { if (!(error instanceof GoogleError && error.status===404)) throw error; }
+    }
+  }
   for (const app of apps) {
     const address = `google_cloud_run_v2_service.app[${JSON.stringify(app.name)}]`;
     if (existing.has(app.name) && !state.split("\n").includes(address)) await terraform(["import", "-input=false", `-var-file=${variables}`, address, `projects/${app.project}/locations/${app.region}/services/${app.service}`]);

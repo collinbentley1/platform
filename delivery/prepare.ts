@@ -2,7 +2,7 @@ import { resolve, join } from "node:path";
 import { mkdir, cp } from "node:fs/promises";
 import { projects, type Project } from "./catalog.ts";
 import { api, output, GitHubError } from "./github.ts";
-import { requireSha, doctor } from "./consumer.ts";
+import { requireSha } from "./consumer.ts";
 import { command } from "./process.ts";
 import { checksPassed, latestRelease } from "./upgrade.ts";
 
@@ -68,8 +68,7 @@ async function source(): Promise<void> {
     await command([...git, "fetch", "--depth=1", `https://github.com/collinbentley1/${app.name}.git`, sha], { cwd: directory, env });
     await command([...git, "checkout", "--detach", "FETCH_HEAD"], { cwd: directory, env });
   }
-  const failures = await doctor(directory, resolve("release"), release);
-  if (failures.length) throw new Error(`Application has not consumed the selected release: ${failures.join(", ")}`);
+  await command([process.execPath, join(resolve("release"), "tools/platform-v1.ts"), "doctor", directory, "--sha", release]);
   // Build receives data only, no checkout hooks or repository credentials.
 }
 if (import.meta.main) {

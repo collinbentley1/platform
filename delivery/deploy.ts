@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { imageName, type Project } from "./catalog.ts";
+import { imageName, defaults, type Project } from "./catalog.ts";
 import { command, gcloud } from "./process.ts";
 import { google, operation } from "./google.ts";
 import { scanImage } from "./scan.ts";
@@ -119,7 +119,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   await writeFile(join(directory, "environment.json"), JSON.stringify(environment), { mode: 0o600 });
   try {
     await requireCurrentSource(app, evidence, previewPr);
-    await gcloud(["run", "deploy", `${app.service}${preview ? "-preview-v1" : ""}`, `--project=${app.project}`, `--region=${app.region}`, `--image=${imageName(app)}@${evidence.digest}`, `--service-account=${runtimeIdentity(app, preview)}`, `--env-vars-file=${join(directory, "environment.json")}`, ...(secrets.length ? [`--set-secrets=${secrets.join(",")}`] : ["--clear-secrets"]), "--no-traffic", `--tag=${tag}`, `--revision-suffix=${suffix}`, "--min-instances=0", `--max-instances=${preview ? 2 : 10}`, "--memory=512Mi", "--cpu=1", "--concurrency=80", "--timeout=60s", "--ingress=all", preview ? "--invoker-iam-check" : "--no-invoker-iam-check", `--labels=platform-managed=v1,platform-source=${evidence.sourceSha},platform-release=${evidence.platformSha}`]);
+    await gcloud(["run", "deploy", `${app.service}${preview ? "-preview-v1" : ""}`, `--project=${app.project}`, `--region=${app.region}`, `--image=${imageName(app)}@${evidence.digest}`, `--service-account=${runtimeIdentity(app, preview)}`, `--env-vars-file=${join(directory, "environment.json")}`, ...(secrets.length ? [`--set-secrets=${secrets.join(",")}`] : ["--clear-secrets"]), "--no-traffic", `--tag=${tag}`, `--revision-suffix=${suffix}`, "--min=0", "--min-instances=0", `--max=${preview ? defaults.previewMaxInstances : defaults.productionMaxInstances}`, `--max-instances=${preview ? defaults.previewMaxInstances : defaults.productionMaxInstances}`, "--memory=512Mi", "--cpu=1", "--concurrency=80", "--timeout=60s", "--ingress=all", preview ? "--invoker-iam-check" : "--no-invoker-iam-check", `--labels=platform-managed=v1,platform-source=${evidence.sourceSha},platform-release=${evidence.platformSha}`]);
     const revision = await google<Revision>(`https://run.googleapis.com/v2/projects/${app.project}/locations/${app.region}/services/${app.service}${preview ? "-preview-v1" : ""}/revisions/${revisionName}`);
     if (revision.serviceAccount !== runtimeIdentity(app, preview) || !revision.conditions.some(condition => condition.type === "Ready" && condition.state === "CONDITION_SUCCEEDED") || ![`${imageName(app)}@${evidence.runnableDigest}`, `${imageName(app)}@${evidence.digest}`].includes(revision.containers[0]?.image ?? "")) throw new Error("Staged runtime identity, image, or readiness differs.");
     const staged = await service(app, preview);

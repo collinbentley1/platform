@@ -19,9 +19,9 @@ export async function runtimeFiles(root: string): Promise<Record<string, string>
   return files;
 }
 
-export function caller(workflow: string, sha: string, events: string, name: string, permissions: string): string {
+export function caller(workflow: string, sha: string, events: string, name: string, permissions: string, platformInput = true): string {
   requireSha(sha);
-  return `name: ${name}\n\non:\n${events}\npermissions: {}\n\njobs:\n  run:\n    name: ${name}\n    permissions:\n${permissions}\n    with:\n      platform_sha: ${sha}\n    uses: collinbentley1/platform/.github/workflows/${workflow}@${sha}\n`;
+  return `name: ${name}\n\non:\n${events}\npermissions: {}\n\njobs:\n  run:\n    name: ${name}\n    permissions:\n${permissions}\n${platformInput ? `    with:\n      platform_sha: ${sha}\n` : ""}    uses: collinbentley1/platform/.github/workflows/${workflow}@${sha}\n`;
 }
 
 export async function managedFiles(root: string, sha: string): Promise<Record<string, string>> {
@@ -31,9 +31,14 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.npmrc\nnpmrc\n.local\n.data\nnode_modules\ndist\ncoverage\n**/gha-creds-*.json\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n**/*.pem\n**/*.key\n**/*.p12\n**/*.pfx\n";
   files["bunfig.toml"] = 'env = false\ntelemetry = false\n\n[install]\nexact = true\nminimumReleaseAge = 604800\nregistry = "https://registry.npmjs.org"\n';
   files[".github/workflows/application.yml"] = caller("application-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      pull_request:\n        required: false\n        type: string\n", "Bun verify", "      contents: read\n      pull-requests: read\n      checks: write").replace(/      platform_sha:/, "      pull_request: ${{ inputs.pull_request || '' }}\n      platform_sha:");
+  files[".github/workflows/security.yml"] = caller("security-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  schedule:\n    - cron: '31 7 * * 1'\n", "CodeQL", "      contents: read\n      security-events: write", false);
   /* Central installation-token upgrader owns release proposals. */
-  files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n  issue_comment:\n    types: [created, edited]\n  pull_request_review:\n    types: [submitted]\n  pull_request_review_comment:\n    types: [created, edited, deleted]\n  schedule:\n    - cron: '7,22,37,52 * * * *'\n  workflow_dispatch:\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write");
-  files[".github/dependabot.yml"] = 'version: 2\nupdates:\n  - package-ecosystem: bun\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n    groups:\n      dependencies:\n        patterns: ["*"]\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "collinbentley1/platform/*"\n';
+  files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n  pull_request_review:\n    types: [submitted, edited, dismissed]\n  schedule:\n    - cron: '7,22,37,52 * * * *'\n  workflow_dispatch:\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write\n      actions: write");
+  const runtimeDependencies=Object.keys((JSON.parse(files[".platform/runtime/package.json"]!) as {dependencies:Record<string,string>}).dependencies).sort();
+  files[".github/dependabot.yml"] = Bun.YAML.stringify({version:2,updates:[
+    {"package-ecosystem":"bun",directory:"/",schedule:{interval:"weekly"},cooldown:{"default-days":7},groups:{dependencies:{patterns:["*"]}},ignore:runtimeDependencies.map(name=>({"dependency-name":name}))},
+    {"package-ecosystem":"github-actions",directory:"/",schedule:{interval:"weekly"},ignore:[{"dependency-name":"collinbentley1/platform/*"}]}
+  ]}).trimEnd()+"\n";
   files["tools/verify-socket-config.ts"] = 'const config = Bun.TOML.parse(await Bun.file("bunfig.toml").text()) as { install?: { registry?: string; minimumReleaseAge?: number; security?: unknown } };\nif (config.install?.registry !== "https://registry.npmjs.org" || config.install.minimumReleaseAge !== 604800 || config.install.security) throw new Error("Dependency policy differs from the managed platform contract.");\nexport {};\n';
   return files;
 }
@@ -89,6 +94,11 @@ export async function upgrade(root: string, source: string, sha: string, options
   const packageManager=(JSON.parse(await readFile(join(source,"package.json"),"utf8")) as {packageManager:string}).packageManager;
   const manifest=manifestText===undefined?undefined:runtimeManifest(manifestText,desired[".platform/runtime/package.json"]!,packageManager);
   const updateManifest=manifest!==undefined && manifest!==manifestText;
+  const reviewText = (await readFile(join(source,"templates/app/AGENTS.md"),"utf8")).trim();
+  const guidance = `<!-- platform-review-rules -->\n${reviewText}\n<!-- /platform-review-rules -->\n`;
+  const agents = await regularText(root,"AGENTS.md") ?? "";
+  const custom = agents.trim()===reviewText ? "" : agents.replace(/<!-- platform-review-rules -->[\s\S]*?<!-- \/platform-review-rules -->\s*/g,"").trim();
+  const nextAgents = `${custom ? custom+"\n\n" : ""}${guidance}`;
   const changed: string[] = [];
   for (const [path, content] of Object.entries(desired)) {
     if (await regularText(root, path) !== content) changed.push(path);
@@ -98,11 +108,14 @@ export async function upgrade(root: string, source: string, sha: string, options
     const path = `.github/workflows/${file}`;
     if (!Object.hasOwn(desired, path) && await regularText(root, path) !== undefined) { changed.push(path); removed.add(path); }
   }
+  for (const path of ["tools/socket-security-scanner.ts", "tools/platform-verify.ts"]) if (await regularText(root,path)!==undefined) { changed.push(path); removed.add(path); }
   for (const path of Object.keys(previous?.managed ?? {})) if (!Object.hasOwn(desired, path) && !removed.has(path)) { changed.push(path); removed.add(path); }
   if(updateManifest) changed.push("package.json","bun.lock");
+  if(nextAgents!==agents) changed.push("AGENTS.md");
   if (!options.check) {
     for (const path of removed) await unlink(join(root, path));
-    for (const path of changed.filter(path => !removed.has(path) && path!=="package.json" && path!=="bun.lock")) { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), desired[path]!); }
+    for (const path of changed.filter(path => !removed.has(path) && path!=="package.json" && path!=="bun.lock" && path!=="AGENTS.md")) { await mkdir(dirname(join(root, path)), { recursive: true }); await writeFile(join(root, path), desired[path]!); }
+    if(nextAgents!==agents) await writeFile(join(root,"AGENTS.md"),nextAgents);
     if(updateManifest) {
       await regularText(root,"bun.lock"); // Refuse a credential-bearing job writing through a repository symlink.
       await writeFile(join(root,"package.json"),manifest!);
@@ -116,7 +129,7 @@ export async function upgrade(root: string, source: string, sha: string, options
 export async function doctor(root: string, source: string, sha: string): Promise<string[]> {
   const expected = await managedFiles(source, sha); const failures: string[] = [];
   const server = await regularText(root, "src/server.ts");
-  if (!server || !/import\s*\{[^}]*\bsecureHandler\b[^}]*\}\s*from\s*["'][^"']*\.platform\/runtime\/http\.ts["']/.test(server) || !/\bsecureHandler\s*\(/.test(server)) failures.push("the application entry point must consume the shared HTTP runtime");
+  if (!server || !(/import\s*\{[^}]*\bsecureHandler\b[^}]*\}\s*from\s*["'][^"']*\.platform\/runtime\/http\.ts["']/.test(server) && /\bsecureHandler\s*\(/.test(server)) && !(/import\s*\{[^}]*\bapplication\b[^}]*\}\s*from\s*["'][^"']*\.platform\/runtime\/application\.ts["']/.test(server) && /\bapplication\s*\(/.test(server))) failures.push("the application entry point must consume the shared HTTP runtime");
   for (const [path, content] of Object.entries(expected)) if (await regularText(root, path) !== content) failures.push(`managed file differs: ${path}`);
   const manifest=await regularText(root,"package.json");
   if(manifest) {

@@ -1,0 +1,27 @@
+name: Production browser smoke
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 11 * * 2'
+permissions: {}
+jobs:
+  smoke:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: reference-smoke
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - run: bun ci --ignore-scripts --no-env-file
+      - run: bun x playwright install --with-deps chromium
+      - name: Exercise only the synthetic account
+        env:
+          PLATFORM_TEST_ORIGIN: https://platform-reference-882468538648.us-east4.run.app
+          PLATFORM_TEST_EMAIL: ${{ secrets.PLATFORM_TEST_EMAIL }}
+          PLATFORM_TEST_PASSWORD: ${{ secrets.PLATFORM_TEST_PASSWORD }}
+        run: bun x playwright test

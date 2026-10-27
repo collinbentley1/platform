@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: bun
-    directory: /
+    directories: [/, /runtime, /templates/app]
     schedule: {interval: weekly}
     cooldown: {default-days: 7}
     groups:

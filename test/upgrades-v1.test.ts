@@ -3,6 +3,13 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { doctor, upgrade, runtimeManifest, runtimeFiles } from "../delivery/consumer.ts";
+import {validateCatalog} from "../delivery/catalog.ts";
+import catalog from "../delivery/projects.json";
+
+test("catalog proposals cannot raise cost ceilings or provide invalid capacity",()=>{
+  validateCatalog(structuredClone(catalog));
+  for(const defaults of [{...catalog.defaults,monthlyBudgetUSD:31},{...catalog.defaults,monthlyBudgetUSD:NaN},{...catalog.defaults,productionMaxInstances:3},{...catalog.defaults,productionMaxInstances:0},{...catalog.defaults,productionMaxInstances:1.5},{...catalog.defaults,previewMaxInstances:2}])expect(()=>validateCatalog({...structuredClone(catalog),defaults})).toThrow("budget or capacity");
+});
 
 const source = resolve(import.meta.dir, "..");
 const first = "a".repeat(40); const second = "b".repeat(40);

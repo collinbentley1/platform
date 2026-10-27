@@ -3,12 +3,35 @@ on:
   schedule:
     - cron: '17 */4 * * *'
   workflow_dispatch:
+    inputs:
+      repository:
+        description: Registered consumer, or all consumers
+        type: string
+        default: ''
 permissions: {}
 concurrency:
   group: platform-consumer-upgrades
   cancel-in-progress: false
 jobs:
+  catalog:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      applications: ${{ steps.catalog.outputs.applications }}
+      repositories: ${{ steps.catalog.outputs.repositories }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: catalog
+        env:
+          PLATFORM_REPOSITORY: ${{ inputs.repository }}
+        run: bun delivery/matrix.ts
   upgrade:
+    needs: catalog
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -16,13 +39,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        repository: [cdbentley, critical-history, healthmcp, runsetta, virtual-care-mcp]
+        repository: ${{ fromJSON(needs.catalog.outputs.repositories) }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: main
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - name: Resolve the protected release
@@ -35,6 +57,7 @@ jobs:
           ref: ${{ steps.release.outputs.sha }}
           path: release
           persist-credentials: false
+      - run: bash release/delivery/install-bun.sh
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         id: app
         with:
@@ -52,4 +75,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PLATFORM_TARGET_REPOSITORY: collinbentley1/${{ matrix.repository }}
-        run: bun delivery/upgrade.ts release --adopt
+        run: bun release/delivery/upgrade.ts release --adopt

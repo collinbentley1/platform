@@ -50,3 +50,9 @@ override.tf.json
 *_override.tf.json
 .terraform.lock.hcl.tmp
 # END platform-managed Terraform safety rules
+
+.local/
+playwright-report/
+test-results/
+firebase-debug.log
+ui-debug.log

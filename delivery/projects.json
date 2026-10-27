@@ -109,5 +109,10 @@
       },
       "secrets": {}
     }
-  ]
+  ],
+  "defaults": {
+    "productionMaxInstances": 2,
+    "previewMaxInstances": 1,
+    "monthlyBudgetUSD": 30
+  }
 }

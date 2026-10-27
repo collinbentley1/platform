@@ -14,14 +14,14 @@ export function checksPassed(checks: readonly Check[], required: readonly { cont
   return required.every(rule => [...latest.values()].some(check => check.name === rule.context && (rule.app_id === null || rule.app_id === check.app.id) && check.conclusion === "success"));
 }
 
-export async function latestRelease(): Promise<{ sha: string; tag: string }> {
-  const release = await api<{ tag_name: string; draft: boolean; prerelease: boolean }>("/repos/collinbentley1/platform/releases/latest");
+export async function latestRelease(read: <T>(path:string)=>Promise<T> = api): Promise<{ sha: string; tag: string }> {
+  const release = await read<{ tag_name: string; draft: boolean; prerelease: boolean }>("/repos/collinbentley1/platform/releases/latest");
   if (release.draft || release.prerelease || !/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(release.tag_name)) throw new Error("Invalid platform release.");
-  let object = (await api<{ object: { type: string; sha: string } }>(`/repos/collinbentley1/platform/git/ref/tags/${release.tag_name}`)).object;
-  for (let i = 0; object.type === "tag" && i < 3; i++) object = (await api<{ object: { type: string; sha: string } }>(`/repos/collinbentley1/platform/git/tags/${requireSha(object.sha)}`)).object;
+  let object = (await read<{ object: { type: string; sha: string } }>(`/repos/collinbentley1/platform/git/ref/tags/${release.tag_name}`)).object;
+  for (let i = 0; object.type === "tag" && i < 3; i++) object = (await read<{ object: { type: string; sha: string } }>(`/repos/collinbentley1/platform/git/tags/${requireSha(object.sha)}`)).object;
   if (object.type !== "commit") throw new Error("Release does not resolve to a commit.");
   const sha = requireSha(object.sha);
-  const ancestry = await api<{ status: string }>(`/repos/collinbentley1/platform/compare/${sha}...main`);
+  const ancestry = await read<{ status: string }>(`/repos/collinbentley1/platform/compare/${sha}...main`);
   if (!["ahead", "identical"].includes(ancestry.status)) throw new Error("Release is not from protected platform main.");
   return { sha, tag: release.tag_name };
 }

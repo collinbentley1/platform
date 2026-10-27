@@ -10,6 +10,7 @@ const flag = (name: string) => { const i = args.indexOf(name); return i >= 0 ? a
 const sha = flag("--sha") ?? Bun.env.PLATFORM_WORKFLOW_SHA ?? (await new Response(Bun.spawn(["git", "rev-parse", "HEAD"], { cwd: source, stdout: "pipe" }).stdout).text()).trim();
 const target = resolve(args[0] ?? ".");
 switch (command) {
+  case "create": { const { create } = await import("../delivery/create.ts"); await create(args[0] ?? "", args.slice(1)); break; }
   case "init":
   case "scaffold": {
     const name = args[0]; const destination = resolve(args[1] ?? name ?? "");
@@ -34,13 +35,16 @@ switch (command) {
     const { provision } = await import("../delivery/provision.ts");
     await provision(args[0] ?? "", args.includes("--apply")); break;
   }
+  case "rotate-secret": { const { rotate } = await import("../delivery/rotate.ts"); await rotate(args[0] ?? "",args[1] ?? ""); break; }
+  case "budget": { const { budget } = await import("../delivery/operations.ts"); await budget(Number(args[0] ?? 30)); break; }
+  case "status": { const { status } = await import("../delivery/operations.ts"); status(); break; }
   case "repository-settings": {
     const { settings } = await import("../delivery/settings.ts");
     await settings(args[0] ?? ""); break;
   }
   case "help":
   case undefined:
-    console.log("platform init <name> [directory] --sha <release>\nplatform verify [directory]\nplatform doctor [directory] --sha <release>\nplatform upgrade [directory] --sha <release> [--check] [--adopt]\nplatform enroll <registered-google-project> [--apply]\nplatform repository-settings <registered-repository>\n\nThe complete starter includes local SQLite and production Identity Platform + Firestore.\nPublished platform releases propose managed consumer PRs; all checks and current-head automated review must pass before automatic merge.\nCloud publishing and deployment run only in the protected platform repository. Each application owns its frontend and product code."); break;
+    console.log("platform create <name> --project <id> [--billing-account <id>] --apply\nplatform init <name> [directory] --sha <release>\nplatform budget [total-monthly-USD]\nplatform rotate-secret <app> <environment-key> < replacement-secret\nplatform status\nplatform verify [directory]\nplatform doctor [directory] --sha <release>\nplatform upgrade [directory] --sha <release> [--check] [--adopt]\nplatform enroll <registered-google-project> [--apply]\nplatform repository-settings <registered-repository>\n\nThe complete starter includes local SQLite and production Identity Platform + Firestore.\nPublished platform releases propose managed consumer PRs; all checks and current-head automated review must pass before automatic merge.\nCloud publishing and deployment run only in the protected platform repository. Each application owns its frontend and product code."); break;
   default: throw new Error("Unknown command; run platform help.");
 }
 

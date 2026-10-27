@@ -2,12 +2,8 @@ name: Platform review admission
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
-  issue_comment:
-    types: [created, edited]
   pull_request_review:
-    types: [submitted]
-  pull_request_review_comment:
-    types: [created, edited, deleted]
+    types: [submitted, edited, dismissed]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
@@ -24,6 +20,7 @@ jobs:
       contents: read
       pull-requests: read
       checks: write
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

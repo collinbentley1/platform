@@ -21,7 +21,23 @@ concurrency:
   group: delivery-${{ inputs.application || 'all' }}-${{ inputs.pull_request || 'production' }}
   cancel-in-progress: false
 jobs:
+  catalog:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      applications: ${{ steps.catalog.outputs.applications }}
+      repositories: ${{ steps.catalog.outputs.repositories }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: catalog
+        run: bun delivery/matrix.ts
   cleanup:
+    needs: catalog
     name: Remove closed preview tags
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
@@ -29,14 +45,7 @@ jobs:
     environment: deploy-${{ matrix.application }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - {application: cdbentley, project: cdbentley, number: '882468538648'}
-          - {application: critical-history, project: critical-history-16823277, number: '422714632513'}
-          - {application: healthmcp, project: medlock-1025243085, number: '229383559510'}
-          - {application: runsetta, project: runsetta, number: '601124730704'}
-          - {application: virtual-care-mcp, project: virtual-care-mcp, number: '894875537243'}
-          - {application: platform-reference, project: cdbentley, number: '882468538648'}
+      matrix: ${{ fromJSON(needs.catalog.outputs.applications) }}
     permissions:
       contents: read
       pull-requests: read
@@ -102,7 +111,7 @@ jobs:
           ref: ${{ matrix.release }}
           path: release
           persist-credentials: false
-      - run: bash delivery/install-bun.sh
+      - run: bash release/delivery/install-bun.sh
       - name: Prepare the exact application and release
         env:
           PLATFORM_APP: ${{ matrix.app }}

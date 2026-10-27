@@ -116,3 +116,25 @@ test("oversized records are rejected before a Firestore write and equal timestam
 test("HEAD preserves the UTF-8 JSON representation length",async()=>{const handler=secureHandler(()=>json({value:"é"}));const get=await handler(new Request("https://app.example/"));const head=await handler(new Request("https://app.example/",{method:"HEAD"}));expect(head.headers.get("Content-Length")).toBe(String((await get.arrayBuffer()).byteLength));expect(await head.text()).toBe("");});
 
 test("JSON framing uses one serialization even for stateful values",async()=>{let calls=0;const response=json({toJSON(){calls++;return{value:"é".repeat(calls)};}},200,{"Cache-Control":"max-age=300"});const body=await response.arrayBuffer();expect(calls).toBe(1);expect(response.headers.get("Content-Length")).toBe(String(body.byteLength));expect(response.headers.get("Cache-Control")).toBe("max-age=300");});
+
+test("account data deletion removes only its owner's records", async () => {
+  const root=await mkdtemp(join(tmpdir(),"platform-account-cleanup-")); const store=await sqliteStore(join(root,"data.sqlite"));
+  try {
+    for(const owner of ["alice","bob"]) await store.put(owner,{id:crypto.randomUUID(),title:owner,createdAt:new Date().toISOString()});
+    await store.removeAll("alice"); await store.removeAll("alice");
+    expect(await store.list("alice")).toEqual([]); expect((await store.list("bob"))[0]?.title).toBe("bob");
+    await expect(store.put("alice",{id:crypto.randomUUID(),title:"late write",createdAt:new Date().toISOString()})).rejects.toMatchObject({status:410});
+  } finally {store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test("account recovery hides missing accounts but surfaces provider outages", async () => {
+  const {managedIdentity}=await import("../runtime/identity.ts");
+  const fetcher=globalThis.fetch;let status=400;let code="EMAIL_NOT_FOUND";
+  globalThis.fetch=(async(_input:unknown)=>Response.json({error:{message:code}},{status})) as typeof fetch;
+  try {
+    const provider=managedIdentity("demo-recovery-test","synthetic-key");
+    await expect(provider.sendReset("synthetic@example.invalid")).resolves.toBeUndefined();
+    status=503;code="UNAVAILABLE";await expect(provider.sendReset("synthetic@example.invalid")).rejects.toMatchObject({status:503});
+    status=400;code="API_KEY_INVALID";await expect(provider.sendReset("synthetic@example.invalid")).rejects.toMatchObject({status:400});
+  } finally {globalThis.fetch=fetcher;}
+});
