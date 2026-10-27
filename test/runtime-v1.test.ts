@@ -1,11 +1,11 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import { generateKeyPair, SignJWT } from "jose";
 import { mkdtemp, rm, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HttpError, readJson, secureHandler, serveStatic, requireOrigin } from "../runtime/http.ts";
+import { HttpError, json, readJson, secureHandler, serveStatic, requireOrigin } from "../runtime/http.ts";
 import { identityVerifier, sessionCookie, sessionToken } from "../runtime/auth.ts";
-import { sqliteStore, firestoreStore, memoryStore } from "../runtime/data.ts";
+import { sqliteStore, firestoreStore, memoryStore, cachedReadiness } from "../runtime/data.ts";
 
 describe("shared application boundaries", () => {
   test("bounds streamed input without trusting content length and rejects malformed UTF-8", async () => {
@@ -82,11 +82,25 @@ test("Firestore readiness requires a successful database operation, including on
     return Response.json(status===200?{documents:[]}:{error:{status:"NOT_FOUND"}},{status});
   }) as typeof fetch;
   try{
-    const store=firestoreStore("demo-project","platform_records",async()=>"synthetic-test-identity");
-    await expect(store.ready()).rejects.toThrow("Data unavailable");
-    status=403;await expect(store.ready()).rejects.toThrow("Data unavailable");
-    status=200;await expect(store.ready()).resolves.toBeUndefined();
+    const store=()=>firestoreStore("demo-project","platform_records",async()=>"synthetic-test-identity");
+    await expect(store().ready()).rejects.toThrow("Datastore unavailable");
+    status=403;await expect(store().ready()).rejects.toThrow("Datastore unavailable");
+    status=200;await expect(store().ready()).resolves.toBeUndefined();
   }finally{globalThis.fetch=original;}
+});
+
+test("readiness coalesces requests, caches failures and retries after the bounded interval", async () => {
+  let now=0,calls=0,fail=true;
+  const clock=spyOn(performance,"now").mockImplementation(()=>now);
+  const ready=cachedReadiness(async()=>{calls++;if(fail)throw new Error("private database details");});
+  try {
+    const results=await Promise.allSettled(Array.from({length:20},()=>ready()));
+    expect(calls).toBe(1);expect(results.every(result=>result.status==="rejected" && result.reason.message==="Datastore unavailable.")).toBe(true);
+    fail=false;await expect(ready()).rejects.toThrow("Datastore unavailable");expect(calls).toBe(1);
+    now=5000;await Promise.all(Array.from({length:20},()=>ready()));expect(calls).toBe(2);
+    await ready();expect(calls).toBe(2);
+    now=10000;await ready();expect(calls).toBe(3);
+  } finally {clock.mockRestore();}
 });
 
  test("Firestore retains empty string values consistently with the other stores",async()=>{
@@ -98,3 +112,5 @@ test("Firestore readiness requires a successful database operation, including on
 test("memory previews sort by creation time before selecting the newest 100",async()=>{const store=memoryStore();const newer={id:crypto.randomUUID(),title:"new",createdAt:"2030-01-01"};await store.put("alice",newer);for(let i=0;i<100;i++)await store.put("alice",{id:crypto.randomUUID(),title:"older",createdAt:"2020-01-01"});const listed=await store.list("alice");expect(listed).toHaveLength(100);expect(listed[0]).toEqual(newer);});
 
 test("oversized records are rejected before a Firestore write and equal timestamps sort consistently",async()=>{const original=globalThis.fetch;let calls=0;globalThis.fetch=(async(_input:unknown)=>{calls++;return Response.json({});}) as typeof fetch;try{const store=firestoreStore("demo-project","platform_records",async()=>"synthetic");await expect(store.put("alice",{id:crypto.randomUUID(),title:"x".repeat(4096),createdAt:new Date().toISOString()})).rejects.toMatchObject({status:400});expect(calls).toBe(0);const memory=memoryStore();const ids=["00000000-0000-0000-0000-000000000001","00000000-0000-0000-0000-000000000002"];for(const id of ids)await memory.put("alice",{id,title:"same",createdAt:"2030-01-01"});expect((await memory.list("alice")).map(value=>value.id)).toEqual(ids.toReversed());}finally{globalThis.fetch=original;}});
+
+test("HEAD preserves the UTF-8 JSON representation length",async()=>{const handler=secureHandler(()=>json({value:"é"}));const get=await handler(new Request("https://app.example/"));const head=await handler(new Request("https://app.example/",{method:"HEAD"}));expect(head.headers.get("Content-Length")).toBe(String((await get.arrayBuffer()).byteLength));expect(await head.text()).toBe("");});

@@ -65,6 +65,11 @@ function routed(traffic: readonly Traffic[]): string {
   return JSON.stringify(traffic.filter(target => (target.percent ?? 0) > 0).map(target => ({ revision: target.revision?.split("/").at(-1), percent: target.percent })).sort((a, b) => (a.revision ?? "").localeCompare(b.revision ?? "")));
 }
 
+export function previewTraffic(traffic: readonly Traffic[], tag: string, candidateTag: string, revision: string): Traffic[] {
+  if(traffic.some(item=>!item.revision))throw new Error("Cannot resolve preview traffic revisions.");
+  return [...traffic.filter(item => item.tag !== tag && item.tag !== candidateTag).map(item => ({ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision: item.revision!.split("/").at(-1)!, ...(item.percent === undefined ? {} : { percent: item.percent }), ...(item.tag ? { tag: item.tag } : {}) })), { type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision, tag }];
+}
+
 export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: string): Promise<{ url: string; revision: string }> {
   const preview = Boolean(previewPr); const name = servicePath(app, preview);
   await requireCurrentSource(app, evidence, previewPr);
@@ -73,12 +78,13 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const previousTraffic = before.trafficStatuses ?? [];
   const nonce = crypto.randomUUID(); const suffix = `p${nonce.replaceAll("-", "").slice(0, 18)}`;
   const revisionName = `${app.service}${preview ? "-preview-v1" : ""}-${suffix}`;
-  const tag = previewPr ? `pr-${previewPr}` : "candidate";
+  const tag = `candidate-${suffix}`;
+  const previewTag = previewPr ? `pr-${previewPr}` : undefined;
   const directory = await mkdtemp(join(tmpdir(), "platform-deploy-"));
   const environment: Record<string, string> = {
     ...(preview ? previewEnvironment(app) : app.env), NODE_ENV: "production", PLATFORM_DEPLOY_NONCE: nonce, PLATFORM_SOURCE_SHA: evidence.sourceSha, PLATFORM_RELEASE_SHA: evidence.platformSha,
   };
-  const previewOrigin = new URL(before.uri); previewOrigin.hostname = `${tag}---${previewOrigin.hostname}`;
+  const previewOrigin = new URL(before.uri); previewOrigin.hostname = `${previewTag ?? tag}---${previewOrigin.hostname}`;
   if (preview && app.name === "virtual-care-mcp") environment.PUBLIC_BASE_URL = previewOrigin.origin;
   if (preview && app.name === "healthmcp") Object.assign(environment,{ALLOWED_HOSTS:previewOrigin.hostname,ALLOWED_ORIGINS:previewOrigin.origin,CANONICAL_HOST:previewOrigin.hostname,LEGACY_HOSTS:""});
   if (!preview && app.name === "healthmcp") {
@@ -108,7 +114,29 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     if (preview) {
       const anonymous = await fetch(new URL("/livez", target.uri), { redirect: "error", signal: AbortSignal.timeout(15_000) });
       if (![401, 403].includes(anonymous.status)) throw new Error("Private preview accepts anonymous requests.");
-      return { url: target.uri, revision: revisionName };
+      if (routed(staged.trafficStatuses ?? []) !== routed(previousTraffic)) throw new Error("Preview base traffic changed during staging.");
+      const previous = previousTraffic.find(item => item.tag === previewTag);
+      const existing = staged.trafficStatuses?.find(item => item.tag === previewTag);
+      if (previous?.revision !== existing?.revision) throw new Error("Preview route changed during staging.");
+      await requireCurrentSource(app, evidence, previewPr);
+      const promoted = await google<{ name: string }>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`, "PATCH", { name, etag: staged.etag, traffic: previewTraffic(staged.trafficStatuses ?? [], previewTag!, tag, revisionName) });
+      await operation(promoted.name);
+      try {
+        const current = await service(app, true);
+        if (!current.trafficStatuses?.some(item => item.tag === previewTag && item.revision?.split("/").at(-1) === revisionName)) throw new Error("Preview promotion did not converge.");
+        for (let attempt=0;;attempt++) {
+          try { await probe(previewOrigin.origin, nonce, token); if(app.data)await ready(previewOrigin.origin,token); break; }
+          catch(error) { if(attempt===2)throw error; await Bun.sleep(2000); }
+        }
+      } catch(error) {
+        const failed=await service(app,true);
+        if(failed.trafficStatuses?.some(item=>item.tag===previewTag&&item.revision?.split("/").at(-1)===revisionName)) {
+          const traffic=previous ? previewTraffic(failed.trafficStatuses,previewTag!,tag,previous.revision!.split("/").at(-1)!) : previewTraffic(failed.trafficStatuses,previewTag!,tag,revisionName).filter(item=>item.tag!==previewTag);
+          const rollback=await google<{name:string}>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`,"PATCH",{name,etag:failed.etag,traffic});await operation(rollback.name);
+        }
+        throw error;
+      }
+      return { url: previewOrigin.origin, revision: revisionName };
     }
     if (routed(staged.trafficStatuses ?? []) !== routed(previousTraffic)) throw new Error("Production traffic changed during staging.");
     await requireCurrentSource(app, evidence);
