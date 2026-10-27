@@ -39,18 +39,35 @@ export function reviewRequestDue(comments: readonly {body:string;created_at:stri
   return !previous || now-Date.parse(previous.created_at)>=4*60*60_000;
 }
 
+type RefreshComment = {id:number;body:string;created_at:string;user:{id:number};performed_via_github_app?:{id:number}|null};
+export function recoverableReviewDraft(comments: readonly RefreshComment[], head:string, draftActor:number|undefined): RefreshComment|undefined {
+  return comments.filter(comment=>comment.performed_via_github_app?.id===5488696 && comment.user.id===draftActor && comment.body.includes(`<!-- platform-review-pending:${head} -->`)).at(-1);
+}
+
 export async function requestReview(number: string, head: string): Promise<void> {
-  const comments = await pages<{ body: string; created_at: string; user: {id:number} }>(`/repos/${repository()}/issues/${number}/comments`);
-  const marker = `<!-- platform-review-head:${head} -->`;
-  if (!reviewRequestDue(comments,head)) return;
+  const comments = await pages<RefreshComment>(`/repos/${repository()}/issues/${number}/comments`);
   const pr=await pullRequest(number);
-  if(pr.head.sha!==head || pr.draft) throw new Error("Review refresh requires the unchanged ready upgrade PR.");
-  await api(`/repos/${repository()}/issues/${number}/comments`, "POST", { body: `Refresh automatic review.\n\n${marker}` });
+  if(pr.head.sha!==head) throw new Error("Review refresh requires the unchanged upgrade PR.");
+  let pending:RefreshComment|undefined;
+  if(pr.draft) {
+    const events=await pages<{event:string;actor:{id:number}}>(`/repos/${repository()}/issues/${number}/events`);
+    pending=recoverableReviewDraft(comments,head,events.filter(event=>event.event==="converted_to_draft").at(-1)?.actor.id);
+    if(!pending)throw new Error("A manually drafted upgrade requires owner review.");
+  } else {
+    if (!reviewRequestDue(comments,head)) return;
+    pending=await api<RefreshComment>(`/repos/${repository()}/issues/${number}/comments`, "POST", {body:`Refreshing automatic review.\n\n<!-- platform-review-pending:${head} -->`});
+    await graphql(`mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
+  }
   // Repository-wide automatic reviews use the configured owner's review allowance.
   // A bot-authored @mention can resolve a different billing identity.
-  await graphql(`mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
   if((await pullRequest(number)).head.sha!==head) throw new Error("Upgrade head changed during review refresh.");
-  await graphql(`mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
+  const markReady=()=>graphql(`mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id}}}`,{id:pr.node_id});
+  try {await markReady();} catch(error) {
+    const current=await pullRequest(number);if(current.head.sha!==head)throw error;
+    if(current.draft)await markReady(); // Pending provenance lets the next producer run retry another failure.
+  }
+  // Start the cooldown only after the ready-for-review transition succeeded.
+  await api(`/repos/${repository()}/issues/comments/${pending.id}`,"PATCH",{body:`Refresh automatic review.\n\n<!-- platform-review-head:${head} -->`});
 }
 
 export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promise<void> {
