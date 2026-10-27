@@ -65,9 +65,18 @@ function routed(traffic: readonly Traffic[]): string {
   return JSON.stringify(traffic.filter(target => (target.percent ?? 0) > 0).map(target => ({ revision: target.revision?.split("/").at(-1), percent: target.percent })).sort((a, b) => (a.revision ?? "").localeCompare(b.revision ?? "")));
 }
 
+export function normalizedTraffic(traffic:readonly Traffic[]):Traffic[] {
+  if(traffic.some(item=>!item.revision))throw new Error("Cannot resolve traffic revisions.");
+  return traffic.map(item=>({type:"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",revision:item.revision!.split("/").at(-1)!,...(item.percent===undefined?{}:{percent:item.percent}),...(item.tag?{tag:item.tag}:{})}));
+}
+export function routingState(traffic:readonly Traffic[]):string {
+  return JSON.stringify({weighted:routed(traffic),tags:normalizedTraffic(traffic).filter(item=>item.tag).map(item=>({revision:item.revision,tag:item.tag})).sort((a,b)=>a.tag!.localeCompare(b.tag!))});
+}
+export function productionTraffic(traffic:readonly Traffic[],revision:string,candidateTag:string):Traffic[] {
+  return [{type:"TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",revision,percent:100},...normalizedTraffic(traffic.filter(item=>item.tag && item.tag!==candidateTag)).map(item=>({type:item.type!,revision:item.revision!,tag:item.tag!}))];
+}
 export function previewTraffic(traffic: readonly Traffic[], tag: string, candidateTag: string, revision: string): Traffic[] {
-  if(traffic.some(item=>!item.revision))throw new Error("Cannot resolve preview traffic revisions.");
-  return [...traffic.filter(item => item.tag !== tag && item.tag !== candidateTag).map(item => ({ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision: item.revision!.split("/").at(-1)!, ...(item.percent === undefined ? {} : { percent: item.percent }), ...(item.tag ? { tag: item.tag } : {}) })), { type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision, tag }];
+  return [...normalizedTraffic(traffic.filter(item=>item.tag!==tag && item.tag!==candidateTag)), { type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision, tag }];
 }
 
 export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: string): Promise<{ url: string; revision: string }> {
@@ -141,13 +150,14 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
       }
       return { url: previewOrigin.origin, revision: revisionName };
     }
-    if (routed(staged.trafficStatuses ?? []) !== routed(previousTraffic)) throw new Error("Production traffic changed during staging.");
+    if (routingState((staged.trafficStatuses ?? []).filter(item=>item.tag!==tag)) !== routingState(previousTraffic)) throw new Error("Production traffic changed during staging.");
     await requireCurrentSource(app, evidence);
     // The etag protects against an overlapping operator or a stale deployment run.
-    const result = await google<{ name: string }>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`, "PATCH", { name, etag: staged.etag, traffic: [{ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision: revisionName, percent: 100 }] });
+    const promotedTraffic=productionTraffic(staged.trafficStatuses??[],revisionName,tag);
+    const result = await google<{ name: string }>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`, "PATCH", { name, etag: staged.etag, traffic: promotedTraffic });
     await operation(result.name);
     const current = await service(app);
-    if (routed(current.trafficStatuses ?? []) !== routed([{ revision: revisionName, percent: 100 }])) throw new Error("Production route did not converge to the verified revision.");
+    if (routingState(current.trafficStatuses ?? []) !== routingState(promotedTraffic)) throw new Error("Production route did not converge to the verified revision.");
     try {
       for(let attempt=0;;attempt++) {
         try {
@@ -161,13 +171,13 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     } catch (error) {
       const failed = await service(app);
       // Roll back only our own route, with a fresh etag. Never overwrite another operator.
-      if (routed(failed.trafficStatuses ?? []) === routed([{ revision: revisionName, percent: 100 }])) {
-        const rollbackTraffic = previousTraffic.filter(item => (item.percent ?? 0) > 0).map(item => ({ type: "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", revision: item.revision?.split("/").at(-1), percent: item.percent }));
-        if (!rollbackTraffic.length || rollbackTraffic.some(item => !item.revision)) throw new Error("Cannot resolve the previous production route for rollback.");
+      if (routingState(failed.trafficStatuses ?? []) === routingState(promotedTraffic)) {
+        const rollbackTraffic = normalizedTraffic(previousTraffic);
+        if (!rollbackTraffic.some(item=>(item.percent??0)>0)) throw new Error("Cannot resolve the previous production route for rollback.");
         const rollback = await google<{ name: string }>(`https://run.googleapis.com/v2/${name}?updateMask=traffic`, "PATCH", { name, etag: failed.etag, traffic: rollbackTraffic });
         await operation(rollback.name);
         const restored = await service(app);
-        if (routed(restored.trafficStatuses ?? []) !== routed(previousTraffic)) throw new Error("Production rollback did not converge.");
+        if (routingState(restored.trafficStatuses ?? []) !== routingState(previousTraffic)) throw new Error("Production rollback did not converge.");
         console.error(JSON.stringify({ event: "deployment-rolled-back", app: app.name, failedRevision: revisionName }));
       }
       throw error;
