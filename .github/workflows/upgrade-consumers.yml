@@ -19,7 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: main
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - id: catalog
@@ -39,7 +38,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: main
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - name: Resolve the protected release
@@ -52,6 +50,7 @@ jobs:
           ref: ${{ steps.release.outputs.sha }}
           path: release
           persist-credentials: false
+      - run: bash release/delivery/install-bun.sh
       - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         id: app
         with:
@@ -69,4 +68,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           PLATFORM_TARGET_REPOSITORY: collinbentley1/${{ matrix.repository }}
-        run: bun delivery/upgrade.ts release --adopt
+        run: bun release/delivery/upgrade.ts release --adopt
