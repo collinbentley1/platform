@@ -4,13 +4,13 @@ import {consumerReviewCheck,platformReviewCheck} from "./review.ts";
 
 const actions = [
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+  "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
   "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
   "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
   "google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db",
-  "github/codeql-action/init@793b778da9c9275a0f276522b27cb5fc14bba279",
-  "github/codeql-action/analyze@793b778da9c9275a0f276522b27cb5fc14bba279",
+  "github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370",
+  "github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370",
   "collinbentley1/platform/.github/workflows/*@*",
 ];
 export async function settings(name: string): Promise<void> {
