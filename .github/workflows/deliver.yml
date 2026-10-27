@@ -225,6 +225,7 @@ jobs:
           service_account: platform-deploy@${{ matrix.project }}.iam.gserviceaccount.com
           token_format: id_token
           id_token_audience: ${{ steps.preview.outputs.audience }}
+          id_token_include_email: true
           create_credentials_file: false
           export_environment_variables: false
       - name: Scan, stage, probe, and route the verified revision
