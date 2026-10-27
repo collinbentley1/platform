@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { api, graphql, pages, repository, pullRequest, type PullRequest } from "./github.ts";
+import { api, graphql, pages, GitHubError, repository, pullRequest, type PullRequest } from "./github.ts";
 import { upgrade, requireSha } from "./consumer.ts";
 import { command } from "./process.ts";
 import { automatedReview, requestReview } from "./review.ts";
@@ -101,7 +101,13 @@ export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_
     }
     if (checksPassed(checks, required) && await automatedReview(prNumber, head)) {
       const latest = await pullRequest(prNumber); if (latest.head.sha !== head) throw new Error("Upgrade head changed before merge admission.");
-      const merged=await api<{merged:boolean}>(`/repos/${repository()}/pulls/${prNumber}/merge`,"PUT",{sha:head,merge_method:"squash"});
+      let merged:{merged:boolean};
+      try { merged=await api<{merged:boolean}>(`/repos/${repository()}/pulls/${prNumber}/merge`,"PUT",{sha:head,merge_method:"squash"}); }
+      catch(error) {
+        // GitHub can lag the completed checks while recalculating protected-branch admission.
+        if(error instanceof GitHubError && [405,409].includes(error.status)) {await Bun.sleep(20_000);continue;}
+        throw error;
+      }
       if(!merged.merged) throw new Error("Verified automatic merge did not complete.");
       console.log(JSON.stringify({ event: "upgrade-auto-merged", repository: repository(), pullRequest: prNumber, head })); return;
     }

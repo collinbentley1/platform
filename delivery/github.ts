@@ -5,10 +5,11 @@ export function repository(): string {
   if (!/^collinbentley1\/[a-zA-Z0-9._-]+$/.test(name)) throw new Error("Unexpected GitHub repository.");
   return name;
 }
+export class GitHubError extends Error { constructor(readonly status:number){super(`GitHub request failed (${status}).`);} }
 export async function api<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   if (!path.startsWith("/") || path.startsWith("//") || !Bun.env.GH_TOKEN) throw new Error("Invalid GitHub request.");
   const response = await fetch(`https://api.github.com${path}`, { method, headers: { Authorization: `Bearer ${Bun.env.GH_TOKEN}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(30_000), redirect: "error" });
-  if (!response.ok) throw new Error(`GitHub request failed (${response.status}).`);
+  if (!response.ok) throw new GitHubError(response.status);
   return response.status === 204 ? undefined as T : await response.json() as T;
 }
 export async function pages<T>(path: string): Promise<T[]> {
