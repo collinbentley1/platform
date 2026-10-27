@@ -11,6 +11,7 @@ export function validateCatalog(value: { schemaVersion: number; owner: string; p
   const names = new Set<string>(); const ids = new Set<string>();
   for (const app of value.projects) {
     if (!/^[a-z][a-z0-9-]{0,39}$/.test(app.name) || !/^[1-9][0-9]*$/.test(app.repositoryId) || !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(app.project) || !/^[1-9][0-9]*$/.test(app.number) || app.region !== "us-east4" || !/^[a-z][a-z0-9-]{0,39}$/.test(app.service) || !/^[a-z][a-z0-9-]{0,39}$/.test(app.registry)) throw new Error("Invalid project identity.");
+    if (`${app.service}-preview-v1`.length + 17 > 46) throw new Error("Service name leaves insufficient room for Cloud Run preview tags; use a shorter service alias.");
     if (names.has(app.name) || ids.has(app.repositoryId)) throw new Error("Duplicate project identity.");
     names.add(app.name); ids.add(app.repositoryId);
     if (app.sourceDirectory !== undefined && (app.repository !== "platform" || app.repositoryId !== platformRepositoryId || app.sourceDirectory !== "templates/app")) throw new Error("Invalid reference source.");

@@ -78,7 +78,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const previousTraffic = before.trafficStatuses ?? [];
   const nonce = crypto.randomUUID(); const suffix = `p${nonce.replaceAll("-", "").slice(0, 18)}`;
   const revisionName = `${app.service}${preview ? "-preview-v1" : ""}-${suffix}`;
-  const tag = `candidate-${suffix}`;
+  const tag = `c${nonce.replaceAll("-", "").slice(0, 16)}`;
   const previewTag = previewPr ? `pr-${previewPr}` : undefined;
   const directory = await mkdtemp(join(tmpdir(), "platform-deploy-"));
   const environment: Record<string, string> = {
