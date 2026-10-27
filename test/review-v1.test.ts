@@ -10,3 +10,9 @@ test("recognizes a completed source-bound Codex summary without treating a runni
 });
 
 test("failed reviews can be retried on the upgrade schedule without spamming a running review",()=>{const head="a".repeat(40);const previous={body:`@codex review\n<!-- platform-review-head:${head} -->`,created_at:"2030-01-01T00:00:00Z",user:{id:1}};expect(reviewRequestDue([previous],head,Date.parse("2030-01-01T03:59:00Z"))).toBe(false);expect(reviewRequestDue([previous],head,Date.parse("2030-01-01T04:00:00Z"))).toBe(true);expect(reviewRequestDue([previous,{body:`<!-- codex-pull-request-review-summary --> {"commit_sha":"${head}","status":"running"}`,created_at:previous.created_at,user:{id:199175422}}],head,Date.parse("2030-01-01T05:00:00Z"))).toBe(false);});
+
+ test("a completed review for an older head does not suppress a retry for the current head",()=>{
+ const head="a".repeat(40),created_at="2030-01-01T00:00:00Z";
+ const comments=[{body:`@codex review\n<!-- platform-review-head:${head} -->`,created_at,user:{id:1}},{body:'<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | ✅ **Completed** | `bbbbbbb` |',created_at,user:{id:199175422}}];
+ expect(reviewRequestDue(comments,head,Date.parse("2030-01-01T05:00:00Z"))).toBe(true);
+ });
