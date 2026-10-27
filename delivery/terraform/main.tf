@@ -84,17 +84,30 @@ resource "google_service_account_iam_member" "audit_wif" {
   role               = "roles/iam.workloadIdentityUser"
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.delivery.name}/attribute.authority/collinbentley1/platform/.github/workflows/reconcile-v1.yml@refs/heads/main:audit-${each.key}"
 }
+resource "google_artifact_registry_repository" "images" {
+  for_each      = local.registries
+  project       = var.project_id
+  location      = "us-east4"
+  repository_id = each.key
+  format        = "DOCKER"
+  docker_config { immutable_tags = true }
+  depends_on = [google_project_service.services]
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes  = [description, cleanup_policies, cleanup_policy_dry_run]
+  }
+}
 resource "google_artifact_registry_repository_iam_member" "publish" {
   for_each   = local.registries
   location   = "us-east4"
-  repository = each.key
+  repository = google_artifact_registry_repository.images[each.key].repository_id
   role       = "roles/artifactregistry.writer"
   member     = "serviceAccount:${google_service_account.publish.email}"
 }
 resource "google_artifact_registry_repository_iam_member" "deploy" {
   for_each   = local.registries
   location   = "us-east4"
-  repository = each.key
+  repository = google_artifact_registry_repository.images[each.key].repository_id
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${google_service_account.deploy.email}"
 }
@@ -102,7 +115,7 @@ resource "google_artifact_registry_repository_iam_member" "deploy" {
 resource "google_artifact_registry_repository_iam_member" "audit" {
   for_each   = local.registries
   location   = "us-east4"
-  repository = each.key
+  repository = google_artifact_registry_repository.images[each.key].repository_id
   role       = "roles/artifactregistry.reader"
   member     = "serviceAccount:${google_service_account.audit.email}"
 }

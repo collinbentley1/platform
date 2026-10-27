@@ -1,7 +1,7 @@
 import { command } from "./process.ts";
 import { readText } from "../runtime/http.ts";
 
-const hosts = new Set(["containeranalysis.googleapis.com", "run.googleapis.com", "storage.googleapis.com", "identitytoolkit.googleapis.com", "apikeys.googleapis.com", "firestore.googleapis.com", "monitoring.googleapis.com", "recaptchaenterprise.googleapis.com"]);
+const hosts = new Set(["artifactregistry.googleapis.com", "containeranalysis.googleapis.com", "run.googleapis.com", "storage.googleapis.com", "identitytoolkit.googleapis.com", "apikeys.googleapis.com", "firestore.googleapis.com", "monitoring.googleapis.com", "recaptchaenterprise.googleapis.com"]);
 export class GoogleError extends Error { constructor(readonly status: number, readonly code?: string) { super(`Google API request failed (${status}).`); } }
 export async function accessToken(): Promise<string> { return Bun.env.GOOGLE_OAUTH_ACCESS_TOKEN ?? await command(["gcloud", "auth", "print-access-token"], { quiet: true }); }
 export async function google<T>(address: string, method = "GET", body?: unknown, quotaProject?: string): Promise<T> {

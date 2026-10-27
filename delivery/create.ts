@@ -70,7 +70,8 @@ export async function create(name: string, args: string[]): Promise<void> {
   await command([process.execPath,"tools/platform.ts","budget"],{cwd:root});
   await command([process.execPath, "tools/platform.ts", "repository-settings", name], { cwd: root });
   await command([process.execPath, "tools/platform.ts", "enroll", projectId, "--apply"], { cwd: root });
-  await command(["gh", "workflow", "run", "upgrade-consumers.yml", "--repo", `${owner}/platform`, "--ref", "main"]);
+  await workflow("upgrade-consumers.yml", `${owner}/platform`);
+  await workflow("application.yml", `${owner}/${name}`);
   await deliver(name);
   console.log(JSON.stringify({ event: "project-deployed", origin, installationUrls }));
 }
@@ -106,9 +107,12 @@ export async function catalogChange(change:string,title:string,mutate:(catalog:P
 }
 
 export async function deliver(name:string):Promise<void>{
-  const result=await command(["gh","workflow","run","deliver.yml","--repo",`${owner}/platform`,"--ref","main","-f",`application=${name}`,"-f","force=true"]);
+  await workflow("deliver.yml",`${owner}/platform`,["-f",`application=${name}`,"-f","force=true"]);
+}
+async function workflow(file:string,repository:string,fields:string[]=[]):Promise<void>{
+  const result=await command(["gh","workflow","run",file,"--repo",repository,"--ref","main",...fields]);
   const run=/actions\/runs\/([0-9]+)/.exec(result)?.[1];
-  console.log(JSON.stringify({event:"delivery-started",result,installationUrls}));
-  if(!run)throw new Error("Delivery was dispatched; use gh run list to follow it before claiming completion.");
-  await command(["gh","run","watch",run,"--repo",`${owner}/platform`,"--exit-status"]);
+  console.log(JSON.stringify({event:"workflow-started",workflow:file,repository,result,installationUrls}));
+  if(!run)throw new Error("Workflow was dispatched; use gh run list to follow it before claiming completion.");
+  await command(["gh","run","watch",run,"--repo",repository,"--exit-status"]);
 }
