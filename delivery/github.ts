@@ -25,7 +25,7 @@ export async function output(values: Record<string, string>): Promise<void> {
   if (Bun.env.GITHUB_OUTPUT) await appendFile(Bun.env.GITHUB_OUTPUT, Object.entries(values).map(([name, value]) => `${name}=${value}\n`).join(""));
   else console.log(JSON.stringify(values));
 }
-export type PullRequest = { number: number; state: string; draft: boolean; head: { sha: string; repo: { id: number; full_name: string } }; base: { ref: string; repo: { id: number } }; node_id: string };
+export type PullRequest = { number: number; state: string; draft: boolean; mergeable_state?: string; head: { sha: string; repo: { id: number; full_name: string } }; base: { ref: string; repo: { id: number } }; node_id: string };
 export async function pullRequest(number: string): Promise<PullRequest> {
   if (!/^[1-9][0-9]*$/.test(number)) throw new Error("Invalid pull request number.");
   const pr = await api<PullRequest>(`/repos/${repository()}/pulls/${number}`);

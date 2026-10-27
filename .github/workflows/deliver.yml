@@ -239,4 +239,5 @@ jobs:
           RELEASE_SHA: ${{ matrix.release }}
           SOURCE_SHA: ${{ matrix.sha }}
           IDENTITY_API_KEY: ${{ vars.IDENTITY_API_KEY }}
+          RECAPTCHA_SITE_KEY: ${{ vars.RECAPTCHA_SITE_KEY }}
         run: bun delivery/run.ts deploy "$RUNNER_TEMP/evidence/evidence.json"

@@ -70,7 +70,7 @@ export function firestoreStore(project: string, collection = "platform_records",
   const call = async (url: string, init: RequestInit = {}) => boundedFetch(url, { ...init, headers: { "Content-Type": "application/json", ...Object.fromEntries(new Headers(init.headers)), Authorization: `Bearer ${await getToken()}` } });
   const decode = (doc: { name?: string; fields?: Record<string, { stringValue?: string }> }): RecordValue => {
     const id = doc.name?.split("/").at(-1); const title = doc.fields?.title?.stringValue; const createdAt = doc.fields?.createdAt?.stringValue;
-    if (!id || !title || !createdAt) throw new Error("Invalid stored record.");
+    if (!id || typeof title !== "string" || typeof createdAt !== "string") throw new Error("Invalid stored record.");
     recordId(id); return { id, title, createdAt };
   };
   return {

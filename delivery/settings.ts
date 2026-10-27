@@ -19,11 +19,17 @@ export async function settings(name: string): Promise<void> {
   if (String(metadata.id) !== expectedId) throw new Error("Repository numeric identity changed.");
   const write = (endpoint: string, value?: unknown, method = "PUT") => command(["gh", "api", "--method", method, endpoint, ...(value === undefined ? [] : ["--input", "-"])], value === undefined ? {} : {stdin:JSON.stringify(value)});
   await write(`${path}/actions/permissions`, {enabled:true,allowed_actions:"selected",sha_pinning_required:true});
-  await write(`${path}/actions/permissions/selected-actions`, {github_owned_allowed:false,verified_allowed:false,patterns_allowed:actions});
+  await write(`${path}/actions/permissions/selected-actions`, {github_owned_allowed:false,verified_allowed:false,patterns_allowed:name === "platform" ? actions : actions.map(action => action.slice(0,action.lastIndexOf("@"))+"@*")});
   await write(`${path}/actions/permissions/workflow`, {default_workflow_permissions:"read",can_approve_pull_request_reviews:false});
   await write(path, {allow_auto_merge:true,delete_branch_on_merge:true,security_and_analysis:{secret_scanning:{status:"enabled"},secret_scanning_push_protection:{status:"enabled"}}}, "PATCH");
   await write(`${path}/vulnerability-alerts`);
   await write(`${path}/automated-security-fixes`);
+  if (name !== "platform") {
+    const existing = await github<{required_status_checks:{checks:Array<{context:string;app_id:number|null}>}}>(`${path}/branches/main/protection`);
+    const replaced = new Set(["Bun verify / Bun verify","Automated review","infrastructure / Terraform validate","infrastructure / Checkov","Socket Firewall / Socket Firewall","Socket Security: Project Report","Socket Security: Pull Request Alerts"]);
+    const checks = [...existing.required_status_checks.checks.filter(check=>!replaced.has(check.context)),{context:"Bun verify / Bun verify",app_id:15368},{context:"Automated review",app_id:15368},{context:"Socket Security: Project Report",app_id:156372},{context:"Socket Security: Pull Request Alerts",app_id:156372}];
+    await write(`${path}/branches/main/protection/required_status_checks`,{strict:true,checks},"PATCH");
+  }
   console.log(JSON.stringify({repository:name,actions:"sha-only",nativeSecurity:true,autoMerge:true}));
 }
 if (import.meta.main) for (const name of Bun.argv.slice(2)) await settings(name);

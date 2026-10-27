@@ -47,7 +47,9 @@ export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promi
       if (await automatedReview(number, head)) { success = true; return; }
       await Bun.sleep(20_000);
     }
-    throw new Error("Automated review has not completed, or feedback remains unresolved.");
+    // The published check remains unsuccessful. A later review event can refresh it
+    // without leaving a failed polling-worker job on the same commit forever.
+    console.info(JSON.stringify({event:"automated-review-pending",repository:repository(),pullRequest:number,head}));
   } finally { await api(`/repos/${repository()}/check-runs/${check.id}`, "PATCH", { status: "completed", conclusion: success ? "success" : "failure", completed_at: new Date().toISOString() }); }
 }
 

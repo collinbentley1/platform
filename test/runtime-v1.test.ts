@@ -88,3 +88,9 @@ test("Firestore readiness requires a successful database operation, including on
     status=200;await expect(store.ready()).resolves.toBeUndefined();
   }finally{globalThis.fetch=original;}
 });
+
+ test("Firestore retains empty string values consistently with the other stores",async()=>{
+ const original=globalThis.fetch;const id=crypto.randomUUID();
+ globalThis.fetch=(async(_input:unknown)=>Response.json({name:`projects/demo/databases/(default)/documents/records/${id}`,fields:{title:{stringValue:""},createdAt:{stringValue:""}}})) as typeof fetch;
+ try { const store=firestoreStore("demo-project","platform_records",async()=>"synthetic"); await expect(store.put("alice",{id,title:"",createdAt:""})).resolves.toEqual({id,title:"",createdAt:""}); } finally {globalThis.fetch=original;}
+ });

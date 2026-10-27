@@ -79,6 +79,13 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
   const previewOrigin = new URL(before.uri); previewOrigin.hostname = `${tag}---${previewOrigin.hostname}`;
   if (preview && app.name === "virtual-care-mcp") environment.PUBLIC_BASE_URL = previewOrigin.origin;
   if (preview && app.name === "healthmcp") Object.assign(environment,{ALLOWED_HOSTS:previewOrigin.hostname,ALLOWED_ORIGINS:previewOrigin.origin,CANONICAL_HOST:previewOrigin.hostname,LEGACY_HOSTS:""});
+  if (!preview && app.name === "healthmcp") {
+    Object.assign(environment,{IDENTITY_PLATFORM_AUDIENCE:app.project,IDENTITY_PLATFORM_CONTINUE_URL:`https://${app.env.CANONICAL_HOST}/api/waitlist/confirm`,RECAPTCHA_PROJECT_ID:app.project});
+    if (Bun.env.RECAPTCHA_SITE_KEY) {
+      if (!/^[A-Za-z0-9_-]{20,100}$/.test(Bun.env.RECAPTCHA_SITE_KEY)) throw new Error("Invalid managed reCAPTCHA configuration.");
+      environment.RECAPTCHA_SITE_KEY=Bun.env.RECAPTCHA_SITE_KEY;
+    }
+  }
   if (app.identity) {
     if (preview) environment.PUBLIC_ORIGIN = previewOrigin.origin;
     else { const key = Bun.env.IDENTITY_API_KEY; if (!key) { await rm(directory, { recursive: true, force: true }); throw new Error("Identity client configuration is missing."); } environment.IDENTITY_API_KEY = key; }

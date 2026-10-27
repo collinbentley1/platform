@@ -17,6 +17,13 @@ export async function environments(apps: readonly Project[] = projects): Promise
       const value=await gcloud<{keyString:string}>(["services","api-keys","get-key-string",key.name,`--project=${app.project}`]);
       await command(["gh","variable","set","IDENTITY_API_KEY","--repo","collinbentley1/platform","--env",`deploy-${app.name}`],{stdin:value.keyString,quiet:true});
     }
+    if (app.name === "healthmcp") {
+      const keys=await gcloud<Array<{name:string;displayName:string}>>(["recaptcha","keys","list",`--project=${app.project}`]);
+      const selected=keys.filter(key=>key.displayName==="Medlock waitlist ownership");
+      const siteKey=selected.length===1?selected[0]!.name.split("/").at(-1):undefined;
+      if (!siteKey || !/^[A-Za-z0-9_-]{20,100}$/.test(siteKey)) throw new Error("Managed reCAPTCHA configuration is missing or ambiguous.");
+      await command(["gh","variable","set","RECAPTCHA_SITE_KEY","--repo","collinbentley1/platform","--env",`deploy-${app.name}`],{stdin:siteKey,quiet:true});
+    }
     console.log(JSON.stringify({event:"github-environments-enrolled",app:app.name,branches:["main"]}));
   }
 }

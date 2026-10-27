@@ -52,7 +52,7 @@ export async function proposeUpgrade(source: string, release: { sha: string; tag
 }
 
 export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_000): Promise<void> {
-  const pr = await pullRequest(prNumber); const head = pr.head.sha;
+  const pr = await pullRequest(prNumber); let head = pr.head.sha;
   await requestReview(prNumber, head);
   const rules = await api<{ required_status_checks?: { checks: Array<{ context: string; app_id: number | null }> } }>(`/repos/${repository()}/branches/main/protection`);
   const required = rules.required_status_checks?.checks ?? [];
@@ -60,6 +60,15 @@ export async function enableVerifiedMerge(prNumber: string, timeoutMs = 20 * 60_
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const current = await pullRequest(prNumber); if (current.head.sha !== head) throw new Error("Upgrade head changed.");
+    if (current.mergeable_state === "behind") {
+      await api(`/repos/${repository()}/pulls/${prNumber}/update-branch`, "PUT", {expected_head_sha:head});
+      let refreshed = await pullRequest(prNumber);
+      for (let attempt=0; refreshed.head.sha===head && attempt<12; attempt++) { await Bun.sleep(2000); refreshed=await pullRequest(prNumber); }
+      if (refreshed.head.sha===head) throw new Error("Branch refresh did not complete; the upgrade remains open.");
+      head = refreshed.head.sha;
+      await requestReview(prNumber, head);
+      continue;
+    }
     const checks: Check[] = [];
     for (let page = 1; page <= 50; page++) {
       const result = await api<{ check_runs: Check[] }>(`/repos/${repository()}/commits/${head}/check-runs?filter=latest&per_page=100&page=${page}`);
