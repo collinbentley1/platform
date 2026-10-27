@@ -123,5 +123,6 @@ test("account data deletion removes only its owner's records", async () => {
     for(const owner of ["alice","bob"]) await store.put(owner,{id:crypto.randomUUID(),title:owner,createdAt:new Date().toISOString()});
     await store.removeAll("alice"); await store.removeAll("alice");
     expect(await store.list("alice")).toEqual([]); expect((await store.list("bob"))[0]?.title).toBe("bob");
+    await expect(store.put("alice",{id:crypto.randomUUID(),title:"late write",createdAt:new Date().toISOString()})).rejects.toMatchObject({status:410});
   } finally {store.close();await rm(root,{recursive:true,force:true});}
 });

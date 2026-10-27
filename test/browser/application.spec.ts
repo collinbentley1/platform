@@ -59,9 +59,6 @@ test("managed signup, verification, durable CRUD, recovery, revocation, isolatio
   expect((await (await context.request.get("/api/notes")).json()).notes).toHaveLength(1);
   await other.request.delete("http://127.0.0.1:8089/api/account", { headers }); await other.close();
   const peer = await browser.newContext({ storageState: await context.storageState() });
-  const session = await (await context.request.get("/api/session")).json();
-  // Google revocation timestamps have one-second precision.
-  await expect.poll(() => Math.floor(Date.now()/1000)).toBeGreaterThan(session.user.authenticatedAt);
   await page.getByRole("button", { name: "Sign out all devices", exact: true }).click();
   await expect.poll(async () => (await peer.request.get("http://127.0.0.1:8089/api/notes")).status()).toBe(401); await peer.close();
   await page.getByLabel("Email", { exact: true }).fill(email); await page.getByLabel("Password", { exact: true }).fill(newPassword);

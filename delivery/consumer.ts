@@ -19,9 +19,9 @@ export async function runtimeFiles(root: string): Promise<Record<string, string>
   return files;
 }
 
-export function caller(workflow: string, sha: string, events: string, name: string, permissions: string): string {
+export function caller(workflow: string, sha: string, events: string, name: string, permissions: string, platformInput = true): string {
   requireSha(sha);
-  return `name: ${name}\n\non:\n${events}\npermissions: {}\n\njobs:\n  run:\n    name: ${name}\n    permissions:\n${permissions}\n    with:\n      platform_sha: ${sha}\n    uses: collinbentley1/platform/.github/workflows/${workflow}@${sha}\n`;
+  return `name: ${name}\n\non:\n${events}\npermissions: {}\n\njobs:\n  run:\n    name: ${name}\n    permissions:\n${permissions}\n${platformInput ? `    with:\n      platform_sha: ${sha}\n` : ""}    uses: collinbentley1/platform/.github/workflows/${workflow}@${sha}\n`;
 }
 
 export async function managedFiles(root: string, sha: string): Promise<Record<string, string>> {
@@ -31,7 +31,7 @@ export async function managedFiles(root: string, sha: string): Promise<Record<st
   files[".dockerignore"] = ".git\n.github\n.env\n.env.*\n.npmrc\nnpmrc\n.local\n.data\nnode_modules\ndist\ncoverage\n**/gha-creds-*.json\n**/.terraform\n**/*.tfstate*\n**/*.tfplan*\n**/*.pem\n**/*.key\n**/*.p12\n**/*.pfx\n";
   files["bunfig.toml"] = 'env = false\ntelemetry = false\n\n[install]\nexact = true\nminimumReleaseAge = 604800\nregistry = "https://registry.npmjs.org"\n';
   files[".github/workflows/application.yml"] = caller("application-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      pull_request:\n        required: false\n        type: string\n", "Bun verify", "      contents: read\n      pull-requests: read\n      checks: write").replace(/      platform_sha:/, "      pull_request: ${{ inputs.pull_request || '' }}\n      platform_sha:");
-  files[".github/workflows/security.yml"] = caller("security-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  schedule:\n    - cron: '31 7 * * 1'\n", "CodeQL", "      contents: read\n      security-events: write");
+  files[".github/workflows/security.yml"] = caller("security-v1.yml", sha, "  push:\n    branches: [main]\n  pull_request:\n  schedule:\n    - cron: '31 7 * * 1'\n", "CodeQL", "      contents: read\n      security-events: write", false);
   /* Central installation-token upgrader owns release proposals. */
   files[".github/workflows/review-gate.yml"] = caller("review-gate-v1.yml", sha, "  pull_request_target:\n    types: [opened, synchronize, reopened, ready_for_review]\n  issue_comment:\n    types: [created, edited]\n  pull_request_review:\n    types: [submitted]\n  pull_request_review_comment:\n    types: [created, edited, deleted]\n  schedule:\n    - cron: '7,22,37,52 * * * *'\n  workflow_dispatch:\n", "Automated review", "      contents: read\n      pull-requests: read\n      checks: write");
   files[".github/dependabot.yml"] = 'version: 2\nupdates:\n  - package-ecosystem: bun\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n    groups:\n      dependencies:\n        patterns: ["*"]\n  - package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "collinbentley1/platform/*"\n';

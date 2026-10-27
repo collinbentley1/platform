@@ -29,7 +29,7 @@ provider "google" {
 }
 
 resource "google_project_service" "services" {
-  for_each           = toset(concat(["run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : [], contains(keys(local.apps), "healthmcp") ? ["identitytoolkit.googleapis.com", "recaptchaenterprise.googleapis.com", "secretmanager.googleapis.com"] : []))
+  for_each           = toset(concat(["run.googleapis.com", "artifactregistry.googleapis.com", "containerscanning.googleapis.com", "containeranalysis.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com", "monitoring.googleapis.com"], local.data_enabled ? ["firestore.googleapis.com"] : [], local.identity_enabled ? ["identitytoolkit.googleapis.com", "apikeys.googleapis.com"] : [], length(local.secrets) > 0 ? ["secretmanager.googleapis.com"] : [], contains(keys(local.apps), "healthmcp") ? ["identitytoolkit.googleapis.com", "recaptchaenterprise.googleapis.com", "secretmanager.googleapis.com"] : []))
   project            = var.project_id
   service            = each.key
   disable_on_destroy = false

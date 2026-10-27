@@ -1,4 +1,4 @@
-import { command } from "../delivery/process.ts";
+import { command, gcloud } from "../delivery/process.ts";
 import { project } from "../delivery/catalog.ts";
 import { google, GoogleError, operation } from "../delivery/google.ts";
 if (Bun.env.GITHUB_ACTIONS || !Bun.argv.includes("--apply")) throw new Error("Owner recovery drill: bun tools/recovery-drill.ts <registered-app> --apply (temporary Firestore clone).");
@@ -31,9 +31,9 @@ try {
       let exists = true;
       try { await google(`${base}/${name}`); } catch (error) { if (!missing(error)) throw error; exists = false; }
       if (exists) {
-        const unlock = await google<{name:string}>(`${base}/${name}?updateMask=delete_protection_state`,"PATCH",{name,deleteProtectionState:"DELETE_PROTECTION_DISABLED"});
+        const unlock = await gcloud<{name:string}>(["firestore","databases","update",`--database=${id}`,`--project=${app.project}`,"--no-delete-protection"]);
         if(unlock.name.includes("/operations/")) await operation(unlock.name);
-        const removal = await google<{name:string}>(`${base}/${name}`,"DELETE"); await operation(removal.name);
+        const removal = await gcloud<{name:string}>(["firestore","databases","delete",`--database=${id}`,`--project=${app.project}`]); await operation(removal.name);
       }
       console.log(JSON.stringify({ event: "recovery-clone-removed", database: id }));
     }

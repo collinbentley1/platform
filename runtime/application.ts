@@ -68,7 +68,7 @@ export function application(config: ApplicationConfig, dependencies: Application
       const age = Math.floor(Date.now() / 1000) - user.authenticatedAt;
       if (!Number.isFinite(age) || age < 0 || age > 300) throw new HttpError(401, "Sign in again before changing your account.");
       if (url.pathname === "/api/account") { await dependencies.store.removeAll(user.id); await dependencies.identity.remove(user.id); }
-      else await dependencies.identity.revoke(user.id);
+      else { await Bun.sleep(Math.max(0, (user.authenticatedAt + 1) * 1000 - Date.now())); await dependencies.identity.revoke(user.id); }
       return json({ ok: true }, 200, { "Set-Cookie": sessionCookie(origin, "", 0) });
     }
     const protectedIdentity = async () => { const user = await identify(); if (!user.emailVerified) throw new HttpError(403, "Verify your email, then sign in again."); if (!["GET", "HEAD"].includes(request.method)) { try { await shared.consume("writes"); } catch { throw new HttpError(429, "Too many requests. Try again in a minute."); } } return user; };

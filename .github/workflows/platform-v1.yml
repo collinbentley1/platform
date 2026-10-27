@@ -2,6 +2,7 @@ name: Platform
 on:
   push:
     branches: [main, codex/production-platform]
+    paths-ignore: [delivery/projects.json]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
