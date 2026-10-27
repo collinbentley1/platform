@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { doctor, upgrade, runtimeManifest } from "../delivery/consumer.ts";
+import { doctor, upgrade, runtimeManifest, runtimeFiles } from "../delivery/consumer.ts";
 
 const source = resolve(import.meta.dir, "..");
 const first = "a".repeat(40); const second = "b".repeat(40);
@@ -34,3 +34,5 @@ describe("managed platform upgrades", () => {
 });
 
 test("runtime dependency upgrades preserve product dependencies and scripts",()=>{ const current=JSON.stringify({dependencies:{product:"9.0.0"},scripts:{start:"custom"},packageManager:"bun@1.4.0"}); const next=runtimeManifest(current,JSON.stringify({dependencies:{jose:"6.1.3"}}),"bun@1.4.2"); expect(JSON.parse(next)).toEqual({dependencies:{product:"9.0.0",jose:"6.1.3"},scripts:{start:"custom"},packageManager:"bun@1.4.2"});expect(runtimeManifest(next,JSON.stringify({dependencies:{jose:"6.1.3"}}),"bun@1.4.2")).toBe(next);});
+
+test("runtime generation has a canonical order across filesystem enumeration orders",async()=>{const root=await mkdtemp(join(tmpdir(),"platform-order-"));try{for(const name of ["first","second"]){await mkdir(join(root,name,"runtime"),{recursive:true});const names=name==="first"?["http.ts","auth.ts","data.ts","package.json"]:["package.json","data.ts","auth.ts","http.ts"];for(const file of names)await writeFile(join(root,name,"runtime",file),file);}const first=await runtimeFiles(join(root,"first")),second=await runtimeFiles(join(root,"second"));expect(Object.keys(first)).toEqual([".platform/runtime/auth.ts",".platform/runtime/data.ts",".platform/runtime/http.ts",".platform/runtime/package.json"]);expect(JSON.stringify(first)).toBe(JSON.stringify(second));}finally{await rm(root,{recursive:true,force:true});}});
