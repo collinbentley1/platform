@@ -28,6 +28,8 @@ export async function create(name: string, args: string[]): Promise<void> {
     cloud = await gcloud(["projects", "describe", projectId]);
   }
   if(cloud.labels?.["platform-onboarding"]!==name || cloud.labels?.["platform-owner"]!=="16823277")throw new Error("Create uses a dedicated project labeled by this onboarding command. Use enroll to adopt existing projects.");
+  const billingState=await gcloud<{billingEnabled:boolean}>(["billing","projects","describe",projectId]);
+  if(!billingState.billingEnabled){const billing=option("--billing-account");if(!billing)throw new Error("Resume with --billing-account to enable project billing.");await command(["gcloud","billing","projects","link",projectId,`--billing-account=${billing}`,"--quiet"]);}
   const origin = option("--origin") ?? `https://${name}-${cloud.projectNumber}.us-east4.run.app`;
   if (new URL(origin).origin !== origin || !origin.startsWith("https://")) throw new Error("Use an exact HTTPS origin, without a path.");
   const marker = join(directory, ".platform/onboarding.json");

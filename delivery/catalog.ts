@@ -2,6 +2,7 @@ import catalogSource from "./projects.json";
 
 export type Project = { name: string; repositoryId: string; project: string; number: string; region: string; registry: string; service: string; data: boolean; env: Record<string, string>; secrets: Record<string, string>; repository?: string; sourceDirectory?: string; identity?: boolean };
 const catalog = catalogSource as unknown as { schemaVersion: number; owner: string; platformRepositoryId: string; projects: Project[] };
+export const defaults = catalogSource.defaults;
 export const owner = "collinbentley1";
 export const platformRepositoryId = "1255856466";
 export const projects: readonly Project[] = catalog.projects;

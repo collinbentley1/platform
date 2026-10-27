@@ -176,7 +176,7 @@ resource "google_cloud_run_v2_service" "app" {
     service_account = google_service_account.runtime[each.key].email
     scaling {
       min_instance_count = 0
-      max_instance_count = 2
+      max_instance_count = local.catalog.defaults.productionMaxInstances
     }
     containers {
       image = var.initial_images[each.key]
@@ -196,7 +196,7 @@ resource "google_cloud_run_v2_service" "preview" {
     service_account = google_service_account.preview[each.key].email
     scaling {
       min_instance_count = 0
-      max_instance_count = 1
+      max_instance_count = local.catalog.defaults.previewMaxInstances
     }
     containers {
       image = var.initial_images[each.key]

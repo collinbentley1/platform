@@ -1,10 +1,10 @@
-import { projects } from "./catalog.ts";
+import { projects, defaults } from "./catalog.ts";
 import { command, gcloud } from "./process.ts";
 
 // Owner-only setup. Billing email alerts are free; no Pub/Sub, metric alert
 // policies, uptime-check resources, log exports or resident monitoring service.
 export async function budget(total: number): Promise<void> {
-  if (Bun.env.GITHUB_ACTIONS || !Number.isFinite(total) || total <= 0 || total > 30) throw new Error("Owner budget must be between zero and 30 USD.");
+  if (Bun.env.GITHUB_ACTIONS || !Number.isFinite(total) || total <= 0 || total > defaults.monthlyBudgetUSD) throw new Error("Owner budget must be between zero and 30 USD.");
   const accounts = new Set<string>();
   for (const project of new Set(projects.map(app => app.project))) {
     const value = await gcloud<{ billingAccountName: string; billingEnabled: boolean }>(["billing", "projects", "describe", project]);
