@@ -88,4 +88,22 @@ export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promi
   } finally { await api(`/repos/${repository()}/check-runs/${check.id}`, "PATCH", { status: "completed", conclusion: success ? "success" : "failure", completed_at: new Date().toISOString() }); }
 }
 
-if (import.meta.main) await reviewGate(Bun.argv[2] ?? "");
+export async function reviewSweep():Promise<void> {
+  const pulls=await pages<{number:number;draft:boolean;head:{sha:string;repo:{id:number}|null};base:{ref:string;repo:{id:number}}}>(`/repos/${repository()}/pulls?state=open`);
+  for(const pr of pulls.filter(pr=>!pr.draft && pr.base.ref==="main" && pr.head.repo?.id===pr.base.repo.id)) {
+    const head=pr.head.sha;
+    const admitted=await automatedReview(String(pr.number),head);
+    const result=await api<{check_runs:Array<{id:number;name:string;app:{id:number};status:string;conclusion:string|null}>}>(`/repos/${repository()}/commits/${head}/check-runs?check_name=Automated%20review&filter=latest&per_page=100`);
+    if(result.check_runs.length>=100)throw new Error("Review check inventory exceeds its bound.");
+    const previous=result.check_runs.filter(check=>check.name==="Automated review" && check.app.id===15368).sort((a,b)=>b.id-a.id)[0];
+    if(admitted ? previous?.status==="completed" && previous.conclusion==="success" : previous?.conclusion!=="success")continue;
+    const current=await pullRequest(String(pr.number));if(current.head.sha!==head || current.draft)continue;
+    await api(`/repos/${repository()}/check-runs`,"POST",{name:"Automated review",head_sha:head,status:"completed",conclusion:admitted?"success":"failure",completed_at:new Date().toISOString()});
+    console.log(JSON.stringify({event:"review-admission-refreshed",repository:repository(),pullRequest:pr.number,head,admitted}));
+  }
+}
+
+if (import.meta.main) {
+  if(Bun.argv[2]==="sweep")await reviewSweep();
+  else await reviewGate(Bun.argv[2] ?? "");
+}

@@ -28,3 +28,27 @@ test("interrupted review refreshes remain recoverable without taking over a huma
   expect(recoverableReviewDraft([pending],"b".repeat(40),123)).toBeUndefined();
   expect(recoverableReviewDraft([{...pending,body:`<!-- platform-review-head:${head} -->`}],head,123)).toBeUndefined();
 });
+
+test("scheduled admission recovers a failed check after a bare resolution and invalidates a bare reopening",async()=>{
+  const {reviewSweep}=await import("../delivery/review.ts");const original=globalThis.fetch,token=Bun.env.GH_TOKEN,target=Bun.env.PLATFORM_TARGET_REPOSITORY;
+  const head="a".repeat(40);let resolved=true,writes=0;let previous={id:1,name:"Automated review",app:{id:15368},status:"completed",conclusion:"failure"};
+  const pr={number:1,state:"open",draft:false,head:{sha:head,repo:{id:1}},base:{ref:"main",repo:{id:1}}};
+  Bun.env.GH_TOKEN="synthetic-test-token";Bun.env.PLATFORM_TARGET_REPOSITORY="collinbentley1/cdbentley";
+  globalThis.fetch=(async(input:unknown,options?:RequestInit)=>{
+    const path=new URL(String(input)).pathname;
+    if(path.endsWith("/pulls"))return Response.json([pr,{...pr,number:2,head:{...pr.head,repo:{id:2}}}]);
+    if(path.endsWith("/pulls/1"))return Response.json(pr);
+    if(path.endsWith("/issues/1/comments"))return Response.json([{user:{id:199175422},body:`<!-- codex-pull-request-review-summary -->\n| 📝 **Code Review** | ✅ **Completed** | \`${head}\` |`}]);
+    if(path.endsWith(`/commits/${head}`))return Response.json({sha:head});
+    if(path==="/graphql")return Response.json({data:{repository:{pullRequest:{reviewThreads:{nodes:[{isResolved:resolved}],pageInfo:{hasNextPage:false,endCursor:null}}}}}});
+    if(path.endsWith("/pulls/1/reviews"))return Response.json([]);
+    if(path.endsWith("/check-runs") && options?.method==="POST"){const value=JSON.parse(String(options.body));previous={...previous,id:previous.id+1,...value};writes++;return Response.json(previous);}
+    if(path.endsWith("/check-runs"))return Response.json({check_runs:[previous,{...previous,id:9999,app:{id:5488696},conclusion:"success"}]});
+    throw new Error("Unexpected admission fixture request");
+  }) as typeof fetch;
+  try {
+    await reviewSweep();expect(writes).toBe(1);expect(previous.conclusion).toBe("success");
+    resolved=false;await reviewSweep();expect(writes).toBe(2);expect(previous.conclusion).toBe("failure");
+    await reviewSweep();expect(writes).toBe(2);
+  } finally {globalThis.fetch=original;if(token===undefined)delete Bun.env.GH_TOKEN;else Bun.env.GH_TOKEN=token;if(target===undefined)delete Bun.env.PLATFORM_TARGET_REPOSITORY;else Bun.env.PLATFORM_TARGET_REPOSITORY=target;}
+});

@@ -7,12 +7,12 @@ on:
         required: true
 permissions: {}
 concurrency:
-  group: review-${{ github.repository_id }}-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.sha }}
+  group: review-${{ github.repository_id }}-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.sha }}-${{ github.event_name }}
   cancel-in-progress: true
 jobs:
   review:
     name: Review admission
-    if: github.event.pull_request || github.event.issue.pull_request
+    if: github.event.pull_request || github.event.issue.pull_request || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 18
     permissions:
@@ -30,4 +30,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-        run: bun delivery/review.ts "$PR_NUMBER"
+        run: bun delivery/review.ts "${PR_NUMBER:-sweep}"
