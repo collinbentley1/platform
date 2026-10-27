@@ -7,18 +7,18 @@ import { command } from "./process.ts";
 import { checksPassed, latestRelease } from "./upgrade.ts";
 
 type Item = { app: string; sha: string; release: string; project: string; number: string; pr: string };
-export function sourceChecksPassed(app:Project,checks:Parameters<typeof checksPassed>[0]):boolean {
+export function sourceChecksPassed(app:Project,checks:Parameters<typeof checksPassed>[0],preview=false):boolean {
   const names=app.repository==="platform"?["Platform verify","Terraform modules","Complete starter and container"]:["Bun verify / Bun verify",...(app.name==="runsetta"?["Swift package check"]:[])];
-  const required=[...names.map(context=>({context,app_id:15368})),... ["Socket Security: Project Report","Socket Security: Pull Request Alerts"].map(context=>({context,app_id:156372}))];
+  const required=[...names.map(context=>({context,app_id:15368})),... ["Socket Security: Project Report",...(preview?["Socket Security: Pull Request Alerts"]:[])].map(context=>({context,app_id:156372}))];
   const contexts=new Set(required.map(check=>check.context));
   // Deployment outcomes on platform main are independent of source admission.
   return checksPassed(checks.filter(check=>contexts.has(check.name)),required);
 }
-async function eligible(app: Project, sha: string): Promise<boolean> {
+async function eligible(app: Project, sha: string, preview: boolean): Promise<boolean> {
   const repo = app.repository ?? app.name;
   const result = await api<{ check_runs: Parameters<typeof checksPassed>[0] }>(`/repos/collinbentley1/${repo}/commits/${sha}/check-runs?filter=latest&per_page=100`);
   if (result.check_runs.length >= 100) throw new Error("Check inventory exceeds the delivery bound.");
-  return sourceChecksPassed(app,result.check_runs);
+  return sourceChecksPassed(app,result.check_runs,preview);
 }
 async function plan(): Promise<void> {
   const release = await latestRelease(); const selected = Bun.env.PLATFORM_APP;
@@ -48,7 +48,7 @@ async function plan(): Promise<void> {
     if (!pr && Bun.env.PLATFORM_FORCE !== "true") {
       try { const response = await fetch(`https://${app.service}-${app.number}.${app.region}.run.app/livez`, {redirect:"error",signal:AbortSignal.timeout(10_000)}); if(response.ok && response.headers.get("X-Platform-Source") === sha && response.headers.get("X-Platform-Release") === release.sha) continue; } catch {}
     }
-    if (!await eligible(app, sha)) { if (selected) throw new Error("Application checks have not passed."); continue; }
+    if (!await eligible(app, sha,Boolean(pr))) { if (selected) throw new Error("Application checks have not passed."); continue; }
     items.push({ app: app.name, sha, release: app.sourceDirectory ? sha : release.sha, project: app.project, number: app.number, pr });
   }
   await output({ matrix: JSON.stringify({ include: items }), ready: String(items.length > 0) });
