@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: '17 */4 * * *'
   workflow_dispatch:
+    inputs:
+      repository:
+        description: Registered consumer, or all consumers
+        type: string
+        default: ''
 permissions: {}
 concurrency:
   group: platform-consumer-upgrades
@@ -22,6 +27,8 @@ jobs:
           persist-credentials: false
       - run: bash delivery/install-bun.sh
       - id: catalog
+        env:
+          PLATFORM_REPOSITORY: ${{ inputs.repository }}
         run: bun delivery/matrix.ts
   upgrade:
     needs: catalog

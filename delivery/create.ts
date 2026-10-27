@@ -73,7 +73,7 @@ export async function create(name: string, args: string[]): Promise<void> {
   await command([process.execPath,"tools/platform.ts","budget"],{cwd:root});
   await command([process.execPath, "tools/platform.ts", "repository-settings", name], { cwd: root });
   await command([process.execPath, "tools/platform.ts", "enroll", projectId, "--apply"], { cwd: root });
-  await workflow("upgrade-consumers.yml", `${owner}/platform`);
+  await workflow("upgrade-consumers.yml", `${owner}/platform`, ["-f", `repository=${name}`]);
   await workflow("application.yml", `${owner}/${name}`);
   await deliver(name);
   console.log(JSON.stringify({ event: "project-deployed", origin, installationUrls }));
