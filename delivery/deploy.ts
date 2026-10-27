@@ -54,6 +54,11 @@ async function probe(url: string, nonce: string, token?: string): Promise<void> 
   if (value.deployment !== nonce) throw new Error("Health response belongs to a different revision.");
 }
 
+async function ready(url: string, token?: string): Promise<void> {
+  const response = await fetch(new URL("/readyz", url), {redirect:"error",signal:AbortSignal.timeout(20_000),...(token?{headers:{Authorization:`Bearer ${token}`}}:{})});
+  if (!response.ok || !(await response.json() as {ok?:boolean}).ok) throw new Error("Application datastore readiness failed.");
+}
+
 function routed(traffic: readonly Traffic[]): string {
   return JSON.stringify(traffic.filter(target => (target.percent ?? 0) > 0).map(target => ({ revision: target.revision?.split("/").at(-1), percent: target.percent })).sort((a, b) => (a.revision ?? "").localeCompare(b.revision ?? "")));
 }
@@ -90,6 +95,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     const token = preview ? Bun.env.PLATFORM_PREVIEW_TOKEN ?? await command(["gcloud", "auth", "print-identity-token"], { quiet: true }) : undefined;
     if (!target?.uri) throw new Error("The exact staged revision has no health route.");
     await probe(target.uri, nonce, token);
+    if (app.identity) await ready(target.uri, token);
     if (preview) {
       const anonymous = await fetch(new URL("/livez", target.uri), { redirect: "error", signal: AbortSignal.timeout(15_000) });
       if (![401, 403].includes(anonymous.status)) throw new Error("Private preview accepts anonymous requests.");
@@ -104,6 +110,7 @@ export async function deploy(app: Project, evidence: ImageEvidence, previewPr?: 
     if (routed(current.trafficStatuses ?? []) !== routed([{ revision: revisionName, percent: 100 }])) throw new Error("Production route did not converge to the verified revision.");
     try {
       await probe(app.env.PUBLIC_ORIGIN ?? current.uri, nonce);
+      if (app.identity) await ready(app.env.PUBLIC_ORIGIN ?? current.uri);
       const root = await fetch(new URL("/", app.env.PUBLIC_ORIGIN ?? current.uri), {redirect:"error",signal:AbortSignal.timeout(20_000)});
       if (!root.ok || !root.headers.get("X-Request-ID")) throw new Error("Application entry route failed after promotion.");
     } catch (error) {

@@ -21,6 +21,45 @@ concurrency:
   group: delivery-${{ inputs.application || 'all' }}-${{ inputs.pull_request || 'production' }}
   cancel-in-progress: false
 jobs:
+  cleanup:
+    name: Remove closed preview tags
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: deploy-${{ matrix.application }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {application: cdbentley, project: cdbentley, number: '882468538648'}
+          - {application: critical-history, project: critical-history-16823277, number: '422714632513'}
+          - {application: healthmcp, project: medlock-1025243085, number: '229383559510'}
+          - {application: runsetta, project: runsetta, number: '601124730704'}
+          - {application: virtual-care-mcp, project: virtual-care-mcp, number: '894875537243'}
+          - {application: platform-reference, project: cdbentley, number: '882468538648'}
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        id: google
+        with:
+          workload_identity_provider: projects/${{ matrix.number }}/locations/global/workloadIdentityPools/platform-delivery/providers/github
+          service_account: platform-deploy@${{ matrix.project }}.iam.gserviceaccount.com
+          token_format: access_token
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Remove only verified closed-PR preview targets
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+          GH_TOKEN: ${{ github.token }}
+          PLATFORM_APP: ${{ matrix.application }}
+        run: bun delivery/cleanup.ts
   plan:
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
