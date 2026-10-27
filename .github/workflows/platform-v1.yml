@@ -50,14 +50,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Install verified Bun
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
-          echo "36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913  $RUNNER_TEMP/bun.zip" | sha256sum --check --strict
-          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun-bin"
-          echo "$RUNNER_TEMP/bun-bin/bun-linux-x64" >> "$GITHUB_PATH"
+      - run: bash delivery/install-bun.sh
       - name: Verify shared runtime and upgrades
         run: |
           bun ci --ignore-scripts --no-env-file
@@ -93,9 +86,29 @@ jobs:
           path: ${{ runner.temp }}/reference.oci.tar
           retention-days: 1
           if-no-files-found: error
+  browser:
+    name: Browser application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - run: bun ci --ignore-scripts --no-env-file
+      - run: bunx playwright install --with-deps chromium
+      - run: bun run test:browser
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: failure()
+        with:
+          name: browser-report
+          path: playwright-report
+          retention-days: 3
   release:
     name: Publish verified release
-    needs: [verify, terraform, reference]
+    needs: [verify, terraform, reference, browser]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5

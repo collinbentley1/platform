@@ -2,14 +2,17 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IdentityProvider } from "../.platform/runtime/identity.ts";
 import { createHandler } from "../src/server.ts";
 import { sqliteStore, memoryStore } from "../.platform/runtime/data.ts";
+
+const identity = (id?: string): IdentityProvider => ({ verify: async token => ({ id: token, emailVerified: true, authenticatedAt: Math.floor(Date.now()/1000) }), signIn: async () => id ?? "alice", signUp: async () => "new-user", sendVerification: async () => {}, sendReset: async () => {}, confirm: async () => {}, revoke: async () => {}, remove: async () => {} });
 
 test("a signed-in user can save, retry, and delete a durable note without exposing another user's records", async () => {
   const root = await mkdtemp(join(tmpdir(), "application-test-")); const store = await sqliteStore(join(root, "notes.sqlite"));
   const origin = "https://application.example";
   const handler = createHandler({ origin, publicDirectory: "./public", development: false, nonce: "test-deployment" }, {
-    store, verify: async token => ({ id: token }), signIn: async () => "alice",
+    store, identity: identity(),
   });
   const request = (path: string, method = "GET", body?: unknown, user = "alice") => new Request(origin + path, {
     method, headers: { origin, "content-type": "application/json", cookie: `__Host-platform-session=${user}` }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -37,7 +40,7 @@ test("development authentication cannot be exposed on a public origin", () => {
 test("TLS termination retains secure host-only sessions and rejects forged hosts and cross-site origins", async () => {
   const origin = "https://application.example";
   const handler = createHandler({origin,publicDirectory:"./public",development:false}, {
-    store:memoryStore(),verify:async token=>({id:token}),signIn:async()=>"verified-identity",
+    store:memoryStore(),identity:identity("verified-identity"),
   });
   const login = await handler(new Request("http://application.example/api/session",{method:"POST",headers:{Origin:origin,"Content-Type":"application/json"},body:JSON.stringify({email:"test@example.invalid",password:"synthetic"})}));
   expect(login.status).toBe(200);

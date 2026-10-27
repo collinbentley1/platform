@@ -116,3 +116,12 @@ test("oversized records are rejected before a Firestore write and equal timestam
 test("HEAD preserves the UTF-8 JSON representation length",async()=>{const handler=secureHandler(()=>json({value:"é"}));const get=await handler(new Request("https://app.example/"));const head=await handler(new Request("https://app.example/",{method:"HEAD"}));expect(head.headers.get("Content-Length")).toBe(String((await get.arrayBuffer()).byteLength));expect(await head.text()).toBe("");});
 
 test("JSON framing uses one serialization even for stateful values",async()=>{let calls=0;const response=json({toJSON(){calls++;return{value:"é".repeat(calls)};}},200,{"Cache-Control":"max-age=300"});const body=await response.arrayBuffer();expect(calls).toBe(1);expect(response.headers.get("Content-Length")).toBe(String(body.byteLength));expect(response.headers.get("Cache-Control")).toBe("max-age=300");});
+
+test("account data deletion removes only its owner's records", async () => {
+  const root=await mkdtemp(join(tmpdir(),"platform-account-cleanup-")); const store=await sqliteStore(join(root,"data.sqlite"));
+  try {
+    for(const owner of ["alice","bob"]) await store.put(owner,{id:crypto.randomUUID(),title:owner,createdAt:new Date().toISOString()});
+    await store.removeAll("alice"); await store.removeAll("alice");
+    expect(await store.list("alice")).toEqual([]); expect((await store.list("bob"))[0]?.title).toBe("bob");
+  } finally {store.close();await rm(root,{recursive:true,force:true});}
+});

@@ -1,0 +1,5 @@
+## Code Review Rules
+
+- Keep KISS: flag new bespoke gates or infrastructure when the existing provider, Codex review, CodeQL, Socket, or Playwright can enforce the behavior. Require a concrete failure case for additional checking code. Preserve custom frontends and the $30 combined monthly GCP budget; no new paid monitoring or always-on services by default.
+- Trace platform changes through consumers: runtime dependencies, starter manifests, Bun build/CI/runtime versions and hashes, action pins, and registration must remain coordinated. Security policy belongs in the managed runtime; product UI and domain handlers remain consumer-owned. Review the actual request path, not just imports.
+- Treat identity and delivery as trust boundaries: verify user ownership, revocation, recent authentication for account destruction, cross-origin rejection, private previews without production data, and exact source/image authority. Tests may use emulators only on loopback; production must reject them. Flag consequential security defects; leave style checks to CI.

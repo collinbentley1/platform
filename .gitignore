@@ -7,3 +7,9 @@ gha-creds-*.json
 .env
 .env.*
 !.env.example
+
+.local/
+playwright-report/
+test-results/
+firebase-debug.log
+ui-debug.log

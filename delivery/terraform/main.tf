@@ -176,7 +176,7 @@ resource "google_cloud_run_v2_service" "app" {
     service_account = google_service_account.runtime[each.key].email
     scaling {
       min_instance_count = 0
-      max_instance_count = 10
+      max_instance_count = 2
     }
     containers {
       image = var.initial_images[each.key]
@@ -196,7 +196,7 @@ resource "google_cloud_run_v2_service" "preview" {
     service_account = google_service_account.preview[each.key].email
     scaling {
       min_instance_count = 0
-      max_instance_count = 2
+      max_instance_count = 1
     }
     containers {
       image = var.initial_images[each.key]
@@ -229,8 +229,9 @@ resource "google_cloud_run_v2_service_iam_member" "preview_invoke" {
 }
 
 resource "google_identity_platform_config" "identity" {
-  count   = local.identity_enabled ? 1 : 0
-  project = var.project_id
+  count              = local.identity_enabled ? 1 : 0
+  project            = var.project_id
+  authorized_domains = distinct(concat(["localhost", "${var.project_id}.firebaseapp.com"], [for app in local.apps : replace(try(app.env.PUBLIC_ORIGIN, "https://${app.service}-${app.number}.${app.region}.run.app"), "https://", "") if try(app.identity, false)]))
   sign_in {
     phone_number { enabled = false }
     email {
@@ -239,6 +240,19 @@ resource "google_identity_platform_config" "identity" {
     }
   }
   depends_on = [google_project_service.services]
+}
+
+resource "google_project_iam_custom_role" "identity_runtime" {
+  count       = local.identity_enabled ? 1 : 0
+  role_id     = "platformAccountLifecycle"
+  title       = "Managed application account lifecycle"
+  permissions = ["firebaseauth.users.get", "firebaseauth.users.update", "firebaseauth.users.delete", "serviceusage.services.use"]
+}
+resource "google_project_iam_member" "identity_runtime" {
+  for_each = { for name, app in local.apps : name => app if try(app.identity, false) }
+  project  = var.project_id
+  role     = google_project_iam_custom_role.identity_runtime[0].name
+  member   = "serviceAccount:${google_service_account.runtime[each.key].email}"
 }
 resource "google_apikeys_key" "identity" {
   count        = local.identity_enabled ? 1 : 0

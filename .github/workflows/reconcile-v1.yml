@@ -11,21 +11,31 @@ on:
         default: false
 permissions: {}
 jobs:
+  catalog:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      applications: ${{ steps.catalog.outputs.applications }}
+      repositories: ${{ steps.catalog.outputs.repositories }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: catalog
+        run: bun delivery/matrix.ts
   audit:
+    needs: catalog
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: audit-${{ matrix.application }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - {application: cdbentley, project: cdbentley, number: '882468538648'}
-          - {application: critical-history, project: critical-history-16823277, number: '422714632513'}
-          - {application: healthmcp, project: medlock-1025243085, number: '229383559510'}
-          - {application: runsetta, project: runsetta, number: '601124730704'}
-          - {application: virtual-care-mcp, project: virtual-care-mcp, number: '894875537243'}
-          - {application: platform-reference, project: cdbentley, number: '882468538648'}
+      matrix: ${{ fromJSON(needs.catalog.outputs.applications) }}
     permissions:
       contents: read
       id-token: write

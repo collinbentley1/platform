@@ -8,7 +8,24 @@ concurrency:
   group: platform-consumer-upgrades
   cancel-in-progress: false
 jobs:
+  catalog:
+    if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      applications: ${{ steps.catalog.outputs.applications }}
+      repositories: ${{ steps.catalog.outputs.repositories }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          persist-credentials: false
+      - run: bash delivery/install-bun.sh
+      - id: catalog
+        run: bun delivery/matrix.ts
   upgrade:
+    needs: catalog
     if: github.repository_id == '1255856466' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -16,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        repository: [cdbentley, critical-history, healthmcp, runsetta, virtual-care-mcp]
+        repository: ${{ fromJSON(needs.catalog.outputs.repositories) }}
     permissions:
       contents: read
     steps:

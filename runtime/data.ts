@@ -8,6 +8,7 @@ export interface RecordStore {
   list(owner: string): Promise<RecordValue[]>;
   put(owner: string, record: RecordValue): Promise<RecordValue>;
   remove(owner: string, id: string): Promise<void>;
+  removeAll(owner: string): Promise<void>;
   ready(): Promise<void>;
   close(): void;
 }
@@ -45,6 +46,7 @@ export function memoryStore(): RecordStore {
       records.set(id, previous ?? { ...record }); return { ...(previous ?? record) };
     },
     async remove(owner, id) { ownerId(owner); recordId(id); records.delete(key(owner, id)); },
+    async removeAll(owner) { ownerId(owner); for (const id of records.keys()) if (JSON.parse(id)[0] === owner) records.delete(id); },
     async ready() {}, close() { records.clear(); },
   };
 }
@@ -67,6 +69,7 @@ export async function sqliteStore(path: string): Promise<RecordStore> {
       return saved;
     },
     async remove(owner, id) { ownerId(owner); recordId(id); db.query("DELETE FROM records WHERE owner=? AND id=?").run(owner, id); },
+    async removeAll(owner) { ownerId(owner); db.query("DELETE FROM records WHERE owner=?").run(owner); },
     async ready() { db.query("SELECT 1").get(); }, close() { db.close(); },
   };
 }
@@ -114,6 +117,19 @@ export function firestoreStore(project: string, collection = "platform_records",
       if (!response.ok) throw new Error("Data unavailable."); return decode(JSON.parse(await readText(response, 262_144)) as Parameters<typeof decode>[0]);
     },
     async remove(owner, id) { recordId(id); const result = await call(`${base}/${ownerPath(owner)}/${id}`, { method: "DELETE" }); if (!result.ok && result.status !== 404) throw new Error("Data unavailable."); },
+    async removeAll(owner) {
+      // Delete only this account's namespace, in retryable bounded batches.
+      for (let batch = 0; batch < 100; batch++) {
+        const response = await call(`${base}/${ownerPath(owner)}?pageSize=100&mask.fieldPaths=createdAt`);
+        if (!response.ok) throw new Error("Account data cleanup unavailable.");
+        const value = JSON.parse(await readText(response, 262_144)) as { documents?: Array<{ name: string }> };
+        if (!value.documents?.length) return;
+        const result = await call(`${base}:commit`, { method: "POST", body: JSON.stringify({ writes: value.documents.map(document => ({ delete: document.name })) }) });
+        if (!result.ok) throw new Error("Account data cleanup unavailable.");
+        await result.body?.cancel();
+      }
+      throw new Error("Account cleanup is incomplete. Retry to continue.");
+    },
     ready: cachedReadiness(async () => { const response = await call(`${base}/${collection}?pageSize=1&mask.fieldPaths=createdAt`); if (!response.ok) throw new Error("Data unavailable."); await response.body?.cancel(); }), close() {},
   };
 }
