@@ -89,7 +89,7 @@ export async function reviewGate(number: string, timeoutMs = 15 * 60_000): Promi
 }
 
 export async function reviewSweep():Promise<void> {
-  const pulls=await pages<{number:number;draft:boolean;head:{sha:string;repo:{id:number}|null};base:{ref:string;repo:{id:number}}}>(`/repos/${repository()}/pulls?state=open`);
+  const pulls=await pages<{number:number;draft:boolean;head:{sha:string;ref:string;repo:{id:number}|null};base:{ref:string;repo:{id:number}}}>(`/repos/${repository()}/pulls?state=open`);
   for(const pr of pulls.filter(pr=>!pr.draft && pr.base.ref==="main" && pr.head.repo?.id===pr.base.repo.id)) {
     const head=pr.head.sha;
     const admitted=await automatedReview(String(pr.number),head);
@@ -101,8 +101,8 @@ export async function reviewSweep():Promise<void> {
     // Checks published by scheduled/manual runs do not satisfy GitHub's PR
     // requirements. Rerun the source-bound eligible workflow instead.
     const workflow=repository()==="collinbentley1/platform"?"platform-review.yml":"review-gate.yml";
-    const runs=await api<{workflow_runs:Array<{id:number;head_sha:string;status:string}>}>(`/repos/${repository()}/actions/workflows/${workflow}/runs?event=pull_request_target&head_sha=${head}&per_page=100`);
-    const run=runs.workflow_runs.find(run=>run.head_sha===head);
+    const runs=await api<{workflow_runs:Array<{id:number;status:string;pull_requests:Array<{number:number}>}>}>(`/repos/${repository()}/actions/workflows/${workflow}/runs?event=pull_request_target&branch=${encodeURIComponent(pr.head.ref)}&per_page=100`);
+    const run=runs.workflow_runs.find(run=>run.pull_requests.some(pull=>pull.number===pr.number));
     if(!run || run.status!=="completed")continue;
     await api(`/repos/${repository()}/actions/runs/${run.id}/rerun`,"POST");
     console.log(JSON.stringify({event:"review-admission-rerun",repository:repository(),pullRequest:pr.number,head,admitted}));

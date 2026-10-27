@@ -32,7 +32,7 @@ test("interrupted review refreshes remain recoverable without taking over a huma
 test("scheduled admission reruns an eligible workflow after bare resolution or reopening",async()=>{
   const {reviewSweep}=await import("../delivery/review.ts");const original=globalThis.fetch,token=Bun.env.GH_TOKEN,target=Bun.env.PLATFORM_TARGET_REPOSITORY;
   const head="a".repeat(40);let resolved=true,writes=0;let previous={id:1,name:"Automated review",app:{id:15368},status:"completed",conclusion:"failure"};
-  const pr={number:1,state:"open",draft:false,head:{sha:head,repo:{id:1}},base:{ref:"main",repo:{id:1}}};
+  const pr={number:1,state:"open",draft:false,head:{sha:head,ref:"fixture",repo:{id:1}},base:{ref:"main",repo:{id:1}}};
   Bun.env.GH_TOKEN="synthetic-test-token";Bun.env.PLATFORM_TARGET_REPOSITORY="collinbentley1/cdbentley";
   globalThis.fetch=(async(input:unknown,options?:RequestInit)=>{
     const path=new URL(String(input)).pathname;
@@ -43,7 +43,7 @@ test("scheduled admission reruns an eligible workflow after bare resolution or r
     if(path==="/graphql")return Response.json({data:{repository:{pullRequest:{reviewThreads:{nodes:[{isResolved:resolved}],pageInfo:{hasNextPage:false,endCursor:null}}}}}});
     if(path.endsWith("/pulls/1/reviews"))return Response.json([]);
     if(path.endsWith("/check-runs"))return Response.json({check_runs:[previous,{...previous,id:9999,app:{id:5488696},conclusion:"success"}]});
-    if(path.endsWith("/actions/workflows/review-gate.yml/runs"))return Response.json({workflow_runs:[{id:123,head_sha:head,status:"completed"}]});
+    if(path.endsWith("/actions/workflows/review-gate.yml/runs"))return Response.json({workflow_runs:[{id:123,head_sha:"b".repeat(40),status:"completed",pull_requests:[{number:1}]}]});
     if(path.endsWith("/actions/runs/123/rerun") && options?.method==="POST"){writes++;previous={...previous,conclusion:resolved?"success":"failure"};return new Response(null,{status:201});}
     throw new Error("Unexpected admission fixture request");
   }) as typeof fetch;
