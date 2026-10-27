@@ -2,7 +2,11 @@ name: Platform
 on:
   push:
     branches: [main, codex/production-platform]
-    paths-ignore: [delivery/projects.json]
+    paths-ignore:
+      - delivery/projects.json
+      - delivery/terraform/**
+      - delivery/settings.ts
+      - .github/workflows/upgrade-consumers.yml
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -81,7 +85,7 @@ jobs:
           curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/readyz | jq -e '.ok == true'
           curl -fsS -H 'Host: reference.test' -H 'Origin: https://reference.test' -H 'Content-Type: application/json' --data '{"id":"12345678-1234-1234-1234-123456789012","title":"Container verification"}' http://127.0.0.1:8080/api/notes | jq -e '.title == "Container verification"'
           curl -fsS -H 'Host: reference.test' http://127.0.0.1:8080/api/notes | jq -e '.notes | length == 1'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: reference-image
           path: ${{ runner.temp }}/reference.oci.tar
@@ -101,7 +105,7 @@ jobs:
       - run: bun ci --ignore-scripts --no-env-file
       - run: bun x playwright install --with-deps chromium
       - run: bun run test:browser
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: failure()
         with:
           name: browser-report
