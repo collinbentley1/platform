@@ -44,7 +44,8 @@ export async function ensureCloudRunCap(app: Pick<Project, "project" | "number">
   if (money?.currencyCode !== "USD" || !Number.isFinite(amountNanos) || amountNanos < 0 || !["CONFIGURED", "ENFORCED"].includes(cap.spendCap?.outputState ?? "")) throw new Error(`Cloud Run cap for ${app.project} needs owner attention.`);
   if (amountNanos > limitCents * 1e7) {
     if (cap.spendCap?.outputState !== "CONFIGURED" || !cap.etag) throw new Error(`Cloud Run cap for ${app.project} needs owner attention before lowering; enforced caps are not lifted automatically.`);
-    return request<NativeBudget>(`${cap.name}?updateMask=amount`, { etag: cap.etag, amount: { specifiedAmount } }, "PATCH");
+    const { name, ...configuration } = cap;
+    return request<NativeBudget>(`${name}?updateMask=amount.specifiedAmount,spendCap.inputState`, { ...configuration, amount: { specifiedAmount }, spendCap: { inputState: "CONFIGURED" } }, "PATCH");
   }
   return cap;
 }

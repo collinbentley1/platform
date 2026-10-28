@@ -9,8 +9,12 @@ const account = "billingAccounts/000000-111111-222222";
 const cap = (state = "CONFIGURED", units = "4") => ({
   name: `${account}/budgets/existing-cap`,
   etag: "original",
-  budgetFilter: { projects: [`projects/${app.number}`], services: ["services/152E-C115-5142"] },
+  displayName: "Existing project cap",
+  budgetFilter: { projects: [`projects/${app.number}`], services: ["services/152E-C115-5142"], calendarPeriod: "MONTH", creditTypesTreatment: "EXCLUDE_ALL_CREDITS" },
   amount: { specifiedAmount: { currencyCode: "USD", units, nanos: 0 } },
+  thresholdRules: [0.5, 0.8, 1].map(thresholdPercent => ({ thresholdPercent })),
+  notificationsRule: { enableProjectLevelRecipients: true },
+  ownershipScope: "ALL_USERS",
   spendCap: { outputState: state },
 });
 
@@ -71,8 +75,9 @@ test("an existing cap is lowered once with its etag when the combined budget shr
   let existing = cap(); const writes: unknown[] = [];
   const request = async <T>(path: string, body?: unknown, method?: string): Promise<T> => {
     if (body) {
-      expect(method).toBe("PATCH"); expect(path).toBe(`${existing.name}?updateMask=amount`);
-      expect(body).toEqual({ etag: "original", amount: { specifiedAmount: { currencyCode: "USD", units: "0", nanos: 200_000_000 } } });
+      expect(method).toBe("PATCH"); expect(path).toBe(`${existing.name}?updateMask=amount.specifiedAmount,spendCap.inputState`);
+      expect(body).toMatchObject({ etag: "original", budgetFilter: existing.budgetFilter, thresholdRules: existing.thresholdRules, notificationsRule: existing.notificationsRule, spendCap: { inputState: "CONFIGURED" }, amount: { specifiedAmount: { currencyCode: "USD", units: "0", nanos: 200_000_000 } } });
+      expect(body).not.toHaveProperty("name");
       writes.push(body); existing = { ...cap(), etag: "updated", amount: { specifiedAmount: { currencyCode: "USD", units: "0", nanos: 200_000_000 } } };
       return structuredClone(existing) as T;
     }
