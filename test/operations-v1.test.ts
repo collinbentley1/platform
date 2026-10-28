@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { ensureCloudRunCap } from "../delivery/operations.ts";
+import { ensureCloudRunCap, cloudRunCapCents } from "../delivery/operations.ts";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -8,8 +8,9 @@ const app = { project: "test-project", number: "123456789" };
 const account = "billingAccounts/000000-111111-222222";
 const cap = (state = "CONFIGURED", units = "4") => ({
   name: `${account}/budgets/existing-cap`,
+  etag: "original",
   budgetFilter: { projects: [`projects/${app.number}`], services: ["services/152E-C115-5142"] },
-  amount: { specifiedAmount: { currencyCode: "USD", units } },
+  amount: { specifiedAmount: { currencyCode: "USD", units, nanos: 0 } },
   spendCap: { outputState: state },
 });
 
@@ -38,7 +39,7 @@ test("a new project gets a monthly native Cloud Run cap and rerunning creates no
 });
 
 test("setup preserves stricter and enforced caps without raising or lifting them", async () => {
-  for (const existing of [cap("CONFIGURED", "2"), cap("ENFORCED")]) {
+  for (const existing of [cap("CONFIGURED", "2"), cap("CONFIGURED", "0"), cap("ENFORCED")]) {
     const request = async <T>(_path: string, body?: unknown): Promise<T> => {
       expect(body).toBeUndefined();
       return structuredClone({ budgets: [existing] }) as T;
@@ -47,14 +48,47 @@ test("setup preserves stricter and enforced caps without raising or lifting them
   }
 });
 
-test("a lifted or excessive existing cap needs owner attention rather than a duplicate", async () => {
-  for (const existing of [cap("AWAITING_NEXT_PERIOD"), cap("CONFIGURED", "8")]) {
+test("a lifted cap or invalid currency needs owner attention rather than a duplicate", async () => {
+  const foreign = cap(); foreign.amount.specifiedAmount.currencyCode = "EUR";
+  for (const existing of [cap("AWAITING_NEXT_PERIOD"), foreign]) {
     const request = async <T>(_path: string, body?: unknown): Promise<T> => {
       expect(body).toBeUndefined();
       return structuredClone({ budgets: [existing] }) as T;
     };
     await expect(ensureCloudRunCap(app, account, request)).rejects.toThrow("owner attention");
   }
+});
+
+test("per-project caps stay within the requested combined budget as projects grow", () => {
+  for (const [total, count, expected] of [[30, 5, 400], [30, 8, 375], [1, 5, 20], [1, 3, 33]]) {
+    const cents = cloudRunCapCents(total!, count!);
+    expect(cents).toBe(expected!); expect(cents * count!).toBeLessThanOrEqual(total! * 100);
+  }
+  for (const [total, count] of [[31, 5], [0, 5], [NaN, 5], [30, 0], [0.01, 5]]) expect(() => cloudRunCapCents(total!, count!)).toThrow();
+});
+
+test("an existing cap is lowered once with its etag when the combined budget shrinks", async () => {
+  let existing = cap(); const writes: unknown[] = [];
+  const request = async <T>(path: string, body?: unknown, method?: string): Promise<T> => {
+    if (body) {
+      expect(method).toBe("PATCH"); expect(path).toBe(`${existing.name}?updateMask=amount`);
+      expect(body).toEqual({ etag: "original", amount: { specifiedAmount: { currencyCode: "USD", units: "0", nanos: 200_000_000 } } });
+      writes.push(body); existing = { ...cap(), etag: "updated", amount: { specifiedAmount: { currencyCode: "USD", units: "0", nanos: 200_000_000 } } };
+      return structuredClone(existing) as T;
+    }
+    return structuredClone({ budgets: [existing] }) as T;
+  };
+  const limit = cloudRunCapCents(1, 5);
+  await ensureCloudRunCap(app, account, request, limit);
+  await ensureCloudRunCap(app, account, request, limit);
+  expect(writes).toHaveLength(1);
+});
+
+test("lowering the budget cannot lift an enforced cap", async () => {
+  const request = async <T>(_path: string, body?: unknown): Promise<T> => {
+    expect(body).toBeUndefined(); return { budgets: [cap("ENFORCED")] } as T;
+  };
+  await expect(ensureCloudRunCap(app, account, request, cloudRunCapCents(1, 5))).rejects.toThrow("not lifted");
 });
 
 test("a cap on a later page is reused instead of duplicated", async () => {

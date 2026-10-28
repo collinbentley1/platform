@@ -3,14 +3,21 @@ import { command, gcloud } from "./process.ts";
 
 type NativeBudget = {
   name: string;
+  etag?: string;
   budgetFilter?: { projects?: string[]; services?: string[] };
   amount?: { specifiedAmount?: { currencyCode: string; units?: string; nanos?: number } };
   spendCap?: { outputState: string };
 };
-type BudgetRequest = <T>(path: string, body?: unknown) => Promise<T>;
+type BudgetRequest = <T>(path: string, body?: unknown, method?: "GET" | "POST" | "PATCH") => Promise<T>;
 const cloudRunService = "services/152E-C115-5142";
 
-export async function ensureCloudRunCap(app: Pick<Project, "project" | "number">, account: string, request: BudgetRequest): Promise<NativeBudget> {
+export function cloudRunCapCents(total: number, projectCount: number): number {
+  const cents = Math.min(400, Math.floor(total * 100 / projectCount));
+  if (!Number.isFinite(total) || total <= 0 || total > defaults.monthlyBudgetUSD || !Number.isInteger(projectCount) || projectCount < 1 || cents < 1) throw new Error("Budget must be at most 30 USD and allocate at least one cent per project.");
+  return cents;
+}
+
+export async function ensureCloudRunCap(app: Pick<Project, "project" | "number">, account: string, request: BudgetRequest, limitCents = 400): Promise<NativeBudget> {
   const budgets: NativeBudget[] = [];
   let pageToken = "";
   do {
@@ -21,27 +28,33 @@ export async function ensureCloudRunCap(app: Pick<Project, "project" | "number">
   } while (pageToken);
   const matches = budgets.filter(budget => budget.spendCap && budget.budgetFilter?.projects?.includes(`projects/${app.number}`) && budget.budgetFilter?.services?.includes(cloudRunService));
   if (matches.length > 1) throw new Error(`Cloud Run cap is ambiguous for ${app.project}.`);
+  const specifiedAmount = { currencyCode: "USD", units: String(Math.floor(limitCents / 100)), nanos: limitCents % 100 * 1e7 };
   const cap = matches[0] ?? await request<NativeBudget>(`${account}/budgets`, {
     displayName: `Platform Cloud Run cap - ${app.project}`,
     budgetFilter: { projects: [`projects/${app.number}`], services: [cloudRunService], creditTypesTreatment: "EXCLUDE_ALL_CREDITS", calendarPeriod: "MONTH" },
-    amount: { specifiedAmount: { currencyCode: "USD", units: "4", nanos: 0 } },
+    amount: { specifiedAmount },
     thresholdRules: [0.5, 0.8, 1].map(thresholdPercent => ({ thresholdPercent })),
     notificationsRule: { enableProjectLevelRecipients: true },
     ownershipScope: "ALL_USERS",
     spendCap: { inputState: "CONFIGURED" },
   });
   const money = cap.amount?.specifiedAmount;
-  const amount = Number(money?.units ?? 0) + (money?.nanos ?? 0) / 1e9;
+  const amountNanos = Number(money?.units ?? 0) * 1e9 + (money?.nanos ?? 0);
   // Keep stricter caps and enforcement intact; setup never raises or lifts them.
-  if (money?.currencyCode !== "USD" || !(amount > 0 && amount <= 4) || !["CONFIGURED", "ENFORCED"].includes(cap.spendCap?.outputState ?? "")) throw new Error(`Cloud Run cap for ${app.project} needs owner attention; it was not changed.`);
+  if (money?.currencyCode !== "USD" || !Number.isFinite(amountNanos) || amountNanos < 0 || !["CONFIGURED", "ENFORCED"].includes(cap.spendCap?.outputState ?? "")) throw new Error(`Cloud Run cap for ${app.project} needs owner attention.`);
+  if (amountNanos > limitCents * 1e7) {
+    if (cap.spendCap?.outputState !== "CONFIGURED" || !cap.etag) throw new Error(`Cloud Run cap for ${app.project} needs owner attention before lowering; enforced caps are not lifted automatically.`);
+    return request<NativeBudget>(`${cap.name}?updateMask=amount`, { etag: cap.etag, amount: { specifiedAmount } }, "PATCH");
+  }
   return cap;
 }
 
 // Owner-only native billing controls; no resident monitoring service.
 export async function budget(total: number): Promise<void> {
-  if (Bun.env.GITHUB_ACTIONS || !Number.isFinite(total) || total <= 0 || total > defaults.monthlyBudgetUSD) throw new Error("Owner budget must be between zero and 30 USD.");
+  if (Bun.env.GITHUB_ACTIONS) throw new Error("Budget setup requires the owner's session.");
   const accounts = new Set<string>();
   const enrolled = [...new Map(projects.map(app => [app.project, app])).values()];
+  const limitCents = cloudRunCapCents(total, enrolled.length);
   const billing = new Map<string, string>();
   for (const { project } of enrolled) {
     const value = await gcloud<{ billingAccountName: string; billingEnabled: boolean }>(["billing", "projects", "describe", project]);
@@ -61,13 +74,13 @@ export async function budget(total: number): Promise<void> {
   if (!quotaProject) throw new Error("No enrolled project is available for budget setup.");
   await command(["gcloud", "services", "enable", "billingbudgets.googleapis.com", `--project=${quotaProject}`, "--quiet"]);
   const token = await command(["gcloud", "auth", "print-access-token"], { quiet: true });
-  const request: BudgetRequest = async <T>(path: string, body?: unknown): Promise<T> => {
-    const response = await fetch(`https://billingbudgets.googleapis.com/v1/${path}`, { method: body ? "POST" : "GET", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Goog-User-Project": quotaProject }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: "error", signal: AbortSignal.timeout(30_000) });
+  const request: BudgetRequest = async <T>(path: string, body?: unknown, method: "GET" | "POST" | "PATCH" = body ? "POST" : "GET"): Promise<T> => {
+    const response = await fetch(`https://billingbudgets.googleapis.com/v1/${path}`, { method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Goog-User-Project": quotaProject }, ...(body ? { body: JSON.stringify(body) } : {}), redirect: "error", signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw new Error(`Native budget API failed (${response.status}). Rerun budget setup after resolving access.`);
     return await response.json() as T;
   };
   for (const app of enrolled) {
-    const cap = await ensureCloudRunCap(app, billing.get(app.project)!, request);
+    const cap = await ensureCloudRunCap(app, billing.get(app.project)!, request, limitCents);
     console.log(JSON.stringify({ event: "cloud-run-cap-configured", project: app.project, amount: cap.amount, state: cap.spendCap?.outputState }));
   }
 }
