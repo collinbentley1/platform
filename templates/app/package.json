@@ -15,12 +15,12 @@
     "verify:ci": "bun run format:check && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
-    "jose": "6.2.13",
+    "jose": "6.2.15",
     "firebase-admin": "14.5.0",
     "rate-limiter-flexible": "11.2.3"
   },
   "devDependencies": {
-    "@types/bun": "1.4.3",
+    "@types/bun": "1.4.4",
     "typescript": "7.0.2"
   },
   "packageManager": "bun@1.4.4"
